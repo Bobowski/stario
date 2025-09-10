@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img alt="stario-logo" src="https://raw.githubusercontent.com/bobowski/stario/main/docs/img/stario.png">
+    <img alt="stario-logo" src="https://raw.githubusercontent.com/bobowski/stario/main/docs/img/stario.png" style="height: 200px; width: auto;">
   </picture>
 </p>
 
