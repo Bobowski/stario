@@ -24,13 +24,8 @@ async def online_counter():
         await asyncio.sleep(interval)
 
 
-async def say_hello():
-    yield "append", "body", "<div>Hello there!</div>"
-
-
 # url routes
 app = Stario(
     Query("/", home),
     Query("/online-counter", online_counter),
-    Command("/hello", say_hello),
 )
