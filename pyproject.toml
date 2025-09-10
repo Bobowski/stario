@@ -1,0 +1,27 @@
+[project]
+name = "stario"
+version = "0.1.0"
+description = "Stario brings back the joy of building web apps"
+readme = "README.md"
+authors = [
+    { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "brotli-asgi>=1.4.0",
+    "pydantic>=2.11.7",
+    "starlette>=0.47.2",
+    "uvicorn>=0.35.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.6,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.403",
+    "pytest>=8.4.1",
+    "ruff>=0.12.8",
+    "ty>=0.0.1a19",
+]
