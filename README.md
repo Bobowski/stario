@@ -10,7 +10,7 @@
 
 ---
 
-**Documentation**: Coming soon
+**Documentation**: <a href="https://stario.dev" target="_blank">stario.dev</a>
 
 **Source Code**: <a href="https://github.com/bobowski/stario/tree/main/stario" target="_blank">https://github.com/bobowski/stario</a>
 
