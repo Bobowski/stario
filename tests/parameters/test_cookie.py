@@ -3,11 +3,11 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import Cookie
+from stario.parameters import ParseCookie
 
 
 def test_cookie_ok():
-    async def handler(session: Annotated[str, Cookie("session")]):
+    async def handler(session: Annotated[str, ParseCookie("session")]):
         return session
 
     app = Stario(Query("/c", handler))
@@ -19,7 +19,7 @@ def test_cookie_ok():
 
 
 def test_cookie_missing():
-    async def handler(session: Annotated[str, Cookie("session")]):
+    async def handler(session: Annotated[str, ParseCookie("session")]):
         return session
 
     app = Stario(Query("/c", handler))
@@ -32,7 +32,7 @@ def test_cookie_missing():
 
 def test_cookie_invalid_type():
     # Expect int from cookie (unusual but supported), provide string
-    async def handler(num: Annotated[int, Cookie("num")]):
+    async def handler(num: Annotated[int, ParseCookie("num")]):
         return str(num)
 
     app = Stario(Query("/n", handler))

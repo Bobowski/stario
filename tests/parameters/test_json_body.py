@@ -3,11 +3,11 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Command, Stario
-from stario.parameters import JsonBody
+from stario.parameters import ParseJsonBody
 
 
 def test_json_body_dict_ok():
-    async def handler(payload: Annotated[dict, JsonBody[dict]()]):
+    async def handler(payload: Annotated[dict, ParseJsonBody[dict]()]):
         return payload.get("k", "missing")
 
     app = Stario(Command("/json", handler))
@@ -19,7 +19,7 @@ def test_json_body_dict_ok():
 
 
 def test_json_body_list_ok():
-    async def handler(items: Annotated[list[int], JsonBody[list[int]]()]):
+    async def handler(items: Annotated[list[int], ParseJsonBody[list[int]]()]):
         return str(sum(items))
 
     app = Stario(Command("/json-list", handler))
@@ -31,7 +31,7 @@ def test_json_body_list_ok():
 
 
 def test_json_body_invalid_payload():
-    async def handler(payload: Annotated[dict, JsonBody[dict]()]):
+    async def handler(payload: Annotated[dict, ParseJsonBody[dict]()]):
         return "never"
 
     app = Stario(Command("/json-bad", handler))

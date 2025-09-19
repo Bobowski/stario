@@ -3,23 +3,23 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import Header
+from stario.parameters import ParseHeader
 
 
 def test_header_ok():
-    async def handler(token: Annotated[str, Header("x-token")]):
+    async def handler(token: Annotated[str, ParseHeader("x-token")]):
         return token
 
     app = Stario(Query("/h", handler))
 
     with TestClient(app) as client:
         resp = client.get("/h", headers={"x-token": "abc"})
-    assert resp.status_code == 200
     assert resp.text == "abc"
+    assert resp.status_code == 200
 
 
 def test_header_missing():
-    async def handler(token: Annotated[str, Header("x-token")]):
+    async def handler(token: Annotated[str, ParseHeader("x-token")]):
         return token
 
     app = Stario(Query("/h", handler))
@@ -32,7 +32,7 @@ def test_header_missing():
 
 def test_header_invalid_type():
     # Expect int, send non-int; header values are strings
-    async def handler(x: Annotated[int, Header("x-num")]):
+    async def handler(x: Annotated[int, ParseHeader("x-num")]):
         return str(x)
 
     app = Stario(Query("/hn", handler))

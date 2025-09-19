@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from inspect import Parameter as InspectParameter
-from typing import Any, cast, get_args
+from typing import Annotated, Any, cast, get_args
 
 from pydantic import TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException
@@ -37,9 +37,8 @@ class _ParamExtractorSync[T]:
         """
         Initialize the synchronous parameter extractor with validation and default handling.
         """
-
         self.request_param = rparam
-        self.name = rparam.name or iparam.name
+        self.name = rparam.name if rparam.name else iparam.name
         self.return_type = get_args(iparam.annotation)[0]
         self.default: T | object = iparam.default
         self.adapter: TypeAdapter[Any] = TypeAdapter(self.return_type)
@@ -72,7 +71,7 @@ class _ParamExtractorSync[T]:
             )
 
 
-class QueryParam[T](RequestParameter[T]):
+class ParseQueryParam[T](RequestParameter[T]):
     """
     Extracts a single query parameter from the request.
     """
@@ -84,7 +83,7 @@ class QueryParam[T](RequestParameter[T]):
         return request.query_params[name]
 
 
-class QueryParams[T](RequestParameter[T]):
+class ParseQueryParams[T](RequestParameter[T]):
     """
     Extracts multiple query parameters with the same name from the request.
     """
@@ -99,7 +98,7 @@ class QueryParams[T](RequestParameter[T]):
         return values
 
 
-class PathParam[T](RequestParameter[T]):
+class ParsePathParam[T](RequestParameter[T]):
     """
     Extracts a path parameter from the request.
     """
@@ -111,7 +110,7 @@ class PathParam[T](RequestParameter[T]):
         return request.path_params[name]
 
 
-class Header[T](RequestParameter[T]):
+class ParseHeader[T](RequestParameter[T]):
     """
     Extracts a single header from the request.
     """
@@ -123,7 +122,7 @@ class Header[T](RequestParameter[T]):
         return request.headers[name]
 
 
-class Headers[T](RequestParameter[T]):
+class ParseHeaders[T](RequestParameter[T]):
     """
     Extracts multiple headers with the same name from the request.
     """
@@ -138,7 +137,7 @@ class Headers[T](RequestParameter[T]):
         return values
 
 
-class Cookie[T](RequestParameter[T]):
+class ParseCookie[T](RequestParameter[T]):
     """
     Extracts a cookie from the request.
     """
@@ -150,7 +149,7 @@ class Cookie[T](RequestParameter[T]):
         return request.cookies[name]
 
 
-class RawBody:
+class ParseRawBody:
     """
     Extracts the raw body of the request as bytes or str.
     Note: Request body can only be read once per request. Ensure only one body extractor is used per endpoint to avoid issues.
@@ -174,7 +173,7 @@ class _RawBodyExtractor[T]:
     Asynchronous extractor for raw request body.
     """
 
-    def __init__(self, rparam: RawBody, iparam: InspectParameter) -> None:
+    def __init__(self, rparam: ParseRawBody, iparam: InspectParameter) -> None:
         self.encoding = rparam.encoding
         self.return_type: type[T] = get_args(iparam.annotation)[0]
 
@@ -195,7 +194,7 @@ class _RawBodyExtractor[T]:
         )
 
 
-class JsonBody[T]:
+class ParseJsonBody[T]:
     """
     Extracts and validates the JSON body of the request using Pydantic.
     Note: For performance, ensure body is read only once; this assumes single body param per endpoint.
@@ -231,7 +230,7 @@ class _JsonBodyExtractor[T]:
             )
 
 
-class Body[T]:
+class ParseBody[T]:
     """
     Generic body extractor that handles bytes, str, or JSON based on type and content-type.
     Note: For optimal performance and correctness, use only one body extractor per endpoint as body can be read only once.
@@ -279,3 +278,15 @@ class _BodyExtractor[T]:
             status_code=415,
             detail=f"Unsupported media type header. Expected {self.return_type}. Received {request.headers.get('Content-Type')}",
         )
+
+
+# Syntax sugar
+type QueryParam[T] = Annotated[T, ParseQueryParam()]
+type QueryParams[T] = Annotated[T, ParseQueryParams()]
+type PathParam[T] = Annotated[T, ParsePathParam()]
+type Header[T] = Annotated[T, ParseHeader()]
+type Headers[T] = Annotated[T, ParseHeaders()]
+type Cookie[T] = Annotated[T, ParseCookie()]
+type Body[T] = Annotated[T, ParseBody()]
+type JsonBody[T] = Annotated[T, ParseJsonBody()]
+type RawBody[T] = Annotated[T, ParseRawBody()]

@@ -3,11 +3,11 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Command, Stario
-from stario.parameters import RawBody
+from stario.parameters import ParseRawBody
 
 
 def test_raw_body_bytes_ok():
-    async def handler(data: Annotated[bytes, RawBody()]) -> str:
+    async def handler(data: Annotated[bytes, ParseRawBody()]) -> str:
         return str(len(data))
 
     app = Stario(Command("/raw", handler))
@@ -19,7 +19,7 @@ def test_raw_body_bytes_ok():
 
 
 def test_raw_body_str_ok_with_custom_encoding():
-    async def handler(data: Annotated[str, RawBody(encoding="utf-8")]):
+    async def handler(data: Annotated[str, ParseRawBody(encoding="utf-8")]):
         return str(len(data))
 
     app = Stario(Command("/raw-str", handler))

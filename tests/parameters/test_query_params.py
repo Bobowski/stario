@@ -3,11 +3,12 @@ from typing import Annotated, List
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import QueryParams
+from stario.parameters import ParseQueryParams
 
 
 def test_query_params_ok():
-    async def handler(tags: Annotated[list[str], QueryParams()]):
+
+    async def handler(tags: Annotated[list[str], ParseQueryParams()]):
         return ",".join(tags)
 
     app = Stario(Query("/tags", handler))
@@ -19,7 +20,7 @@ def test_query_params_ok():
 
 
 def test_query_params_missing():
-    async def handler(tags: Annotated[List[str], QueryParams()]):
+    async def handler(tags: Annotated[List[str], ParseQueryParams()]):
         return ",".join(tags)
 
     app = Stario(Query("/tags", handler))
@@ -32,7 +33,7 @@ def test_query_params_missing():
 
 def test_query_params_invalid_type():
     # Expect list[int], send strings
-    async def handler(ids: Annotated[list[int], QueryParams()]):
+    async def handler(ids: Annotated[list[int], ParseQueryParams()]):
         return ",".join(str(i) for i in ids)
 
     app = Stario(Query("/ids", handler))

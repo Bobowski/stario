@@ -3,11 +3,11 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import Headers
+from stario.parameters import ParseHeaders
 
 
 def test_headers_ok_multiple_values():
-    async def handler(values: Annotated[list[str], Headers("x-dup")]):
+    async def handler(values: Annotated[list[str], ParseHeaders("x-dup")]):
         return ",".join(values)
 
     app = Stario(Query("/hh", handler))
@@ -19,7 +19,7 @@ def test_headers_ok_multiple_values():
 
 
 def test_headers_missing():
-    async def handler(values: Annotated[list[str], Headers("x-dup")]):
+    async def handler(values: Annotated[list[str], ParseHeaders("x-dup")]):
         return ",".join(values)
 
     app = Stario(Query("/hh", handler))
@@ -32,7 +32,7 @@ def test_headers_missing():
 
 def test_headers_type_validation():
     # Expect list[int], provide non-int among values
-    async def handler(values: Annotated[list[int], Headers("x-nums")]):
+    async def handler(values: Annotated[list[int], ParseHeaders("x-nums")]):
         return ",".join(str(v) for v in values)
 
     app = Stario(Query("/hic", handler))

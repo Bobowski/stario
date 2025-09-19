@@ -1,12 +1,10 @@
 import asyncio
-from typing import Annotated
 
 from stario import Query, Stario
-from stario.parameters import QueryParam
 from stario.toys import ToyPage
 
 
-async def home(q: Annotated[int, QueryParam()] = 1):
+def home():
     return ToyPage(
         """
         <h2>Realtime responses!</h2>

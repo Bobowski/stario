@@ -3,11 +3,11 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Command, Stario
-from stario.parameters import Body
+from stario.parameters import ParseBody
 
 
 def test_body_ok_raw_bytes():
-    async def handler(data: Annotated[bytes, Body()]):
+    async def handler(data: Annotated[bytes, ParseBody()]):
         # Return hex length for stable text
         return str(len(data))
 
@@ -20,7 +20,7 @@ def test_body_ok_raw_bytes():
 
 
 def test_body_missing_is_empty():
-    async def handler(data: Annotated[bytes, Body()]):
+    async def handler(data: Annotated[bytes, ParseBody()]):
         return str(len(data))
 
     app = Stario(Command("/b", handler))
@@ -33,7 +33,7 @@ def test_body_missing_is_empty():
 
 
 def test_body_string_len_with_multibyte():
-    async def handler(data: Annotated[str, Body()]):
+    async def handler(data: Annotated[str, ParseBody()]):
         # Return the length of the string (number of characters)
         return str(len(data))
 
@@ -49,7 +49,7 @@ def test_body_string_len_with_multibyte():
 
 
 def test_body_invalid_type_expect_int():
-    async def handler(num: Annotated[int, Body()]):
+    async def handler(num: Annotated[int, ParseBody()]):
         return str(num)
 
     app = Stario(Command("/n", handler))
@@ -66,7 +66,7 @@ def test_body_invalid_type_expect_int():
 
 
 def test_body_json_to_dict_ok():
-    async def handler(payload: Annotated[dict, Body()]):
+    async def handler(payload: Annotated[dict, ParseBody()]):
         # Ensure we actually received a dict
         if payload.get("a") == 1 and payload.get("b") == "x":
             return "ok"
@@ -81,7 +81,7 @@ def test_body_json_to_dict_ok():
 
 
 def test_body_json_expected_dict_but_plain_text():
-    async def handler(payload: Annotated[dict, Body()]):
+    async def handler(payload: Annotated[dict, ParseBody()]):
         return "never"
 
     app = Stario(Command("/j2", handler))
@@ -94,7 +94,7 @@ def test_body_json_expected_dict_but_plain_text():
 
 
 def test_body_json_expected_dict_empty_body():
-    async def handler(payload: Annotated[dict, Body()]):
+    async def handler(payload: Annotated[dict, ParseBody()]):
         return "never"
 
     app = Stario(Command("/j3", handler))

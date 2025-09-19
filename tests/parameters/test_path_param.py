@@ -3,11 +3,11 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import PathParam
+from stario.parameters import ParsePathParam
 
 
 def test_path_param_ok():
-    async def handler(id: Annotated[int, PathParam()]):
+    async def handler(id: Annotated[int, ParsePathParam()]):
         return str(id)
 
     app = Stario(Query("/items/{id}", handler))
@@ -19,7 +19,7 @@ def test_path_param_ok():
 
 
 def test_path_param_missing_not_match():
-    async def handler(id: Annotated[int, PathParam()]):
+    async def handler(id: Annotated[int, ParsePathParam()]):
         return str(id)
 
     app = Stario(Query("/items/{id}", handler))
@@ -31,7 +31,7 @@ def test_path_param_missing_not_match():
 
 
 def test_path_param_invalid_type():
-    async def handler(id: Annotated[int, PathParam()]):
+    async def handler(id: Annotated[int, ParsePathParam()]):
         return str(id)
 
     app = Stario(Query("/items/{id}", handler))

@@ -71,6 +71,22 @@ class Injectable(Protocol):
 R = TypeVar("R")
 
 
+def _inspect_parameter(prm: Parameter) -> Parameter:
+    annotation = prm.annotation
+    return_type = prm.annotation
+
+    if hasattr(annotation, "__value__"):
+        return_type = get_args(annotation)[0]
+        annotation = annotation.__value__
+
+        if get_origin(annotation) is Annotated:
+            _, *args = get_args(annotation)
+            print("replaces")
+            annotation = Annotated[return_type, *args]
+
+    return Parameter(prm.name, prm.kind, default=prm.default, annotation=annotation)
+
+
 class Dependency:
 
     __slots__ = ("name", "function", "is_async", "lifetime", "children")
@@ -92,6 +108,8 @@ class Dependency:
     @classmethod
     def _build_node(cls, prm: Parameter) -> Self:
 
+        prm = _inspect_parameter(prm)
+
         if get_origin(prm.annotation) is Annotated:
             # name: Annotated[type, dependency[, lifetime]]
 
@@ -104,7 +122,7 @@ class Dependency:
                 )
 
             lifetime = modifiers[0] if modifiers else "request"
-            func = arg.on_inspect(prm) if isinstance(arg, Injectable) else arg
+            func = arg.on_inspect(prm) if hasattr(arg, "on_inspect") else arg
             return cls._build_tree(prm.name, func, lifetime)
 
         if isinstance(prm.annotation, type):
@@ -208,13 +226,17 @@ class Dependency:
                 arguments = {child.name: await child.resolve(app, request)}
 
             else:
-                # Multiple children - use TaskGroup for parallel execution
-                async with asyncio.TaskGroup() as tg:
-                    tasks = [
-                        tg.create_task(d.resolve(app, request)) for d in self.children
-                    ]
+                # Multiple children - use gather for parallel execution
+                results = await asyncio.gather(
+                    *[d.resolve(app, request) for d in self.children],
+                    return_exceptions=True,
+                )
+                # Check for exceptions and raise the first one found
+                for result in results:
+                    if isinstance(result, Exception):
+                        raise result
                 arguments = {
-                    c.name: task.result() for c, task in zip(self.children, tasks)
+                    c.name: result for c, result in zip(self.children, results)
                 }
 
             # Execute function
