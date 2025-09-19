@@ -4,7 +4,6 @@ from starlette.middleware import Middleware
 from starlette.routing import get_name
 
 from stario.routing import HeadersConstraint, StarRoute
-from stario.types import CacheScope, RunMode
 from stario.wrappers import QuickRouteWrapper
 
 
@@ -20,13 +19,11 @@ class Query(StarRoute):
         middleware: Sequence[Middleware] | None = None,
         # Stario specific
         headers: HeadersConstraint | None = None,
-        cache: CacheScope = "request",
-        mode: RunMode = "auto",
     ) -> None:
         # fmt: off
         super().__init__(
             path              = path,
-            endpoint          = QuickRouteWrapper(endpoint, cache=cache, mode=mode).__call__,
+            endpoint          = QuickRouteWrapper(endpoint).__call__,
             methods           = methods,
             name              = name or get_name(endpoint),
             include_in_schema = include_in_schema,
@@ -48,14 +45,12 @@ class Command(StarRoute):
         middleware: Sequence[Middleware] | None = None,
         # Stario specific
         headers: HeadersConstraint | None = None,
-        cache: CacheScope = "request",
-        mode: RunMode = "auto",
     ) -> None:
 
         # fmt: off
         super().__init__(
             path              = path,
-            endpoint          = QuickRouteWrapper(endpoint, cache=cache, mode=mode).__call__,
+            endpoint          = QuickRouteWrapper(endpoint).__call__,
             methods           = methods,
             name              = name or get_name(endpoint),
             include_in_schema = include_in_schema,

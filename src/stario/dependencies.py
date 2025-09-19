@@ -1,7 +1,6 @@
 import asyncio
 import functools
 import inspect
-from dataclasses import dataclass
 from inspect import (
     Parameter,
     isasyncgenfunction,
@@ -12,28 +11,61 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Literal,
+    Protocol,
     Self,
+    Sequence,
     TypeIs,
     TypeVar,
+    cast,
     get_args,
     get_origin,
-    get_type_hints,
     overload,
+    runtime_checkable,
 )
 
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
+from stario.application import Stario
+
 # from stario.application import Stario
-from stario.parameters import RequestParam
-from stario.types import CacheScope, RunMode
+
+type DependencyLifetime = Literal["transient", "request", "singleton", "lazy"]
+"""
+Specifies the lifetime of a dependency instance:
+
+- "transient": Called every time the dependency is used. Could be called multiple times in the same request.
+- "request": Called once and shared for the duration of a request. Reused for subdependencies within the same request.
+- "singleton": Called once and shared for the entire lifetime of the application. Use this to avoid global variables.
+- "lazy": Returns a callable that can be called to get the actual dependency instance.
+          This is useful for dependencies that are expensive to create and you want to defer the creation until it's actually needed.
+
+Use this type to control how dependencies are shared and reused within your application.
+"""
 
 
-@dataclass
-class Inject:
-    func: Callable
-    cache: CacheScope = "request"
-    mode: RunMode = "auto"
+@runtime_checkable
+class Injectable(Protocol):
+
+    def on_inspect(self, parameter: Parameter) -> Callable[..., Any]:
+        """
+        This is called when we're trying to build a dependency tree.
+        Use this to build a dependency that requires some special handling based on the parameter it's used as.
+
+        def foo(name: Annotated[int, MyInjectable()]) -> int:
+            ...
+
+        class MyInjectable:
+            def on_inspect(self, parameter: Parameter) -> Callable[..., int]:
+                if parameter.annotation == int:
+                    return lambda: 42
+                else:
+                    raise ValueError(f"Unknown annotation: {parameter.annotation}")
+
+        In this case MyInjectable will be provided a context it's being used in (parameter),
+          and should return a dedicated callable to actually be used while requested.
+        """
+        ...
 
 
 R = TypeVar("R")
@@ -41,185 +73,166 @@ R = TypeVar("R")
 
 class Dependency:
 
+    __slots__ = ("name", "function", "is_async", "lifetime", "children")
+
     def __init__(
         self,
-        func: Callable[..., Any],
-        cache: CacheScope = "request",
-        mode: RunMode = "auto",
-        return_type: type[Any] | None = None,
-        default: Any = Parameter.empty,
+        name: str,
+        function: Callable[..., Any] | type[Request] | type[Stario],
+        lifetime: DependencyLifetime = "request",
+        children: Sequence[Self] | None = None,
     ) -> None:
-        # This is what we use to resolve the dependency
-        self.func = func
-        self.cache = cache
-        self.mode = mode
-        # Useful info for the tree
-        self.is_async = is_async_callable(self.func)
-        self.is_gen = is_generator_callable(self.func)
-        self.return_type = return_type or get_type_hints(self.func).get("return")
-        self.default = default
-        self.children: dict[str, Self] = {}
 
-    async def call(self, *args: Any, **kwargs: Any) -> Any:
-        if self.mode == "auto":
-            # Auto: async if async
-            if self.is_async:
-                return await self.func(*args, **kwargs)
-            elif self.is_gen:
-                # This is for a StreamingResponse so we compute it sync
-                #   and then it's handled by the StreamingResponse threded / async like it wants
-                return self.func(*args, **kwargs)
-
-            # run on threadpool if sync
-            return await run_in_threadpool(self.func, *args, **kwargs)
-
-        if self.mode == "sync":
-            if self.is_async:
-                # We can't run this on threadpool
-                return await self.func(*args, **kwargs)
-
-            return self.func(*args, **kwargs)
-
-        if self.mode == "thread":
-            return await run_in_threadpool(self.func, *args, **kwargs)
-
-        raise ValueError(f"Unknown run mode: {self.mode}")
+        self.name = name
+        self.function = function
+        self.is_async = is_async_callable(function)
+        self.lifetime = lifetime
+        self.children = list(children) if children is not None else []
 
     @classmethod
-    def _build_function_parameter(cls, param: Parameter) -> Self:
-        """
-        Based on the function inspect parameter, build a dependency for it.
-        """
+    def _build_node(cls, prm: Parameter) -> Self:
 
-        if get_origin(param.annotation) is Annotated:
+        if get_origin(prm.annotation) is Annotated:
+            # name: Annotated[type, dependency[, lifetime]]
 
             try:
-                # We're interested in the second argument
-                # The first is the annotated type, so we don't care
-                _, arg, *_ = get_args(param.annotation)
+                _, arg, *modifiers = get_args(prm.annotation)
 
             except ValueError:
                 raise ValueError(
-                    f"Unknown annotation: {param.name} must be Annotated with one argument"
+                    f"Unknown annotation: {prm.name} must be Annotated with one argument"
                 )
 
-            if isinstance(arg, RequestParam):
-                # Updates url param based on inspect info like defaults etc.
+            lifetime = modifiers[0] if modifiers else "request"
+            func = arg.on_inspect(prm) if isinstance(arg, Injectable) else arg
+            return cls._build_tree(prm.name, func, lifetime)
 
-                # Getting those params should be "quick" so we run it sync
-                #  rather than delegating to threadpool
-                return cls.build(
-                    function=arg.digest_parameter(param),
-                    mode="sync",
-                    default=param.default,
-                )
+        if isinstance(prm.annotation, type):
+            # name: Request | Stario
+            # will be replaced by actual Request or Stario instance on resolve
 
-            elif isinstance(arg, Inject):
-                return cls.build(
-                    function=arg.func,
-                    cache=arg.cache,
-                    mode=arg.mode,
-                    default=param.default,
-                )
+            if issubclass(prm.annotation, Request):
+                return cls(prm.name, Request)
 
-            return cls.build(function=arg, default=param.default)
+            elif issubclass(prm.annotation, Stario):
+                return cls(prm.name, Stario)
 
-        elif isinstance(param.annotation, type) and issubclass(
-            param.annotation, Request
-        ):
-            # This is something of a special case
-            return cls(Request)
+            raise ValueError(f"Unknown annotation type: {prm.annotation}")
 
-        elif param.default is not Parameter.empty:
-            return cls(
-                func=lambda: param.default,
-                return_type=param.annotation,  # type: ignore[assignment]
-                mode="sync",
-                default=param.default,
-            )
+        if prm.default is not Parameter.empty:
+            # name: Any = default
 
-        else:
-            # We cannot really build dependencies for this so we give up
-            raise ValueError(
-                f"Unknown annotation: {param.name}: {param.annotation} must be Annotated or Request"
-            )
+            return cls(prm.name, lambda: prm.default)
+
+        raise ValueError(f"Unknown annotation: {prm.annotation}")
 
     @classmethod
-    def build(
+    def _build_tree(
         cls,
-        function: Callable[..., Any],
-        cache: CacheScope = "request",
-        mode: RunMode = "auto",
-        default: Any = Parameter.empty,
+        name: str,
+        handler: Callable[..., Any],
+        lifetime: DependencyLifetime = "request",
     ) -> Self:
         """
         Builds a tree of dependencies starting from a given function.
         """
 
-        func = get_callable(function)
-        signature = inspect.signature(func)
-        info = cls(func=func, cache=cache, mode=mode, default=default)
+        fn = get_callable(handler)
+        signature = inspect.signature(fn)
+        children = [
+            cls._build_node(param)
+            for param in signature.parameters.values()
+            if param.name != "self"
+        ]
 
-        info.children = {
-            param_name: cls._build_function_parameter(param)
-            for param_name, param in signature.parameters.items()
-            if param_name != "self"
-        }
+        return cls(name, fn, lifetime, children)
 
-        return info
+    @classmethod
+    def build(cls, handler: Callable[..., Any]) -> Self:
+        """
+        Builds a tree of dependencies starting from a given function.
+        """
 
-    async def resolve(
-        self,
-        request: Request,
-        app: Any,
-        futures: dict[Callable, Awaitable[Any]],
-    ) -> Any:
+        return cls._build_tree(handler.__name__, handler)
 
-        if self.func is Request:
+    async def resolve(self, app: Stario, request: Request) -> Any:
+        # Fast path for built-in types
+        if isinstance(self.function, type) and issubclass(self.function, Request):
             return request
 
-        if self.cache == "app" and self.func in app.cache:
-            return app.cache[self.func]
+        if isinstance(self.function, type) and issubclass(self.function, Stario):
+            return app
 
-        if self.cache == "request" and self.func in futures:
-            return await futures[self.func]
+        # After checks, self.function must be callable
+        self.function = cast(Callable[..., Any], self.function)
 
-        fut = asyncio.Future()
-        if self.cache == "request":
-            futures[self.func] = fut
+        # Get caches once
+        singletons = app.state.cache
 
+        # Handle singleton lifetime with early return
+        if self.lifetime == "singleton":
+            if self.function in singletons:
+                return await singletons[self.function]
+            # Create future for singleton
+            fut = asyncio.Future()
+            singletons[self.function] = fut
+
+        # Handle request lifetime
+        elif self.lifetime == "request":
+            # Initialize request cache if not exists
+            if not hasattr(request.state, "cache"):
+                request.state.cache = {}
+
+            futures = request.state.cache
+
+            if self.function in futures:
+                return await futures[self.function]
+
+            # Create future for request scope
+            fut = asyncio.Future()
+            futures[self.function] = fut
+
+        else:
+            fut = None
+
+        # TODO: lazy?
+
+        # Resolve children efficiently
         try:
-            if len(self.children) == 1:
-                name, child = list(self.children.items())[0]
-                arguments = {name: await child.resolve(request, app, futures)}
-
-            elif self.children:
-                dep_results = await asyncio.gather(
-                    *[d.resolve(request, app, futures) for d in self.children.values()]
-                )
-                arguments = {k: v for k, v in zip(self.children.keys(), dep_results)}
-
-            else:
+            if not self.children:
                 arguments = {}
 
-            # Execute this node's function
-            result = await self.call(**arguments)
-
-            if self.cache == "app":
-                app.cache[self.func] = result
-
-            elif self.cache == "request":
-                fut.set_result(result)
+            elif len(self.children) == 1:
+                # Single child - no need for TaskGroup
+                child = self.children[0]
+                arguments = {child.name: await child.resolve(app, request)}
 
             else:
-                # For 'none' scope, return result directly without setting future
-                return result  # type: ignore
+                # Multiple children - use TaskGroup for parallel execution
+                async with asyncio.TaskGroup() as tg:
+                    tasks = [
+                        tg.create_task(d.resolve(app, request)) for d in self.children
+                    ]
+                arguments = {
+                    c.name: task.result() for c, task in zip(self.children, tasks)
+                }
+
+            # Execute function
+            if self.is_async:
+                result = await self.function(**arguments)
+            else:
+                result = self.function(**arguments)
+
+            # Set result in future if we created one
+            if fut is not None:
+                fut.set_result(result)
 
             return result
 
         except Exception as e:
-            if self.cache in ("request", "app"):
-                fut.set_exception(e)
+            if fut is not None and not fut.done():
+                # Avoid un-retrieved exception warnings on cached futures
+                fut.cancel()
             raise e
 
 

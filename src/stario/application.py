@@ -84,7 +84,8 @@ class Stario:
         self.user_middleware = [] if middleware is None else list(middleware)
         self.middleware_stack: ASGIApp | None = None
 
-        self.cache: dict[Callable, Any] = {}
+        cache: dict[Callable, Any] = {}
+        self.state.cache = cache
 
         # self.dependency_overrides: dict[Callable, Callable] = {}
         # """

@@ -6,7 +6,6 @@ from starlette.responses import HTMLResponse, Response, StreamingResponse
 # from stario.application import Stario
 from stario.datastar import _HtmlProvider, patch_to_sse
 from stario.dependencies import Dependency
-from stario.types import CacheScope, RunMode
 
 
 class HandlerWrapper(Protocol):
@@ -18,21 +17,15 @@ class HandlerWrapper(Protocol):
 
 class QuickRouteWrapper:
 
-    def __init__(
-        self,
-        handler: Callable,
-        *,
-        cache: CacheScope = "request",
-        mode: RunMode = "auto",
-    ) -> None:
+    def __init__(self, handler: Callable) -> None:
         self.handler = handler
-        self.dep = Dependency.build(handler, cache, mode)
+        self.dep = Dependency.build(handler)
 
     async def __call__(self, request: Request) -> Response:
 
         app = request.app
 
-        content = await self.dep.resolve(request, app, {})
+        content = await self.dep.resolve(app, request)
 
         if isinstance(content, Response):
             return content

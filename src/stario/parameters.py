@@ -1,119 +1,298 @@
-from inspect import Parameter
-from types import UnionType
-from typing import Any, Self, cast, get_args, get_origin
+from abc import ABC, abstractmethod
+from inspect import Parameter as InspectParameter
+from typing import Annotated, Any, cast, get_args
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
 
-class RequestParam[T]:
+class RequestParameter[T](ABC):
+    """
+    Abstract base class for extracting parameters from HTTP requests.
+    Subclasses implement specific extraction logic for different parts of the request.
+    """
+
+    PARAMETER_LOCATION: str = "parameter"
 
     def __init__(self, name: str | None = None) -> None:
-        """ """
-
         self.name: str | None = name
-        self.return_type: type[T] | None = None
-        self.default: T | object = Parameter.empty
-        self.adapter: TypeAdapter[Any] | None = None
 
-    @classmethod
-    def full_build(
-        cls,
-        name: str | None = None,
-        return_type: type[T] | None = None,
-        default: T | object = Parameter.empty,
-    ) -> Self:
-        p = cls(name)
-        p.return_type = return_type
-        p.default = default
-        p.adapter = TypeAdapter(return_type) if return_type else None
-        return p
+    def on_inspect(self, param: InspectParameter) -> "_ParamExtractorSync[T]":
+        return _ParamExtractorSync(self, param)
 
-    def digest_parameter(self, param: Parameter) -> "RequestParam[T]":
+    @staticmethod
+    @abstractmethod
+    def extract(request: Request, name: str) -> Any:
         """
-        We assume this will be called after the parameter has been digested.
-        So we can use the return type to get the adapter.
+        Extract the raw value of the parameter from the request.
+        This method must be implemented by subclasses.
         """
-
-        target_type, *_ = get_args(param.annotation)
-
-        self.name = self.name or param.name
-        self.default = self.default or param.default
-        self.return_type = self.return_type or target_type
-        self.adapter = TypeAdapter(self.return_type) if self.return_type else None
-
-        return self
-
-    def extract(self, request: Request) -> Any:
         raise NotImplementedError
 
+
+class _ParamExtractorSync[T]:
+
+    def __init__(self, rparam: RequestParameter[T], iparam: InspectParameter) -> None:
+        """
+        Initialize the synchronous parameter extractor with validation and default handling.
+        """
+
+        self.request_param = rparam
+        self.name = rparam.name or iparam.name
+        self.return_type = get_args(iparam.annotation)[0]
+        self.default: T | object = iparam.default
+        self.adapter: TypeAdapter[Any] = TypeAdapter(self.return_type)
+
+    @property
+    def parameter_location(self) -> str:
+        return self.request_param.PARAMETER_LOCATION
+
     def __call__(self, request: Request) -> T:
+        """
+        Extract and validate the parameter value from the request.
+        Handles defaults and raises appropriate HTTP exceptions on errors.
+        """
         try:
-            raw = self.extract(request)
-            assert self.adapter is not None
-            return self.adapter.validate_python(raw)  # type: ignore[no-any-return]
-
+            raw = self.request_param.extract(request, self.name)
+            return self.adapter.validate_python(raw)
         except KeyError:
-            if self.default is not Parameter.empty:
+            if self.default is not InspectParameter.empty:
                 return cast(T, self.default)
-            raise
+
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required {self.parameter_location} '{self.name}'. Provide it in the request.",
+            )
+        except ValidationError as e:
+            expected = getattr(self.return_type, "__name__", str(self.return_type))
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid {self.parameter_location} '{self.name}'. Expected {expected}. {e}",
+            )
 
 
-class QuerySingle[T](RequestParam[T]):
+class QueryParam[T](RequestParameter[T]):
+    """
+    Extracts a single query parameter from the request.
+    """
 
-    def extract(self, request: Request) -> str:
-        assert self.name is not None
-        return request.query_params[self.name]
+    PARAMETER_LOCATION = "query parameter"
 
-
-class QueryList[T](RequestParam[T]):
-
-    def extract(self, request: Request) -> list[str]:
-        assert self.name is not None
-        return request.query_params.getlist(self.name)
+    @staticmethod
+    def extract(request: Request, name: str) -> str:
+        return request.query_params[name]
 
 
-class QueryParam[T](RequestParam[T]):
+class QueryParams[T](RequestParameter[T]):
+    """
+    Extracts multiple query parameters with the same name from the request.
+    """
 
-    def digest_parameter(self, param: Parameter) -> "RequestParam[T]":
+    PARAMETER_LOCATION = "query parameter"
 
-        p = super().digest_parameter(param)
+    @staticmethod
+    def extract(request: Request, name: str) -> list[str]:
+        values = request.query_params.getlist(name)
+        if not values:
+            raise KeyError(name)
+        return values
 
-        # we need to decide if user wants a single query param or a list of query params
 
-        if p.return_type is not None and get_origin(p.return_type) is UnionType:
+class PathParam[T](RequestParameter[T]):
+    """
+    Extracts a path parameter from the request.
+    """
 
-            for union_type in get_args(p.return_type):
-                if get_origin(union_type) is list:
-                    return QueryList[T].full_build(p.name, union_type, p.default)
+    PARAMETER_LOCATION = "path parameter"
 
-        else:
-            if p.return_type is not None and get_origin(p.return_type) is list:
-                return QueryList[T].full_build(p.name, p.return_type, p.default)
+    @staticmethod
+    def extract(request: Request, name: str) -> str:
+        return request.path_params[name]
 
-        return QuerySingle[T].full_build(p.name, p.return_type, p.default)
+
+class Header[T](RequestParameter[T]):
+    """
+    Extracts a single header from the request.
+    """
+
+    PARAMETER_LOCATION = "header"
+
+    @staticmethod
+    def extract(request: Request, name: str) -> str:
+        return request.headers[name]
+
+
+class Headers[T](RequestParameter[T]):
+    """
+    Extracts multiple headers with the same name from the request.
+    """
+
+    PARAMETER_LOCATION = "header"
+
+    @staticmethod
+    def extract(request: Request, name: str) -> list[str]:
+        values = request.headers.getlist(name)
+        if not values:
+            raise KeyError(name)
+        return values
+
+
+class Cookie[T](RequestParameter[T]):
+    """
+    Extracts a cookie from the request.
+    """
+
+    PARAMETER_LOCATION = "cookie"
+
+    @staticmethod
+    def extract(request: Request, name: str) -> str:
+        return request.cookies[name]
+
+
+class RawBody:
+    """
+    Extracts the raw body of the request as bytes or str.
+    Note: Request body can only be read once per request. Ensure only one body extractor is used per endpoint to avoid issues.
+    """
+
+    def __init__(self, encoding: str = "utf-8") -> None:
+        self.encoding = encoding
+
+    def on_inspect(self, param: InspectParameter) -> "_RawBodyExtractor":
+        return_type = get_args(param.annotation)[0]
+        if return_type not in [bytes, str]:
+            raise ValueError(
+                f"Invalid return type for RawBody: {return_type}, must be bytes or str"
+            )
+
+        return _RawBodyExtractor(self, param)
+
+
+class _RawBodyExtractor[T]:
+    """
+    Asynchronous extractor for raw request body.
+    """
+
+    def __init__(self, rparam: RawBody, iparam: InspectParameter) -> None:
+        self.encoding = rparam.encoding
+        self.return_type: type[T] = get_args(iparam.annotation)[0]
+
+    async def __call__(self, request: Request) -> bytes | str:
+        """
+        Asynchronously extract the raw body.
+        Decodes to str if specified, otherwise returns bytes.
+        """
+        raw = await request.body()
+        if self.return_type is bytes:
+            return raw
+
+        if self.return_type is str:
+            return raw.decode(self.encoding)
+
+        raise ValueError(
+            f"Invalid return type for RawBody: {self.return_type}, must be bytes or str"
+        )
+
+
+class JsonBody[T]:
+    """
+    Extracts and validates the JSON body of the request using Pydantic.
+    Note: For performance, ensure body is read only once; this assumes single body param per endpoint.
+    """
+
+    def on_inspect(self, param: InspectParameter) -> "_JsonBodyExtractor[T]":
+        return _JsonBodyExtractor(param)
+
+
+class _JsonBodyExtractor[T]:
+    """
+    Asynchronous extractor for JSON body with validation.
+    """
+
+    def __init__(self, iparam: InspectParameter) -> None:
+        self.return_type = get_args(iparam.annotation)[0]
+        self.default: T | object = iparam.default
+        self.adapter: TypeAdapter[Any] = TypeAdapter(self.return_type)
+
+    async def __call__(self, request: Request) -> T:
+        """
+        Asynchronously extract and validate the JSON body.
+        """
+        try:
+            raw = await request.body()
+            return self.adapter.validate_json(raw)
+
+        except ValidationError as e:
+            expected = getattr(self.return_type, "__name__", str(self.return_type))
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid request body. Expected {expected}. {e}",
+            )
 
 
 class Body[T]:
-    pass
+    """
+    Generic body extractor that handles bytes, str, or JSON based on type and content-type.
+    Note: For optimal performance and correctness, use only one body extractor per endpoint as body can be read only once.
+    """
+
+    def on_inspect(self, param: InspectParameter) -> "_BodyExtractor[T]":
+        return _BodyExtractor(param)
 
 
-class PathParam[T](RequestParam[T]):
+class _BodyExtractor[T]:
+    """
+    Asynchronous generic body extractor.
+    """
 
-    def extract(self, request: Request) -> str:
-        assert self.name is not None
-        return request.path_params[self.name]
+    def __init__(self, iparam: InspectParameter) -> None:
+        self.return_type = get_args(iparam.annotation)[0]
+        self.default: T | object = iparam.default
+        self.adapter: TypeAdapter[Any] = TypeAdapter(self.return_type)
+
+    async def __call__(self, request: Request) -> T:
+        """
+        Asynchronously extract the body based on expected type and content-type.
+        """
+
+        if self.return_type is bytes:
+            return cast(T, await request.body())
+
+        try:
+            if self.return_type is str:
+                raw = await request.body()
+                return cast(T, raw.decode(encoding="utf-8"))
+
+            if request.headers.get("Content-Type") == "application/json":
+                raw = await request.body()
+                return self.adapter.validate_json(raw)
+
+        except ValidationError as e:
+            expected = getattr(self.return_type, "__name__", str(self.return_type))
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid request body. Expected {expected}. {e}",
+            )
+
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported media type header. Expected {self.return_type}. Received {request.headers.get('Content-Type')}",
+        )
 
 
-class Header[T](RequestParam[T]):
+# Shorthand aliases for type annotations - syntax sugar
+"""
+These type aliases provide shorthand for annotating parameters with extractors.
+Example usage: def handler(param: aQueryParam[int]) -> ...
+"""
 
-    def extract(self, request: Request) -> str:
-        assert self.name is not None
-        return request.headers[self.name]
-
-
-class Cookie[T](RequestParam[T]):
-
-    def extract(self, request: Request) -> str:
-        assert self.name is not None
-        return request.cookies[self.name]
+type aCookie[T] = Annotated[T, Cookie[T]()]
+type aHeader[T] = Annotated[T, Header[T]()]
+type aHeaders[T] = Annotated[list[T], Headers[T]()]
+type aPathParam[T] = Annotated[T, PathParam[T]()]
+type aQueryParam[T] = Annotated[T, QueryParam[T]()]
+type aQueryParams[T] = Annotated[list[T], QueryParams[T]()]
+type aBody[T] = Annotated[T, Body[T]()]
+type aJsonBody[T] = Annotated[T, JsonBody[T]()]
+type aRawBody[T] = Annotated[T, RawBody()]
