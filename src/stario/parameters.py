@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from inspect import Parameter as InspectParameter
-from typing import Annotated, Any, cast, get_args
+from typing import Any, cast, get_args
 
 from pydantic import TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException
@@ -279,20 +279,3 @@ class _BodyExtractor[T]:
             status_code=415,
             detail=f"Unsupported media type header. Expected {self.return_type}. Received {request.headers.get('Content-Type')}",
         )
-
-
-# Shorthand aliases for type annotations - syntax sugar
-"""
-These type aliases provide shorthand for annotating parameters with extractors.
-Example usage: def handler(param: aQueryParam[int]) -> ...
-"""
-
-type aCookie[T] = Annotated[T, Cookie[T]()]
-type aHeader[T] = Annotated[T, Header[T]()]
-type aHeaders[T] = Annotated[list[T], Headers[T]()]
-type aPathParam[T] = Annotated[T, PathParam[T]()]
-type aQueryParam[T] = Annotated[T, QueryParam[T]()]
-type aQueryParams[T] = Annotated[list[T], QueryParams[T]()]
-type aBody[T] = Annotated[T, Body[T]()]
-type aJsonBody[T] = Annotated[T, JsonBody[T]()]
-type aRawBody[T] = Annotated[T, RawBody()]
