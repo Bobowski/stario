@@ -198,7 +198,7 @@ class RichConsoleSink:
             )
 
             # Path (padded to 28 characters for alignment)
-            title.append(f"{group.request_log.path:<28} ", style="white")
+            title.append(f"{group.request_log.path:<50} ", style="white")
 
         if group.response_log is not None:
             # Status code and duration
@@ -293,7 +293,7 @@ class RichConsoleSink:
             line.append(f"{group.request_log.method:<7} ", style=f"bold {method_color}")
 
             # Path (padded to 28 characters for alignment)
-            line.append(f"{group.request_log.path:<28} ", style="white")
+            line.append(f"{group.request_log.path:<50} ", style="white")
 
         if group.response_log is not None:
             # Status code and duration

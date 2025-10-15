@@ -145,7 +145,7 @@ class Tag:
         self.rendered = self.tag_start + self.no_children_close
 
     def __call__(
-        self, *children: Attributes | HtmlElement
+        self, *children: Attributes | HtmlElement | None
     ) -> HtmlElementTuple | SafeString:
         """
         Create an HTML element with attributes and children.
@@ -184,6 +184,9 @@ class Tag:
         append_child = child_elements.append
 
         for child in children:
+
+            if child is None:
+                continue
 
             # Non-dict is assumed to be a child HTML element
             if not isinstance(child, Mapping):
@@ -306,10 +309,26 @@ def _render(nodes: Iterable[HtmlElement], append: Callable[[str], None]) -> None
     """
     for node in nodes:
         if type(node) is tuple:
-            append(node[0])
-            _render(node[1], append)
-            append(node[2])
-            continue
+            if len(node) == 3:
+                append(node[0])
+                _render(node[1], append)
+                append(node[2])
+                continue
+
+            else:
+                raise HtmlRenderError(
+                    f"Invalid tuple length for HTML element: {len(node)}",
+                    context={
+                        "node_type": type(node).__name__,
+                        "node_value": str(node)[:100],
+                    },
+                    help_text="HTML elements must be tuples with three elements: start tag, children, and end tag.",
+                    example="""from stario.html import div, p, render
+
+# Correct rendering:
+html = render(div({"class": "container"}, p("Hello")))
+""",
+                )
 
         if type(node) is SafeString:
             append(node.safe_str)
