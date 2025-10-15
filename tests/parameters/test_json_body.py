@@ -3,7 +3,7 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Command, Stario
-from stario.parameters import ParseJsonBody
+from stario.requests import ParseJsonBody
 
 
 def test_json_body_dict_ok():

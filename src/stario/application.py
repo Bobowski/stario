@@ -8,13 +8,16 @@ from typing import (
     TypeVar,
 )
 
-from starlette.applications import Starlette
 from starlette.datastructures import State, URLPath
 from starlette.middleware import Middleware
+from starlette.middleware.exceptions import ExceptionMiddleware
 from starlette.routing import BaseRoute
 from starlette.types import ASGIApp, ExceptionHandler, Lifespan, Receive, Scope, Send
 
-from stario.middlewares import BrotliMiddleware
+from stario.exceptions import MiddlewareError
+from stario.logging.queue import LogQueue
+from stario.middlewares.brotli import BrotliMiddleware
+from stario.middlewares.guardian import GuardianMiddleware
 from stario.routing import StarRouter
 
 AppType = TypeVar("AppType", bound="Stario")
@@ -43,6 +46,7 @@ class Stario:
         lifespan: Lifespan[AppType] | None = None,
         debug: bool = False,
         router_class: type[StarRouter] = StarRouter,
+        log_sinks: Sequence[Any] | None = None,
     ) -> None:
         """Initializes the application.
 
@@ -70,6 +74,8 @@ class Stario:
             router_class: A class to use for the router. By default we use `StarRouter`.
                 You can use this to customize the behaviour of the app, just consider
                 what are the implications :)
+            log_sinks: Optional list of log sinks to use. If None, defaults are chosen
+                based on debug mode (RichConsoleSink for debug, JSONSink for production).
         """
 
         self.debug = debug
@@ -86,6 +92,11 @@ class Stario:
 
         cache: dict[Callable, Any] = {}
         self.state.cache = cache
+
+        # Configure log queue
+        self.log_queue = LogQueue(sinks=log_sinks)
+        self.router.on_startup.append(self.log_queue.start)
+        self.router.on_shutdown.append(self.log_queue.stop)
 
         # self.dependency_overrides: dict[Callable, Callable] = {}
         # """
@@ -112,8 +123,33 @@ class Stario:
             # - we like it so there's no need to re-implement it
             # Starlette expects its own instance; use the instance method to
             # construct the stack with our attributes
-            self.middleware_stack = Starlette.build_middleware_stack(self)  # type: ignore[arg-type]
+            self.middleware_stack = self.build_middleware_stack()
         await self.middleware_stack(scope, receive, send)
+
+    def build_middleware_stack(self) -> ASGIApp:
+        error_handler = None
+        exception_handlers: dict[Any, ExceptionHandler] = {}
+
+        for key, value in self.exception_handlers.items():
+            if key in (500, Exception):
+                error_handler = value
+            else:
+                exception_handlers[key] = value
+
+        middleware = (
+            [
+                Middleware(
+                    GuardianMiddleware, log_queue=self.log_queue, handler=error_handler
+                )
+            ]
+            + self.user_middleware
+            + [Middleware(ExceptionMiddleware, handlers=exception_handlers)]
+        )
+
+        app = self.router
+        for cls, args, kwargs in reversed(middleware):
+            app = cls(app, *args, **kwargs)
+        return app
 
     def add(self, route: BaseRoute) -> None:
         # We diverge from Starlette here because I think having more control over
@@ -133,7 +169,35 @@ class Stario:
         **kwargs: P.kwargs,
     ) -> None:
         if self.middleware_stack is not None:
-            raise RuntimeError("Cannot add middleware after an application has started")
+            raise MiddlewareError(
+                "Cannot add middleware after the application has started",
+                context={
+                    "middleware_class": getattr(
+                        middleware_class, "__name__", str(middleware_class)
+                    ),
+                },
+                help_text="Middleware must be added during application initialization, before any requests are handled.",
+                example="""from stario import Stario
+from starlette.middleware.cors import CORSMiddleware
+
+# ✅ Correct: Add middleware during initialization
+app = Stario()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+)
+
+# Or pass middleware in constructor:
+app = Stario(
+    middleware=[
+        Middleware(CORSMiddleware, allow_origins=["*"])
+    ]
+)
+
+# ❌ Incorrect: Adding middleware after app started
+# This will fail if app has already handled a request""",
+            )
         self.user_middleware.insert(0, Middleware(middleware_class, *args, **kwargs))
 
     def add_exception_handler(

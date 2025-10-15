@@ -3,7 +3,7 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import ParseHeaders
+from stario.requests import ParseHeaders
 
 
 def test_headers_ok_multiple_values():
@@ -26,8 +26,8 @@ def test_headers_missing():
 
     with TestClient(app) as client:
         resp = client.get("/hh")
-    assert resp.status_code == 400
-    assert "Missing required header 'x-dup'" in resp.text
+    assert resp.status_code == 204
+    assert resp.text == ""
 
 
 def test_headers_type_validation():

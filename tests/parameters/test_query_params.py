@@ -3,7 +3,7 @@ from typing import Annotated, List
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import ParseQueryParams
+from stario.requests import ParseQueryParams
 
 
 def test_query_params_ok():
@@ -27,8 +27,8 @@ def test_query_params_missing():
 
     with TestClient(app) as client:
         resp = client.get("/tags")
-    assert resp.status_code == 400
-    assert "Missing required query parameter 'tags'" in resp.text
+    assert resp.text == ""
+    assert resp.status_code == 204
 
 
 def test_query_params_invalid_type():

@@ -3,7 +3,7 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import ParseHeader
+from stario.requests import ParseHeader
 
 
 def test_header_ok():

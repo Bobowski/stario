@@ -3,7 +3,7 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import ParsePathParam
+from stario.requests import ParsePathParam
 
 
 def test_path_param_ok():

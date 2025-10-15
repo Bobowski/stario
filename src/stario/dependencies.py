@@ -1,34 +1,29 @@
 import asyncio
 import functools
 import inspect
-from inspect import (
-    Parameter,
-    isasyncgenfunction,
-    isgeneratorfunction,
-)
+import types
 from typing import (
     Annotated,
     Any,
     Awaitable,
     Callable,
     Literal,
-    Protocol,
-    Self,
     Sequence,
-    TypeIs,
     TypeVar,
     cast,
     get_args,
     get_origin,
     overload,
-    runtime_checkable,
 )
 
 from starlette.requests import Request
 
 from stario.application import Stario
-
-# from stario.application import Stario
+from stario.exceptions import (
+    DependencyBuildError,
+    InvalidAnnotationError,
+    InvalidCallableError,
+)
 
 type DependencyLifetime = Literal["transient", "request", "singleton", "lazy"]
 """
@@ -44,59 +39,28 @@ Use this type to control how dependencies are shared and reused within your appl
 """
 
 
-@runtime_checkable
-class Injectable(Protocol):
-
-    def on_inspect(self, parameter: Parameter) -> Callable[..., Any]:
-        """
-        This is called when we're trying to build a dependency tree.
-        Use this to build a dependency that requires some special handling based on the parameter it's used as.
-
-        def foo(name: Annotated[int, MyInjectable()]) -> int:
-            ...
-
-        class MyInjectable:
-            def on_inspect(self, parameter: Parameter) -> Callable[..., int]:
-                if parameter.annotation == int:
-                    return lambda: 42
-                else:
-                    raise ValueError(f"Unknown annotation: {parameter.annotation}")
-
-        In this case MyInjectable will be provided a context it's being used in (parameter),
-          and should return a dedicated callable to actually be used while requested.
-        """
-        ...
+def resolve_request(request: Request) -> Request:
+    return request
 
 
-R = TypeVar("R")
+def resolve_stario(request: Request) -> Stario:
+    return request.app
 
 
-def _inspect_parameter(prm: Parameter) -> Parameter:
-    annotation = prm.annotation
-    return_type = prm.annotation
-
-    if hasattr(annotation, "__value__"):
-        return_type = get_args(annotation)[0]
-        annotation = annotation.__value__
-
-        if get_origin(annotation) is Annotated:
-            _, *args = get_args(annotation)
-            print("replaces")
-            annotation = Annotated[return_type, *args]
-
-    return Parameter(prm.name, prm.kind, default=prm.default, annotation=annotation)
+# TypeVar for methods that can return different generic variants
+U = TypeVar("U")
 
 
-class Dependency:
+class Dependency[T]:
 
     __slots__ = ("name", "function", "is_async", "lifetime", "children")
 
     def __init__(
         self,
         name: str,
-        function: Callable[..., Any] | type[Request] | type[Stario],
+        function: Callable[..., T],
         lifetime: DependencyLifetime = "request",
-        children: Sequence[Self] | None = None,
+        children: Sequence["Dependency[Any]"] | None = None,
     ) -> None:
 
         self.name = name
@@ -106,7 +70,7 @@ class Dependency:
         self.children = list(children) if children is not None else []
 
     @classmethod
-    def _build_node(cls, prm: Parameter) -> Self:
+    def _build_node(cls, prm: inspect.Parameter) -> "Dependency[Any]":
 
         prm = _inspect_parameter(prm)
 
@@ -116,13 +80,29 @@ class Dependency:
             try:
                 _, arg, *modifiers = get_args(prm.annotation)
 
-            except ValueError:
-                raise ValueError(
-                    f"Unknown annotation: {prm.name} must be Annotated with one argument"
-                )
+            except ValueError as e:
+                raise InvalidAnnotationError(
+                    f"Invalid Annotated type for parameter '{prm.name}'",
+                    context={
+                        "parameter": prm.name,
+                        "annotation": str(prm.annotation),
+                        "error": str(e),
+                    },
+                    help_text="Annotated types to be considered for dependency injection must have at least one type argument and one dependency callable.",
+                    example="""from typing import Annotated
+from stario.requests import ParseQueryParam
+
+# Correct usage:
+def handler(user_id: Annotated[int, ParseQueryParam()]): ...
+def handler(data: Annotated[dict, my_function]): ...
+
+# With lifetime:
+def handler(db: Annotated[Database, get_db, "singleton"]): ...""",
+                ) from e
 
             lifetime = modifiers[0] if modifiers else "request"
-            func = arg.on_inspect(prm) if hasattr(arg, "on_inspect") else arg
+            func = _try_apply_parameter_decorator(arg, prm)
+
             return cls._build_tree(prm.name, func, lifetime)
 
         if isinstance(prm.annotation, type):
@@ -130,67 +110,96 @@ class Dependency:
             # will be replaced by actual Request or Stario instance on resolve
 
             if issubclass(prm.annotation, Request):
-                return cls(prm.name, Request)
+                return Dependency(prm.name, resolve_request)
 
             elif issubclass(prm.annotation, Stario):
-                return cls(prm.name, Stario)
+                return Dependency(prm.name, resolve_stario)
 
-            raise ValueError(f"Unknown annotation type: {prm.annotation}")
+            raise InvalidAnnotationError(
+                f"Unsupported annotation type for parameter '{prm.name}'",
+                context={
+                    "parameter": prm.name,
+                    "annotation": str(prm.annotation),
+                    "annotation_type": type(prm.annotation).__name__,
+                },
+                help_text="Only Request, Stario, or another Annotated dependency are supported for dependency injection.",
+                example="""from typing import Annotated
+from starlette.requests import Request, ParseQueryParam
+from stario import Stario
 
-        if prm.default is not Parameter.empty:
+# Supported patterns:
+def handler(request: Request): ...                       # Request (can access scope, headers, etc.)
+def handler(app: Stario): ...                            # Stario app instance
+def handler(user_id: Annotated[int, ParseQueryParam()]): # Annotated with parameter extractor
+def handler(db: Annotated[DB, get_db]): ...              # Annotated with dependency function""",
+            )
+
+        if prm.default is not inspect.Parameter.empty:
             # name: Any = default
 
-            return cls(prm.name, lambda: prm.default)
+            return Dependency[Any](prm.name, lambda: prm.default)
 
-        raise ValueError(f"Unknown annotation: {prm.annotation}")
+        raise InvalidAnnotationError(
+            f"Cannot resolve dependency for parameter '{prm.name}'",
+            context={
+                "parameter": prm.name,
+                "annotation": str(prm.annotation),
+                "has_default": prm.default is not inspect.Parameter.empty,
+            },
+            help_text="Parameters must have a type annotation (Request, Stario, Annotated) or a default value.",
+            example="""from typing import Annotated
+from starlette.requests import Request, QueryParam
+from stario import Stario
+
+# Correct approaches:
+def handler(request: Request): ...          # Type annotation
+def handler(user_id: QueryParam[int]): ...  # Annotated type
+def handler(page: int = 1): ...             # Default value
+def handler(debug: bool = False): ...       # Default value""",
+        )
 
     @classmethod
-    def _build_tree(
+    def _build_tree[U](
         cls,
         name: str,
-        handler: Callable[..., Any],
+        handler: Callable[..., U],
         lifetime: DependencyLifetime = "request",
-    ) -> Self:
+    ) -> "Dependency[U]":
         """
         Builds a tree of dependencies starting from a given function.
         """
 
-        fn = get_callable(handler)
-        signature = inspect.signature(fn)
-        children = [
-            cls._build_node(param)
-            for param in signature.parameters.values()
-            if param.name != "self"
-        ]
+        parameters, creation_func = _inspect_callable(handler)
+        children = [cls._build_node(param) for param in parameters]
 
-        return cls(name, fn, lifetime, children)
+        return Dependency(name, creation_func, lifetime, children)
 
     @classmethod
-    def build(cls, handler: Callable[..., Any]) -> Self:
+    def build[U](
+        cls,
+        handler: Callable[..., U],
+        lifetime: DependencyLifetime = "request",
+    ) -> "Dependency[U]":
         """
         Builds a tree of dependencies starting from a given function.
         """
 
-        return cls._build_tree(handler.__name__, handler)
+        return Dependency._build_tree(handler.__name__, handler, lifetime)
 
-    async def resolve(self, app: Stario, request: Request) -> Any:
+    async def resolve(self, request: Request) -> T:
+
         # Fast path for built-in types
-        if isinstance(self.function, type) and issubclass(self.function, Request):
-            return request
-
-        if isinstance(self.function, type) and issubclass(self.function, Stario):
-            return app
-
-        # After checks, self.function must be callable
-        self.function = cast(Callable[..., Any], self.function)
+        if self.function is resolve_request or self.function is resolve_stario:
+            return self.function(request)
 
         # Get caches once
-        singletons = app.state.cache
+        singletons = request.app.state.cache
 
         # Handle singleton lifetime with early return
         if self.lifetime == "singleton":
             if self.function in singletons:
                 return await singletons[self.function]
+
             # Create future for singleton
             fut = asyncio.Future()
             singletons[self.function] = fut
@@ -223,12 +232,12 @@ class Dependency:
             elif len(self.children) == 1:
                 # Single child - no need for TaskGroup
                 child = self.children[0]
-                arguments = {child.name: await child.resolve(app, request)}
+                arguments = {child.name: await child.resolve(request)}
 
             else:
                 # Multiple children - use gather for parallel execution
                 results = await asyncio.gather(
-                    *[d.resolve(app, request) for d in self.children],
+                    *[d.resolve(request) for d in self.children],
                     return_exceptions=True,
                 )
                 # Check for exceptions and raise the first one found
@@ -241,7 +250,7 @@ class Dependency:
 
             # Execute function
             if self.is_async:
-                result = await self.function(**arguments)
+                result = await cast(Awaitable[T], self.function(**arguments))
             else:
                 result = self.function(**arguments)
 
@@ -263,33 +272,160 @@ AwaitableCallable = Callable[..., Awaitable[T]]
 
 
 @overload
-def is_async_callable(obj: AwaitableCallable[T]) -> TypeIs[AwaitableCallable[T]]: ...
+def is_async_callable(obj: AwaitableCallable[T]) -> bool: ...
 
 
 @overload
-def is_async_callable(obj: Any) -> TypeIs[AwaitableCallable[Any]]: ...
+def is_async_callable(obj: Any) -> bool: ...
 
 
-def is_async_callable(obj: Any) -> Any:
+def is_async_callable(obj: Any) -> bool:
     while isinstance(obj, functools.partial):
         obj = obj.func
 
     return inspect.iscoroutinefunction(obj) or (
-        callable(obj) and inspect.iscoroutinefunction(obj.__call__)
+        callable(obj)
+        and hasattr(obj, "__call__")
+        and inspect.iscoroutinefunction(obj.__call__)
     )
 
 
-def is_generator_callable(obj: Any) -> bool:
-    while isinstance(obj, functools.partial):
-        obj = obj.func
+def _inspect_callable(callable_obj: Any) -> tuple[list[inspect.Parameter], Callable]:
+    """
+    Inspects a callable to return its expected arguments, annotations, and a creation function.
 
-    return isgeneratorfunction(obj) or isasyncgenfunction(obj)
+    Returns:
+        tuple: (parameters, creation_func)
+        - parameters: List of parameters (excluding self/cls for bound methods).
+        - creation_func: Function that can be called with the expected arguments.
+    """
+    if not callable(callable_obj):
+        raise InvalidCallableError(
+            f"Expected a callable object but got {type(callable_obj).__name__}",
+            context={
+                "object": str(callable_obj),
+                "type": type(callable_obj).__name__,
+            },
+            help_text="Dependencies must be callable functions, methods, or classes.",
+            example="""# Correct dependency patterns:
+def get_database() -> Database:
+    return Database()
+
+# Then use in route:
+def handler(db: Annotated[Database, get_database]): ...""",
+        )
+
+    # Get the signature of the callable
+    try:
+        sig = inspect.signature(callable_obj)
+    except ValueError as e:
+        # Handle built-in callables with no signature (e.g., len, print)
+        raise DependencyBuildError(
+            f"Cannot inspect signature of built-in callable: {callable_obj}",
+            context={
+                "callable": str(callable_obj),
+                "type": type(callable_obj).__name__,
+            },
+            help_text="Built-in functions cannot be used as dependencies.",
+        ) from e
+
+    # Extract argument names and annotations
+    parameters = [
+        param
+        for param_name, param in sig.parameters.items()
+        if not (
+            param_name in ("self", "cls")
+            and param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+    ]
+
+    # Create the creation function
+    if isinstance(callable_obj, types.MethodType):
+        # Bound method - need to call with self as first argument
+        def creation_func(*args, **kwargs):
+            return callable_obj.__func__(callable_obj.__self__, *args, **kwargs)
+
+    else:
+        # Everything else: functions, callable objects, classes, etc.
+        # inspect.signature() already handles __call__ correctly
+        creation_func = callable_obj
+
+    return parameters, creation_func
 
 
-def get_callable(obj: Any) -> Callable:
-    # If it's the function use it, if it's an object with a __call__ use that
+def _inspect_parameter(p: inspect.Parameter) -> inspect.Parameter:
+    # TODO!
+    annotation = p.annotation
+    return_type = p.annotation
+    try:
+        annotation = annotation.__value__
+    except AttributeError:
+        pass
 
-    if inspect.isroutine(obj) or inspect.iscoroutinefunction(obj):
+    # Unwind Annotated definitions, even if not generics
+    # (i.e., if annotation is an Annotated type, extract its base and metadata)
+    if hasattr(annotation, "__value__"):
+        args = get_args(annotation)
+        if args:
+            return_type = args[0]
+        annotation = annotation.__value__
+        if get_origin(annotation) is Annotated:
+            _, *args = get_args(annotation)
+            annotation = Annotated[return_type, *args]
+    elif get_origin(annotation) is Annotated:
+        # Handles direct Annotated[...] (not via __value__)
+        base, *meta = get_args(annotation)
+        annotation = Annotated[base, *meta]
+
+    return inspect.Parameter(p.name, p.kind, default=p.default, annotation=annotation)
+
+
+def _try_apply_parameter_decorator(obj: Any, param: inspect.Parameter) -> Any:
+    """
+    Try to apply the object as a parameter decorator to the given parameter.
+
+    If the object is a callable that expects exactly one parameter and can be
+    called with an inspect.Parameter, it applies the decorator and returns the result.
+    Otherwise, returns the original object unchanged.
+
+    Args:
+        obj: The potential decorator object
+        param: The inspect.Parameter to pass to the decorator
+
+    Returns:
+        Either the result of obj(param) if obj is a parameter decorator,
+        or the original obj if it's not.
+    """
+    if not callable(obj):
         return obj
 
-    return obj.__call__
+    if is_async_callable(obj):
+        return obj
+
+    try:
+        sig = inspect.signature(obj)
+    except (ValueError, TypeError):
+        return obj
+
+    # Filter out self/cls parameters for methods
+    parameters = [
+        param_obj
+        for param_name, param_obj in sig.parameters.items()
+        if not (
+            param_name in ("self", "cls")
+            and param_obj.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+    ]
+
+    # Must have exactly one parameter
+    if len(parameters) != 1 or parameters[0].annotation != inspect.Parameter:
+        return obj
+
+    # Try applying as parameter decorator
+    try:
+        result = obj(param)
+        # If it returns a callable, it's likely a successful parameter decorator application
+        return result if callable(result) else obj
+    except Exception:
+        # If calling with Parameter fails, return original object
+        return obj

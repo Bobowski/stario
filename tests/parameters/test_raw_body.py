@@ -3,7 +3,7 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Command, Stario
-from stario.parameters import ParseRawBody
+from stario.requests import ParseRawBody
 
 
 def test_raw_body_bytes_ok():

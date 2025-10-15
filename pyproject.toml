@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "brotli-asgi>=1.4.0",
     "pydantic>=2.11.7",
+    "rich>=14.1.0",
     "starlette>=0.47.2",
     "uvicorn>=0.35.0",
 ]

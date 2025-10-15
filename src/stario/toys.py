@@ -1,7 +1,8 @@
-from stario.datastar import LOAD_DATASTAR
+from stario.html import b, body, div, head, html, meta, pre, script, title
+from stario.html.core import HtmlElement
 
 
-def ToyInspector() -> str:
+def toy_inspector() -> HtmlElement:
     """
     We simply add a div positioned absolutely on the top right of the page
     with the label of key-binding opening the debug panel (CMD+P by default)
@@ -14,52 +15,59 @@ def ToyInspector() -> str:
     https://data-star.dev/reference/attributes#data-json-signals
     """
 
-    # Define simple CSS for the debug panel
-    debug_panel_css = """
-<style>
-.stario-debug-panel {
-    position: absolute;
-    top: 1rem;
-    right: 1rem;
-    opacity: 0.95;
-    border: 1px solid #ccc;
-    background: #fff;
-    padding: 0.75rem;
-    min-width: 220px;
-    z-index: 1000;
-}
-.stario-debug-pre {
-    background: #f4f4f4;
-    border: 1px solid #eee;
-    padding: 0.5rem;
-    margin-bottom: 0.25rem;
-    font-size: 0.95em;
-    max-height: 200px;
-    overflow: auto;
-}
-</style>
-"""
-
-    debug_panel_html = """
-<div class="stario-debug-panel">
-    <b>Debug Inspector:</b>
-    <pre class="stario-debug-pre" data-json-signals></pre>
-</div>
-"""
-
-    return f"""{debug_panel_css}{debug_panel_html}"""
+    return div(
+        {
+            "style": {
+                "position": "absolute",
+                "top": "1rem",
+                "right": "1rem",
+                "opacity": "0.95",
+                "border": "1px solid #ccc",
+                "background": "#fff",
+                "padding": "0.75rem",
+                "min-width": "220px",
+                "z-index": "1000",
+            },
+        },
+        b("Debug Inspector:"),
+        pre(
+            {
+                "data-json-signals": True,
+                "style": {
+                    "background": "#f4f4f4",
+                    "border": "1px solid #eee",
+                    "padding": "0.5rem",
+                    "margin-bottom": "0.25rem",
+                    "font-size": "0.95em",
+                    "max-height": "200px",
+                    "overflow": "auto",
+                },
+            }
+        ),
+    )
 
 
-def ToyPage(contents: str, title: str = "Playground") -> str:
-    return f"""
-<html>
-    <head>
-        <title>{title}</title>
-        {LOAD_DATASTAR}
-    </head>
-    <body>
-        {contents}
-        {ToyInspector()}
-    </body>
-</html>
-"""
+load_datastar = script(
+    {
+        "type": "module",
+        "src": "https://cdn.jsdelivr.net/gh/starfederation/datastar@main/bundles/datastar.js",
+    },
+)
+
+
+def toy_page(
+    *content: HtmlElement,
+    page_title: str = "Playground",
+) -> HtmlElement:
+
+    return html(
+        head(
+            meta({"charset": "UTF-8"}),
+            title(page_title),
+            load_datastar,
+        ),
+        body(
+            *content,
+            toy_inspector(),
+        ),
+    )

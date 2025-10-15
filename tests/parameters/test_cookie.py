@@ -3,7 +3,7 @@ from typing import Annotated
 from starlette.testclient import TestClient
 
 from stario import Query, Stario
-from stario.parameters import ParseCookie
+from stario.requests import ParseCookie
 
 
 def test_cookie_ok():
