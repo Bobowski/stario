@@ -1,6 +1,6 @@
 [project]
 name = "stario"
-version = "0.2.0"
+version = "1.0.1"
 description = "Stario brings back the joy of building web apps"
 readme = "README.md"
 authors = [

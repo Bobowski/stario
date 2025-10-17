@@ -74,19 +74,19 @@ pip install uvicorn
 ```python
 # main.py
 import asyncio
-from stario import Stario, Query, Command
-from stario.toys import ToyPage
+from stario import Stario, Query
+from stario.toys import toy_page
+from stario.html import div, h2
 
 
 async def home():
-    return ToyPage(
-        """
-        <h2>Realtime responses!</h2>
-        <div data-on-load="@get('/online-counter')">
-            This shows how long the connection has been open.
-        </div>
-        <div id="online-counter"></div>
-        """
+    return toy_page(
+        h2("Realtime responses!"),
+        div(
+            {"data-on-load": "@get('/online-counter')"},
+            "This shows how long the connection has been open.",
+        ),
+        div({"id": "online-counter"}),
     )
 
 
@@ -94,8 +94,8 @@ async def online_counter():
     duration = 0
     interval = 0.01
     while True:
-        # Yielding strings/patches streams as SSE with DataStar-compatible events
-        yield f"<div id='online-counter'>Online since: {duration:.1f}s</div>"
+        # Yielding HTML elements streams as SSE with DataStar-compatible events
+        yield div({"id": "online-counter"}, f"Online since: {duration:.1f}s")
         duration += interval
         await asyncio.sleep(interval)
 

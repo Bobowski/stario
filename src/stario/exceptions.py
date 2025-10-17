@@ -1,3 +1,6 @@
+from starlette.exceptions import HTTPException as HTTPException
+
+
 class StarioException(Exception):
     """Base exception for all errors in the Stario framework.
 
