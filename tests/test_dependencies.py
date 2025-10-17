@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Annotated
+from typing import Annotated, Awaitable
 
 from starlette.testclient import TestClient
 
@@ -151,3 +151,103 @@ def test_dependencies_lifetimes_singleton():
     assert call_counts["dep1"] == 1  # only on first request
     assert call_counts["dep2"] == 1
     assert call_counts["dep3"] == 2  # both requests
+
+
+def test_dependencies_lazy_awaitable():
+
+    call_counts = defaultdict(int)
+
+    def slow_dep() -> int:
+        # Count how many times this is called
+        call_counts["slow_dep"] += 1
+        return 42
+
+    async def handler(
+        lazy_value: Annotated[Awaitable[int], slow_dep, "lazy"],
+    ) -> str:
+        # At this point, slow_dep has NOT been called yet
+        assert call_counts["slow_dep"] == 0
+        # Only when we await the lazy_value should it be called
+        result = await lazy_value
+        assert result == 42
+        assert call_counts["slow_dep"] == 1
+        return f"Lazy resolved to: {result}"
+
+    app = Stario(Command("/dep", handler))
+
+    with TestClient(app) as client:
+        resp = client.post("/dep")
+
+    assert resp.status_code == 200
+    assert resp.text == "Lazy resolved to: 42"
+    # Verify the dependency was only called once
+    assert call_counts["slow_dep"] == 1
+
+
+def test_dependencies_lazy_with_subdependencies():
+
+    call_counts = defaultdict(int)
+
+    def base_dep() -> int:
+        call_counts["base_dep"] += 1
+        return 10
+
+    def derived_dep(base: Annotated[int, base_dep]) -> int:
+        call_counts["derived_dep"] += 1
+        return base + 5
+
+    async def handler(
+        lazy_value: Annotated[Awaitable[int], derived_dep, "lazy"],
+    ) -> str:
+        # Neither dependency has been called yet
+        assert call_counts["base_dep"] == 0
+        assert call_counts["derived_dep"] == 0
+
+        # Await the lazy dependency - this should resolve both base_dep and derived_dep
+        result = await lazy_value
+        assert result == 15  # 10 + 5
+        assert call_counts["base_dep"] == 1
+        assert call_counts["derived_dep"] == 1
+        return f"Lazy resolved to: {result}"
+
+    app = Stario(Command("/dep", handler))
+
+    with TestClient(app) as client:
+        resp = client.post("/dep")
+
+    assert resp.status_code == 200
+    assert resp.text == "Lazy resolved to: 15"
+    # Both dependencies called once
+    assert call_counts["base_dep"] == 1
+    assert call_counts["derived_dep"] == 1
+
+
+def test_dependencies_lazy_with_async_function():
+
+    call_counts = defaultdict(int)
+
+    async def async_dep() -> int:
+        call_counts["async_dep"] += 1
+        # Simulate some async work
+        return 99
+
+    async def handler(
+        lazy_value: Annotated[Awaitable[int], async_dep, "lazy"],
+    ) -> str:
+        # The async function has NOT been called yet
+        assert call_counts["async_dep"] == 0
+
+        # Await the lazy dependency
+        result = await lazy_value
+        assert result == 99
+        assert call_counts["async_dep"] == 1
+        return f"Async lazy resolved to: {result}"
+
+    app = Stario(Command("/dep", handler))
+
+    with TestClient(app) as client:
+        resp = client.post("/dep")
+
+    assert resp.status_code == 200
+    assert resp.text == "Async lazy resolved to: 99"
+    assert call_counts["async_dep"] == 1

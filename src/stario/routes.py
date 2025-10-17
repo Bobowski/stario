@@ -1,4 +1,4 @@
-from typing import Any, Awaitable, Callable, Collection, Mapping, Sequence, override
+from typing import Any, Callable, Collection, Mapping, Sequence, override
 
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
@@ -7,14 +7,12 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Match, Route, get_name
 from starlette.types import Receive, Scope, Send
 
+from stario.datastar.adapters import detached_command
 from stario.datastar.adapters import handler as datastar_handler
-
-type HeadersConstraint = Mapping[str, str | None] | Sequence[
-    str | tuple[str, str | None]
-]
-type EndpointFunction[T] = Callable[..., T]
-type RequestHandler = Callable[[Scope, Receive, Send], Awaitable[None]]
-type AdapterFunction[T] = Callable[[EndpointFunction[T]], RequestHandler]
+from stario.types import (
+    AdapterFunction,
+    HeadersConstraint,
+)
 
 
 class StarRoute[T](Route):
@@ -185,5 +183,30 @@ class Command[T](StarRoute[T]):
         # fmt: on
 
 
-class CommandDetached[T](StarRoute[T]):
-    pass
+class DetachedCommand[T](StarRoute[T]):
+    def __init__(
+        self,
+        path: str,
+        endpoint: Callable[..., T],
+        *,
+        methods: Collection[str] | None = ["POST"],
+        name: str | None = None,
+        include_in_schema: bool = True,
+        middleware: Sequence[Middleware] | None = None,
+        # Stario specific
+        headers: HeadersConstraint | None = None,
+        adapter: AdapterFunction[T] = detached_command(),
+    ) -> None:
+
+        # fmt: off
+        super().__init__(
+            path              = path,
+            endpoint          = endpoint,
+            methods           = methods,
+            name              = name,
+            include_in_schema = include_in_schema,
+            middleware        = middleware,
+            headers           = headers,
+            adapter           = adapter,
+        )
+        # fmt: on

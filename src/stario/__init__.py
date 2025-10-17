@@ -24,4 +24,5 @@ from .datastar import SignalsPatch as SignalsPatch
 
 # Routes
 from .routes import Command as Command
+from .routes import DetachedCommand as DetachedCommand
 from .routes import Query as Query

@@ -187,7 +187,7 @@ def handler(debug: bool = False): ...       # Default value""",
 
         return Dependency._build_tree(handler.__name__, handler, lifetime)
 
-    async def resolve(self, request: Request) -> T:
+    async def resolve(self, request: Request) -> T | Awaitable[T]:
 
         # Fast path for built-in types
         if self.function is resolve_request or self.function is resolve_stario:
@@ -220,10 +220,45 @@ def handler(debug: bool = False): ...       # Default value""",
             fut = asyncio.Future()
             futures[self.function] = fut
 
+        # Handle lazy lifetime - return an awaitable that resolves on demand
+        elif self.lifetime == "lazy":
+
+            async def lazy_resolver() -> T:
+                # Resolve children efficiently
+                if not self.children:
+                    arguments = {}
+
+                elif len(self.children) == 1:
+                    # Single child - no need for gather
+                    child = self.children[0]
+                    arguments = {child.name: await child.resolve(request)}
+
+                else:
+                    # Multiple children - use gather for parallel execution
+                    results = await asyncio.gather(
+                        *[d.resolve(request) for d in self.children],
+                        return_exceptions=True,
+                    )
+                    # Check for exceptions and raise the first one found
+                    for result in results:
+                        if isinstance(result, Exception):
+                            raise result
+                    arguments = {
+                        c.name: result for c, result in zip(self.children, results)
+                    }
+
+                # Execute function
+                if self.is_async:
+                    result = await cast(Awaitable[T], self.function(**arguments))
+                else:
+                    result = self.function(**arguments)
+
+                return result
+
+            return lazy_resolver()
+
         else:
             fut = None
-
-        # TODO: lazy?
 
         # Resolve children efficiently
         try:

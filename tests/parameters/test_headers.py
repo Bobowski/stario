@@ -20,14 +20,16 @@ def test_headers_ok_multiple_values():
 
 def test_headers_missing():
     async def handler(values: Annotated[list[str], ParseHeaders("x-dup")]):
-        return ",".join(values)
+        value = ",".join(values)
+        if value == "":
+            return "empty"
+        return value
 
     app = Stario(Query("/hh", handler))
-
     with TestClient(app) as client:
         resp = client.get("/hh")
-    assert resp.status_code == 204
-    assert resp.text == ""
+    assert resp.status_code == 200
+    assert resp.text == "empty"
 
 
 def test_headers_type_validation():

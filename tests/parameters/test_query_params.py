@@ -21,14 +21,17 @@ def test_query_params_ok():
 
 def test_query_params_missing():
     async def handler(tags: Annotated[List[str], ParseQueryParams()]):
-        return ",".join(tags)
+        value = ",".join(tags)
+        if value == "":
+            return "empty"
+        return value
 
     app = Stario(Query("/tags", handler))
 
     with TestClient(app) as client:
         resp = client.get("/tags")
-    assert resp.text == ""
-    assert resp.status_code == 204
+    assert resp.text == "empty"
+    assert resp.status_code == 200
 
 
 def test_query_params_invalid_type():

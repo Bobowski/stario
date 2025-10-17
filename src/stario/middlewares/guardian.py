@@ -41,6 +41,11 @@ class GuardianMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # We need uid and duration
+        request_id = str(uuid.uuid4())
+        scope["stario.request_id"] = request_id
+        exception_info = None
+
         # This is to track if the response has started
         #  borrowed from starlette
         response_started = False
@@ -51,14 +56,16 @@ class GuardianMiddleware:
 
             if message["type"] == "http.response.start":
                 response_started = True
-                scope["stario.response_started"] = True
                 status_code = message["status"]
-            await send(message)
 
-        # We need uid and duration
-        request_id = str(uuid.uuid4())
-        scope["stario.request_id"] = request_id
-        exception_info = None
+                # Update scope with useful information
+                scope["stario.response_started"] = True
+                message["headers"].append(
+                    (b"x-request-id", request_id.encode("latin-1"))
+                )
+
+            # Continue sending the message
+            await send(message)
 
         self.access_logger.request(
             request_id=request_id,
@@ -69,7 +76,6 @@ class GuardianMiddleware:
 
         try:
             await self.app(scope, receive, _send)
-
         except Exception as exc:
             request = Request(scope)
 
