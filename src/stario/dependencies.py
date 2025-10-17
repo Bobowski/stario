@@ -70,22 +70,22 @@ class Dependency[T]:
         self.children = list(children) if children is not None else []
 
     @classmethod
-    def _build_node(cls, prm: inspect.Parameter) -> "Dependency[Any]":
+    def _build_node(cls, p: inspect.Parameter) -> "Dependency[Any]":
 
-        prm = _inspect_parameter(prm)
+        p = _unwrap_type_alias(p)
 
-        if get_origin(prm.annotation) is Annotated:
+        if get_origin(p.annotation) is Annotated:
             # name: Annotated[type, dependency[, lifetime]]
 
             try:
-                _, arg, *modifiers = get_args(prm.annotation)
+                _, arg, *modifiers = get_args(p.annotation)
 
             except ValueError as e:
                 raise InvalidAnnotationError(
-                    f"Invalid Annotated type for parameter '{prm.name}'",
+                    f"Invalid Annotated type for parameter '{p.name}'",
                     context={
-                        "parameter": prm.name,
-                        "annotation": str(prm.annotation),
+                        "parameter": p.name,
+                        "annotation": str(p.annotation),
                         "error": str(e),
                     },
                     help_text="Annotated types to be considered for dependency injection must have at least one type argument and one dependency callable.",
@@ -101,26 +101,26 @@ def handler(db: Annotated[Database, get_db, "singleton"]): ...""",
                 ) from e
 
             lifetime = modifiers[0] if modifiers else "request"
-            func = _try_apply_parameter_decorator(arg, prm)
+            func = _try_apply_parameter_decorator(arg, p)
 
-            return cls._build_tree(prm.name, func, lifetime)
+            return cls._build_tree(p.name, func, lifetime)
 
-        if isinstance(prm.annotation, type):
+        if isinstance(p.annotation, type):
             # name: Request | Stario
             # will be replaced by actual Request or Stario instance on resolve
 
-            if issubclass(prm.annotation, Request):
-                return Dependency(prm.name, resolve_request)
+            if issubclass(p.annotation, Request):
+                return Dependency(p.name, resolve_request)
 
-            elif issubclass(prm.annotation, Stario):
-                return Dependency(prm.name, resolve_stario)
+            elif issubclass(p.annotation, Stario):
+                return Dependency(p.name, resolve_stario)
 
             raise InvalidAnnotationError(
-                f"Unsupported annotation type for parameter '{prm.name}'",
+                f"Unsupported annotation type for parameter '{p.name}'",
                 context={
-                    "parameter": prm.name,
-                    "annotation": str(prm.annotation),
-                    "annotation_type": type(prm.annotation).__name__,
+                    "parameter": p.name,
+                    "annotation": str(p.annotation),
+                    "annotation_type": type(p.annotation).__name__,
                 },
                 help_text="Only Request, Stario, or another Annotated dependency are supported for dependency injection.",
                 example="""from typing import Annotated
@@ -134,17 +134,17 @@ def handler(user_id: Annotated[int, ParseQueryParam()]): # Annotated with parame
 def handler(db: Annotated[DB, get_db]): ...              # Annotated with dependency function""",
             )
 
-        if prm.default is not inspect.Parameter.empty:
+        if p.default is not inspect.Parameter.empty:
             # name: Any = default
 
-            return Dependency[Any](prm.name, lambda: prm.default)
+            return Dependency[Any](p.name, lambda: p.default)
 
         raise InvalidAnnotationError(
-            f"Cannot resolve dependency for parameter '{prm.name}'",
+            f"Cannot resolve dependency for parameter '{p.name}'",
             context={
-                "parameter": prm.name,
-                "annotation": str(prm.annotation),
-                "has_default": prm.default is not inspect.Parameter.empty,
+                "parameter": p.name,
+                "annotation": str(p.annotation),
+                "has_default": p.default is not inspect.Parameter.empty,
             },
             help_text="Parameters must have a type annotation (Request, Stario, Annotated) or a default value.",
             example="""from typing import Annotated
@@ -353,31 +353,31 @@ def handler(db: Annotated[Database, get_database]): ...""",
     return parameters, creation_func
 
 
-def _inspect_parameter(p: inspect.Parameter) -> inspect.Parameter:
-    # TODO!
-    annotation = p.annotation
-    return_type = p.annotation
-    try:
-        annotation = annotation.__value__
-    except AttributeError:
-        pass
+def _unwrap_type_alias(p: inspect.Parameter) -> inspect.Parameter:
+    """Unwrap TypeAliasType like QueryParam[T] to Annotated[T, ...].
 
-    # Unwind Annotated definitions, even if not generics
-    # (i.e., if annotation is an Annotated type, extract its base and metadata)
-    if hasattr(annotation, "__value__"):
-        args = get_args(annotation)
-        if args:
-            return_type = args[0]
-        annotation = annotation.__value__
-        if get_origin(annotation) is Annotated:
-            _, *args = get_args(annotation)
-            annotation = Annotated[return_type, *args]
-    elif get_origin(annotation) is Annotated:
-        # Handles direct Annotated[...] (not via __value__)
-        base, *meta = get_args(annotation)
-        annotation = Annotated[base, *meta]
+    Returns the unwrapped parameter.
+    """
+    if not hasattr(p.annotation, "__value__"):
+        return p
 
-    return inspect.Parameter(p.name, p.kind, default=p.default, annotation=annotation)
+    nested = p.annotation.__value__
+    if get_origin(nested) is not Annotated:
+        return p
+
+    args = get_args(p.annotation)
+    if not args:
+        return p
+
+    return_type = args[0]
+    _, *meta = get_args(nested)
+
+    return inspect.Parameter(
+        p.name,
+        p.kind,
+        default=p.default,
+        annotation=Annotated[return_type, *meta],
+    )
 
 
 def _try_apply_parameter_decorator(obj: Any, param: inspect.Parameter) -> Any:
