@@ -9,6 +9,7 @@ from typing import (
     Callable,
     Literal,
     Sequence,
+    TypeAliasType,
     TypeVar,
     cast,
     get_args,
@@ -358,26 +359,34 @@ def _unwrap_type_alias(p: inspect.Parameter) -> inspect.Parameter:
 
     Returns the unwrapped parameter.
     """
-    if not hasattr(p.annotation, "__value__"):
+
+    nested = getattr(p.annotation, "__value__", None)
+    if nested is None:
+        # not a type alias or generic alias
         return p
 
-    nested = p.annotation.__value__
-    if get_origin(nested) is not Annotated:
-        return p
+    # if it's TypeAliasType, unwrap it
+    if isinstance(p.annotation, TypeAliasType):
+        return inspect.Parameter(
+            p.name,
+            p.kind,
+            default=p.default,
+            annotation=nested,
+        )
 
-    args = get_args(p.annotation)
-    if not args:
-        return p
+    # if it's GenericAlias, unwrap it
+    if isinstance(p.annotation, types.GenericAlias):
+        return_type = get_args(p.annotation)[0]
+        _, *meta = get_args(nested)
 
-    return_type = args[0]
-    _, *meta = get_args(nested)
+        return inspect.Parameter(
+            p.name,
+            p.kind,
+            default=p.default,
+            annotation=Annotated[return_type, *meta],
+        )
 
-    return inspect.Parameter(
-        p.name,
-        p.kind,
-        default=p.default,
-        annotation=Annotated[return_type, *meta],
-    )
+    raise ValueError(f"Unsupported annotation type: {type(p.annotation).__name__}")
 
 
 def _try_apply_parameter_decorator(obj: Any, param: inspect.Parameter) -> Any:

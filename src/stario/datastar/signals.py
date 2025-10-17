@@ -9,13 +9,11 @@ from .events import SignalsDict
 
 
 class ParseSignals:
-
     def __init__(self, name: str = "datastar"):
         self.name = name
         self.adapter = TypeAdapter(SignalsDict)
 
     async def __call__(self, request: Request) -> SignalsDict:
-
         if request.method == "GET":
             raw = request.query_params.get(self.name)
         else:
@@ -24,7 +22,18 @@ class ParseSignals:
         if raw is None:
             return {}
 
-        return self.adapter.validate_json(raw)
+        try:
+            return self.adapter.validate_json(raw)
+        except ValidationError as exc:
+            # Pydantic validation failed (malformed/invalid JSON, model error)
+            raise HTTPException(
+                status_code=422, detail=f"Format of signals payload is invalid. {exc}"
+            )
+        except Exception as exc:
+            # Invalid JSON, parsing errors, etc.
+            raise HTTPException(
+                status_code=400, detail=f"Malformed signals payload. {exc}"
+            )
 
 
 type Signals = Annotated[SignalsDict, ParseSignals()]
