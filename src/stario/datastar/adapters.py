@@ -73,8 +73,7 @@ class _StarioAdapter:
             return await response(scope, receive, send)
 
         # Fast path: None content
-        # TODO: should we assume not None or we are ok with bool()? think lists, strings, etc.
-        if not content:
+        if content is None:
             response = HTMLResponse(content=None, status_code=204)
             return await response(scope, receive, send)
 
