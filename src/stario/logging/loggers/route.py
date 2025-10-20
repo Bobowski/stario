@@ -192,7 +192,7 @@ def get_route_logger(request: Request) -> RouteLogger:
     return RouteLogger(
         queue=request.app.log_queue,
         min_level=LogLevel.INFO,
-        threshold_level=LogLevel.WARNING,
+        threshold_level=LogLevel.INFO,
         scope=request.scope,
     )
 

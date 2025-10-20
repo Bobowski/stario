@@ -46,40 +46,57 @@ class _StarioAdapter:
         # Create request for easier access
         request = Request(scope, receive, send)
 
-        # Resolve dependencies
-        content = await self.dependencies.resolve(request)
+        try:
+            # Resolve dependencies
+            content = await self.dependencies.resolve(request)
 
-        # Fast path: direct Response return (most common case)
-        if isinstance(content, Response):
-            return await content(scope, receive, send)
+            # Fast path: direct Response return (most common case)
+            if isinstance(content, Response):
+                response = content
 
-        # Fast path: Generator (SSE streaming)
-        if isinstance(content, Generator):
-            response = StreamingResponse(
-                content=(patch_to_sse(item, self.renderer) for item in content),
-                media_type="text/event-stream",
-                headers=self.SSE_HEADERS,
-            )
-            return await response(scope, receive, send)
+            # Fast path: Generator (SSE streaming)
+            elif isinstance(content, Generator):
+                response = StreamingResponse(
+                    content=(patch_to_sse(item, self.renderer) for item in content),
+                    media_type="text/event-stream",
+                    headers=self.SSE_HEADERS,
+                )
 
-        # Fast path: AsyncGenerator (SSE streaming)
-        if isinstance(content, AsyncGenerator):
-            response = StreamingResponse(
-                content=(patch_to_sse(item, self.renderer) async for item in content),
-                media_type="text/event-stream",
-                headers=self.SSE_HEADERS,
-            )
-            return await response(scope, receive, send)
+            # Fast path: AsyncGenerator (SSE streaming)
+            elif isinstance(content, AsyncGenerator):
+                response = StreamingResponse(
+                    content=(
+                        patch_to_sse(item, self.renderer) async for item in content
+                    ),
+                    media_type="text/event-stream",
+                    headers=self.SSE_HEADERS,
+                )
 
-        # Fast path: None content
-        if content is None:
-            response = HTMLResponse(content=None, status_code=204)
-            return await response(scope, receive, send)
+            # Fast path: None content
+            elif content is None:
+                response = HTMLResponse(content=None, status_code=204)
 
-        # Render content and return HTML response
-        rendered = self.renderer(content)
-        response = HTMLResponse(content=rendered, status_code=200)
-        await response(scope, receive, send)
+            # Render content and return HTML response
+            else:
+                rendered = self.renderer(content)
+                response = HTMLResponse(content=rendered, status_code=200)
+
+            # Send response
+            await response(scope, receive, send)
+
+        finally:
+
+            # Cleanup is guaranteed to run here, even on exception or early return
+            # Reverse order to ensure LIFO cleanup (last dependency in, first out)
+            for cleanup in reversed(getattr(request.state, "cleanups", [])):
+                try:
+                    if cleanup[0]:
+                        await cleanup[1](None, None, None)
+                    else:
+                        cleanup[1](None, None, None)
+                except Exception:
+                    # Log cleanup exceptions but don't interrupt other cleanups
+                    continue
 
 
 @dataclass(slots=True)
@@ -108,35 +125,51 @@ class _DetachedCommandAdapter:
         # Create request for easier access
         request = Request(scope, receive, send)
 
-        if len(self.dependencies.children) == 0:
-            arguments = {}
+        try:
+            if len(self.dependencies.children) == 0:
+                arguments = {}
 
-        elif len(self.dependencies.children) == 1:
-            # Single child - no need for TaskGroup
-            child = self.dependencies.children[0]
-            arguments = {child.name: await child.resolve(request)}
+            elif len(self.dependencies.children) == 1:
+                # Single child - no need for TaskGroup
+                child = self.dependencies.children[0]
+                arguments = {child.name: await child.resolve(request)}
 
-        else:
-            # Multiple children - use gather for parallel execution
-            results = await asyncio.gather(
-                *[d.resolve(request) for d in self.dependencies.children],
-                return_exceptions=True,
+            else:
+                # Multiple children - use gather for parallel execution
+                results = await asyncio.gather(
+                    *[d.resolve(request) for d in self.dependencies.children],
+                    return_exceptions=True,
+                )
+                # Check for exceptions and raise the first one found
+                for result in results:
+                    if isinstance(result, Exception):
+                        raise result
+                arguments = {
+                    c.name: result
+                    for c, result in zip(self.dependencies.children, results)
+                }
+
+            # We know that no exceptions were raised, so we can create the background task
+            response = HTMLResponse(
+                content=None,
+                status_code=204,
+                background=BackgroundTask(self.dependencies.function, **arguments),
             )
-            # Check for exceptions and raise the first one found
-            for result in results:
-                if isinstance(result, Exception):
-                    raise result
-            arguments = {
-                c.name: result for c, result in zip(self.dependencies.children, results)
-            }
+            await response(scope, receive, send)
 
-        # We know that no exceptions were raised, so we can create the background task
-        response = HTMLResponse(
-            content=None,
-            status_code=204,
-            background=BackgroundTask(self.dependencies.function, **arguments),
-        )
-        return await response(scope, receive, send)
+        finally:
+
+            # Cleanup is guaranteed to run here, even on exception or early return
+            # Reverse order to ensure LIFO cleanup (last dependency in, first out)
+            for cleanup in reversed(getattr(request.state, "cleanups", [])):
+                try:
+                    if cleanup[0]:
+                        await cleanup[1](None, None, None)
+                    else:
+                        cleanup[1](None, None, None)
+                except Exception:
+                    # Log cleanup exceptions but don't interrupt other cleanups
+                    continue
 
 
 def handler[T](

@@ -54,7 +54,13 @@ U = TypeVar("U")
 
 class Dependency[T]:
 
-    __slots__ = ("name", "function", "is_async", "lifetime", "children")
+    __slots__ = (
+        "name",
+        "function",
+        "is_async",
+        "lifetime",
+        "children",
+    )
 
     def __init__(
         self,
@@ -290,6 +296,23 @@ def handler(debug: bool = False): ...       # Default value""",
             else:
                 result = self.function(**arguments)
 
+            # It's possible that the function returns a context manager instance
+            # Combine async/sync context manager detection and avoid duplicate hasattr
+            cleanup = None
+            if async_cm := is_async_context_manager(result):
+                result = await async_cm[0]()
+                cleanup = (True, async_cm[1])  # (is_async: True, cleanup)
+            elif sync_cm := is_sync_context_manager(result):
+                result = sync_cm[0]()
+                cleanup = (False, sync_cm[1])  # (is_async: False, cleanup)
+
+            if cleanup is not None:
+                # Use try/except to optimize for the common case (cleanups already exists)
+                try:
+                    request.state.cleanups.append(cleanup)
+                except AttributeError:
+                    request.state.cleanups = [cleanup]
+
             # Set result in future if we created one
             if fut is not None:
                 fut.set_result(result)
@@ -324,6 +347,42 @@ def is_async_callable(obj: Any) -> bool:
         and hasattr(obj, "__call__")
         and inspect.iscoroutinefunction(obj.__call__)
     )
+
+
+def is_sync_context_manager(obj: Any) -> tuple[Callable, Callable] | None:
+    """
+    Check if an object is a synchronous context manager.
+
+    Returns a tuple of the __enter__ and __exit__ methods if the object has both.
+    This includes instances of classes implementing the context manager protocol.
+    """
+    # Use __slots__-safe presence and callable test, avoid type() or attribute search if possible
+    # Try to access the dunder directly for maximum speed (avoids MRO lookup unless necessary)
+    try:
+        enter = obj.__enter__
+        exit_ = obj.__exit__
+        if callable(enter) and callable(exit_):
+            return (enter, exit_)
+        return None
+    except AttributeError:
+        return None
+
+
+def is_async_context_manager(obj: Any) -> tuple[Callable, Callable] | None:
+    """
+    Check if an object is an asynchronous context manager.
+
+    Returns a tuple of the __aenter__ and __aexit__ methods if the object has both.
+    This includes instances of classes implementing the async context manager protocol.
+    """
+    try:
+        aenter = obj.__aenter__
+        aexit = obj.__aexit__
+        if callable(aenter) and callable(aexit):
+            return (aenter, aexit)
+        return None
+    except AttributeError:
+        return None
 
 
 def _inspect_callable(callable_obj: Any) -> tuple[list[inspect.Parameter], Callable]:
