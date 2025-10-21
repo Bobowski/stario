@@ -199,6 +199,15 @@ def handler(debug: bool = False): ...       # Default value""",
         if self.function is resolve_request or self.function is resolve_stario:
             return self.function(request)
 
+        # Check for override - most-performant short-circuit
+        if (override_func := request.app._mocks.get(self.function)) is not None:
+            # Recursively resolve the override function
+            return await Dependency._build_tree(
+                self.name,
+                override_func,
+                cast(DependencyLifetime, self.lifetime),
+            ).resolve(request)
+
         # Get caches once
         singletons = request.app.state.cache
 

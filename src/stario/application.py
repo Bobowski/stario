@@ -1,12 +1,19 @@
+import types
+from contextlib import contextmanager
 from typing import (
+    Annotated,
     Any,
     Callable,
     Collection,
+    Generator,
     Mapping,
     ParamSpec,
     Protocol,
     Sequence,
+    TypeAliasType,
     TypeVar,
+    get_args,
+    get_origin,
 )
 
 from starlette.datastructures import State, URLPath
@@ -95,21 +102,13 @@ class Stario:
         cache: dict[Callable, Any] = {}
         self.state.cache = cache
 
+        # Private mocks dict for testing - use via context manager
+        self._mocks: dict[Callable, Callable] = {}
+
         # Configure log queue
         self.log_queue = LogQueue(sinks=log_sinks)
         self.router.on_startup.append(self.log_queue.start)
         self.router.on_shutdown.append(self.log_queue.stop)
-
-        # self.dependency_overrides: dict[Callable, Callable] = {}
-        # """
-        # A dictionary with overrides for the dependencies.
-
-        # Each key is the original dependency callable, and the value is the
-        # actual dependency that should be called.
-
-        # This is for testing, to replace expensive dependencies with testing
-        # versions.
-        # """
 
     @property
     def routes(self) -> list[BaseRoute]:
@@ -341,3 +340,62 @@ app = Stario(
             return func
 
         return decorator
+
+    @contextmanager
+    def mocks(self, overrides: dict[Any, Callable]) -> Generator[None, None, None]:
+        """
+        Context manager to temporarily override dependencies for testing.
+
+        Handles unpacking Annotated types to extract the actual dependency function.
+        This allows using Annotated declarations or direct functions as keys.
+
+        Parameters:
+            overrides: Dictionary mapping dependency functions to their mock replacements.
+                      Keys can be either the dependency function directly or an Annotated type.
+
+        Example:
+            def mock_db() -> Database:
+                return InMemoryDatabase()
+
+            # Using the dependency function directly
+            with app.mocks({get_db: mock_db}):
+                with TestClient(app) as client:
+                    resp = client.post("/api")
+
+            # Or using Annotated declaration (also works)
+            with app.mocks({Annotated[Database, get_db]: mock_db}):
+                with TestClient(app) as client:
+                    resp = client.post("/api")
+        """
+        # Unpack Annotated keys if needed
+        unpacked = {
+            _unpack_annotated_override_key(key): value
+            for key, value in overrides.items()
+        }
+
+        # Apply overrides
+        self._mocks.update(unpacked)
+        try:
+            yield
+        finally:
+            # Cleanup - remove only the keys we added
+            for key in unpacked:
+                self._mocks.pop(key, None)
+
+
+def _unpack_annotated_override_key(key: Any) -> Callable:
+    # First, unwrap generic type aliases (TypeAliasType, GenericAlias)
+    nested = getattr(key, "__value__", None)
+    if nested is not None:
+        # It's a type alias, unwrap it to get the actual type
+        if isinstance(key, TypeAliasType) or isinstance(key, types.GenericAlias):
+            key = nested
+
+    # Now check if we have an Annotated type
+    if get_origin(key) is Annotated:
+        args = get_args(key)
+        if len(args) >= 2:
+            # args[0] is the type, args[1] is the dependency function
+            return args[1]
+
+    return key
