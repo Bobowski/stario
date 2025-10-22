@@ -29,7 +29,6 @@ class RouteLogger:
         "context",
         "buffer",
         "triggered",
-        "context",
     )
 
     def __init__(
@@ -40,7 +39,6 @@ class RouteLogger:
         threshold_level: LogLevel,
         # Context
         scope: Scope,
-        context: dict[str, Any] | None = None,
     ):
 
         # Configuration
@@ -51,26 +49,10 @@ class RouteLogger:
         # Context
         self.request_id = scope["stario.request_id"]
         self.scope = scope
-        self.context = context or {}
 
         # State
         self.buffer: list[RouteLogRecord] = []
         self.triggered = min_level >= threshold_level
-        self.context: dict[str, Any] = context or {}
-
-    def bind(self, **kwargs: Any) -> "RouteLogger":
-        """Clone logger with additional context."""
-        logger = RouteLogger(
-            queue=self.queue,
-            min_level=self.min_level,
-            threshold_level=self.threshold_level,
-            scope=self.scope,
-            context={**self.context, **kwargs},
-        )
-        # If the parent logger is already in passthru
-        #  child should aswell
-        logger.triggered = self.triggered
-        return logger
 
     def _log(
         self,
@@ -88,7 +70,7 @@ class RouteLogger:
             timestamp=time.time(),
             level=level,
             message=message,
-            context=self.context | kwargs,
+            context=kwargs,
             buffered=False,
             background=self.scope.get("stario.response_started", False),
             exc_info=exc_info,

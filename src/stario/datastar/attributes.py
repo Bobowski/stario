@@ -1,3 +1,4 @@
+import json
 import re
 from collections.abc import Iterable
 from typing import Annotated, Literal
@@ -272,26 +273,53 @@ ds.on("scroll", "action()", throttle=(100, "noleading", "trailing"))""",
     )
 
 
-def quick_json_dump(obj: dict) -> str:
+def quick_js_dump(obj: dict) -> str:
     """
-    Quick JSON dump for small, flat dictionaries used in Datastar attributes.
+    Quick JavaScript object notation dump for small, possibly nested dictionaries used in Datastar attributes.
 
-    This is an optimized JSON serializer for simple key-value pairs commonly
-    used in Datastar attributes. Only supports string keys and values.
+    This is an optimized serializer for key-value pairs commonly used in Datastar attributes.
+    Returns JavaScript object notation with unquoted keys and string values as expressions.
+    Supports string (as expressions), number, boolean, None, and nested dict values.
 
     Args:
-        obj: Dictionary with string keys and values
+        obj: Dictionary with string keys and values (str, int, float, bool, None, or dict)
 
     Returns:
-        JSON string representation
+        JavaScript object notation string representation
 
     Examples:
-        >>> quick_json_dump({"title": "Hello", "disabled": "true"})
-        '{"title":"Hello","disabled":"true"}'
-        >>> quick_json_dump({"class": "active"})
-        '{"class":"active"}'
+        >>> quick_js_dump({"title": "Hello", "disabled": "$isDisabled"})
+        '{title:Hello,disabled:$isDisabled}'
+        >>> quick_js_dump({"class": "active"})
+        '{class:active}'
+        >>> quick_js_dump({"count": 5, "flag": True})
+        '{count:5,flag:true}'
+        >>> quick_js_dump({"user": {"name": "Alice", "age": 30}})
+        '{user:{name:Alice,age:30}}'
+        >>> quick_js_dump({"outer": {"inner": {"foo": "bar"}}})
+        '{outer:{inner:{foo:bar}}}'
+        >>> quick_js_dump({"value": None})
+        '{value:null}'
     """
-    items = [f'"{k}":"{v}"' for k, v in obj.items()]
+
+    def _to_js_value(v):
+        if isinstance(v, dict):
+            return quick_js_dump(v)
+        elif isinstance(v, str):
+            # Treat strings as expressions (output without quotes)
+            return v
+        elif v is None:
+            return "null"
+        elif isinstance(v, bool):
+            return "true" if v else "false"
+        elif isinstance(v, (int, float)):
+            return str(v)
+        else:
+            raise TypeError(
+                f"quick_json_dump only supports str, bool, int, float, None, dict values, got {type(v).__name__}"
+            )
+
+    items = [f"{k}:{_to_js_value(v)}" for k, v in obj.items()]
     return "{" + ",".join(items) + "}"
 
 
@@ -432,7 +460,7 @@ class DatastarAttributes:
             >>> attrs.attr({"title": "$tooltip", "disabled": "$isDisabled"})
             {'data-attr': '{"title":"$tooltip","disabled":"$isDisabled"}'}
         """
-        return {"data-attr": quick_json_dump(attr_dict)}
+        return {"data-attr": quick_js_dump(attr_dict)}
 
     def bind(self, signal_name: str) -> dict[str, str]:
         """
@@ -479,7 +507,7 @@ class DatastarAttributes:
             >>> attrs.class_({"hidden": "$isHidden", "active": "$isActive"})
             {'data-class': '{"hidden":"$isHidden","active":"$isActive"}'}
         """
-        return {"data-class": quick_json_dump(class_dict)}
+        return {"data-class": quick_js_dump(class_dict)}
 
     def computed(self, computed_dict: dict[str, str]) -> dict[str, str]:
         """
@@ -700,7 +728,7 @@ class DatastarAttributes:
                 d["include"] = parse_filter_value(include)
             if exclude is not None:
                 d["exclude"] = parse_filter_value(exclude)
-            value = quick_json_dump(d)
+            value = quick_js_dump(d)
         else:
             value = True
 
@@ -906,7 +934,7 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
 
             return {
                 key: expression,
-                "data-on-signal-patch-filter": quick_json_dump(filter_dict),
+                "data-on-signal-patch-filter": quick_js_dump(filter_dict),
             }
 
         return {key: expression}
@@ -1106,8 +1134,12 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             {'data-signals__ifmissing': '{"fallback":"default"}'}
         """
         if ifmissing:
-            return {"data-signals__ifmissing": quick_json_dump(signals_dict)}
-        return {"data-signals": quick_json_dump(signals_dict)}
+            return {
+                "data-signals__ifmissing": json.dumps(
+                    signals_dict, separators=(",", ":")
+                )
+            }
+        return {"data-signals": json.dumps(signals_dict, separators=(",", ":"))}
 
     def style(self, style_dict: dict[str, str]) -> dict[str, str]:
         """
@@ -1129,7 +1161,7 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             >>> attrs.style({"color": "$themeColor", "opacity": "$alpha"})
             {'data-style': '{"color":"$themeColor","opacity":"$alpha"}'}
         """
-        return {"data-style": quick_json_dump(style_dict)}
+        return {"data-style": quick_js_dump(style_dict)}
 
     def text(self, expression: str) -> dict[str, str]:
         """
@@ -1249,7 +1281,7 @@ class DatastarActions:
                 filter_dict["include"] = parse_filter_value(include)
             if exclude is not None:
                 filter_dict["exclude"] = parse_filter_value(exclude)
-            filter_json = quick_json_dump(filter_dict)
+            filter_json = quick_js_dump(filter_dict)
 
             return f"@setAll({value}, {filter_json})"
         return f"@setAll({value})"
@@ -1287,7 +1319,7 @@ class DatastarActions:
                 filter_dict["include"] = parse_filter_value(include)
             if exclude is not None:
                 filter_dict["exclude"] = parse_filter_value(exclude)
-            filter_json = quick_json_dump(filter_dict)
+            filter_json = quick_js_dump(filter_dict)
 
             return f"@toggleAll({filter_json})"
         return "@toggleAll()"
@@ -1347,14 +1379,14 @@ class DatastarActions:
             if exclude is not None:
                 filter_dict["exclude"] = parse_filter_value(exclude)
 
-            filter_json = quick_json_dump(filter_dict)
+            filter_json = quick_js_dump(filter_dict)
             options.append(f"filterSignals: {filter_json}")
 
         if selector is not None:
             options.append(f"selector: '{selector}'")
 
         if headers is not None:
-            headers_json = quick_json_dump(headers)
+            headers_json = quick_js_dump(headers)
             options.append(f"headers: {headers_json}")
 
         if open_when_hidden:
