@@ -1,6 +1,6 @@
 import re
 from collections.abc import Iterable
-from typing import Annotated, Any, Literal, overload
+from typing import Annotated, Literal
 
 from stario.application import Stario
 from stario.exceptions import DatastarConfigError
@@ -143,14 +143,18 @@ def time_to_string(time: TimeValue) -> str:
 
 type Debounce = (
     TimeValue
-    | tuple[TimeValue, Literal["leading", "notrail"]]
-    | tuple[TimeValue, Literal["leading", "notrail"], Literal["leading", "notrail"]]
+    | tuple[TimeValue, Literal["leading", "notrailing"]]
+    | tuple[
+        TimeValue, Literal["leading", "notrailing"], Literal["leading", "notrailing"]
+    ]
 )
 
 type Throttle = (
     TimeValue
-    | tuple[TimeValue, Literal["noleading", "trail"]]
-    | tuple[TimeValue, Literal["noleading", "trail"], Literal["noleading", "trail"]]
+    | tuple[TimeValue, Literal["noleading", "trailing"]]
+    | tuple[
+        TimeValue, Literal["noleading", "trailing"], Literal["noleading", "trailing"]
+    ]
 )
 
 
@@ -162,7 +166,7 @@ def debounce_to_string(debounce: Debounce) -> str:
     time has passed since the last event.
 
     Args:
-        debounce: Time value or tuple with time and modifiers ('leading', 'notrail')
+        debounce: Time value or tuple with time and modifiers ('leading', 'notrailing')
 
     Returns:
         Datastar debounce modifier string
@@ -172,8 +176,8 @@ def debounce_to_string(debounce: Debounce) -> str:
         'debounce.500ms'
         >>> debounce_to_string((1, "leading"))
         'debounce.1s.leading'
-        >>> debounce_to_string((0.3, "leading", "notrail"))
-        'debounce.300ms.leading.notrail'
+        >>> debounce_to_string((0.3, "leading", "notrailing"))
+        'debounce.300ms.leading.notrailing'
     """
     # shortcut for the most common case
     if isinstance(debounce, (int, float, str)):
@@ -218,7 +222,7 @@ def throttle_to_string(throttle: Throttle) -> str:
     Throttling ensures an event handler executes at most once per specified time period.
 
     Args:
-        throttle: Time value or tuple with time and modifiers ('noleading', 'trail')
+        throttle: Time value or tuple with time and modifiers ('noleading', 'trailing')
 
     Returns:
         Datastar throttle modifier string
@@ -226,10 +230,10 @@ def throttle_to_string(throttle: Throttle) -> str:
     Examples:
         >>> throttle_to_string(1)
         'throttle.1s'
-        >>> throttle_to_string((0.5, "trail"))
-        'throttle.500ms.trail'
-        >>> throttle_to_string((2, "noleading", "trail"))
-        'throttle.2s.noleading.trail'
+        >>> throttle_to_string((0.5, "trailing"))
+        'throttle.500ms.trailing'
+        >>> throttle_to_string((2, "noleading", "trailing"))
+        'throttle.2s.noleading.trailing'
     """
     # shortcut for the most common case
     if isinstance(throttle, (int, float, str)):
@@ -261,10 +265,10 @@ ds.on("scroll", "action()", throttle="500ms")   # 500ms
 ds.on("scroll", "action()", throttle=1.5)       # 1500ms
 
 # With single modifier:
-ds.on("scroll", "action()", throttle=(100, "trail"))
+ds.on("scroll", "action()", throttle=(100, "trailing"))
 
 # With two modifiers:
-ds.on("scroll", "action()", throttle=(100, "noleading", "trail"))""",
+ds.on("scroll", "action()", throttle=(100, "noleading", "trailing"))""",
     )
 
 
@@ -391,35 +395,22 @@ def to_kebab_key(key: str) -> tuple[str, Case]:
 
 class DatastarAttributes:
     """
-    Generator for Datastar data-* attributes and actions.
+    Generator for Datastar data-* attributes.
 
-    This class provides methods to generate all Datastar attributes and actions
-    with proper formatting, modifiers, and type safety. It integrates with the
-    Stario application to resolve endpoint names to URLs.
+    This class provides methods to generate Datastar HTML attributes with proper
+    formatting and type safety. These attributes don't require any external
+    dependencies.
 
     Reference: https://data-star.dev/reference/attributes
 
-    Attributes:
-        app: The Stario application instance for URL resolution
-
     Examples:
-        >>> from stario.application import Stario
-        >>> app = Stario()
-        >>> ds = DatastarAttributes(app)
-        >>> ds.text("$message")
+        >>> from stario.datastar import DatastarAttributes
+        >>> attrs = DatastarAttributes()
+        >>> attrs.text("$message")
         {'data-text': '$message'}
-        >>> ds.show("$isVisible")
+        >>> attrs.show("$isVisible")
         {'data-show': '$isVisible'}
     """
-
-    def __init__(self, app: Stario) -> None:
-        """
-        Initialize the DatastarAttributes generator.
-
-        Args:
-            app: Stario application instance for endpoint name -> URL resolution
-        """
-        self.app = app
 
     def attr(self, attr_dict: dict[str, str]) -> dict[str, str]:
         """
@@ -437,8 +428,8 @@ class DatastarAttributes:
             Dictionary with data-attr attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.attr({"title": "$tooltip", "disabled": "$isDisabled"})
+            >>> attrs = DatastarAttributes()
+            >>> attrs.attr({"title": "$tooltip", "disabled": "$isDisabled"})
             {'data-attr': '{"title":"$tooltip","disabled":"$isDisabled"}'}
         """
         return {"data-attr": quick_json_dump(attr_dict)}
@@ -460,10 +451,10 @@ class DatastarAttributes:
             Dictionary with data-bind attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.bind("username")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.bind("username")
             {'data-bind': 'username'}
-            >>> ds.bind("email")
+            >>> attrs.bind("email")
             {'data-bind': 'email'}
         """
         return {"data-bind": signal_name}
@@ -484,8 +475,8 @@ class DatastarAttributes:
             Dictionary with data-class attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.class_({"hidden": "$isHidden", "active": "$isActive"})
+            >>> attrs = DatastarAttributes()
+            >>> attrs.class_({"hidden": "$isHidden", "active": "$isActive"})
             {'data-class': '{"hidden":"$isHidden","active":"$isActive"}'}
         """
         return {"data-class": quick_json_dump(class_dict)}
@@ -507,11 +498,11 @@ class DatastarAttributes:
             Dictionary with data-computed-* attributes with proper case modifiers
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.computed({"fullName": "$firstName + ' ' + $lastName"})
-            {'data-computed-full-name': "$firstName + ' ' + $lastName"}
-            >>> ds.computed({"total_price": "$quantity * $price"})
-            {'data-computed-total-price__case.snake': '$quantity * $price'}
+            >>> attrs = DatastarAttributes()
+            >>> attrs.computed({"fullName": "$firstName + ' ' + $lastName"})
+            {'data-computed:full-name': "$firstName + ' ' + $lastName"}
+            >>> attrs.computed({"total_price": "$quantity * $price"})
+            {'data-computed:total-price__case.snake': '$quantity * $price'}
         """
 
         # 2-pass: first collect kebab/from_case, then build dict
@@ -520,9 +511,9 @@ class DatastarAttributes:
         ]
         result = {
             (
-                f"data-computed-{kebab_key}"
+                f"data-computed:{kebab_key}"
                 if from_case == "camel"  # Default
-                else f"data-computed-{kebab_key}__case.{from_case}"
+                else f"data-computed:{kebab_key}__case.{from_case}"
             ): value
             for (kebab_key, from_case), value in kebab_cases
         }
@@ -546,10 +537,10 @@ class DatastarAttributes:
             Dictionary with data-effect attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.effect("$total = $price * $quantity")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.effect("$total = $price * $quantity")
             {'data-effect': '$total = $price * $quantity'}
-            >>> ds.effect("console.log($count)")
+            >>> attrs.effect("console.log($count)")
             {'data-effect': 'console.log($count)'}
         """
         return {"data-effect": expression}
@@ -571,10 +562,10 @@ class DatastarAttributes:
             Dictionary with data-ignore or data-ignore__self attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.ignore()
+            >>> attrs = DatastarAttributes()
+            >>> attrs.ignore()
             {'data-ignore': True}
-            >>> ds.ignore(self_only=True)
+            >>> attrs.ignore(self_only=True)
             {'data-ignore__self': True}
         """
         if self_only:
@@ -594,8 +585,8 @@ class DatastarAttributes:
             Dictionary with data-ignore-morph attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.ignore_morph()
+            >>> attrs = DatastarAttributes()
+            >>> attrs.ignore_morph()
             {'data-ignore-morph': True}
         """
         return {"data-ignore-morph": True}
@@ -616,13 +607,56 @@ class DatastarAttributes:
             Dictionary with data-indicator attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.indicator("loading")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.indicator("loading")
             {'data-indicator': 'loading'}
-            >>> ds.indicator("isFetching")
+            >>> attrs.indicator("isFetching")
             {'data-indicator': 'isFetching'}
         """
         return {"data-indicator": signal_name}
+
+    def init(
+        self,
+        expression: str,
+        *,
+        delay: TimeValue | None = None,
+        viewtransition: bool = False,
+    ) -> dict[str, str]:
+        """
+        Execute an expression when the element loads.
+
+        Triggers once when the element is first added to the DOM and
+        Datastar initializes it. Useful for lazy-loading data.
+
+        Reference: https://data-star.dev/reference/attributes#data-on-load
+
+        Args:
+            expression: Datastar expression to execute
+            delay: Delay before executing expression
+            viewtransition: Use view transitions for updates
+
+        Returns:
+            Dictionary with data-on-load attribute
+
+        Examples:
+            >>> attrs = DatastarAttributes()
+            >>> attrs.init("$init()")
+            {'data-init': '$init()'}
+            >>> attrs.init("$fetchData()", delay=1)
+            {'data-init__delay.1s': '$fetchData()'}
+        """
+        if delay is None:
+            if not viewtransition:
+                return {"data-init": expression}  # default
+
+            return {"data-init__viewtransition": expression}
+
+        mods = "delay." + time_to_string(delay)
+
+        if viewtransition:
+            mods += "__viewtransition"
+
+        return {"data-init__" + mods: expression}
 
     def json_signals(
         self,
@@ -649,12 +683,12 @@ class DatastarAttributes:
             Dictionary with data-json-signals attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.json_signals()
+            >>> attrs = DatastarAttributes()
+            >>> attrs.json_signals()
             {'data-json-signals': True}
-            >>> ds.json_signals(include="user.*")
+            >>> attrs.json_signals(include="user.*")
             {'data-json-signals': '{"include":"user.*"}'}
-            >>> ds.json_signals(exclude=["password", "token"], terse=True)
+            >>> attrs.json_signals(exclude=["password", "token"], terse=True)
             {'data-json-signals__terse': '{"exclude":"password|token"}'}
         """
 
@@ -674,10 +708,8 @@ class DatastarAttributes:
             return {"data-json-signals__terse": value}
         return {"data-json-signals": value}
 
-    @overload
-    def on(
+    def on_intersect(
         self,
-        event: Literal["intersect"],
         expression: str,
         *,
         once: bool = False,
@@ -710,17 +742,37 @@ class DatastarAttributes:
             Dictionary with data-on-intersect attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.on("intersect", "console.log('visible')")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.on_intersect("console.log('visible')")
             {'data-on-intersect': "console.log('visible')"}
-            >>> ds.on("intersect", "$load()", once=True, half=True)
+            >>> attrs.on_intersect("$load()", once=True, half=True)
             {'data-on-intersect__once__half': '$load()'}
         """
+        modifiers: list[str] = []
+        append = modifiers.append
+        if once:
+            append("once")
+        if half:
+            append("half")
+        if full:
+            append("full")
+        if delay is not None:
+            append("delay." + time_to_string(delay))
+        if debounce is not None:
+            append(debounce_to_string(debounce))
+        if throttle is not None:
+            append(throttle_to_string(throttle))
+        if viewtransition:
+            append("viewtransition")
 
-    @overload
-    def on(
+        if len(modifiers) > 0:
+            mods = "__".join(modifiers)
+            return {"data-on-intersect__" + mods: expression}
+
+        return {"data-on-intersect": expression}
+
+    def on_interval(
         self,
-        event: Literal["interval"],
         expression: str,
         *,
         duration: TimeValue | tuple[TimeValue, Literal["leading"]] = "1s",
@@ -744,52 +796,55 @@ class DatastarAttributes:
             Dictionary with data-on-interval attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.on("interval", "$refresh()")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.on_interval("$refresh()")
             {'data-on-interval': '$refresh()'}
-            >>> ds.on("interval", "$poll()", duration=5)
+            >>> attrs.on_interval("$poll()", duration=5)
             {'data-on-interval__duration.5s': '$poll()'}
-            >>> ds.on("interval", "$check()", duration=(2, "leading"))
+            >>> attrs.on_interval("$check()", duration=(2, "leading"))
             {'data-on-interval__duration.2s.leading': '$check()'}
         """
+        if duration == "1s":
+            if not viewtransition:
+                return {"data-on-interval": expression}  # default
 
-    @overload
-    def on(
+            return {"data-on-interval__viewtransition": expression}
+
+        # TimeValue is a type alias (int | float | str), so we check for those types explicitly:
+        if isinstance(duration, (int, float, str)):
+            mods = "duration." + time_to_string(duration)
+
+        elif isinstance(duration, tuple):
+            mods = f"duration.{time_to_string(duration[0])}.{duration[1]}"
+
+        else:
+            raise DatastarConfigError(
+                f"Invalid duration configuration for on_interval: {duration}",
+                context={
+                    "duration_value": str(duration),
+                    "duration_type": type(duration).__name__,
+                },
+                help_text="Duration must be a time value (int/float/str) or a tuple with time and 'leading' modifier.",
+                example="""from stario.datastar import Datastar
+
+ds = Datastar()
+
+# Simple duration (time only):
+ds.on_interval("action()", duration=1000)      # 1000ms (1 second)
+ds.on_interval("action()", duration="5s")      # 5 seconds
+ds.on_interval("action()", duration=2.5)       # 2.5 seconds
+
+# With leading modifier (fires immediately, then at intervals):
+ds.on_interval("action()", duration=(1000, "leading"))""",
+            )
+
+        if viewtransition:
+            mods += "__viewtransition"
+
+        return {"data-on-interval__" + mods: expression}
+
+    def on_signal_patch(
         self,
-        event: Literal["load"],
-        expression: str,
-        *,
-        delay: TimeValue | None = None,
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-        """
-        Execute an expression when the element loads.
-
-        Triggers once when the element is first added to the DOM and
-        Datastar initializes it. Useful for lazy-loading data.
-
-        Reference: https://data-star.dev/reference/attributes#data-on-load
-
-        Args:
-            expression: Datastar expression to execute
-            delay: Delay before executing expression
-            viewtransition: Use view transitions for updates
-
-        Returns:
-            Dictionary with data-on-load attribute
-
-        Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.on("load", "$init()")
-            {'data-on-load': '$init()'}
-            >>> ds.on("load", "$fetchData()", delay=1)
-            {'data-on-load__delay.1s': '$fetchData()'}
-        """
-
-    @overload
-    def on(
-        self,
-        event: Literal["signal-patch"],
         expression: str,
         *,
         delay: TimeValue | None = None,
@@ -819,14 +874,43 @@ class DatastarAttributes:
             Dictionary with data-on-signal-patch attribute(s)
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.on("signal-patch", "console.log('updated')")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.on_signal_patch("console.log('updated')")
             {'data-on-signal-patch': "console.log('updated')"}
-            >>> ds.on("signal-patch", "$log()", include="user.*", debounce=0.5)
+            >>> attrs.on_signal_patch("$log()", include="user.*", debounce=0.5)
             {'data-on-signal-patch__debounce.500ms': '$log()', 'data-on-signal-patch-filter': '{"include":"user.*"}'}
         """
+        modifiers: list[str] = []
+        append = modifiers.append
 
-    @overload
+        if delay is not None:
+            append("delay." + time_to_string(delay))
+
+        if debounce is not None:
+            append(debounce_to_string(debounce))
+
+        if throttle is not None:
+            append(throttle_to_string(throttle))
+
+        if len(modifiers) > 0:
+            key = "data-on-signal-patch__" + "__".join(modifiers)
+        else:
+            key = "data-on-signal-patch"
+
+        if include is not None or exclude is not None:
+            filter_dict = {}
+            if include is not None:
+                filter_dict["include"] = include
+            if exclude is not None:
+                filter_dict["exclude"] = exclude
+
+            return {
+                key: expression,
+                "data-on-signal-patch-filter": quick_json_dump(filter_dict),
+            }
+
+        return {key: expression}
+
     def on(
         self,
         event: JSEvent | str,
@@ -871,197 +955,18 @@ class DatastarAttributes:
             Dictionary with data-on-{event} attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.on("click", "$count++")
-            {'data-on-click': '$count++'}
-            >>> ds.on("submit", "$save()", prevent=True)
-            {'data-on-submit__prevent': '$save()'}
-            >>> ds.on("input", "$search()", debounce=0.3)
-            {'data-on-input__debounce.300ms': '$search()'}
-            >>> ds.on("click", "$close()", outside=True)
-            {'data-on-click__outside': '$close()'}
-            >>> ds.on("scroll", "$track()", window=True, throttle=0.1)
-            {'data-on-scroll__window__throttle.100ms': '$track()'}
+            >>> attrs = DatastarAttributes()
+            >>> attrs.on("click", "$count++")
+            {'data-on:click': '$count++'}
+            >>> attrs.on("submit", "$save()", prevent=True)
+            {'data-on:submit__prevent': '$save()'}
+            >>> attrs.on("input", "$search()", debounce=0.3)
+            {'data-on:input__debounce.300ms': '$search()'}
+            >>> attrs.on("click", "$close()", outside=True)
+            {'data-on:click__outside': '$close()'}
+            >>> attrs.on("scroll", "$track()", window=True, throttle=0.1)
+            {'data-on:scroll__window__throttle.100ms': '$track()'}
         """
-
-    def on(
-        self,
-        event: str,
-        expression: str,
-        **kwargs: Any,
-    ) -> dict[str, str]:
-
-        if event == "intersect":
-            return self._on_intersect(expression, **kwargs)
-        if event == "interval":
-            return self._on_interval(expression, **kwargs)
-        if event == "load":
-            return self._on_load(expression, **kwargs)
-        if event == "signal-patch":
-            return self._on_signal_patch(expression, **kwargs)
-        return self._on_event(event, expression, **kwargs)
-
-    def _on_intersect(
-        self,
-        expression: str,
-        once: bool = False,
-        half: bool = False,
-        full: bool = False,
-        delay: TimeValue | None = None,
-        debounce: Debounce | None = None,
-        throttle: Throttle | None = None,
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-
-        modifiers: list[str] = []
-        append = modifiers.append
-        if once:
-            append("once")
-        if half:
-            append("half")
-        if full:
-            append("full")
-        if delay is not None:
-            append("delay." + time_to_string(delay))
-        if debounce is not None:
-            append(debounce_to_string(debounce))
-        if throttle is not None:
-            append(throttle_to_string(throttle))
-        if viewtransition:
-            append("viewtransition")
-
-        if len(modifiers) > 0:
-            mods = "__".join(modifiers)
-            return {"data-on-intersect__" + mods: expression}
-
-        return {"data-on-intersect": expression}
-
-    def _on_interval(
-        self,
-        expression: str,
-        duration: TimeValue | tuple[TimeValue, Literal["leading"]] = "1s",
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-
-        if duration == "1s":
-            if not viewtransition:
-                return {"data-on-interval": expression}  # default
-
-            return {"data-on-interval__viewtransition": expression}
-
-        # TimeValue is a type alias (int | float | str), so we check for those types explicitly:
-        if isinstance(duration, (int, float, str)):
-            mods = "duration." + time_to_string(duration)
-
-        elif isinstance(duration, tuple):
-            mods = f"duration.{time_to_string(duration[0])}.{duration[1]}"
-
-        else:
-            raise DatastarConfigError(
-                f"Invalid duration configuration for on_interval: {duration}",
-                context={
-                    "duration_value": str(duration),
-                    "duration_type": type(duration).__name__,
-                },
-                help_text="Duration must be a time value (int/float/str) or a tuple with time and 'leading' modifier.",
-                example="""from stario.datastar import Datastar
-
-ds = Datastar()
-
-# Simple duration (time only):
-ds.on_interval("action()", duration=1000)      # 1000ms (1 second)
-ds.on_interval("action()", duration="5s")      # 5 seconds
-ds.on_interval("action()", duration=2.5)       # 2.5 seconds
-
-# With leading modifier (fires immediately, then at intervals):
-ds.on_interval("action()", duration=(1000, "leading"))""",
-            )
-
-        if viewtransition:
-            mods += "__viewtransition"
-
-        return {"data-on-interval__" + mods: expression}
-
-    def _on_load(
-        self,
-        expression: str,
-        delay: TimeValue | None = None,
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-
-        if delay is None:
-            if not viewtransition:
-                return {"data-on-load": expression}  # default
-
-            return {"data-on-load__viewtransition": expression}
-
-        mods = "delay." + time_to_string(delay)
-
-        if viewtransition:
-            mods += "__viewtransition"
-
-        return {"data-on-load__" + mods: expression}
-
-    def _on_signal_patch(
-        self,
-        expression: str,
-        delay: TimeValue | None = None,
-        debounce: Debounce | None = None,
-        throttle: Throttle | None = None,
-        # Filter
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-    ) -> dict[str, str]:
-
-        modifiers: list[str] = []
-        append = modifiers.append
-
-        if delay is not None:
-            append("delay." + time_to_string(delay))
-
-        if debounce is not None:
-            append(debounce_to_string(debounce))
-
-        if throttle is not None:
-            append(throttle_to_string(throttle))
-
-        if len(modifiers) > 0:
-            key = "data-on-signal-patch__" + "__".join(modifiers)
-        else:
-            key = "data-on-signal-patch"
-
-        if include is not None or exclude is not None:
-            filter_dict = {}
-            if include is not None:
-                filter_dict["include"] = include
-            if exclude is not None:
-                filter_dict["exclude"] = exclude
-
-            return {
-                key: expression,
-                "data-on-signal-patch-filter": quick_json_dump(filter_dict),
-            }
-
-        return {key: expression}
-
-    def _on_event(
-        self,
-        event: JSEvent | str,
-        expression: str,
-        *,
-        once: bool = False,
-        passive: bool = False,
-        capture: bool = False,
-        delay: TimeValue | None = None,
-        debounce: Debounce | None = None,
-        throttle: Throttle | None = None,
-        viewtransition: bool = False,
-        window: bool = False,
-        outside: bool = False,
-        prevent: bool = False,
-        stop: bool = False,
-    ) -> dict[str, str]:
-
         modifiers = []
         append = modifiers.append
         if once:
@@ -1093,9 +998,9 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
 
         if len(modifiers) > 0:
             mods = "__".join(modifiers)
-            return {f"data-on-{kebab_event}__{mods}": expression}
+            return {f"data-on:{kebab_event}__{mods}": expression}
 
-        return {f"data-on-{kebab_event}": expression}
+        return {f"data-on:{kebab_event}": expression}
 
     def preserve_attr(self, attrs: str | list[str]) -> dict[str, str]:
         """
@@ -1114,10 +1019,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Dictionary with data-preserve-attr attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.preserve_attr("value")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.preserve_attr("value")
             {'data-preserve-attr': 'value'}
-            >>> ds.preserve_attr(["value", "checked", "disabled"])
+            >>> attrs.preserve_attr(["value", "checked", "disabled"])
             {'data-preserve-attr': 'value checked disabled'}
         """
         value = attrs if isinstance(attrs, str) else " ".join(attrs)
@@ -1139,10 +1044,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Dictionary with data-ref attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.ref("inputEl")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.ref("inputEl")
             {'data-ref': 'inputEl'}
-            >>> ds.ref("modalElement")
+            >>> attrs.ref("modalElement")
             {'data-ref': 'modalElement'}
         """
         return {"data-ref": signal_name}
@@ -1164,10 +1069,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Dictionary with data-show attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.show("$isVisible")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.show("$isVisible")
             {'data-show': '$isVisible'}
-            >>> ds.show("$count > 0")
+            >>> attrs.show("$count > 0")
             {'data-show': '$count > 0'}
         """
         return {"data-show": expression}
@@ -1194,10 +1099,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Dictionary with data-signals or data-signals__ifmissing attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.signals({"count": "0", "name": "John"})
+            >>> attrs = DatastarAttributes()
+            >>> attrs.signals({"count": "0", "name": "John"})
             {'data-signals': '{"count":"0","name":"John"}'}
-            >>> ds.signals({"fallback": "default"}, ifmissing=True)
+            >>> attrs.signals({"fallback": "default"}, ifmissing=True)
             {'data-signals__ifmissing': '{"fallback":"default"}'}
         """
         if ifmissing:
@@ -1220,8 +1125,8 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Dictionary with data-style attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.style({"color": "$themeColor", "opacity": "$alpha"})
+            >>> attrs = DatastarAttributes()
+            >>> attrs.style({"color": "$themeColor", "opacity": "$alpha"})
             {'data-style': '{"color":"$themeColor","opacity":"$alpha"}'}
         """
         return {"data-style": quick_json_dump(style_dict)}
@@ -1242,15 +1147,47 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Dictionary with data-text attribute
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.text("$message")
+            >>> attrs = DatastarAttributes()
+            >>> attrs.text("$message")
             {'data-text': '$message'}
-            >>> ds.text("$firstName + ' ' + $lastName")
+            >>> attrs.text("$firstName + ' ' + $lastName")
             {'data-text': "$firstName + ' ' + $lastName"}
         """
         return {"data-text": expression}
 
-    # Datastar Actions
+
+class DatastarActions:
+    """
+    Generator for Datastar actions.
+
+    This class provides methods to generate Datastar actions. Some actions
+    (HTTP methods) require the Stario application for URL resolution.
+
+    Reference: https://data-star.dev/reference/actions
+
+    Attributes:
+        app: The Stario application instance for URL resolution
+
+    Examples:
+        >>> from stario.application import Stario
+        >>> from stario.datastar import DatastarActions
+        >>> app = Stario()
+        >>> actions = DatastarActions(app)
+        >>> actions.peek("$count")
+        '@peek($count)'
+        >>> actions.get("/api/users")
+        "@get('/api/users')"
+    """
+
+    def __init__(self, app: Stario) -> None:
+        """
+        Initialize the DatastarActions generator.
+
+        Args:
+            app: Stario application instance for endpoint name -> URL resolution
+        """
+        self.app = app
+
     def peek(self, callable_expr: str) -> str:
         """
         Access signals without subscribing to their changes.
@@ -1267,10 +1204,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @peek() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.peek("$count")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.peek("$count")
             '@peek($count)'
-            >>> ds.peek("$user.name")
+            >>> actions.peek("$user.name")
             '@peek($user.name)'
         """
         return f"@peek({callable_expr})"
@@ -1298,12 +1235,12 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @setAll() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.set_all("0")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.set_all("0")
             '@setAll(0)'
-            >>> ds.set_all("false", include="is.*")
+            >>> actions.set_all("false", include="is.*")
             '@setAll(false, {"include":"is.*"})'
-            >>> ds.set_all("''", exclude=["id", "token"])
+            >>> actions.set_all("''", exclude=["id", "token"])
             '@setAll(\\'\\', {"exclude":"id|token"})'
         """
         if include is not None or exclude is not None:
@@ -1336,12 +1273,12 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @toggleAll() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.toggle_all()
+            >>> actions = DatastarActions(Stario())
+            >>> actions.toggle_all()
             '@toggleAll()'
-            >>> ds.toggle_all(include="is.*")
+            >>> actions.toggle_all(include="is.*")
             '@toggleAll({"include":"is.*"})'
-            >>> ds.toggle_all(exclude=["isAdmin", "isRoot"])
+            >>> actions.toggle_all(exclude=["isAdmin", "isRoot"])
             '@toggleAll({"exclude":"isAdmin|isRoot"})'
         """
         if include is not None or exclude is not None:
@@ -1491,10 +1428,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @get() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.get("/api/users")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.get("/api/users")
             "@get('/api/users')"
-            >>> ds.get("/api/data", include="user.*")
+            >>> actions.get("/api/data", include="user.*")
             '@get(\\'/api/data\\', {filterSignals: {"include":"user.*"}})'
         """
         return self._http_action(
@@ -1555,10 +1492,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @post() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.post("/api/users")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.post("/api/users")
             "@post('/api/users')"
-            >>> ds.post("/api/form", content_type="form")
+            >>> actions.post("/api/form", content_type="form")
             "@post('/api/form', {contentType: 'form'})"
         """
         return self._http_action(
@@ -1606,8 +1543,8 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @put() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.put("/api/users/123")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.put("/api/users/123")
             "@put('/api/users/123')"
         """
         return self._http_action(
@@ -1655,8 +1592,8 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @patch() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.patch("/api/users/123", include=["name", "email"])
+            >>> actions = DatastarActions(Stario())
+            >>> actions.patch("/api/users/123", include=["name", "email"])
             '@patch(\\'/api/users/123\\', {filterSignals: {"include":"name|email"}})'
         """
         return self._http_action(
@@ -1704,8 +1641,8 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @delete() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.delete("/api/users/123")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.delete("/api/users/123")
             "@delete('/api/users/123')"
         """
         return self._http_action(
@@ -1741,10 +1678,10 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @clipboard() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.clipboard("Hello World")
+            >>> actions = DatastarActions(Stario())
+            >>> actions.clipboard("Hello World")
             "@clipboard('Hello World')"
-            >>> ds.clipboard("SGVsbG8=", is_base64=True)
+            >>> actions.clipboard("SGVsbG8=", is_base64=True)
             "@clipboard('SGVsbG8=', true)"
         """
         if is_base64:
@@ -1782,439 +1719,48 @@ ds.on_interval("action()", duration=(1000, "leading"))""",
             Datastar @fit() action string
 
         Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.fit("$value", 0, 100, 0, 1)
+            >>> actions = DatastarActions(Stario())
+            >>> actions.fit("$value", 0, 100, 0, 1)
             '@fit($value, 0, 100, 0, 1, false, false)'
-            >>> ds.fit("$percent", 0, 100, 0, 255, should_clamp=True, should_round=True)
+            >>> actions.fit("$percent", 0, 100, 0, 255, should_clamp=True, should_round=True)
             '@fit($percent, 0, 100, 0, 255, true, true)'
         """
         return f"@fit({v}, {old_min}, {old_max}, {new_min}, {new_max}, {str(should_clamp).lower()}, {str(should_round).lower()})"
 
-    @overload
-    def fetch_on(
-        self,
-        event: Literal["intersect"],
-        uri: str,
-        *,
-        # HTTP options
-        method: Literal["get", "post", "put", "patch", "delete"] = "get",
-        content_type: ContentType | str = "json",
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool = False,
-        retry_interval_ms: int = 1_000,
-        retry_scaler: float = 2.0,
-        retry_max_wait_ms: int = 30_000,
-        retry_max_count: int = 10,
-        request_cancellation: RequestCancellation | str = "auto",
-        # intersect options
-        once: bool = False,
-        half: bool = False,
-        full: bool = False,
-        delay: TimeValue | None = None,
-        debounce: Debounce | None = None,
-        throttle: Throttle | None = None,
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-        """
-        Fetch a resource when the element intersects with the viewport.
 
-        Convenience method that combines data-on-intersect with an HTTP action.
-        Automatically triggers a fetch request when the element becomes visible.
-
-        Reference: https://data-star.dev/reference/attributes#data-on-intersect
-                   https://data-star.dev/reference/actions#backend-actions
-
-        Args:
-            event: Must be "intersect"
-            uri: Endpoint URL or route name
-            method: HTTP method to use
-            content_type: Request content type
-            include: Include only matching signals in request
-            exclude: Exclude matching signals from request
-            selector: CSS selector for elements to update
-            headers: Additional HTTP headers
-            open_when_hidden: Keep connection open when page is hidden
-            retry_interval_ms: Initial retry delay
-            retry_scaler: Exponential backoff multiplier
-            retry_max_wait_ms: Maximum retry delay
-            retry_max_count: Maximum retry attempts
-            request_cancellation: Cancellation strategy
-            once: Fire only once, then remove the listener
-            half: Trigger when at least 50% is visible
-            full: Trigger when 100% is visible
-            delay: Delay before executing expression
-            debounce: Debounce configuration
-            throttle: Throttle configuration
-            viewtransition: Use view transitions for updates
-
-        Returns:
-            Dictionary with data-on-intersect attribute
-
-        Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.fetch_on("intersect", "/api/data")
-            {'data-on-intersect': "@get('/api/data')"}
-            >>> ds.fetch_on("intersect", "/api/users", method="post", once=True, half=True)
-            {'data-on-intersect__once__half': "@post('/api/users')"}
-        """
-
-    @overload
-    def fetch_on(
-        self,
-        event: Literal["interval"],
-        uri: str,
-        *,
-        # HTTP options
-        method: Literal["get", "post", "put", "patch", "delete"] = "get",
-        content_type: ContentType | str = "json",
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool = False,
-        retry_interval_ms: int = 1_000,
-        retry_scaler: float = 2.0,
-        retry_max_wait_ms: int = 30_000,
-        retry_max_count: int = 10,
-        request_cancellation: RequestCancellation | str = "auto",
-        # interval options
-        duration: TimeValue | tuple[TimeValue, Literal["leading"]] = "1s",
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-        """
-        Fetch a resource at regular intervals.
-
-        Convenience method that combines data-on-interval with an HTTP action.
-        Automatically triggers fetch requests at the specified interval.
-
-        Reference: https://data-star.dev/reference/attributes#data-on-interval
-                   https://data-star.dev/reference/actions#backend-actions
-
-        Args:
-            event: Must be "interval"
-            uri: Endpoint URL or route name
-            method: HTTP method to use
-            content_type: Request content type
-            include: Include only matching signals in request
-            exclude: Exclude matching signals from request
-            selector: CSS selector for elements to update
-            headers: Additional HTTP headers
-            open_when_hidden: Keep connection open when page is hidden
-            retry_interval_ms: Initial retry delay
-            retry_scaler: Exponential backoff multiplier
-            retry_max_wait_ms: Maximum retry delay
-            retry_max_count: Maximum retry attempts
-            request_cancellation: Cancellation strategy
-            duration: Interval duration or tuple with duration and "leading" modifier
-            viewtransition: Use view transitions for updates
-
-        Returns:
-            Dictionary with data-on-interval attribute
-
-        Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.fetch_on("interval", "/api/data")
-            {'data-on-interval': "@get('/api/data')"}
-            >>> ds.fetch_on("interval", "/api/poll", duration=5)
-            {'data-on-interval__duration.5s': "@get('/api/poll')"}
-            >>> ds.fetch_on("interval", "/api/check", duration=(2, "leading"))
-            {'data-on-interval__duration.2s.leading': "@get('/api/check')"}
-        """
-
-    @overload
-    def fetch_on(
-        self,
-        event: Literal["load"],
-        uri: str,
-        *,
-        # HTTP options
-        method: Literal["get", "post", "put", "patch", "delete"] = "get",
-        content_type: ContentType | str = "json",
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool = False,
-        retry_interval_ms: int = 1_000,
-        retry_scaler: float = 2.0,
-        retry_max_wait_ms: int = 30_000,
-        retry_max_count: int = 10,
-        request_cancellation: RequestCancellation | str = "auto",
-        # load options
-        delay: TimeValue | None = None,
-        viewtransition: bool = False,
-    ) -> dict[str, str]:
-        """
-        Fetch a resource when the element loads.
-
-        Convenience method that combines data-on-load with an HTTP action.
-        Automatically triggers a fetch request when the element appears.
-
-        Reference: https://data-star.dev/reference/attributes#data-on-load
-                   https://data-star.dev/reference/actions#backend-actions
-
-        Args:
-            event: Must be "load"
-            uri: Endpoint URL or route name
-            method: HTTP method to use
-            content_type: Request content type
-            include: Include only matching signals in request
-            exclude: Exclude matching signals from request
-            selector: CSS selector for elements to update
-            headers: Additional HTTP headers
-            open_when_hidden: Keep connection open when page is hidden
-            retry_interval_ms: Initial retry delay
-            retry_scaler: Exponential backoff multiplier
-            retry_max_wait_ms: Maximum retry delay
-            retry_max_count: Maximum retry attempts
-            request_cancellation: Cancellation strategy
-            delay: Delay before fetching
-            viewtransition: Use view transitions for updates
-
-        Returns:
-            Dictionary with data-on-load attribute
-
-        Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.fetch_on("load", "/api/data")
-            {'data-on-load': "@get('/api/data')"}
-            >>> ds.fetch_on("load", "/api/users", method="post", delay=1)
-            {'data-on-load__delay.1s': "@post('/api/users')"}
-        """
-
-    @overload
-    def fetch_on(
-        self,
-        event: Literal["signal-patch"],
-        uri: str,
-        *,
-        # HTTP options
-        method: Literal["get", "post", "put", "patch", "delete"] = "get",
-        content_type: ContentType | str = "json",
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool = False,
-        retry_interval_ms: int = 1_000,
-        retry_scaler: float = 2.0,
-        retry_max_wait_ms: int = 30_000,
-        retry_max_count: int = 10,
-        request_cancellation: RequestCancellation | str = "auto",
-        # signal-patch options
-        delay: TimeValue | None = None,
-        debounce: Debounce | None = None,
-        throttle: Throttle | None = None,
-        # Filter
-        signal_include: FilterValue | None = None,
-        signal_exclude: FilterValue | None = None,
-    ) -> dict[str, str]:
-        """
-        Fetch a resource when signals are patched from the backend.
-
-        Convenience method that combines data-on-signal-patch with an HTTP action.
-        Automatically triggers fetch requests when server-sent events update signals.
-
-        Reference: https://data-star.dev/reference/attributes#data-on-signal-patch
-                   https://data-star.dev/reference/actions#backend-actions
-
-        Args:
-            event: Must be "signal-patch"
-            uri: Endpoint URL or route name
-            method: HTTP method to use
-            content_type: Request content type
-            include: Include only matching signals in request
-            exclude: Exclude matching signals from request
-            selector: CSS selector for elements to update
-            headers: Additional HTTP headers
-            open_when_hidden: Keep connection open when page is hidden
-            retry_interval_ms: Initial retry delay
-            retry_scaler: Exponential backoff multiplier
-            retry_max_wait_ms: Maximum retry delay
-            retry_max_count: Maximum retry attempts
-            request_cancellation: Cancellation strategy
-            delay: Delay before executing expression
-            debounce: Debounce configuration
-            throttle: Throttle configuration
-            signal_include: Only trigger for signals matching this pattern
-            signal_exclude: Don't trigger for signals matching this pattern
-
-        Returns:
-            Dictionary with data-on-signal-patch attribute(s)
-
-        Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.fetch_on("signal-patch", "/api/data")
-            {'data-on-signal-patch': "@get('/api/data')"}
-            >>> ds.fetch_on("signal-patch", "/api/log", signal_include="user.*", debounce=0.5)
-            {'data-on-signal-patch__debounce.500ms': "@get('/api/log')", 'data-on-signal-patch-filter': '{"include":"user.*"}'}
-        """
-
-    @overload
-    def fetch_on(
-        self,
-        event: JSEvent | str,
-        uri: str,
-        *,
-        # HTTP options
-        method: Literal["get", "post", "put", "patch", "delete"] = "get",
-        content_type: ContentType | str = "json",
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool = False,
-        retry_interval_ms: int = 1_000,
-        retry_scaler: float = 2.0,
-        retry_max_wait_ms: int = 30_000,
-        retry_max_count: int = 10,
-        request_cancellation: RequestCancellation | str = "auto",
-        # event options
-        once: bool = False,
-        passive: bool = False,
-        capture: bool = False,
-        delay: TimeValue | None = None,
-        debounce: Debounce | None = None,
-        throttle: Throttle | None = None,
-        viewtransition: bool = False,
-        window: bool = False,
-        outside: bool = False,
-        prevent: bool = False,
-        stop: bool = False,
-    ) -> dict[str, str]:
-        """
-        Fetch a resource in response to a DOM event.
-
-        Convenience method that combines data-on-{event} with an HTTP action.
-        Automatically triggers fetch requests when the specified DOM event fires.
-
-        Reference: https://data-star.dev/reference/attributes#data-on
-                   https://data-star.dev/reference/actions#backend-actions
-
-        Args:
-            event: Event name (click, input, submit, etc.) or custom event name
-            uri: Endpoint URL or route name
-            method: HTTP method to use
-            content_type: Request content type
-            include: Include only matching signals in request
-            exclude: Exclude matching signals from request
-            selector: CSS selector for elements to update
-            headers: Additional HTTP headers
-            open_when_hidden: Keep connection open when page is hidden
-            retry_interval_ms: Initial retry delay
-            retry_scaler: Exponential backoff multiplier
-            retry_max_wait_ms: Maximum retry delay
-            retry_max_count: Maximum retry attempts
-            request_cancellation: Cancellation strategy
-            once: Fire only once, then remove the listener
-            passive: Mark listener as passive (improves scroll performance)
-            capture: Use capture phase instead of bubble phase
-            delay: Delay before executing expression
-            debounce: Debounce configuration
-            throttle: Throttle configuration
-            viewtransition: Use view transitions for updates
-            window: Attach listener to window instead of element
-            outside: Trigger when event occurs outside the element
-            prevent: Call preventDefault() on the event
-            stop: Call stopPropagation() on the event
-
-        Returns:
-            Dictionary with data-on-{event} attribute
-
-        Examples:
-            >>> ds = DatastarAttributes(Stario())
-            >>> ds.fetch_on("click", "/api/data")
-            {'data-on-click': "@get('/api/data')"}
-            >>> ds.fetch_on("submit", "/api/save", method="post", prevent=True)
-            {'data-on-submit__prevent': "@post('/api/save')"}
-            >>> ds.fetch_on("input", "/api/search", debounce=0.3)
-            {'data-on-input__debounce.300ms': "@get('/api/search')"}
-            >>> ds.fetch_on("click", "/api/close", outside=True)
-            {'data-on-click__outside': "@get('/api/close')"}
-            >>> ds.fetch_on("scroll", "/api/track", window=True, throttle=0.1)
-            {'data-on-scroll__window__throttle.100ms': "@get('/api/track')"}
-        """
-
-    def fetch_on(
-        self,
-        event: str,
-        uri: str,
-        # HTTP options
-        method: Literal["get", "post", "put", "patch", "delete"] = "get",
-        content_type: ContentType | str = "json",
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool = False,
-        retry_interval_ms: int = 1_000,
-        retry_scaler: float = 2.0,
-        retry_max_wait_ms: int = 30_000,
-        retry_max_count: int = 10,
-        request_cancellation: RequestCancellation | str = "auto",
-        **kwargs: Any,
-    ) -> dict[str, str]:
-        """
-        Fetch a resource in response to an event.
-
-        Convenience method that combines data-on-{event} with an HTTP action.
-        Automatically triggers fetch requests when the specified event fires.
-
-        This method works with all event types:
-        - DOM events: "click", "input", "submit", etc.
-        - Special events: "intersect", "interval", "load", "signal-patch"
-
-        Reference: https://data-star.dev/reference/attributes#data-on
-                   https://data-star.dev/reference/actions#backend-actions
-        """
-        # Generate HTTP action expression
-        expression = self._http_action(
-            method,
-            uri,
-            content_type=content_type,
-            include=include,
-            exclude=exclude,
-            selector=selector,
-            headers=headers,
-            open_when_hidden=open_when_hidden,
-            retry_interval_ms=retry_interval_ms,
-            retry_scaler=retry_scaler,
-            retry_max_wait_ms=retry_max_wait_ms,
-            retry_max_count=retry_max_count,
-            request_cancellation=request_cancellation,
-        )
-
-        # Route to appropriate handler based on event type
-        if event == "intersect":
-            return self._on_intersect(expression, **kwargs)
-        if event == "interval":
-            return self._on_interval(expression, **kwargs)
-        if event == "load":
-            return self._on_load(expression, **kwargs)
-        if event == "signal-patch":
-            return self._on_signal_patch(expression, **kwargs)
-        return self._on_event(event, expression, **kwargs)
-
-
-type Datastar = Annotated[DatastarAttributes, DatastarAttributes, "singleton"]
+type Attributes = Annotated[DatastarAttributes, DatastarAttributes, "singleton"]
 """
 Type alias for the DatastarAttributes singleton dependency.
 
 Use this type for dependency injection or type hints when you want to access
-the DatastarAttributes generator, which provides methods to build and manage
-data-* attributes and Datastar actions for your HTML elements.
+the DatastarAttributes generator, which provides methods to build Datastar HTML attributes
+for your HTML elements.
 
-Example (building an HTML element with Datastar attributes and actions):
+Example (building an HTML element with Datastar attributes):
+
+    from stario.html import input
+    def my_input(attrs: Attributes):
+        return input(attrs.bind("username"))
+
+This type alias ensures consistent usage and discoverability throughout your
+application and extensions.
+"""
+
+
+type Actions = Annotated[DatastarActions, DatastarActions, "singleton"]
+"""
+Type alias for the DatastarActions singleton dependency.
+
+Use this type for dependency injection or type hints when you want to access
+the DatastarActions generator, which provides methods to build Datastar actions
+for your HTML elements.
+
+Example (building an HTML element with Datastar actions):
 
     from stario.html import button
-    def my_button(ds: Datastar):
+    def my_button(attr: Attributes, act: Actions):
         return button(
-            ds.bind("buttonLabel"),
-            ds.text("$buttonLabel"),
-            ds.on("click", f'ds.get("/api/do-something") && $buttonLabel = $buttonLabel + " clicked"'),
+            attr.on("click", act.get("some_route")),
             "Click me",
         )
 

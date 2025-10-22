@@ -7,10 +7,10 @@ It's inspired by simple-html library.
 https://github.com/keithasaurus/simple_html
 """
 
-from .core import Attributes as Attributes
 from .core import HtmlElement as HtmlElement
 from .core import SafeString as SafeString
 from .core import Tag as Tag
+from .core import TagAttributes as TagAttributes
 from .core import render as render
 
 DOCTYPE_HTML5 = SafeString("<!doctype html>")

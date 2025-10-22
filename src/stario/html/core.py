@@ -20,7 +20,7 @@ from .types import (
     COMMON_SAFE_ATTRIBUTE_NAMES,
     COMMON_SAFE_CSS_PROPS,
     AttributeDict,
-    Attributes,
+    TagAttributes,
 )
 
 
@@ -145,7 +145,7 @@ class Tag:
         self.rendered = self.tag_start + self.no_children_close
 
     def __call__(
-        self, *children: Attributes | HtmlElement | None
+        self, *children: TagAttributes | HtmlElement | None
     ) -> HtmlElementTuple | SafeString:
         """
         Create an HTML element with attributes and children.

@@ -9,7 +9,7 @@ from typing import (
     get_args,
 )
 
-from stario.html import Attributes, render, script
+from stario.html import TagAttributes, render, script
 
 type PatchMode = Literal[
     "outer",
@@ -166,7 +166,7 @@ class ScriptExecution:
 
     script: str
     auto_remove: bool = True
-    attributes: Attributes | None = None
+    attributes: TagAttributes | None = None
 
     # SSE specific
     event_id: str | None = None

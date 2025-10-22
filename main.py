@@ -1,7 +1,8 @@
 import asyncio
 from typing import Annotated, Awaitable
 
-from stario import Datastar, Stario
+from stario import Stario
+from stario.datastar import Actions, Attributes
 from stario.html import button, h1, p
 from stario.logging import Logger
 from stario.toys import toy_page
@@ -10,13 +11,13 @@ app = Stario()
 
 
 @app.query("/")
-async def home(ds: Datastar, log: Logger):
+async def home(attr: Attributes, act: Actions, log: Logger):
     log.info("Home called")
     return toy_page(
         h1("Home"),
         p("Welcome to the home page"),
         button(
-            ds.fetch_on("click", "/action", method="post"),
+            attr.on("click", act.post("/action")),
             "Click me",
         ),
     )

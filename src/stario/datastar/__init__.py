@@ -1,6 +1,8 @@
 from stario.html import HtmlElement
 
-from .attributes import Datastar as Datastar
+from .attributes import Actions as Actions
+from .attributes import Attributes as Attributes
+from .attributes import DatastarActions as DatastarActions
 from .attributes import DatastarAttributes as DatastarAttributes
 from .events import ElementsPatch as ElementsPatch
 from .events import Event as Event

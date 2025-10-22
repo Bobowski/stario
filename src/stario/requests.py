@@ -120,7 +120,8 @@ class ParseQueryParam[T](RequestParameter[T]):
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Query
+        >>> from stario import Stario
+        >>> from stario.routes import Query
         >>> from stario.requests import ParseQueryParam
         >>>
         >>> # Basic usage with int type
@@ -170,7 +171,8 @@ class ParseQueryParams[T](RequestParameter[T]):
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Query
+        >>> from stario import Stario
+        >>> from stario.routes import Query
         >>> from stario.requests import ParseQueryParams
         >>>
         >>> # Extract multiple tags
@@ -212,7 +214,8 @@ class ParsePathParam[T](RequestParameter[T]):
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Query
+        >>> from stario import Stario
+        >>> from stario.routes import Query
         >>> from stario.requests import ParsePathParam
         >>>
         >>> # Extract user ID from path
@@ -254,7 +257,8 @@ class ParseHeader[T](RequestParameter[T]):
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Query
+        >>> from stario import Stario
+        >>> from stario.routes import Query
         >>> from stario.requests import ParseHeader
         >>>
         >>> # Extract Authorization header
@@ -295,7 +299,8 @@ class ParseHeaders[T](RequestParameter[T]):
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Query
+        >>> from stario import Stario
+        >>> from stario.routes import Query
         >>> from stario.requests import ParseHeaders
         >>>
         >>> # Extract multiple Accept headers
@@ -331,7 +336,8 @@ class ParseCookie[T](RequestParameter[T]):
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Query
+        >>> from stario import Stario
+        >>> from stario.routes import Query
         >>> from stario.requests import ParseCookie
         >>>
         >>> # Extract session ID from cookie
@@ -373,7 +379,8 @@ class ParseRawBody:
     Examples:
         >>> from typing import Annotated
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Command
+        >>> from stario import Stario
+        >>> from stario.routes import Command
         >>> from stario.requests import ParseRawBody
         >>>
         >>> # Extract raw body as bytes
@@ -480,7 +487,8 @@ class ParseJsonBody[T]:
         >>> from typing import Annotated
         >>> from pydantic import BaseModel
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Command
+        >>> from stario import Stario
+        >>> from stario.routes import Command
         >>> from stario.requests import ParseJsonBody
         >>>
         >>> # Define a Pydantic model
@@ -555,7 +563,8 @@ class ParseBody[T]:
         >>> from typing import Annotated
         >>> from pydantic import BaseModel
         >>> from starlette.testclient import TestClient
-        >>> from stario import Stario, Command
+        >>> from stario import Stario
+        >>> from stario.routes import Command
         >>> from stario.requests import ParseBody
         >>>
         >>> # Handle bytes

@@ -16,7 +16,7 @@ type AttributeValue = (
 type AttributeDict = Mapping[str | SafeString, AttributeValue]
 
 # Main attributes dictionary type
-type Attributes = Mapping[str, AttributeValue | AttributeDict]
+type TagAttributes = Mapping[str, AttributeValue | AttributeDict]
 
 
 CommonSafeAttributeName = Literal[

@@ -2,8 +2,9 @@ from typing import Annotated
 
 from starlette.testclient import TestClient
 
-from stario import Command, Stario
+from stario import Stario
 from stario.requests import ParseBody
+from stario.routes import Command
 
 
 def test_body_ok_raw_bytes():

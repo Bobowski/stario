@@ -3,7 +3,8 @@ from typing import Annotated, Awaitable
 
 from starlette.testclient import TestClient
 
-from stario import Command, Stario
+from stario import Stario
+from stario.routes import Command
 
 
 def test_dependencies_simple_ok():

@@ -2,8 +2,9 @@ from typing import Annotated
 
 from starlette.testclient import TestClient
 
-from stario import Query, Stario
+from stario import Stario
 from stario.requests import ParseHeaders
+from stario.routes import Query
 
 
 def test_headers_ok_multiple_values():

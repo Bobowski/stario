@@ -50,7 +50,7 @@ def toy_inspector() -> HtmlElement:
 load_datastar = script(
     {
         "type": "module",
-        "src": "https://cdn.jsdelivr.net/gh/starfederation/datastar@main/bundles/datastar.js",
+        "src": "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.6/bundles/datastar.js",
     },
 )
 

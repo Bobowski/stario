@@ -2,8 +2,9 @@ from typing import Annotated
 
 from starlette.testclient import TestClient
 
-from stario import Command, Stario
+from stario import Stario
 from stario.requests import ParseJsonBody
+from stario.routes import Command
 
 
 def test_json_body_dict_ok():
