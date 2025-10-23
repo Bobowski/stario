@@ -1,7 +1,8 @@
+import base64
 import inspect
 from typing import Annotated, Any, get_args
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
@@ -186,3 +187,30 @@ To specify a custom signal name, use `Annotated` directly:
         # 'counter' will be parsed from the 'online' signal
         ...
 """
+
+
+class FileSignal(BaseModel):
+    """
+    File Upload Signal format.
+    When a file is bound to a signal it is encoded into a base64 string
+    and presented in a dict with the following structure:
+    {
+        "name": "photo.jpg",
+        "contents": "base64encodeddata...",
+        "mime": "image/jpeg",
+    }
+    """
+
+    name: str
+    contents: str
+    mime: str | None = None
+
+    _decoded: bytes | None = None
+
+    def decode(self) -> bytes:
+        if self._decoded is None:
+            self._decoded = base64.b64decode(self.contents)
+        return self._decoded
+
+    def size(self) -> int:
+        return len(self.decode())
