@@ -216,9 +216,25 @@ def handler(debug: bool = False): ...       # Default value""",
             if self.function in singletons:
                 return await singletons[self.function]
 
-            # Create future for singleton
-            fut = asyncio.Future()
-            singletons[self.function] = fut
+            # Use lock to prevent race condition when multiple requests hit singleton creation
+            # Initialize lock dict if not exists
+            if not hasattr(request.app.state, "_singleton_locks"):
+                request.app.state._singleton_locks = {}
+
+            # Get or create lock for this function
+            if self.function not in request.app.state._singleton_locks:
+                request.app.state._singleton_locks[self.function] = asyncio.Lock()
+
+            lock = request.app.state._singleton_locks[self.function]
+
+            # Double-check pattern: check again after acquiring lock
+            async with lock:
+                if self.function in singletons:
+                    return await singletons[self.function]
+
+                # Create future for singleton (will be set after resolution)
+                fut = asyncio.Future()
+                singletons[self.function] = fut
 
         # Handle request lifetime
         elif self.lifetime == "request":

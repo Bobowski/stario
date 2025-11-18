@@ -9,9 +9,48 @@ from starlette.types import Receive, Scope, Send
 
 from stario.dependencies import Dependency, DependencyLifetime
 from stario.html.core import render
+from stario.storyteller.core import get_request_storyteller
 from stario.types import AdapterFunction, EndpointFunction, RequestHandler
 
 from .events import patch_to_sse
+
+
+def _wrap_generator_stream[ElementT](
+    content: Generator[ElementT, None, None],
+    renderer: Callable[[ElementT], str],
+    request: Request,
+) -> Generator[str, None, None]:
+    """Wrap a generator with error handling and SSE conversion."""
+    try:
+        for item in content:
+            yield patch_to_sse(item, renderer)
+    except Exception as exc:
+        storyteller = get_request_storyteller(request)
+        storyteller.failure(
+            "response.error",
+            exc=exc,
+            reason="Exception occurred during SSE stream iteration",
+        )
+        raise exc
+
+
+async def _wrap_async_generator_stream[ElementT](
+    content: AsyncGenerator[ElementT, None],
+    renderer: Callable[[ElementT], str],
+    request: Request,
+) -> AsyncGenerator[str, None]:
+    """Wrap an async generator with error handling and SSE conversion."""
+    try:
+        async for item in content:
+            yield patch_to_sse(item, renderer)
+    except Exception as exc:
+        storyteller = get_request_storyteller(request)
+        storyteller.failure(
+            "response.error",
+            exc=exc,
+            reason="Exception occurred during SSE stream iteration",
+        )
+        raise exc
 
 
 @dataclass(slots=True)
@@ -57,7 +96,9 @@ class _StarioAdapter:
             # Fast path: Generator (SSE streaming)
             elif isinstance(content, Generator):
                 response = StreamingResponse(
-                    content=(patch_to_sse(item, self.renderer) for item in content),
+                    content=_wrap_generator_stream(
+                        content, renderer=self.renderer, request=request
+                    ),
                     media_type="text/event-stream",
                     headers=self.SSE_HEADERS,
                 )
@@ -65,8 +106,8 @@ class _StarioAdapter:
             # Fast path: AsyncGenerator (SSE streaming)
             elif isinstance(content, AsyncGenerator):
                 response = StreamingResponse(
-                    content=(
-                        patch_to_sse(item, self.renderer) async for item in content
+                    content=_wrap_async_generator_stream(
+                        content, renderer=self.renderer, request=request
                     ),
                     media_type="text/event-stream",
                     headers=self.SSE_HEADERS,
@@ -94,8 +135,14 @@ class _StarioAdapter:
                         await cleanup[1](None, None, None)
                     else:
                         cleanup[1](None, None, None)
-                except Exception:
+                except Exception as exc:
+                    storyteller = get_request_storyteller(request)
                     # Log cleanup exceptions but don't interrupt other cleanups
+                    storyteller.failure(
+                        "cleanup.error",
+                        exc=exc,
+                        reason="Exception occurred during dependency cleanup",
+                    )
                     continue
 
 
@@ -150,10 +197,27 @@ class _DetachedCommandAdapter:
                 }
 
             # We know that no exceptions were raised, so we can create the background task
+            # Wrap the background task to log errors
+            storyteller = get_request_storyteller(request)
+
+            async def wrapped_background_task() -> None:
+                try:
+                    if self.dependencies.is_async:
+                        await self.dependencies.function(**arguments)
+                    else:
+                        self.dependencies.function(**arguments)
+                except Exception as exc:
+                    storyteller.failure(
+                        "background_task.error",
+                        exc=exc,
+                        reason="Exception occurred in detached command background task",
+                    )
+                    raise
+
             response = HTMLResponse(
                 content=None,
                 status_code=204,
-                background=BackgroundTask(self.dependencies.function, **arguments),
+                background=BackgroundTask(wrapped_background_task),
             )
             await response(scope, receive, send)
 
@@ -161,14 +225,20 @@ class _DetachedCommandAdapter:
 
             # Cleanup is guaranteed to run here, even on exception or early return
             # Reverse order to ensure LIFO cleanup (last dependency in, first out)
+            storyteller = get_request_storyteller(request)
             for cleanup in reversed(getattr(request.state, "cleanups", [])):
                 try:
                     if cleanup[0]:
                         await cleanup[1](None, None, None)
                     else:
                         cleanup[1](None, None, None)
-                except Exception:
+                except Exception as exc:
                     # Log cleanup exceptions but don't interrupt other cleanups
+                    storyteller.failure(
+                        "cleanup.error",
+                        exc=exc,
+                        reason="Exception occurred during dependency cleanup",
+                    )
                     continue
 
 

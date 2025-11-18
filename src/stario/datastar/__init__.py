@@ -4,6 +4,8 @@ from .attributes import Actions as Actions
 from .attributes import Attributes as Attributes
 from .attributes import DatastarActions as DatastarActions
 from .attributes import DatastarAttributes as DatastarAttributes
+from .attributes import act as act
+from .attributes import attr as attr
 from .events import ElementsPatch as ElementsPatch
 from .events import Event as Event
 from .events import EventStream as EventStream

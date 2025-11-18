@@ -1,5 +1,6 @@
+import sys
 import types
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import (
     Annotated,
     Any,
@@ -23,10 +24,10 @@ from starlette.routing import BaseRoute
 from starlette.types import ASGIApp, ExceptionHandler, Lifespan, Receive, Scope, Send
 
 from stario.exceptions import MiddlewareError
-from stario.logging.queue import LogQueue
 from stario.middlewares.brotli import BrotliMiddleware
 from stario.middlewares.guardian import GuardianMiddleware
 from stario.routing import StarRouter
+from stario.storyteller import JsonListener, RichListener, StoryListener, Storyteller
 from stario.types import HeadersConstraint
 
 AppType = TypeVar("AppType", bound="Stario")
@@ -55,7 +56,7 @@ class Stario:
         lifespan: Lifespan[AppType] | None = None,
         debug: bool = False,
         router_class: type[StarRouter] = StarRouter,
-        log_sinks: Sequence[Any] | None = None,
+        story_listeners: Sequence[StoryListener] | None = None,
     ) -> None:
         """Initializes the application.
 
@@ -83,13 +84,36 @@ class Stario:
             router_class: A class to use for the router. By default we use `StarRouter`.
                 You can use this to customize the behaviour of the app, just consider
                 what are the implications :)
-            log_sinks: Optional list of log sinks to use. If None, defaults are chosen
-                based on debug mode (RichConsoleSink for debug, JSONSink for production).
+            log_sinks: Optional list of log listeners to use. If None, defaults are chosen
+                based on debug mode (RichListener for debug, JsonListener for production).
         """
+
+        # Configure log queue
+        if story_listeners is None:
+            if sys.stdout.isatty():
+                story_listeners = [RichListener()]
+            else:
+                story_listeners = [JsonListener()]
+
+        self.app_storyteller = Storyteller(story_listeners)
+        # Add start and stop to provided lifespan
+
+        @asynccontextmanager
+        async def enriched_lifespan(app: AppType):
+
+            app.app_storyteller.open()
+
+            if lifespan is not None:
+                async with lifespan(app):
+                    yield
+            else:
+                yield
+
+            app.app_storyteller.close()
 
         self.debug = debug
         self.state = State()
-        self.router = router_class(*routes, lifespan=lifespan)
+        self.router = router_class(*routes, lifespan=enriched_lifespan)
         self.exception_handlers = (
             {} if exception_handlers is None else dict(exception_handlers)
         )
@@ -104,11 +128,6 @@ class Stario:
 
         # Private mocks dict for testing - use via context manager
         self._mocks: dict[Callable, Callable] = {}
-
-        # Configure log queue
-        self.log_queue = LogQueue(sinks=log_sinks)
-        self.router.on_startup.append(self.log_queue.start)
-        self.router.on_shutdown.append(self.log_queue.stop)
 
     @property
     def routes(self) -> list[BaseRoute]:
@@ -140,7 +159,9 @@ class Stario:
         middleware = (
             [
                 Middleware(
-                    GuardianMiddleware, log_queue=self.log_queue, handler=error_handler
+                    GuardianMiddleware,
+                    app_storyteller=self.app_storyteller,
+                    handler=error_handler,
                 )
             ]
             + self.user_middleware
@@ -207,13 +228,6 @@ app = Stario(
         handler: ExceptionHandler,
     ) -> None:
         self.exception_handlers[exc_class_or_status_code] = handler
-
-    def add_event_handler(
-        self,
-        event_type: str,
-        func: Callable,
-    ) -> None:
-        self.router.add_event_handler(event_type, func)
 
     def query(
         self,

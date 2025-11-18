@@ -1,18 +1,18 @@
 [project]
 name = "stario"
-version = "1.5.0"
+version = "1.6.0"
 description = "Stario brings back the joy of building web apps"
 readme = "README.md"
 authors = [
     { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "brotli-asgi>=1.4.0",
-    "pydantic>=2.11.7",
+    "pydantic>=2.12.4",
     "rich>=14.1.0",
     "starlette>=0.47.2",
-    "uvicorn>=0.35.0",
+    "uvicorn>=0.38.0",
 ]
 
 [build-system]

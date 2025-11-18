@@ -1778,6 +1778,7 @@ This type alias ensures consistent usage and discoverability throughout your
 application and extensions.
 """
 
+attr = DatastarAttributes()
 
 type Actions = Annotated[DatastarActions, DatastarActions, "singleton"]
 """
@@ -1799,3 +1800,5 @@ Example (building an HTML element with Datastar actions):
 This type alias ensures consistent usage and discoverability throughout your
 application and extensions.
 """
+
+act = DatastarActions(None)  # type: ignore

@@ -1,4 +1,3 @@
-import sys
 import uuid
 
 from starlette._utils import is_async_callable
@@ -7,8 +6,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, ExceptionHandler, Message, Receive, Scope, Send
 
-from stario.logging.loggers.access import AccessLogger
-from stario.logging.queue import LogQueue
+from stario.storyteller import Storyteller
 
 
 class GuardianMiddleware:
@@ -28,13 +26,12 @@ class GuardianMiddleware:
     def __init__(
         self,
         app: ASGIApp,
-        log_queue: LogQueue,
+        app_storyteller: Storyteller,
         handler: ExceptionHandler | None = None,
     ) -> None:
         self.app = app
+        self.app_storyteller = app_storyteller
         self.handler = handler
-        self.log_queue = log_queue
-        self.access_logger = AccessLogger(log_queue)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -42,59 +39,59 @@ class GuardianMiddleware:
             return
 
         # We need uid and duration
-        request_id = str(uuid.uuid4())
-        scope["stario.request_id"] = request_id
-        exception_info = None
+        trace_id = str(uuid.uuid7())
+        # Create a request-specific storyteller (bound with trace_id)
+        story = self.app_storyteller.bind(trace_id=trace_id)
+        scope["stario.request_storyteller"] = story
 
-        # This is to track if the response has started
-        #  borrowed from starlette
+        story.tell(
+            "request.start",
+            method=scope.get("method"),
+            path=scope.get("path"),
+            client=scope.get("client"),
+        )
+
+        # This is to track if the response has started (borrowed from starlette)
         response_started = False
         status_code = None
 
         async def _send(message: Message) -> None:
-            nonlocal response_started, status_code, send
+            nonlocal response_started, status_code
 
             if message["type"] == "http.response.start":
                 response_started = True
                 status_code = message["status"]
 
                 # Update scope with useful information
-                scope["stario.response_started"] = True
-                message["headers"].append(
-                    (b"x-request-id", request_id.encode("latin-1"))
-                )
+                message["headers"].append((b"x-request-id", trace_id.encode("latin-1")))
 
-            # Continue sending the message
+                story.tell("response.start", status_code=status_code)
+
             await send(message)
 
-        self.access_logger.request(
-            request_id=request_id,
-            method=scope["method"],
-            path=scope["path"],
-            client=scope.get("client"),
-        )
+            # Log when we send the last part of the body
+            if (
+                message["type"] == "http.response.body"
+                and message.get("more_body") is False
+            ):
+                story.tell("response.end")
 
         try:
             await self.app(scope, receive, _send)
+
         except Exception as exc:
-            request = Request(scope)
 
             if self.handler is None:
-                # Use our default 500 error handler.
+                # This is the default 500 error handler :)
                 response = PlainTextResponse("Internal Server Error", status_code=500)
-
-                exception_info = sys.exc_info()
-                if exception_info == (None, None, None):
-                    exception_info = None
-                else:
-                    # Ensure exc_info is properly typed
-                    exception_info = (
-                        exception_info if exception_info[0] is not None else None
-                    )
+                story.failure("request.error", exc=exc, reason="Unexpected error")
             else:
+                request = Request(scope)
+
                 # Use an installed 500 error handler.
                 if is_async_callable(self.handler):
-                    # TODO: this needs a bit of typing magic fixes:
+                    # ExceptionHandler can be async or sync, and returns Response | None
+                    # We handle both cases appropriately
                     response = await self.handler(request, exc)  # type: ignore[assignment]
                 else:
                     response = await run_in_threadpool(self.handler, request, exc)
@@ -103,14 +100,5 @@ class GuardianMiddleware:
                 # Response objects are callable ASGI applications
                 await response(scope, receive, _send)
 
-            # We always continue to raise the exception.
-            # This allows servers to log the error, or allows test clients
-            # to optionally raise the error within the test case.
-            # raise exc
-
         # Log the response info
-        self.access_logger.response(
-            request_id=request_id,
-            status_code=status_code or 500,
-            exc_info=exception_info,
-        )
+        story.tell("request.end")

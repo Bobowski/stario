@@ -1,9 +1,11 @@
-from typing import Any, Callable, Sequence, TypeVar
+from typing import Any, Callable, Collection, Sequence, TypeVar
 
 from starlette.datastructures import URLPath
 from starlette.middleware import Middleware
 from starlette.routing import BaseRoute, Router
 from starlette.types import ASGIApp, Lifespan, Receive, Scope, Send
+
+from stario.types import HeadersConstraint
 
 _T = TypeVar("_T")
 
@@ -86,3 +88,129 @@ class StarRouter:
 
     def add_event_handler(self, event_type: str, func: Callable[[], Any]) -> None:
         Router.add_event_handler(self, event_type, func)  # type: ignore[arg-type]
+
+    def query(
+        self,
+        path: str,
+        /,
+        *,
+        methods: Collection[str] | None = None,
+        name: str | None = None,
+        include_in_schema: bool = True,
+        middleware: Sequence[Middleware] | None = None,
+        headers: HeadersConstraint | None = None,
+    ) -> Callable[[Callable], Callable]:
+        """Decorator for registering query routes.
+
+        Parameters:
+            path: The URL path for the route
+            methods: HTTP methods for the route. Defaults to ["GET"]
+            name: Optional name for the route
+            include_in_schema: Whether to include in OpenAPI schema
+            middleware: Optional middleware for this specific route
+            headers: Optional header constraints for route matching
+
+        Returns:
+            A decorator function that registers the endpoint as a query route
+        """
+
+        from stario.routes import Query
+
+        def decorator(func: Callable) -> Callable:
+            route = Query(
+                path,
+                func,
+                methods=methods or ["GET"],
+                name=name,
+                include_in_schema=include_in_schema,
+                middleware=middleware,
+                headers=headers,
+            )
+            self.add(route)
+            return func
+
+        return decorator
+
+    def command(
+        self,
+        path: str,
+        /,
+        *,
+        methods: Collection[str] | None = None,
+        name: str | None = None,
+        include_in_schema: bool = True,
+        middleware: Sequence[Middleware] | None = None,
+        headers: HeadersConstraint | None = None,
+    ) -> Callable[[Callable], Callable]:
+        """Decorator for registering command routes.
+
+        Parameters:
+            path: The URL path for the route
+            methods: HTTP methods for the route. Defaults to ["POST"]
+            name: Optional name for the route
+            include_in_schema: Whether to include in OpenAPI schema
+            middleware: Optional middleware for this specific route
+            headers: Optional header constraints for route matching
+
+        Returns:
+            A decorator function that registers the endpoint as a command route
+        """
+
+        from stario.routes import Command
+
+        def decorator(func: Callable) -> Callable:
+            route = Command(
+                path,
+                func,
+                methods=methods or ["POST"],
+                name=name,
+                include_in_schema=include_in_schema,
+                middleware=middleware,
+                headers=headers,
+            )
+            self.add(route)
+            return func
+
+        return decorator
+
+    def detached_command(
+        self,
+        path: str,
+        /,
+        *,
+        methods: Collection[str] | None = None,
+        name: str | None = None,
+        include_in_schema: bool = True,
+        middleware: Sequence[Middleware] | None = None,
+        headers: HeadersConstraint | None = None,
+    ) -> Callable[[Callable], Callable]:
+        """Decorator for registering detached command routes.
+
+        Parameters:
+            path: The URL path for the route
+            methods: HTTP methods for the route. Defaults to ["POST"]
+            name: Optional name for the route
+            include_in_schema: Whether to include in OpenAPI schema
+            middleware: Optional middleware for this specific route
+            headers: Optional header constraints for route matching
+
+        Returns:
+            A decorator function that registers the endpoint as a detached command route
+        """
+
+        from stario.routes import DetachedCommand
+
+        def decorator(func: Callable) -> Callable:
+            route = DetachedCommand(
+                path,
+                func,
+                methods=methods or ["POST"],
+                name=name,
+                include_in_schema=include_in_schema,
+                middleware=middleware,
+                headers=headers,
+            )
+            self.add(route)
+            return func
+
+        return decorator

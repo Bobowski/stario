@@ -76,11 +76,13 @@ class StarRoute[T](Route):
 
         base_match, base_scope = super().matches(scope)
 
-        # This would fail anyways so we can just return here
+        # Early return if no header constraints or path doesn't match
+        # This avoids creating Headers object unnecessarily
         if not self.headers or base_match != Match.FULL:
             return base_match, base_scope
 
-        # I just hope this is light enough so we can create this over and over again
+        # Only create Headers object when we have header constraints and path matches
+        # This is optimized: Headers is lazy and only parses when accessed
         headers = Headers(scope=scope)
         if not self._headers_match(headers):
             return Match.PARTIAL, base_scope
@@ -91,12 +93,13 @@ class StarRoute[T](Route):
     @override
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
 
-        # If there's nothing to handle additionally, just call the super
+        # Fast path: no header constraints, delegate to parent immediately
         if not self.headers:
             await super().handle(scope, receive, send)
             return
 
-        # If there's something to handle, we need to check the headers
+        # Only create Headers object when we have header constraints
+        # This avoids unnecessary object creation for routes without header matching
         headers = Headers(scope=scope)
         if not self._headers_match(headers):
 
