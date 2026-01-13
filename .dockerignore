@@ -1,0 +1,68 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+tests/
+test_*.py
+*_test.py
+
+# Documentation
+*.md
+docs/
+README.md
+BENCHMARK_README.md
+DOCKER_MEMORY_EXPLAINED.md
+DOCKER_MEMORY_OPTIMIZATION.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.log
+logs/
+*.tmp
+.cache/
+
+# Benchmark and monitoring scripts (not needed in container)
+benchmark_*.py
+benchmark_*.sh
+check_*.py
+check_*.sh
+starlette_benchmark.py
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore

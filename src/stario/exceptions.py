@@ -1,128 +1,111 @@
-from starlette.exceptions import HTTPException as HTTPException
+"""
+Stario Exceptions.
+
+Exception types:
+- StarioError: Framework errors with rich context for debugging
+- HttpException: Expected errors that become HTTP responses
+- ClientDisconnected: Client closed connection (for streaming handlers)
+"""
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from stario.http.writer import Writer
 
 
-class StarioException(Exception):
-    """Base exception for all errors in the Stario framework.
+class StarioError(Exception):
+    """
+    Framework error with context for debugging.
 
-    This exception provides rich context and helpful guidance to developers when things go wrong.
+    Provides structured error info for both humans and AI agents:
+    - message: What went wrong
+    - context: Key-value pairs with relevant data
+    - help_text: How to fix it
+    - example: Working code example
 
-    Attributes:
-        message (str): A clear, human-readable error message.
-        code (str): A unique error code for logging and tracking (e.g., 'DEPENDENCY_RESOLUTION_ERROR').
-        context (dict): Additional debugging info (e.g., {'parameter': 'user_id', 'annotation': 'int'}).
-        help_text (str): Suggested fix or next steps for resolution.
-        example (str | None): Code example showing the correct usage.
+    Example:
+        raise StarioError(
+            "Invalid attribute type",
+            context={"attr": "class", "got": type(val).__name__},
+            help_text="Attributes must be str, int, or bool.",
+        )
     """
 
-    code: str = "STARIO_GENERIC_ERROR"
+    __slots__ = ("message", "context", "help_text", "example")
 
     def __init__(
         self,
         message: str,
-        code: str | None = None,
-        context: dict | None = None,
+        *,
+        context: dict[str, Any] | None = None,
         help_text: str | None = None,
         example: str | None = None,
-    ):
+    ) -> None:
         self.message = message
-        # Prefer instance code if provided, else class code
-        self.code = code or self.__class__.code
         self.context = context or {}
+        self.help_text = help_text
         self.example = example
-        self.help_text = (
-            help_text
-            or f"Check the documentation at https://stario.dev/reference/errors#{self.code.lower()} for more details."
-        )
-        super().__init__(message)
+        super().__init__(self._format())
 
-    def __str__(self):
-        parts = ["\n╭─ Stario Error ─────────────────────────────────────────────"]
-        parts.append(f"│ {self.message}")
-        parts.append("│")
-
-        if self.code:
-            parts.append(f"│ Error Code: {self.code}")
+    def _format(self) -> str:
+        """Format error message with context."""
+        parts = [self.message]
 
         if self.context:
-            parts.append("│ Context:")
-            for key, value in self.context.items():
-                parts.append(f"│   • {key}: {value}")
-
-        if self.example:
-            parts.append("│")
-            parts.append("│ Example (correct usage):")
-            for line in self.example.strip().split("\n"):
-                parts.append(f"│   {line}")
+            ctx = ", ".join(f"{k}={v!r}" for k, v in self.context.items())
+            parts.append(f"  Context: {ctx}")
 
         if self.help_text:
-            parts.append("│")
-            parts.append(f"│ 💡 Help: {self.help_text}")
+            parts.append(f"  Help: {self.help_text}")
 
-        parts.append("╰────────────────────────────────────────────────────────────")
+        if self.example:
+            parts.append(f"  Example:\n{self.example}")
+
         return "\n".join(parts)
 
 
-class HtmlRenderError(StarioException):
-    """Error raised when there is an error rendering HTML."""
+class HttpException(Exception):
+    """
+    HTTP exception - becomes an HTTP response.
 
-    code: str = "HTML_RENDER_ERROR"
+    For errors:
+        raise HttpException(404, "Not found")
+        raise HttpException(401, "Please log in")
 
+    For redirects:
+        raise HttpException(302, "/login")
+        raise HttpException(307, "/new-location")
+    """
 
-class HtmlBuildError(StarioException):
-    """Error raised when there is an error while building HTML tree."""
+    __slots__ = ("status_code", "detail")
 
-    code: str = "HTML_BUILD_ERROR"
+    def __init__(self, status_code: int, detail: str = "") -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
 
-
-class InvalidAttributeValueError(StarioException):
-    """Error raised when an HTML attribute has an invalid value type."""
-
-    code: str = "INVALID_ATTRIBUTE_VALUE"
-
-
-class InvalidStyleValueError(StarioException):
-    """Error raised when a CSS style property has an invalid value type."""
-
-    code: str = "INVALID_STYLE_VALUE"
-
-
-class DependencyResolutionError(StarioException):
-    """Error raised when there is an error while resolving dependencies."""
-
-    code: str = "DEPENDENCY_RESOLUTION_ERROR"
+    def respond(self, w: "Writer") -> None:
+        if 300 <= self.status_code < 400:
+            w.redirect(self.detail, self.status_code)
+        else:
+            w.text(self.detail or "Error", self.status_code)
 
 
-class DependencyBuildError(StarioException):
-    """Error raised when there is an error while building dependencies."""
+class ClientDisconnected(Exception):
+    """
+    Client disconnected during request handling.
 
-    code: str = "DEPENDENCY_BUILD_ERROR"
+    Raised by Writer.write() when client is gone.
+    Streaming handlers can catch this for cleanup.
 
+    Usage:
+        async def sse_handler(c: Context, w: Writer) -> None:
+            try:
+                while True:
+                    w.write(b"data: ping\\n\\n")
+                    await asyncio.sleep(1)
+            except ClientDisconnected:
+                pass  # Client closed browser - cleanup if needed
+    """
 
-class InvalidAnnotationError(StarioException):
-    """Error raised when a parameter has an invalid or unsupported type annotation."""
-
-    code: str = "INVALID_ANNOTATION"
-
-
-class InvalidCallableError(StarioException):
-    """Error raised when a non-callable object is used where a callable is expected."""
-
-    code: str = "INVALID_CALLABLE"
-
-
-class InvalidParameterError(StarioException):
-    """Error raised when a parameter configuration is invalid."""
-
-    code: str = "INVALID_PARAMETER"
-
-
-class DatastarConfigError(StarioException):
-    """Error raised when Datastar configuration (debounce, throttle, etc.) is invalid."""
-
-    code: str = "DATASTAR_CONFIG_ERROR"
-
-
-class MiddlewareError(StarioException):
-    """Error raised when there's an issue with middleware configuration."""
-
-    code: str = "MIDDLEWARE_ERROR"
+    pass

@@ -1,24 +1,53 @@
-from stario.html import b, body, div, head, html, meta, pre, script, title
+from stario.datastar import data
+from stario.html import B, Div, Pre
 from stario.html.core import HtmlElement
 
 
 def toy_inspector() -> HtmlElement:
     """
-    We simply add a div positioned absolutely on the top right of the page
-    with the label of key-binding opening the debug panel (CMD+P by default)
-    and the content of the debug panel being a pre tag with the attribute
-    data-json-signals.
+    A floating debug panel that shows current Datastar signals.
 
-    Should be slightly reduced opacity.
+    Uses data-json-signals attribute to display reactive state.
+    Useful when debugging signal updates.
+    Draggable - hover to see grab cursor, click and drag to move.
 
-    <pre data-json-signals></pre>
-    https://data-star.dev/reference/attributes#data-json-signals
+    Implementation notes:
+    - Uses Datastar events for drag (no inline JS)
+    - All drag state in el.dataset (element-local, no signals)
     """
-
-    return div(
+    return Div(
+        # Mousedown: start drag, store offsets in dataset
+        data.on(
+            "mousedown",
+            """
+            if (evt.target.tagName !== 'PRE') {
+                el.dataset.drag = 1;
+                el.dataset.ox = evt.clientX - el.getBoundingClientRect().left;
+                el.dataset.oy = evt.clientY - el.getBoundingClientRect().top;
+                el.style.cursor = 'grabbing';
+            }
+            """,
+        ),
+        # Mousemove on window: update position while dragging
+        data.on(
+            "mousemove",
+            """
+            if (el.dataset.drag) {
+                el.style.left = (evt.clientX - el.dataset.ox) + 'px';
+                el.style.top = (evt.clientY - el.dataset.oy) + 'px';
+                el.style.right = 'auto';
+            }
+            """,
+        ),
+        # Mouseup on window: stop drag
+        data.on(
+            "mouseup",
+            "delete el.dataset.drag; el.style.cursor = 'grab'",
+        ),
         {
+            "id": "__stario_inspector",
             "style": {
-                "position": "absolute",
+                "position": "fixed",
                 "top": "1rem",
                 "right": "1rem",
                 "opacity": "0.95",
@@ -26,51 +55,35 @@ def toy_inspector() -> HtmlElement:
                 "background": "#fff",
                 "padding": "0.75rem",
                 "width": "320px",
-                "z-index": "1000",
+                "z-index": "9999",
+                "cursor": "grab",
+                "user-select": "none",
+                "border-radius": "4px",
+                "box-shadow": "0 2px 8px rgba(0,0,0,0.15)",
             },
         },
-        b("Debug Inspector:"),
-        pre(
+        B(
+            {"style": {"cursor": "grab"}},
+            "Signals Inspector",
+        ),
+        Pre(
+            data.json_signals(),
             {
-                "data-json-signals": True,
                 "style": {
                     "background": "#f4f4f4",
                     "border": "1px solid #eee",
                     "padding": "0.5rem",
-                    "margin-bottom": "0.25rem",
-                    "font-size": "0.95em",
+                    "margin-top": "0.5rem",
+                    "margin-bottom": "0",
+                    "font-size": "0.85em",
                     "max-height": "200px",
                     "overflow-x": "hidden",
                     "overflow-y": "auto",
                     "text-overflow": "ellipsis",
                     "display": "block",
+                    "cursor": "text",
+                    "user-select": "text",
                 },
-            }
-        ),
-    )
-
-
-load_datastar = script(
-    {
-        "type": "module",
-        "src": "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.6/bundles/datastar.js",
-    },
-)
-
-
-def toy_page(
-    *content: HtmlElement,
-    page_title: str = "Playground",
-) -> HtmlElement:
-
-    return html(
-        head(
-            meta({"charset": "UTF-8"}),
-            title(page_title),
-            load_datastar,
-        ),
-        body(
-            *content,
-            toy_inspector(),
+            },
         ),
     )

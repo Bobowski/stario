@@ -1,0 +1,9 @@
+{
+  "examples": [
+    {
+      "name": "chat",
+      "description": "Real-time chat room",
+      "long_description": "Multi-user chat with typing indicators, message history,\n    and live presence updates. See SSE broadcasting in action."
+    }
+  ]
+}

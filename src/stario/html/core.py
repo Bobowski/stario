@@ -1,19 +1,26 @@
-# This module is inspired by simple-html library
-# https://github.com/keithasaurus/simple_html
-#
-# For Stario I needed to add some opinionated decisions for structures
-#  that could be used across the framework.
-#
+"""
+HTML Core - Tag creation and rendering engine.
+
+Inspired by simple-html (https://github.com/keithasaurus/simple_html),
+with some Stario-specific additions:
+- Better error messages with examples
+- SafeString for trusted content
+- Style dict rendering
+- Nested attribute support (data-*, aria-*, etc.)
+
+Performance notes:
+- faster_escape() avoids html.escape() overhead
+- COMMON_SAFE_ATTRIBUTE_NAMES skips escaping for known-safe attr names
+- _render() uses list.append instead of string concatenation
+- Tag instances pre-compute their start/end strings at creation
+"""
+
 
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import Callable, Iterable
 
-from stario.exceptions import (
-    HtmlRenderError,
-    InvalidAttributeValueError,
-    InvalidStyleValueError,
-)
+from stario.exceptions import StarioError
 
 from .safestring import SafeString
 from .types import (
@@ -33,6 +40,10 @@ def faster_escape(s: str) -> str:
     - No variable reassignments
     - Direct chaining of replace operations
 
+    Security: This prevents XSS attacks by ensuring user content cannot inject
+    HTML tags or break out of attribute values. The five characters escaped are:
+    & < > " ' - covering both tag injection and attribute injection vectors.
+
     Args:
         s: String to escape
 
@@ -47,8 +58,9 @@ def faster_escape(s: str) -> str:
         >>> faster_escape("No special chars")
         'No special chars'
     """
+    # IMPORTANT: & must be replaced first! Otherwise &lt; becomes &amp;lt;
     return (
-        s.replace("&", "&amp;")  # Must be done first!
+        s.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
@@ -214,8 +226,6 @@ class Tag:
                 else:
                     _key = key
 
-                # elif TYPE_CHECKING:
-                #     assert isinstance(key, str)
 
                 if type(val) is str:
                     append_attribute(f' {_key}="{faster_escape(val)}"')
@@ -253,7 +263,7 @@ class Tag:
                     render_nested(_key, val, append_attribute)
                     continue
 
-                raise InvalidAttributeValueError(
+                raise StarioError(
                     f"Invalid value type for attribute '{key}': {type(val).__name__}",
                     context={
                         "attribute": key,
@@ -261,17 +271,17 @@ class Tag:
                         "value": str(val)[:100],
                     },
                     help_text="HTML attributes support: str, int, float, Decimal, bool, None, list, or dict (for nested attributes).",
-                    example="""from stario.html import div
+                    example="""from stario.html import Div
 
 # Supported attribute value types:
-div({"class": "container"})              # str
-div({"tabindex": 0})                     # int
-div({"opacity": 0.5})                    # float
-div({"disabled": True})                  # bool (renders as 'disabled')
-div({"hidden": False})                   # bool (attribute omitted)
-div({"class": ["btn", "primary"]})       # list (joined with spaces)
-div({"data": {"user-id": "123"}})        # dict (nested attributes)
-div({"style": {"color": "red"}})         # dict for styles""",
+Div({"class": "container"})              # str
+Div({"tabindex": 0})                     # int
+Div({"opacity": 0.5})                    # float
+Div({"disabled": True})                  # bool (renders as 'disabled')
+Div({"hidden": False})                   # bool (attribute omitted)
+Div({"class": ["btn", "primary"]})       # list (joined with spaces)
+Div({"data": {"user-id": "123"}})        # dict (nested attributes)
+Div({"style": {"color": "red"}})         # dict for styles""",
                 )
 
         # If there are children, we return a tuple with the tag start, children, and closing tag
@@ -316,17 +326,17 @@ def _render(nodes: Iterable[HtmlElement], append: Callable[[str], None]) -> None
                 continue
 
             else:
-                raise HtmlRenderError(
+                raise StarioError(
                     f"Invalid tuple length for HTML element: {len(node)}",
                     context={
                         "node_type": type(node).__name__,
                         "node_value": str(node)[:100],
                     },
                     help_text="HTML elements must be tuples with three elements: start tag, children, and end tag.",
-                    example="""from stario.html import div, p, render
+                    example="""from stario.html import Div, P, render
 
 # Correct rendering:
-html = render(div({"class": "container"}, p("Hello")))
+html = render(Div({"class": "container"}, P("Hello")))
 """,
                 )
 
@@ -350,25 +360,25 @@ html = render(div({"class": "container"}, p("Hello")))
             append(str(node))
             continue
 
-        raise HtmlRenderError(
+        raise StarioError(
             f"Cannot render element of type {type(node).__name__}",
             context={
                 "node_type": type(node).__name__,
                 "node_value": str(node)[:100],
             },
             help_text="Only str, int, float, Decimal, SafeString, Tag, list, or tuple elements can be rendered.",
-            example="""from stario.html import div, p, SafeString
+            example="""from stario.html import Div, P, SafeString
 
 # Supported element types:
-div("text")                    # str
-div(42)                        # int, float, Decimal
-div(SafeString("<b>bold</b>"))  # SafeString (not escaped)
-div(p("paragraph"))            # Tag
-div([p("one"), p("two")])      # list of elements
+Div("text")                    # str
+Div(42)                        # int, float, Decimal
+Div(SafeString("<b>bold</b>"))  # SafeString (not escaped)
+Div(P("paragraph"))            # Tag
+Div([P("one"), P("two")])      # list of elements
 
 # Incorrect - custom objects need to be converted:
-# div(my_object)  # ❌ Won't work
-div(str(my_object))  # ✅ Convert to string first""",
+# Div(my_object)  # ERROR: Won't work
+Div(str(my_object))  # OK: Convert to string first""",
         )
 
 
@@ -407,26 +417,24 @@ def render_styles(styles: AttributeDict) -> SafeString:
             elif type(key) is SafeString:
                 key = key.safe_str
             else:
-                raise InvalidStyleValueError(
+                raise StarioError(
                     f"Invalid CSS property name type: {type(key).__name__}",
                     context={
                         "property": str(key),
                         "property_type": type(key).__name__,
                     },
                     help_text="CSS property names must be strings or SafeString objects.",
-                    example="""from stario.html import div
+                    example="""from stario.html import Div
 
 # Correct style property names:
-div({"style": {"color": "red"}})                # str keys
-div({"style": {"font-size": "16px"}})           # str with hyphens
-div({"style": {"background-color": "#fff"}})    # str
+Div({"style": {"color": "red"}})                # str keys
+Div({"style": {"font-size": "16px"}})           # str with hyphens
+Div({"style": {"background-color": "#fff"}})    # str
 
 # Incorrect:
-# div({"style": {123: "value"}})  # ❌ Numbers not allowed""",
+# Div({"style": {123: "value"}})  # ERROR: Numbers not allowed""",
                 )
 
-        elif TYPE_CHECKING:
-            assert isinstance(key, str)
 
         # Escape value
         if type(value) is str:
@@ -455,15 +463,15 @@ def render(*nodes: HtmlElement) -> str:
         Complete HTML string
 
     Raises:
-        HtmlRenderError: If rendering fails or unknown element types are encountered
+        StarioError: If rendering fails or unknown element types are encountered
 
     Examples:
-        >>> from stario.html import div, p
-        >>> render(div("Hello"), p("World"))
+        >>> from stario.html import Div, P
+        >>> render(Div("Hello"), P("World"))
         '<div>Hello</div><p>World</p>'
-        >>> render("Plain text", div({"class": "test"}, "Content"))
+        >>> render("Plain text", Div({"class": "test"}, "Content"))
         'Plain text<div class="test">Content</div>'
-        >>> render(div([p("Item 1"), p("Item 2")]))
+        >>> render(Div([P("Item 1"), P("Item 2")]))
         '<div><p>Item 1</p><p>Item 2</p></div>'
     """
     try:
@@ -471,11 +479,11 @@ def render(*nodes: HtmlElement) -> str:
         _render(nodes, results.append)
         return "".join(results)
 
-    except HtmlRenderError:
+    except StarioError:
         # Re-raise our own exceptions without wrapping
         raise
     except Exception as e:
-        raise HtmlRenderError(
+        raise StarioError(
             f"Unexpected error while rendering HTML: {type(e).__name__}: {e}",
             context={
                 "error_type": type(e).__name__,
@@ -483,15 +491,15 @@ def render(*nodes: HtmlElement) -> str:
                 "node_count": len(nodes) if hasattr(nodes, "__len__") else "unknown",
             },
             help_text="Check that all HTML elements are valid types and properly structured.",
-            example="""from stario.html import div, p, render
+            example="""from stario.html import Div, P, render
 
 # Correct rendering:
-html = render(div({"class": "container"}, p("Hello")))
+html = render(Div({"class": "container"}, P("Hello")))
 
 # Make sure all elements are proper types:
-# ❌ render(my_custom_object)
-# ✅ render(str(my_custom_object))
-# ✅ render(div(str(my_custom_object)))""",
+# ERROR: render(my_custom_object)
+# OK: render(str(my_custom_object))
+# OK: render(Div(str(my_custom_object)))""",
         ) from e
 
 
@@ -523,55 +531,53 @@ def render_nested(
     for key in data:
         value = data[key]
 
-        # Escape key
-        if type(key) is SafeString:
-            key = key.safe_str
-        elif TYPE_CHECKING:
-            assert isinstance(key, str)
+        # Escape key - SafeString is already safe, regular strings need escaping
+        if isinstance(key, SafeString):
+            escaped_key = key.safe_str
         else:
-            key = faster_escape(key)
+            escaped_key = faster_escape(str(key))
 
         # Escape value
         if type(value) is str:
-            append(f' {key_prefix}-{key}="{faster_escape(value)}"')
+            append(f' {key_prefix}-{escaped_key}="{faster_escape(value)}"')
             continue
 
         if type(value) is SafeString:
-            append(f' {key_prefix}-{key}="{value.safe_str}"')
+            append(f' {key_prefix}-{escaped_key}="{value.safe_str}"')
             continue
 
         if value is None or value is True:
-            append(f" {key_prefix}-{key}")
+            append(f" {key_prefix}-{escaped_key}")
             continue
 
         if value is False:
             continue
 
         if isinstance(value, (int, float, Decimal)):
-            append(f" {key_prefix}-{key}='{str(value)}'")
+            append(f' {key_prefix}-{escaped_key}="{str(value)}"')
             continue
 
         if type(value) is list:
             joined = " ".join(str(v) for v in value)
-            append(f" {key_prefix}-{key}='{faster_escape(joined)}'")
+            append(f' {key_prefix}-{escaped_key}="{faster_escape(joined)}"')
             continue
 
-        raise InvalidAttributeValueError(
-            f"Invalid value type for nested attribute '{key_prefix}-{key}': {type(value).__name__}",
+        raise StarioError(
+            f"Invalid value type for nested attribute '{key_prefix}-{escaped_key}': {type(value).__name__}",
             context={
                 "attribute_prefix": key_prefix,
-                "attribute_name": key,
+                "attribute_name": escaped_key,
                 "value_type": type(value).__name__,
                 "value": str(value)[:100],
             },
             help_text="Nested attributes (like data-* or aria-*) support: str, int, float, Decimal, bool, None, or list.",
-            example="""from stario.html import button
+            example="""from stario.html import Button
 
 # Correct nested attributes (data-* example):
-button({"data": {"user-id": "123"}})           # str
-button({"data": {"count": 42}})                # int
-button({"data": {"enabled": True}})            # bool
-button({"data": {"tags": ["tag1", "tag2"]}})   # list
+Button({"data": {"user-id": "123"}})           # str
+Button({"data": {"count": 42}})                # int
+Button({"data": {"enabled": True}})            # bool
+Button({"data": {"tags": ["tag1", "tag2"]}})   # list
 
 # Renders as:
 # <button data-user-id="123" data-count="42" data-enabled data-tags="tag1 tag2">

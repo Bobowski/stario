@@ -1,3 +1,14 @@
+"""
+HTML Type definitions.
+
+These types define what values are valid for HTML attributes and styles.
+
+The COMMON_SAFE_* frozensets are performance optimizations:
+- If an attribute name is in COMMON_SAFE_ATTRIBUTE_NAMES, we skip escaping
+- Same for CSS property names in COMMON_SAFE_CSS_PROPS
+- This avoids running escape functions on ~90% of real-world attributes
+"""
+
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import (
