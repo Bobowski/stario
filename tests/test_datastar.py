@@ -3,6 +3,7 @@
 import json
 
 from stario.datastar import at, data, sse
+from stario.datastar.format import js
 from stario.html import Div, P, Span, render
 
 
@@ -223,9 +224,23 @@ class TestDatastarActions:
         assert action == "@post('/api/submit')"
 
     def test_post_with_options(self):
-        action = at.post("/api/submit", include="form.*", selector="#result")
+        payload = {"extra": 123}
+
+        action = at.post(
+            "/api/submit",
+            include="form.*",
+            selector="#result",
+            retry="error",
+            payload=payload,
+        )
+
         assert "@post" in action
         assert "/api/submit" in action
+
+        expected_payload_str = f"payload: {js(payload)}"
+        assert expected_payload_str in action
+
+        assert "retry: 'error'" in action
 
     def test_put(self):
         action = at.put("/api/item/123")
