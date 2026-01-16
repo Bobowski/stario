@@ -15,8 +15,7 @@ from .format import FilterValue, js, parse_filter_value, s
 
 ContentType = Literal["json", "form"]
 RequestCancellation = Literal["auto", "disabled"]
-Retry = Literal["auto", "error", "always"]
-
+Retry = Literal["auto", "error", "always", "never"]
 
 class DatastarActions:
     """
