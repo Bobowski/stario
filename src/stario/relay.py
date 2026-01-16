@@ -14,7 +14,7 @@ Usage:
     relay = Relay()
 
     # Publish (sync, fire-and-forget)
-    relay.publish("room.123.moves")
+    relay.publish("room.123.moves", None)
     relay.publish("room.123.moves", move_data)
 
     # Subscribe (async iterator, auto-cleanup)

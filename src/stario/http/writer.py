@@ -291,7 +291,7 @@ class Writer:
 
         Three usage patterns:
         1. Infinite loop (await inside):
-            async for _ in w.alive:
+            async for _ in w.alive():
                 msg = await queue.get()
                 w.patch(render(msg))
             cleanup()
@@ -302,7 +302,7 @@ class Writer:
             cleanup()
 
         3. One-shot operation:
-            async with w.alive:
+            async with w.alive():
                 result = await slow_api_call()
                 w.patch(render(result))
             cleanup()

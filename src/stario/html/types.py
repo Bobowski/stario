@@ -24,7 +24,13 @@ type AttributeValue = (
     str | SafeString | bool | int | float | Decimal | None | list[AttributeValue]
 )
 
-type AttributeDict = Mapping[str | SafeString, AttributeValue]
+# Nested attribute dictionaries (e.g. {"data": {...}}, {"aria": {...}}, {"style": {...}})
+#
+# Important typing note:
+# `Mapping` is invariant in its key type, so using `Mapping[str | SafeString, ...]` would
+# make a plain `dict[str, ...]` (the common case) *not* assignable. We therefore type
+# nested attribute dict keys as `str` only. (Values can still be `SafeString`.)
+type AttributeDict = Mapping[str, AttributeValue]
 
 # Main attributes dictionary type
 type TagAttributes = Mapping[str, AttributeValue | AttributeDict]

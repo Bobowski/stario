@@ -63,14 +63,12 @@ COLORS = [
 
 # =============================================================================
 # State
+# In production, you'd use a database. For this demo, we'll use in-memory.
 # =============================================================================
-#
-# In production, you'd use a database. For this demo, in-memory is fine.
-# Note: with multiple workers, each has its own state - use Redis/DB for shared state.
 
 # Board state: cell_id -> color hex
 _total_cells = GRID_SIZE * GRID_SIZE
-_initial_cells = random.sample(range(_total_cells), int(_total_cells * 0.8))
+_initial_cells = random.sample(range(_total_cells), int(_total_cells * 0.6))
 board: dict[int, str] = {cell: random.choice(COLORS) for cell in _initial_cells}
 
 # Track connected users (we derive their color from user_id hash)
@@ -79,7 +77,7 @@ users: set[str] = set()
 # Relay: lightweight pub/sub for broadcasting between SSE connections.
 # When state changes, publish to notify all subscribers to re-render.
 # Generic type [None] means no payload - just a "something changed" signal.
-relay = Relay[None]()
+relay = Relay[str]()
 
 
 def color_for_user(user_id: str) -> str:
@@ -196,14 +194,13 @@ def home_view(user_id: str):
     """Full home page - user_id passed via signals for SSE."""
     return page(
         Div(
-            {"class": "container"},
+            {"id": "home", "class": "container"},
             # Signals: client-side reactive state synced with server.
             # ifmissing=True means: only set if not already present (preserves state on re-render)
             # Signals are automatically sent with every @get/@post request.
             data.signals({"user_id": user_id}, ifmissing=True),
             # data.init() runs on element mount - here it opens SSE connection.
-            # at.get("/subscribe") generates: @get('/subscribe')
-            data.init(at.get("/subscribe")),
+            data.init(at.get("/subscribe", retry="always")),
             # Main content
             H1("Tiles - Stario App"),
             P(
@@ -212,7 +209,7 @@ def home_view(user_id: str):
             ),
             info_panel_view(user_id),
             board_view(),
-            toy_inspector(),
+            toy_inspector("bottom-right"),
         ),
     )
 
@@ -238,6 +235,9 @@ async def home(c: Context, w: Writer) -> None:
     """Serve the home page with a fresh user_id."""
     # Generate unique user_id, passed to client via signals
     user_id = str(uuid.uuid4())[:8]
+    # Set context state for reactive attributes
+    c["user_id"] = user_id
+
     # w.html() sends a full HTML response (Content-Type: text/html)
     w.html(home_view(user_id))
 
@@ -255,35 +255,33 @@ async def subscribe(c: Context, w: Writer) -> None:
     """
     # c.signals() parses signals from request (sent automatically by Datastar @get/@post)
     signals = await c.signals(HomeSignals)
-
-    with c.step("subscribe"):
-        if not signals.user_id:
-            c("No user id", {"hint": "user had to change some thing manually"})
-            w.redirect("/")
-            return
+    if not signals.user_id:
+        c("No user id", {"hint": "user had to change some thing manually"})
+        w.redirect("/")
+        return
 
     # Add user and notify everyone (including this new user)
-    c("Connected", {"user_id": signals.user_id})
     users.add(signals.user_id)
-    relay.publish("update", None)
+    relay.publish("join", signals.user_id)
+    c("on_join", {"user_id": signals.user_id})
+    c["user_id"] = signals.user_id
 
     # w.patch() sends SSE with Datastar merge fragments
     # Elements matched by id are updated in-place
     w.patch(home_view(signals.user_id))
-    c("patched")
-    c["hello"] = "world"
+    c("onload patch")
 
     # w.alive() wraps an async iterator and yields until client disconnects.
     # relay.subscribe() yields each time someone publishes to "update" topic.
     # When client disconnects, the loop exits cleanly (no exception).
-    async for _ in w.alive(relay.subscribe("update")):
+    async for event, user_id in w.alive(relay.subscribe("*")):
+        c("on_event", {"event": event, "user_id": user_id})
         w.patch(home_view(signals.user_id))
-        c("board updated")
 
     # Code after the loop runs on disconnect - perfect for cleanup
-    c("Disconnected", {"user_id": signals.user_id})
     users.discard(signals.user_id)
-    relay.publish("update", None)
+    relay.publish("leave", signals.user_id)
+    c("on_leave", {"user_id": signals.user_id})
 
 
 async def click(c: Context, w: Writer) -> None:
@@ -304,6 +302,10 @@ async def click(c: Context, w: Writer) -> None:
 
     cell_id = int(cell_id_param)
 
+    # Set context state for reactive attributes
+    c["user_id"] = signals.user_id
+    c["cell_id"] = cell_id
+
     # Respond immediately with 204 No Content.
     # Important: code after w.empty() still runs! The response is sent,
     # but the handler continues - useful for fire-and-forget patterns.
@@ -317,9 +319,9 @@ async def click(c: Context, w: Writer) -> None:
     else:
         board[cell_id] = user_color
 
-    # Publish triggers all relay.subscribe("update") iterators to yield.
+    # Publish triggers all relay.subscribe("*") iterators to yield.
     # Each SSE connection will re-render and send a patch to its client.
-    relay.publish("update", None)
+    relay.publish("click", signals.user_id)
 
 
 async def main():

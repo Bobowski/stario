@@ -274,7 +274,6 @@ class RichTracer:
             self._live = Live(
                 Group(*[self._panel(s) for s in open_roots]),
                 console=self.console,
-                refresh_per_second=10,
                 transient=True,
             )
             self._live.start()

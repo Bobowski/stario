@@ -15,10 +15,10 @@ import asyncio
 import sys
 from pathlib import Path
 
-from stario import JsonTracer, Relay, RichTracer, Stario
-
 from app.db import create_database
 from app.handlers import home, send_message, subscribe, typing
+
+from stario import JsonTracer, Relay, RichTracer, Stario
 
 
 async def main():

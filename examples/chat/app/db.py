@@ -11,7 +11,7 @@ using closures (Go-style dependency injection).
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .state import Message, User
 
@@ -26,10 +26,9 @@ class Database:
     """
 
     db_path: str
-    _local: threading.local = None
+    _local: threading.local = field(default_factory=threading.local)
 
     def __post_init__(self):
-        self._local = threading.local()
         # Create tables on first init
         self._init_tables()
 
@@ -60,7 +59,8 @@ class Database:
     def _init_tables(self):
         """Create tables if they don't exist."""
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
@@ -69,19 +69,24 @@ class Database:
                     text TEXT NOT NULL,
                     timestamp REAL NOT NULL
                 )
-            """)
-            cur.execute("""
+            """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
                     color TEXT NOT NULL,
                     typing INTEGER NOT NULL DEFAULT 0
                 )
-            """)
-            cur.execute("""
+            """
+            )
+            cur.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_messages_timestamp
                 ON messages(timestamp)
-            """)
+            """
+            )
 
     # =========================================================================
     # Message Operations
@@ -98,11 +103,13 @@ class Database:
                 (msg.id, msg.user_id, msg.username, msg.color, msg.text, msg.timestamp),
             )
             # Keep only last 100 messages
-            cur.execute("""
+            cur.execute(
+                """
                 DELETE FROM messages WHERE id NOT IN (
                     SELECT id FROM messages ORDER BY timestamp DESC LIMIT 100
                 )
-            """)
+            """
+            )
 
     def get_messages(self, limit: int = 100) -> list[Message]:
         """Fetch recent messages, oldest first."""
