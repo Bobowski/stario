@@ -15,7 +15,7 @@ from .format import FilterValue, js, parse_filter_value, s
 
 ContentType = Literal["json", "form"]
 RequestCancellation = Literal["auto", "disabled"]
-
+Retry = Literal["auto", "error", "always", "never"]
 
 class DatastarActions:
     """
@@ -77,6 +77,8 @@ class DatastarActions:
         selector: str | None = None,
         headers: dict[str, str] | None = None,
         open_when_hidden: bool = False,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str = "auto",
         retry_interval_ms: int = 1_000,
         retry_scaler: float = 2.0,
         retry_max_wait_ms: int = 30_000,
@@ -109,6 +111,12 @@ class DatastarActions:
         if open_when_hidden:
             options.append("openWhenHidden: true")
 
+        if payload is not None:
+            options.append(f"payload: {js(payload)}")
+
+        if retry != "auto":
+            options.append(f"retry: '{retry}'")
+
         if retry_interval_ms != 1_000:
             options.append(f"retryInterval: {retry_interval_ms}")
 
@@ -139,6 +147,8 @@ class DatastarActions:
         selector: str | None = None,
         headers: dict[str, str] | None = None,
         open_when_hidden: bool = False,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str = "auto",
         retry_interval_ms: int = 1_000,
         retry_scaler: float = 2.0,
         retry_max_wait_ms: int = 30_000,
@@ -156,6 +166,8 @@ class DatastarActions:
             selector=selector,
             headers=headers,
             open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
             retry_interval_ms=retry_interval_ms,
             retry_scaler=retry_scaler,
             retry_max_wait_ms=retry_max_wait_ms,
@@ -174,6 +186,8 @@ class DatastarActions:
         selector: str | None = None,
         headers: dict[str, str] | None = None,
         open_when_hidden: bool = False,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str = "auto",
         retry_interval_ms: int = 1_000,
         retry_scaler: float = 2.0,
         retry_max_wait_ms: int = 30_000,
@@ -191,6 +205,8 @@ class DatastarActions:
             selector=selector,
             headers=headers,
             open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
             retry_interval_ms=retry_interval_ms,
             retry_scaler=retry_scaler,
             retry_max_wait_ms=retry_max_wait_ms,
@@ -209,6 +225,8 @@ class DatastarActions:
         selector: str | None = None,
         headers: dict[str, str] | None = None,
         open_when_hidden: bool = False,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str = "auto",
         retry_interval_ms: int = 1_000,
         retry_scaler: float = 2.0,
         retry_max_wait_ms: int = 30_000,
@@ -226,6 +244,8 @@ class DatastarActions:
             selector=selector,
             headers=headers,
             open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
             retry_interval_ms=retry_interval_ms,
             retry_scaler=retry_scaler,
             retry_max_wait_ms=retry_max_wait_ms,
@@ -244,6 +264,8 @@ class DatastarActions:
         selector: str | None = None,
         headers: dict[str, str] | None = None,
         open_when_hidden: bool = False,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str = "auto",
         retry_interval_ms: int = 1_000,
         retry_scaler: float = 2.0,
         retry_max_wait_ms: int = 30_000,
@@ -261,6 +283,8 @@ class DatastarActions:
             selector=selector,
             headers=headers,
             open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
             retry_interval_ms=retry_interval_ms,
             retry_scaler=retry_scaler,
             retry_max_wait_ms=retry_max_wait_ms,
@@ -279,6 +303,8 @@ class DatastarActions:
         selector: str | None = None,
         headers: dict[str, str] | None = None,
         open_when_hidden: bool = False,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str = "auto",
         retry_interval_ms: int = 1_000,
         retry_scaler: float = 2.0,
         retry_max_wait_ms: int = 30_000,
@@ -296,6 +322,8 @@ class DatastarActions:
             selector=selector,
             headers=headers,
             open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
             retry_interval_ms=retry_interval_ms,
             retry_scaler=retry_scaler,
             retry_max_wait_ms=retry_max_wait_ms,
