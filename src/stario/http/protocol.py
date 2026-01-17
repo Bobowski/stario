@@ -218,7 +218,7 @@ class HttpProtocol(asyncio.Protocol):
         request = Request(
             method           = _decode_method(parser.get_method()),
             path             = _decode_path(parsed_url.path),
-            query_bytes      = parsed_url.query,
+            query_bytes      = parsed_url.query or b"",
             protocol_version = parser.get_http_version(),
             keep_alive       = parser.should_keep_alive(),
             headers          = headers,
@@ -266,7 +266,6 @@ class HttpProtocol(asyncio.Protocol):
     # =========================================================================
 
     def on_response_completed(self) -> None:
-
         t = self.transport
         w = self._active_writer
         r = self._active_request
