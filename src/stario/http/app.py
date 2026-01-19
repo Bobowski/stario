@@ -171,7 +171,8 @@ class Server:
                 self._stop.set_result(None)
 
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, on_signal)
+            # Compatible with Unix + Windows: schedule shutdown on the running loop.
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(on_signal))
 
         threads = [
             threading.Thread(target=self._thread, args=(i,), daemon=True)
