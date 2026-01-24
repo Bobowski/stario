@@ -4,6 +4,7 @@ Stario - Minimal async HTTP server with optional multi-threading.
 
 import asyncio
 import signal
+import socket
 import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from email.utils import format_datetime
 from functools import lru_cache
 from typing import Any, Callable
 
-from stario.exceptions import HttpException
+from stario.exceptions import HttpException, StarioError
 from stario.http.types import Context
 from stario.telemetry.core import Span
 
@@ -127,6 +128,14 @@ class Server:
     backlog: int = 2048
 
     def __post_init__(self) -> None:
+        # Multiple workers require SO_REUSEPORT to bind to the same port
+        if self.workers > 1 and not hasattr(socket, "SO_REUSEPORT"):
+            raise StarioError(
+                f"Cannot use {self.workers} workers (SO_REUSEPORT unavailable)",
+                help_text="Multiple workers require SO_REUSEPORT to bind to the same port. "
+                "Use workers=1 on Windows, or run on Linux/macOS for multi-worker support.",
+            )
+
         self._running = False
         self._stop: Future[None] = Future()
         self._barrier = threading.Barrier(self.workers)
@@ -231,8 +240,8 @@ class Server:
         connections: set[HttpProtocol] = set()
 
         # This is the only expected failure point (port in use, permission denied)
-        # Always use reuse_port=True to allow clean restarts during development
-        # (e.g., with watchfiles) when the old process hasn't fully released the port
+        # Use reuse_port only when multiple workers need to bind to the same port.
+        # (SO_REUSEPORT availability is validated in __post_init__ when workers > 1)
         server = await loop.create_server(
             lambda: HttpProtocol(
                 loop,
@@ -244,7 +253,7 @@ class Server:
             ),
             self.host,
             self.port,
-            reuse_port=True,
+            reuse_port=self.workers > 1,
             backlog=self.backlog,
             start_serving=False,
         )
