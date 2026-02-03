@@ -3,6 +3,7 @@ Stario - Minimal async HTTP server with optional multi-threading.
 """
 
 import asyncio
+import os
 import signal
 import socket
 import threading
@@ -43,6 +44,10 @@ class Stario(Router):
             HttpException: lambda c, w, exc: exc.respond(w),
         }
 
+        # Host-based routing
+        self._hosts_exact: dict[str, Router] = {}
+        self._hosts_wildcard: list[tuple[str, Router]] = []  # (suffix, router)
+
         @lru_cache(maxsize=64)
         def find_handler(exc_type: type[Exception]) -> ErrorHandler[Any] | None:
             for t in exc_type.__mro__:
@@ -60,6 +65,87 @@ class Stario(Router):
         """Register custom error handler for exception type."""
         self._error_handlers[exc_type] = handler
         self._find_error_handler.cache_clear()
+
+    # =========================================================================
+    # Host-based routing
+    # =========================================================================
+
+    def host(self, pattern: str, router: Router) -> None:
+        """
+        Route requests to a router based on Host header.
+
+        Supports exact matches and wildcard prefixes:
+        - "api.example.com" - exact match
+        - "*.example.com" - wildcard, sets request.subhost to matched portion
+
+        Precedence: exact hosts first, then wildcards (longest suffix first),
+        then fallback to routes registered directly on the app.
+
+        Example:
+            api = Router()
+            api.get("/users", list_users)
+            app.host("api.example.com", api)
+
+            tenant = Router()
+            tenant.get("/dashboard", dashboard)
+            app.host("*.example.com", tenant)  # request.subhost = "acme"
+
+        Host matching is checked before path routing. Routes registered
+        directly on the app act as fallback for unmatched hosts.
+        """
+        pattern = pattern.lower()
+
+        # Reject bare "*" - users should use fallback routes instead
+        if pattern == "*":
+            raise StarioError(
+                "Invalid host pattern: '*'",
+                context={"pattern": pattern},
+                help_text="Use '*.domain.com' for wildcard subdomains. "
+                "Routes registered directly on the app serve as fallback for unmatched hosts.",
+            )
+
+        if pattern.startswith("*."):
+            suffix = pattern[1:]  # "*.example.com" -> ".example.com"
+            # Check for duplicate wildcard
+            for existing_suffix, _ in self._hosts_wildcard:
+                if existing_suffix == suffix:
+                    raise StarioError(
+                        f"Wildcard host already registered: {pattern}",
+                        context={"pattern": pattern},
+                        help_text="Each wildcard pattern can only have one router.",
+                    )
+            self._hosts_wildcard.append((suffix, router))
+            # Longest suffix first for most specific match
+            self._hosts_wildcard.sort(key=lambda x: len(x[0]), reverse=True)
+        else:
+            if pattern in self._hosts_exact:
+                raise StarioError(
+                    f"Host already registered: {pattern}",
+                    context={"pattern": pattern},
+                    help_text="Each host pattern can only have one router.",
+                )
+            self._hosts_exact[pattern] = router
+
+    async def dispatch(self, c: Context, w: Writer) -> None:
+        """Dispatch request, checking host routing first."""
+        # Fast path: skip if no host routing configured
+        if self._hosts_exact or self._hosts_wildcard:
+            host = c.req.host
+
+            # O(1) exact match
+            if router := self._hosts_exact.get(host):
+                await router.dispatch(c, w)
+                return
+
+            # Wildcard match (typically 1-3 patterns)
+            for suffix, router in self._hosts_wildcard:
+                if host.endswith(suffix):
+                    c.req.subhost = host[: -len(suffix)]
+                    await router.dispatch(c, w)
+                    return
+
+        # Fallback to regular path routing
+        await Router.dispatch(self, c, w)
 
     async def handle_request(self, req: Request, w: Writer) -> None:
         """Handle request with tracing and error handling."""
@@ -97,9 +183,17 @@ class Stario(Router):
         port: int = 8000,
         graceful_timeout: float = 5.0,
         workers: int = 1,
+        unix_socket: str | None = None,
     ) -> None:
         """Convenience method to create and run a server."""
-        server = Server(self, host, port, workers, graceful_timeout)
+        server = Server(
+            self,
+            host=host,
+            port=port,
+            workers=workers,
+            graceful_timeout=graceful_timeout,
+            unix_socket=unix_socket,
+        )
         await server.run()
 
 
@@ -126,10 +220,15 @@ class Server:
     workers: int = 1
     graceful_timeout: float = 5.0
     backlog: int = 2048
+    unix_socket: str | None = None
 
     def __post_init__(self) -> None:
-        # Multiple workers require SO_REUSEPORT to bind to the same port
-        if self.workers > 1 and not hasattr(socket, "SO_REUSEPORT"):
+        # Multiple TCP workers require SO_REUSEPORT to bind to the same port
+        if (
+            self.workers > 1
+            and not self.unix_socket
+            and not hasattr(socket, "SO_REUSEPORT")
+        ):
             raise StarioError(
                 f"Cannot use {self.workers} workers (SO_REUSEPORT unavailable)",
                 help_text="Multiple workers require SO_REUSEPORT to bind to the same port. "
@@ -144,6 +243,8 @@ class Server:
         # Shared across workers
         self._date_header = b""
         self._date_task: asyncio.Task[None] | None = None
+        # Pre-created socket (Unix multi-worker)
+        self._sock: socket.socket | None = None
 
         # Telemetry spans
         self._startup_span: Span | None = None
@@ -168,8 +269,11 @@ class Server:
 
         loop = asyncio.get_running_loop()
         span = self._startup_span = self.app._tracer("server.startup")
-        span["server.host"] = self.host
-        span["server.port"] = self.port
+        if self.unix_socket:
+            span["server.unix_socket"] = self.unix_socket
+        else:
+            span["server.host"] = self.host
+            span["server.port"] = self.port
         span["server.workers"] = self.workers
 
         def on_signal() -> None:
@@ -183,6 +287,10 @@ class Server:
             # Compatible with Unix + Windows: schedule shutdown on the running loop.
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(on_signal))
 
+        # Unix sockets: create once, share across worker threads
+        if self.unix_socket:
+            self._sock = self._create_unix_socket()
+
         threads = [
             threading.Thread(target=self._thread, args=(i,), daemon=True)
             for i in range(1, self.workers)
@@ -195,6 +303,10 @@ class Server:
         finally:
             for t in threads:
                 t.join(timeout=self.graceful_timeout + 5)
+
+            # Clean up Unix socket on failure (normal shutdown handled in _shutdown)
+            if self._errors:
+                self._cleanup_unix_socket()
 
             span.end()
             if shutdown := self._shutdown_span:
@@ -239,24 +351,35 @@ class Server:
         """Create server, sync with other workers, start accepting."""
         connections: set[HttpProtocol] = set()
 
-        # This is the only expected failure point (port in use, permission denied)
-        # Use reuse_port only when multiple workers need to bind to the same port.
-        # (SO_REUSEPORT availability is validated in __post_init__ when workers > 1)
-        server = await loop.create_server(
-            lambda: HttpProtocol(
+        def protocol_factory() -> HttpProtocol:
+            return HttpProtocol(
                 loop,
                 self.app.handle_request,
                 lambda: self._date_header,
                 self.app._compression.select,
                 shutdown,
                 connections,
-            ),
-            self.host,
-            self.port,
-            reuse_port=self.workers > 1,
-            backlog=self.backlog,
-            start_serving=False,
-        )
+            )
+
+        # This is the only expected failure point (port in use, permission denied)
+        if self._sock:
+            # Unix socket: all workers share the same pre-created socket
+            server = await loop.create_unix_server(
+                protocol_factory,
+                sock=self._sock,
+                start_serving=False,
+            )
+        else:
+            # TCP: use reuse_port when multiple workers need to bind to the same port
+            # (SO_REUSEPORT availability is validated in __post_init__ when workers > 1)
+            server = await loop.create_server(
+                protocol_factory,
+                self.host,
+                self.port,
+                reuse_port=self.workers > 1,
+                backlog=self.backlog,
+                start_serving=False,
+            )
 
         # Sync - if another worker failed, this raises BrokenBarrierError
         try:
@@ -301,13 +424,10 @@ class Server:
 
         await state.server.wait_closed()
 
-        # Worker 0 stops the date header ticker
-        if worker_id == 0 and self._date_task:
-            self._date_task.cancel()
-            try:
-                await self._date_task
-            except asyncio.CancelledError:
-                pass
+        # Worker 0 cleans up Unix socket and stops the date header ticker
+        if worker_id == 0:
+            self._cleanup_unix_socket()
+            await self._cleanup_date_tick()
 
         # Drain pending tasks
         pending = [
@@ -330,6 +450,37 @@ class Server:
                     t.cancel()
                 # Wait for cancellation to complete
                 await asyncio.gather(*timedout, return_exceptions=True)
+
+    def _create_unix_socket(self) -> socket.socket:
+        """Create and bind Unix socket (called once, shared by all workers)."""
+        assert self.unix_socket
+        if os.path.exists(self.unix_socket):
+            os.unlink(self.unix_socket)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        sock.bind(self.unix_socket)
+        sock.listen(self.backlog)
+        return sock
+
+    def _cleanup_unix_socket(self) -> None:
+        """Close socket and remove socket file."""
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+        if self.unix_socket and os.path.exists(self.unix_socket):
+            os.unlink(self.unix_socket)
+
+    async def _cleanup_date_tick(self) -> None:
+        """Cancel the date header ticker task."""
+        if not self._date_task:
+            return
+
+        self._date_task.cancel()
+        try:
+            await self._date_task
+        except asyncio.CancelledError:
+            pass
+        self._date_task = None
 
     async def _tick_date(self) -> None:
         """

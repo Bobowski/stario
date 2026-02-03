@@ -231,6 +231,7 @@ class Request:
         "method",
         "path",
         "tail",
+        "subhost",
         "headers",
         "protocol_version",
         "keep_alive",
@@ -240,6 +241,7 @@ class Request:
         "_query_dict",
         "_cookies",
         "_signals_cache",
+        "_host",
         # Body
         "_body",
     )
@@ -258,6 +260,9 @@ class Request:
         self.method = method
         self.path = path
         self.tail = ""  # The rest of the path after the prefix match /*
+        self.subhost = (
+            ""  # The matched wildcard portion for host routing (*.example.com)
+        )
         self.headers = headers
         self.protocol_version = protocol_version
         self.keep_alive = keep_alive
@@ -267,8 +272,40 @@ class Request:
         self._query_dict: dict[str, Any] | None = None
         self._cookies: dict[str, str] | None = None
         self._signals_cache: dict[str, Any] | None = None
+        self._host: str | None = None
 
         self._body = body
+
+    # =========================================================================
+    # Host
+    # =========================================================================
+
+    @property
+    def host(self) -> str:
+        """
+        Host from the Host header (without port, lowercase).
+
+        Lowercase for case-insensitive matching per HTTP/DNS spec.
+        Returns empty string if no Host header is present.
+        """
+        if self._host is None:
+            host_header = self.headers.get(b"host")
+            if host_header:
+                # Decode and strip port if present
+                host_str = host_header.decode("latin-1")
+                # Handle IPv6 addresses like [::1]:8000
+                if host_str.startswith("["):
+                    bracket_end = host_str.find("]")
+                    if bracket_end != -1:
+                        self._host = host_str[: bracket_end + 1].lower()
+                    else:
+                        self._host = host_str.lower()
+                else:
+                    # Regular host:port or just host
+                    self._host = host_str.rsplit(":", 1)[0].lower()
+            else:
+                self._host = ""
+        return self._host
 
     # =========================================================================
     # Query string
