@@ -212,7 +212,7 @@ class ResponseRecorder:
             raise RuntimeError(
                 "Cannot stream after one-shot response started. "
                 "You called a one-shot method (html/json/text) before streaming methods (patch/sync). "
-                "Use streaming methods only, or one-shot methods only—not both."
+                "Use streaming methods only, or one-shot methods only-not both."
             )
         if self._mode == "none":
             self._mode = "sse"
@@ -363,7 +363,7 @@ class ResponseRecorder:
             raise RuntimeError(
                 "Cannot send one-shot response after SSE streaming started. "
                 "You called patch()/sync() before html()/json()/text(). "
-                "Use streaming methods only, or one-shot methods only—not both."
+                "Use streaming methods only, or one-shot methods only-not both."
             )
         if self._started:
             raise RuntimeError(

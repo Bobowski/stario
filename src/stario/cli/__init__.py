@@ -322,7 +322,8 @@ def init(name: str | None, template_name: str | None) -> None:
         click.echo(click.style("     uv run main.py", fg="cyan"))
         click.echo()
         click.echo(click.style("     # Or with auto-reload", dim=True))
-        click.echo(click.style('     uvx watchfiles "uv run main.py" .', fg="cyan"))
+        click.echo(click.style('     uv add --dev watchfiles', fg="cyan"))
+        click.echo(click.style('     uv run watchfiles "python main.py" .', fg="cyan"))
         click.echo()
     else:
         # Show manual instructions
@@ -335,7 +336,8 @@ def init(name: str | None, template_name: str | None) -> None:
         click.echo(click.style("     uv run main.py", fg="cyan"))
         click.echo()
         click.echo(click.style("     # Or with auto-reload", dim=True))
-        click.echo(click.style('     uvx watchfiles "uv run main.py" .', fg="cyan"))
+        click.echo(click.style('     uv add --dev watchfiles', fg="cyan"))
+        click.echo(click.style('     uv run watchfiles "python main.py" .', fg="cyan"))
         click.echo()
         click.echo(click.style("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", dim=True))
         click.echo()

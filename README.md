@@ -16,14 +16,14 @@
 
 ## What is Stario?
 
-Stario is a Python web framework for **real-time hypermedia**. While most frameworks treat HTTP as request → response, Stario treats connections as ongoing conversations — open an SSE stream, push DOM patches, sync reactive signals.
+Stario is a Python web framework for **real-time hypermedia**. While most frameworks treat HTTP as request → response, Stario treats connections as ongoing conversations - open an SSE stream, push DOM patches, sync reactive signals.
 
 ## Why Stario?
 
-- **Real-time first** — SSE streaming, DOM patching, reactive signals built-in
-- **Hypermedia** — Native [Datastar](https://data-star.dev/) integration, no JavaScript frameworks needed
-- **Simple** — Go-style handlers `(Context, Writer) → None`
-- **Fast** — Built on `httptools` with zstd/brotli/gzip compression
+- **Real-time first** - SSE streaming, DOM patching, reactive signals built-in
+- **Hypermedia** - Native [Datastar](https://data-star.dev/) integration, no JavaScript frameworks needed
+- **Simple** - Go-style handlers `(Context, Writer) → None`
+- **Fast** - Built on `httptools` with zstd/brotli/gzip compression
 
 ## Get Started
 
