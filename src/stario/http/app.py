@@ -459,6 +459,7 @@ class Server:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.setblocking(False)
         sock.bind(self.unix_socket)
+        os.chmod(self.unix_socket, 0o666)
         sock.listen(self.backlog)
         return sock
 
