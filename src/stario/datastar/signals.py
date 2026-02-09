@@ -17,7 +17,7 @@ async def get_signals(r: Request) -> SignalsDict:
     """
     if r.method == "GET":
         data = r.query.get("datastar")
-        if isinstance(data, str):
+        if data is not None:
             result = json.loads(data)
             if isinstance(result, dict):
                 return result

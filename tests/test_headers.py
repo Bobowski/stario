@@ -6,35 +6,29 @@ from stario.http.headers import (
     HEADER_LOOKUP,
     VALUE_LOOKUP,
     Headers,
-    encode_header,
     encode_value,
 )
 
 
-class TestEncodeHeader:
-    """Test header name encoding."""
+class TestHeaderLookup:
+    """Test header name lookup."""
 
     def test_common_header_fast_path(self):
-        # Common headers should use fast lookup
-        result = encode_header("Content-Type")
-        assert result == b"content-type"
+        assert HEADER_LOOKUP["Content-Type"] == b"content-type"
         assert "Content-Type" in HEADER_LOOKUP
 
     def test_lowercase_header(self):
-        result = encode_header("content-type")
-        assert result == b"content-type"
+        assert HEADER_LOOKUP["content-type"] == b"content-type"
 
     def test_custom_header(self):
-        result = encode_header("X-Custom-Header")
-        assert result == b"x-custom-header"
+        assert HEADER_LOOKUP["X-Custom-Header"] == b"x-custom-header"
 
     def test_bytes_header(self):
-        result = encode_header(b"Content-Type")
-        assert result == b"content-type"
+        assert HEADER_LOOKUP[b"Content-Type"] == b"content-type"
 
     def test_invalid_header_raises(self):
         with pytest.raises(ValueError, match="Invalid header name"):
-            encode_header("Header\x00Name")
+            HEADER_LOOKUP["Header\x00Name"]
 
 
 class TestEncodeValue:
@@ -64,22 +58,22 @@ class TestHeaders:
     def test_set_header(self):
         h = Headers()
         h.set("Content-Type", "text/html")
-        assert h.get("Content-Type") == b"text/html"
+        assert h.get("Content-Type") == "text/html"
 
     def test_set_lowercase(self):
         h = Headers()
         h.set("content-type", "text/html")
-        assert h.get("Content-Type") == b"text/html"
+        assert h.get("Content-Type") == "text/html"
 
     def test_set_bytes(self):
         h = Headers()
         h.set(b"content-type", b"text/html")
-        assert h.get(b"content-type") == b"text/html"
+        assert h.get(b"content-type") == "text/html"
 
     def test_add_single(self):
         h = Headers()
         h.add("X-Custom", "value1")
-        assert h.get("X-Custom") == b"value1"
+        assert h.get("X-Custom") == "value1"
 
     def test_add_multiple(self):
         h = Headers()
@@ -88,8 +82,8 @@ class TestHeaders:
 
         values = h.getlist("Set-Cookie")
         assert len(values) == 2
-        assert b"a=1" in values
-        assert b"b=2" in values
+        assert "a=1" in values
+        assert "b=2" in values
 
     def test_get_nonexistent(self):
         h = Headers()
@@ -97,7 +91,7 @@ class TestHeaders:
 
     def test_get_default(self):
         h = Headers()
-        assert h.get("X-Missing", b"default") == b"default"
+        assert h.get("X-Missing", "default") == "default"
 
     def test_getlist_nonexistent(self):
         h = Headers()
@@ -106,13 +100,13 @@ class TestHeaders:
     def test_getlist_single(self):
         h = Headers()
         h.set("Content-Type", "text/html")
-        assert h.getlist("Content-Type") == [b"text/html"]
+        assert h.getlist("Content-Type") == ["text/html"]
 
     def test_update(self):
         h = Headers()
         h.update({"Content-Type": "text/html", "X-Custom": "value"})
-        assert h.get("Content-Type") == b"text/html"
-        assert h.get("X-Custom") == b"value"
+        assert h.get("Content-Type") == "text/html"
+        assert h.get("X-Custom") == "value"
 
     def test_update_none(self):
         h = Headers()
@@ -122,14 +116,14 @@ class TestHeaders:
     def test_setdefault_new(self):
         h = Headers()
         result = h.setdefault("Content-Type", "text/html")
-        assert result == b"text/html"
-        assert h.get("Content-Type") == b"text/html"
+        assert result == "text/html"
+        assert h.get("Content-Type") == "text/html"
 
     def test_setdefault_existing(self):
         h = Headers()
         h.set("Content-Type", "text/plain")
         result = h.setdefault("Content-Type", "text/html")
-        assert result == b"text/plain"  # Original preserved
+        assert result == "text/plain"  # Original preserved
 
     def test_contains(self):
         h = Headers()
@@ -182,13 +176,28 @@ class TestHeadersRaw:
     def test_rset(self):
         h = Headers()
         h.rset(b"content-type", b"text/html")
-        assert h.get(b"content-type") == b"text/html"
+        assert h.get(b"content-type") == "text/html"
 
     def test_radd(self):
         h = Headers()
         h.radd(b"set-cookie", b"a=1")
         h.radd(b"set-cookie", b"b=2")
         assert len(h.getlist(b"set-cookie")) == 2
+
+    def test_rget(self):
+        h = Headers()
+        h.rset(b"content-type", b"text/html")
+        assert h.rget(b"content-type") == b"text/html"
+        assert h.rget(b"x-missing") is None
+        assert h.rget(b"x-missing", b"default") == b"default"
+
+    def test_rgetlist(self):
+        h = Headers()
+        h.radd(b"set-cookie", b"a=1")
+        h.radd(b"set-cookie", b"b=2")
+        values = h.rgetlist(b"set-cookie")
+        assert values == [b"a=1", b"b=2"]
+        assert h.rgetlist(b"x-missing") == []
 
 
 class TestHeaderChaining:
@@ -208,6 +217,6 @@ class TestHeaderChaining:
         h = Headers()
         h.set("A", "1").set("B", "2").add("C", "3")
 
-        assert h.get("A") == b"1"
-        assert h.get("B") == b"2"
-        assert h.get("C") == b"3"
+        assert h.get("A") == "1"
+        assert h.get("B") == "2"
+        assert h.get("C") == "3"

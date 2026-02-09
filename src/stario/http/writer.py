@@ -155,7 +155,7 @@ class CompressionConfig:
     brotli_level: int = 4  # 0-11, negative to disable
     gzip_level: int = 6  # 1-9, negative to disable
 
-    def select(self, accept_encoding: bytes | None) -> Compressor | None:
+    def select(self, accept_encoding: str | None) -> Compressor | None:
         """
         Select compressor for request based on Accept-Encoding.
 
@@ -167,13 +167,13 @@ class CompressionConfig:
 
         accept = accept_encoding.lower()
 
-        if self.zstd_level >= 0 and b"zstd" in accept:
+        if self.zstd_level >= 0 and "zstd" in accept:
             return _Zstd(self.zstd_level, self.min_size)
 
-        if self.brotli_level >= 0 and b"br" in accept:
+        if self.brotli_level >= 0 and "br" in accept:
             return _Brotli(self.brotli_level, self.min_size)
 
-        if self.gzip_level >= 0 and b"gzip" in accept:
+        if self.gzip_level >= 0 and "gzip" in accept:
             return _Gzip(self.gzip_level, self.min_size)
 
         return None
@@ -422,7 +422,7 @@ class Writer:
         if (
             c is None
             or not c.compressible(body)
-            or h.get(b"content-encoding") is not None
+            or h.rget(b"content-encoding") is not None
         ):
             return body
 
@@ -595,7 +595,7 @@ class Writer:
         headers = self.headers
 
         # Determine mode based on existing headers
-        if headers.get(b"content-length") is not None:
+        if headers.rget(b"content-length") is not None:
             # When we know the length, we don't need to use chunked encoding
             headers.remove(b"transfer-encoding")
             self._known_length = True

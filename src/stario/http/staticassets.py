@@ -342,7 +342,7 @@ class StaticAssets:
             return
 
         # Small file: serve from memory with content negotiation
-        accept = c.req.headers.get(b"accept-encoding", b"").lower()
+        accept = c.req.headers.rget(b"accept-encoding", b"").lower()
         body, encoding = self._select_body(f, accept)
 
         if encoding:

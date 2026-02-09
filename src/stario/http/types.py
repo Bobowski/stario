@@ -103,10 +103,9 @@ class Context:
         if self.req.method == "GET":
             # GET: signals in query string
             data = self.req.query.get("datastar")
-            if isinstance(data, str):
+            if data is not None:
                 signals_data = json.loads(data)
             else:
-                # No datastar param or unexpected type
                 signals_data = {}
         else:
             # POST/PUT/etc: signals in JSON body

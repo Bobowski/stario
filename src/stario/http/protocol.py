@@ -80,7 +80,7 @@ class HttpProtocol(asyncio.Protocol):
         loop: asyncio.AbstractEventLoop,
         request_handler: Callable[[Request, Writer], Coroutine[Any, Any, None]],
         get_date_header: Callable[[], bytes],
-        get_compressor: Callable[[bytes | None], Compressor | None],
+        get_compressor: Callable[[str | None], Compressor | None],
         shutdown: asyncio.Future,
         connections: set["HttpProtocol"],
     ) -> None:
@@ -275,7 +275,7 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = None
             return
 
-        if w.headers.get(b"connection") == b"close" or not r.keep_alive:
+        if w.headers.rget(b"connection") == b"close" or not r.keep_alive:
             t.close()
             self._active_request = None
             self._active_writer = None

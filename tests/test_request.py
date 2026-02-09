@@ -32,7 +32,7 @@ class TestRequestHeaders:
 
     def test_with_headers(self):
         req = TestRequest(headers={"Content-Type": "application/json"})
-        assert req.headers.get("Content-Type") == b"application/json"
+        assert req.headers.get("Content-Type") == "application/json"
 
     def test_multiple_headers(self):
         req = TestRequest(
@@ -42,9 +42,9 @@ class TestRequestHeaders:
                 "X-Custom": "value",
             }
         )
-        assert req.headers.get("Content-Type") == b"application/json"
-        assert req.headers.get("Accept") == b"text/html"
-        assert req.headers.get("X-Custom") == b"value"
+        assert req.headers.get("Content-Type") == "application/json"
+        assert req.headers.get("Accept") == "text/html"
+        assert req.headers.get("X-Custom") == "value"
 
 
 class TestRequestQuery:
@@ -56,23 +56,37 @@ class TestRequestQuery:
 
     def test_simple_query(self):
         req = TestRequest(query={"name": "test"})
-        assert req.query["name"] == "test"
+        assert req.query.get("name") == "test"
 
     def test_multiple_params(self):
         req = TestRequest(query={"a": "1", "b": "2", "c": "3"})
-        # Query values are always strings
-        assert req.query["a"] == "1"
-        assert req.query["b"] == "2"
-        assert req.query["c"] == "3"
+        assert req.query.get("a") == "1"
+        assert req.query.get("b") == "2"
+        assert req.query.get("c") == "3"
 
-    def test_query_args_list(self):
+    def test_query_get_default(self):
+        req = TestRequest()
+        assert req.query.get("missing") is None
+        assert req.query.get("missing", "fallback") == "fallback"
+
+    def test_query_getlist(self):
         req = TestRequest(query={"tags": ["a", "b", "c"]})
-        # query_args returns list of tuples
-        args = req.query_args
-        tag_values = [v for k, v in args if k == "tags"]
-        assert "a" in tag_values
-        assert "b" in tag_values
-        assert "c" in tag_values
+        assert req.query.getlist("tags") == ["a", "b", "c"]
+        assert req.query.getlist("missing") == []
+
+    def test_query_contains(self):
+        req = TestRequest(query={"page": "1"})
+        assert "page" in req.query
+        assert "missing" not in req.query
+
+    def test_query_bool_and_len(self):
+        empty = TestRequest()
+        assert not empty.query
+        assert len(empty.query) == 0
+
+        filled = TestRequest(query={"a": "1"})
+        assert filled.query
+        assert len(filled.query) == 1
 
 
 class TestRequestCookies:

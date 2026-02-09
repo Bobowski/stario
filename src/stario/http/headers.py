@@ -2,20 +2,17 @@
 HTTP Headers - Fast, cached header handling.
 
 Headers are stored as lowercased bytes internally for O(1) comparison.
-Common headers and values are pre-encoded at import time for zero-alloc
-fast paths.
+Common headers and values are pre-encoded at import time.
 
-Design decisions:
-- Bytes internally: Avoids repeated encoding in hot paths
+Design:
+- Bytes internally: avoids repeated encoding in hot paths
 - Lowercase keys: HTTP headers are case-insensitive, normalize once
 - Separate header/value lookups: "Accept" is both a header and a Vary value
-- LRU cache for uncommon headers: Bounded memory for dynamic headers
-
-Memory: ~30 KB at import time for pre-encoded lookup tables.
+- HEADER_LOOKUP caches custom header names on miss via __missing__
+- VALUE_LOOKUP uses .get() without caching (values may carry sensitive data)
 """
 
 import re
-from functools import lru_cache
 from typing import Self
 
 # =============================================================================
@@ -327,87 +324,22 @@ ALL_VALUES: tuple[str, ...] = (
 
 
 # =============================================================================
-# LOOKUP DICTIONARY - Maps str -> bytes (headers lowercased, values as-is)
+# VALIDATION — rejects CTLs/newlines to prevent HTTP response splitting.
+# Header names: RFC 9110 "token" — regex matches *invalid* bytes.
+# Header values: reject CTLs except HT (0x09), allow obs-text (0x80-0xFF).
 # =============================================================================
 
-
-def _build_header_lookup() -> dict[str | bytes, bytes]:
-    """
-    Build header lookup: str -> lowercased bytes
-
-    Maps both canonical and lowercase forms:
-        "Content-Type" -> b"content-type"
-        "content-type" -> b"content-type"
-    """
-    lookup: dict[str | bytes, bytes] = {}
-    for header in ALL_HEADERS:
-        header_bytes = header.encode("latin-1")
-        lowered = header.lower()
-        lowered_bytes = lowered.encode("latin-1")
-        lookup[header] = lowered_bytes
-        lookup[header_bytes] = lowered_bytes
-        lookup[lowered] = lowered_bytes
-        lookup[lowered_bytes] = lowered_bytes
-    return lookup
-
-
-def _build_value_lookup() -> dict[str | bytes, bytes]:
-    """
-    Build value lookup: str -> bytes (case-sensitive)
-
-        "text/html" -> b"text/html"
-    """
-    lookup: dict[str | bytes, bytes] = {}
-    for value in ALL_VALUES:
-        value_bytes = value.encode("latin-1")
-        lookup[value] = value_bytes
-        lookup[value_bytes] = value_bytes
-    return lookup
-
-
-# Separate lookups to avoid collisions (e.g. "Accept" is both a header and a Vary value)
-HEADER_LOOKUP: dict[str | bytes, bytes] = _build_header_lookup()
-VALUE_LOOKUP: dict[str | bytes, bytes] = _build_value_lookup()
-
-# =============================================================================
-# ENCODING FUNCTIONS - OPTIMIZED FOR MAX PERFORMANCE
-# =============================================================================
-#
-# Performance strategy:
-# 1. HEADER_LOOKUP/VALUE_LOOKUP: O(1) dict lookup for ~95% of real traffic
-#    Common headers like "Content-Type" are pre-encoded at import time.
-# 2. LRU cache: For custom headers, validate once and cache the result.
-#    512 entries handles most apps without memory bloat.
-# 3. Regex validation: When we miss both caches, regex is faster than
-#    iterating characters in Python.
-#
-# Security: Header names and values are validated to prevent HTTP response
-# splitting attacks. Invalid characters (CTLs, newlines) are rejected.
-# =============================================================================
-
-# Compiled regex patterns for validation (faster than table lookup for actual validation)
-# Header field-names must be valid "token" characters (RFC 9110).
-# This regex matches *invalid* bytes (CTLs + separators), so search() returning a
-# match means the header name is invalid.
-#
-# Note: inside a character class, [ and ] must be escaped to be treated literally.
 HEADER_RE = re.compile(rb'[\x00-\x1f\x7f()<>@,;:\\"/\[\]\?={} \t]')
 HEADER_VALUE_RE = re.compile(b"[\x00-\x08\x0a-\x1f\x7f]")
 
 
-@lru_cache(maxsize=512)
 def _validate_header(name: str | bytes) -> bytes:
-    """
-    Validate and normalize header name to lowercased bytes.
-    Uses regex for fast validation. Cached for custom headers.
-    """
+    """Validate and normalize header name to lowercased bytes."""
     if isinstance(name, str):
         name = name.encode("latin-1")
 
     lowered = name.lower()
 
-    # Regex validation (optimized C code, faster than Python loop)
-    # Returns None if valid (no invalid chars found)
     if HEADER_RE.search(lowered):
         raise ValueError(f"Invalid header name: {name}")
 
@@ -415,10 +347,7 @@ def _validate_header(name: str | bytes) -> bytes:
 
 
 def _validate_value(value: str | bytes) -> bytes:
-    """
-    Validate header value bytes.
-    Uses regex for fast validation. Cached for custom values.
-    """
+    """Validate header value bytes."""
     if isinstance(value, str):
         value = value.encode("latin-1")
 
@@ -428,27 +357,48 @@ def _validate_value(value: str | bytes) -> bytes:
     return value
 
 
-def encode_header(name: str | bytes) -> bytes:
-    """
-    Encode header name to lowercased bytes.
+# =============================================================================
+# LOOKUPS — separate to avoid collisions (e.g. "Accept" is both a header and a Vary value)
+# =============================================================================
 
-    Fast path: O(1) lookup in common headers dict
-    Slow path: regex validation + LRU caching
-    """
-    if encoded := HEADER_LOOKUP.get(name):
-        return encoded
-    return _validate_header(name)
+
+class _HeaderLookup(dict):
+    """Self-populating header name lookup. Bounded to _MAX_SIZE entries."""
+
+    __slots__ = ()
+    _MAX_SIZE = 1024  # ~400 pre-populated + room for ~600 custom
+
+    def __missing__(self, key: str | bytes) -> bytes:
+        result = _validate_header(key)
+        if len(self) < self._MAX_SIZE:
+            self[key] = result
+        return result
+
+
+HEADER_LOOKUP: _HeaderLookup = _HeaderLookup()
+_h = _hb = _lo = _lob = ""
+for _h in ALL_HEADERS:
+    _hb = _h.encode("latin-1")
+    _lo = _h.lower()
+    _lob = _lo.encode("latin-1")
+    HEADER_LOOKUP[_h] = _lob
+    HEADER_LOOKUP[_hb] = _lob
+    HEADER_LOOKUP[_lo] = _lob
+    HEADER_LOOKUP[_lob] = _lob
+
+VALUE_LOOKUP: dict[str | bytes, bytes] = {}
+_v = _vb = ""
+for _v in ALL_VALUES:
+    _vb = _v.encode("latin-1")
+    VALUE_LOOKUP[_v] = _vb
+    VALUE_LOOKUP[_vb] = _vb
+
+del _h, _hb, _lo, _lob, _v, _vb
 
 
 def encode_value(value: str | bytes) -> bytes:
-    """
-    Encode header value to bytes.
-
-    Fast path: O(1) lookup in common values dict
-    Slow path: regex validation + LRU caching
-    """
+    """Encode header value to bytes. Custom values validated per call (not cached)."""
     if encoded := VALUE_LOOKUP.get(value):
-        # print("cache_hit value", value)
         return encoded
     return _validate_value(value)
 
@@ -459,12 +409,7 @@ def encode_value(value: str | bytes) -> bytes:
 
 
 class Headers:
-    """
-    HTTP Headers container storing headers as lowercased bytes.
-
-    - str names/values: encoded via lookup cache
-    - bytes names/values: passed through as-is
-    """
+    """HTTP Headers container. Keys stored as lowercased bytes."""
 
     __slots__ = ("_data",)
 
@@ -472,49 +417,34 @@ class Headers:
         self, raw_header_data: dict[bytes, bytes | list[bytes]] | None = None
     ) -> None:
         """
-        Initialize Headers with an existing mapping of header entries.
-
-        WARNING: If you use this constructor, you must provide the raw header data already
-        in correct, finalized (lowercased ASCII bytes, no conversion), and the dictionary will
-        be used *as is*, with no copying, normalization, or validation.
-
-        This is intended for advanced use-cases where performance is critical and you can guarantee
-        the structure and correctness of the mapping you provide.
+        WARNING: raw_header_data is used as-is with no validation or normalization.
+        Caller must provide lowercased ASCII bytes keys and valid byte values.
         """
         self._data = raw_header_data or {}
 
     def add(self, name: str | bytes, value: str | bytes) -> Self:
         """Add a header (allows multiple values for same name)."""
-        key = encode_header(name)
+        key = HEADER_LOOKUP[name]
         val = encode_value(value)
-        existing = self._data.get(key)
-        if existing is None:
-            self._data[key] = val
-        elif isinstance(existing, list):
-            existing.append(val)
-        else:
-            self._data[key] = [existing, val]
+        if (existing := self._data.setdefault(key, val)) is not val:
+            if isinstance(existing, list):
+                existing.append(val)
+            else:
+                self._data[key] = [existing, val]
         return self
 
     def set(self, name: str | bytes, value: str | bytes) -> Self:
         """Set a header (replaces existing)."""
-        self._data[encode_header(name)] = encode_value(value)
+        self._data[HEADER_LOOKUP[name]] = encode_value(value)
         return self
 
     # -------------------------------------------------------------------------
-    # Raw methods - no encoding/validation, use when you know what you're doing
+    # Raw methods - no encoding/validation
     # -------------------------------------------------------------------------
 
     def radd(self, name: bytes, value: bytes) -> Self:
-        """
-        Add a header without encoding/validation (raw).
-
-        WARNING: Caller must ensure:
-        - name is lowercased bytes (e.g. b"content-type", not b"Content-Type")
-        - value is valid bytes (no control characters except tab)
-        """
-        existing = self._data.setdefault(name, value)
-        if existing is not value:
+        """Add raw header. Caller must provide lowercased name and valid value bytes."""
+        if (existing := self._data.setdefault(name, value)) is not value:
             if isinstance(existing, list):
                 existing.append(value)
             else:
@@ -522,13 +452,7 @@ class Headers:
         return self
 
     def rset(self, name: bytes, value: bytes) -> Self:
-        """
-        Set a header without encoding/validation (raw).
-
-        WARNING: Caller must ensure:
-        - name is lowercased bytes (e.g. b"content-type", not b"Content-Type")
-        - value is valid bytes (no control characters except tab)
-        """
+        """Set raw header. Caller must provide lowercased name and valid value bytes."""
         self._data[name] = value
         return self
 
@@ -537,36 +461,60 @@ class Headers:
             return self
         # Directly add items to _data (faster than calling set repeatedly)
         for name, value in other.items():
-            self._data[encode_header(name)] = encode_value(value)
+            self._data[HEADER_LOOKUP[name]] = encode_value(value)
         return self
 
-    def setdefault(self, name: str | bytes, value: str | bytes) -> bytes:
-        """Set header if not present, return value."""
-        key = encode_header(name)
-        if key not in self._data:
-            self._data[key] = encode_value(value)
-        existing = self._data[key]
-        return existing if isinstance(existing, bytes) else existing[0]
+    def setdefault(self, name: str | bytes, value: str | bytes) -> str:
+        """Set header if not present, return value as string."""
+        key = HEADER_LOOKUP[name]
+        existing = self._data.get(key)
+        if existing is None:
+            val = encode_value(value)
+            self._data[key] = val
+            return val.decode("latin-1")
+        raw = existing if isinstance(existing, bytes) else existing[0]
+        return raw.decode("latin-1")
 
-    def get[T: bytes | None = None](
+    def get[T: str | None = None](
         self, name: str | bytes, default: T = None
-    ) -> T | bytes:
-        """Get first value for header."""
-        value = self._data.get(name if isinstance(name, bytes) else encode_header(name))
+    ) -> T | str:
+        """Get first value for header, decoded as string."""
+        value = self._data.get(name if isinstance(name, bytes) else HEADER_LOOKUP[name])
+        if value is None:
+            return default
+        raw = value if isinstance(value, bytes) else value[0]
+        return raw.decode("latin-1")
+
+    def getlist(self, name: str | bytes) -> list[str]:
+        """Get all values for header, decoded as strings."""
+        value = self._data.get(name if isinstance(name, bytes) else HEADER_LOOKUP[name])
+        if value is None:
+            return []
+        if isinstance(value, bytes):
+            return [value.decode("latin-1")]
+        return [v.decode("latin-1") for v in value]
+
+    # -------------------------------------------------------------------------
+    # Raw read methods - return bytes
+    # -------------------------------------------------------------------------
+
+    def rget[T: bytes | None = None](self, name: bytes, default: T = None) -> T | bytes:
+        """Get first value for header as raw bytes."""
+        value = self._data.get(name)
         if value is None:
             return default
         return value if isinstance(value, bytes) else value[0]
 
-    def getlist(self, name: str | bytes) -> list[bytes]:
-        """Get all values for header."""
-        value = self._data.get(name if isinstance(name, bytes) else encode_header(name))
+    def rgetlist(self, name: bytes) -> list[bytes]:
+        """Get all values for header as raw bytes."""
+        value = self._data.get(name)
         if value is None:
             return []
         return [value] if isinstance(value, bytes) else list(value)
 
     def remove(self, name: str | bytes) -> Self:
         """Remove a header."""
-        self._data.pop(name if isinstance(name, bytes) else encode_header(name), None)
+        self._data.pop(name if isinstance(name, bytes) else HEADER_LOOKUP[name], None)
         return self
 
     def items(self) -> list[tuple[bytes, bytes]]:
@@ -585,7 +533,7 @@ class Headers:
         self._data.clear()
 
     def __contains__(self, name: str | bytes) -> bool:
-        key = name if isinstance(name, bytes) else encode_header(name)
+        key = name if isinstance(name, bytes) else HEADER_LOOKUP[name]
         return key in self._data
 
     def __len__(self) -> int:

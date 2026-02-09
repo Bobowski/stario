@@ -7,14 +7,13 @@ Simple, immutable request data. No connection state.
 import asyncio
 import http.cookies
 import json as json_module
-from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
 from typing import Any
-from urllib.parse import parse_qsl
 
 from stario.exceptions import HttpException
 
 from .headers import Headers
+from .query import QueryParams
 
 
 def _parse_cookies(cookie_string: str) -> dict[str, str]:
@@ -237,8 +236,7 @@ class Request:
         "keep_alive",
         # Parsed data (lazy)
         "_query_bytes",
-        "_query_args",
-        "_query_dict",
+        "_query",
         "_cookies",
         "_signals_cache",
         "_host",
@@ -268,8 +266,7 @@ class Request:
         self.keep_alive = keep_alive
         self._query_bytes = query_bytes
 
-        self._query_args: list[tuple[str, str]] | None = None
-        self._query_dict: dict[str, Any] | None = None
+        self._query: QueryParams | None = None
         self._cookies: dict[str, str] | None = None
         self._signals_cache: dict[str, Any] | None = None
         self._host: str | None = None
@@ -289,10 +286,8 @@ class Request:
         Returns empty string if no Host header is present.
         """
         if self._host is None:
-            host_header = self.headers.get(b"host")
-            if host_header:
-                # Decode and strip port if present
-                host_str = host_header.decode("latin-1")
+            host_str = self.headers.get("host")
+            if host_str:
                 # Handle IPv6 addresses like [::1]:8000
                 if host_str.startswith("["):
                     bracket_end = host_str.find("]")
@@ -312,32 +307,18 @@ class Request:
     # =========================================================================
 
     @property
-    def query(self) -> dict[str, str | list[str]]:
-        """Parsed query string as dict."""
-        if self._query_dict is None:
+    def query(self) -> QueryParams:
+        """Parsed query parameters with consistent access.
 
-            decoded_dict = defaultdict[str, list[str]](list)
-            for k, v in parse_qsl(
-                self._query_bytes.decode("latin-1"),
-                keep_blank_values=True,
-                separator="&",
-            ):
-                decoded_dict[k].append(v)
-            self._query_dict = {
-                k: v if len(v) > 1 else v[0] for k, v in decoded_dict.items()
-            }
-        return self._query_dict
-
-    @property
-    def query_args(self) -> list[tuple[str, str]]:
-        """Query string as list of (key, value) tuples."""
-        if self._query_args is None:
-            self._query_args = parse_qsl(
-                self._query_bytes.decode("latin-1"),
-                keep_blank_values=True,
-                separator="&",
-            )
-        return self._query_args
+        Usage:
+            req.query.get("page")           → str | None
+            req.query.get("page", "1")      → str
+            req.query.getlist("tags")        → list[str]
+            "page" in req.query             → bool
+        """
+        if self._query is None:
+            self._query = QueryParams(self._query_bytes)
+        return self._query
 
     # =========================================================================
     # Cookies
@@ -348,8 +329,7 @@ class Request:
         """Parsed cookies from Cookie header."""
         if self._cookies is None:
             self._cookies = {}
-            for cookie_bytes in self.headers.getlist(b"cookie"):
-                cookie_str = cookie_bytes.decode("latin-1")
+            for cookie_str in self.headers.getlist("cookie"):
                 self._cookies.update(_parse_cookies(cookie_str))
         return self._cookies
 

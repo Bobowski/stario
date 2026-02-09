@@ -293,9 +293,9 @@ async def click(c: Context, w: Writer) -> None:
         w.redirect("/")
         return
 
-    # Query params accessed via c.req.query dict
+    # Query params accessed via c.req.query
     cell_id_param = c.req.query.get("cellId")
-    if cell_id_param is None or isinstance(cell_id_param, list):
+    if cell_id_param is None:
         c("No cell id", {"hint": "pass cellId as query parameter"})
         w.redirect("/")
         return
