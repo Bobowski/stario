@@ -208,6 +208,7 @@ class _WorkerState:
 
     server: asyncio.Server
     connections: set[HttpProtocol]
+    tasks: set[asyncio.Task[None]]
 
 
 @dataclass
@@ -328,7 +329,7 @@ class Server:
             shutdown = asyncio.wrap_future(self._stop)
             state = await self._startup(loop, worker_id, shutdown)
             await shutdown  # Wait for shutdown signal
-            await self._shutdown(loop, worker_id, state)
+            await self._shutdown(worker_id, state)
 
         except threading.BrokenBarrierError:
             pass  # Another worker failed - they logged the error
@@ -350,6 +351,7 @@ class Server:
     ) -> _WorkerState:
         """Create server, sync with other workers, start accepting."""
         connections: set[HttpProtocol] = set()
+        tasks: set[asyncio.Task[None]] = set()
 
         def protocol_factory() -> HttpProtocol:
             return HttpProtocol(
@@ -359,6 +361,7 @@ class Server:
                 self.app._compression.select,
                 shutdown,
                 connections,
+                tasks,
             )
 
         # This is the only expected failure point (port in use, permission denied)
@@ -397,30 +400,59 @@ class Server:
 
         await server.start_serving()
 
-        return _WorkerState(server, connections)
+        return _WorkerState(server, connections, tasks)
 
-    async def _shutdown(
-        self, loop: asyncio.AbstractEventLoop, worker_id: int, state: _WorkerState
-    ) -> None:
-        """Gracefully shutdown: drain connections, close server."""
+    async def _shutdown(self, worker_id: int, state: _WorkerState) -> None:
+        """Gracefully shutdown: close connections, cancel handlers, clean up.
 
-        span = self._shutdown_span
-        if span:
-            span[f"server.worker.{worker_id}.connections"] = len(state.connections)
+        Shutdown sequence:
+        1. Stop accepting new connections
+        2. Wait up to graceful_timeout for handlers to finish
+        3. Force-close remaining connections
+        4. Cancel any handler tasks still running
+        5. Clean up server resources (unix socket, date tick)
 
+        Only stario-managed handler tasks are cancelled. External tasks on
+        the same event loop are never touched, so periodic flushes, metrics
+        collectors, etc. keep running normally.
+        """
+
+        # Stop accepting new connections
         state.server.close()
 
-        if connections := state.connections:
+        # alive() listens to the shutdown future, so handlers already
+        # know to stop. Give them graceful_timeout to finish on their
+        # own (send final SSE event, complete in-flight response, etc.)
+        open_connections = len(state.connections)
+        for _ in range(int(self.graceful_timeout / 0.1)):
+            # Check each 0.1 seconds if the connections are closed
+            if not state.connections:
+                break
 
-            # default alive() listens to disconnect and shutdown
-            # so if they do so they should already know to stop
-            # Give them a chance to clean up / send last message
             await asyncio.sleep(0.1)
 
-            # Force-close remaining connections
-            for conn in connections:
-                if conn.transport and not conn.transport.is_closing():
-                    conn.transport.close()
+        # Force-close remaining connections
+        remaining = [
+            c.transport
+            for c in state.connections
+            if c.transport and not c.transport.is_closing()
+        ]
+        for transport in remaining:
+            transport.close()
+
+        # Cancel handler tasks still running after connections closed
+        stuck = [t for t in state.tasks if not t.done()]
+        for t in stuck:
+            t.cancel()
+        if stuck:
+            await asyncio.gather(*stuck, return_exceptions=True)
+
+        # Log the shutdown metrics
+        if span := self._shutdown_span:
+            w = f"server.worker.{worker_id}"
+            span[f"{w}.connections_at_shutdown"] = open_connections
+            span[f"{w}.connections_force_closed"] = len(remaining)
+            span[f"{w}.handler_tasks_cancelled"] = len(stuck)
 
         await state.server.wait_closed()
 
@@ -428,28 +460,6 @@ class Server:
         if worker_id == 0:
             self._cleanup_unix_socket()
             await self._cleanup_date_tick()
-
-        # Drain pending tasks
-        pending = [
-            t
-            for t in asyncio.all_tasks(loop)
-            if t is not asyncio.current_task() and not t.done()
-        ]
-        if span:
-            span[f"server.worker.{worker_id}.pending_tasks"] = len(pending)
-        if pending:
-            try:
-                async with asyncio.timeout(self.graceful_timeout):
-                    await asyncio.gather(*pending, return_exceptions=True)
-            except TimeoutError:
-
-                timedout = [t for t in pending if not t.done()]
-                if span:
-                    span[f"server.worker.{worker_id}.timedout_tasks"] = len(timedout)
-                for t in timedout:
-                    t.cancel()
-                # Wait for cancellation to complete
-                await asyncio.gather(*timedout, return_exceptions=True)
 
     def _create_unix_socket(self) -> socket.socket:
         """Create and bind Unix socket (called once, shared by all workers)."""

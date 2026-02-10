@@ -2,11 +2,13 @@
 HTTP/1.1 Protocol - Simple, fast.
 
 This module handles the low-level HTTP/1.1 parsing and connection management.
-Uses httptools (Joyent's http-parser via Cython) for parsing.
+Uses httptools (http-parser via Cython) for parsing.
 
 Design decisions:
-- No task tracking: Uses asyncio.all_tasks() at shutdown for simplicity.
-  Individual task tracking adds complexity with minimal benefit for our use case.
+- Task tracking: Handler tasks are registered in a per-worker set shared with
+  the server. During shutdown, connections are closed first (graceful timeout),
+  then any remaining handler tasks are cancelled. Only stario-managed tasks
+  are affected; external tasks on the same loop are never touched.
 - Pipelining support: Requests are queued if the prior response isn't complete.
   This is rare in practice (browsers mostly use concurrent connections), but
   required for HTTP/1.1 compliance.
@@ -73,6 +75,7 @@ class HttpProtocol(asyncio.Protocol):
         "_shutdown",
         "_pipeline",
         "_connections",
+        "_tasks",
     )
 
     def __init__(
@@ -83,6 +86,7 @@ class HttpProtocol(asyncio.Protocol):
         get_compressor: Callable[[str | None], Compressor | None],
         shutdown: asyncio.Future,
         connections: set["HttpProtocol"],
+        tasks: set[asyncio.Task[None]],
     ) -> None:
         self.loop = loop
         self.request_handler = request_handler
@@ -90,6 +94,7 @@ class HttpProtocol(asyncio.Protocol):
         self.get_compressor = get_compressor
         self._shutdown = shutdown
         self._connections = connections
+        self._tasks = tasks
 
         self.parser = httptools.HttpRequestParser(self)
         self.transport: asyncio.Transport | None = None
@@ -240,7 +245,7 @@ class HttpProtocol(asyncio.Protocol):
             self._active_request = request
             self._active_writer = writer
 
-            self.loop.create_task(self.request_handler(request, writer))
+            self._spawn_handler(request, writer)
 
         else:
             # Earlier request has not responded yet, queue it for later
@@ -275,7 +280,11 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = None
             return
 
-        if w.headers.rget(b"connection") == b"close" or not r.keep_alive:
+        if (
+            w.headers.rget(b"connection") == b"close"
+            or not r.keep_alive
+            or self._shutdown.done()
+        ):
             t.close()
             self._active_request = None
             self._active_writer = None
@@ -287,7 +296,7 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = next_w
             self._active_request = next_r
 
-            self.loop.create_task(self.request_handler(next_r, next_w))
+            self._spawn_handler(next_r, next_w)
             self._cancel_timeout()
             t.resume_reading()
         else:
@@ -295,6 +304,12 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = None
             self._reset_timeout()
             t.resume_reading()
+
+    def _spawn_handler(self, request: Request, writer: Writer) -> None:
+        """Create a handler task and register it in the worker's task set."""
+        task = self.loop.create_task(self.request_handler(request, writer))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # =========================================================================
     # Errors
