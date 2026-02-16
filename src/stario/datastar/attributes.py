@@ -7,7 +7,7 @@ The package-level public exports live in `stario.datastar` (`datastar/__init__.p
 
 import json
 from dataclasses import asdict, is_dataclass
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from stario.exceptions import StarioError
 
@@ -156,18 +156,39 @@ JSEvent = Literal[
 class DatastarAttributes:
     """Generator for Datastar data-* attributes."""
 
-    def attr(self, attr_dict: dict[str, str]) -> dict[str, str]:
-        return {"data-attr": js(attr_dict)}
+    @overload
+    def attr(self, key: str, expression: str) -> dict[str, str]: ...
+    @overload
+    def attr(self, key: dict[str, str]) -> dict[str, str]: ...
+    def attr(self, key: str | dict[str, str], expression: str | None = None) -> dict[str, str]:
+        if isinstance(key, str):
+            return {f"data-attr:{key}": expression or ""}
+        return {"data-attr": js(key)}
 
     def bind(self, signal_name: str) -> dict[str, str]:
         return {"data-bind": signal_name}
 
-    def class_(self, class_dict: dict[str, str]) -> dict[str, str]:
-        return {"data-class": js(class_dict)}
+    @overload
+    def class_(self, name: str, expression: str) -> dict[str, str]: ...
+    @overload
+    def class_(self, name: dict[str, str]) -> dict[str, str]: ...
+    def class_(self, name: str | dict[str, str], expression: str | None = None) -> dict[str, str]:
+        if isinstance(name, str):
+            return {f"data-class:{name}": expression or ""}
+        return {"data-class": js(name)}
 
-    def computed(self, computed_dict: dict[str, str]) -> dict[str, str]:
+    @overload
+    def computed(self, key: str, expression: str) -> dict[str, str]: ...
+    @overload
+    def computed(self, key: dict[str, str]) -> dict[str, str]: ...
+    def computed(self, key: str | dict[str, str], expression: str | None = None) -> dict[str, str]:
+        if isinstance(key, str):
+            kebab_key, from_case = to_kebab_key(key)
+            if from_case == "camel":
+                return {f"data-computed:{kebab_key}": expression or ""}
+            return {f"data-computed:{kebab_key}__case.{from_case}": expression or ""}
         kebab_cases = [
-            (to_kebab_key(key), value) for key, value in computed_dict.items()
+            (to_kebab_key(k), value) for k, value in key.items()
         ]
         return {
             (
@@ -399,42 +420,53 @@ class DatastarAttributes:
     def show(self, expression: str) -> dict[str, str]:
         return {"data-show": expression}
 
+    @overload
+    def signals(self, key: str, expression: str, *, ifmissing: bool = ...) -> dict[str, str]: ...
+    @overload
+    def signals(self, key: dict[str, SignalValue] | Any, *, ifmissing: bool = ...) -> dict[str, str]: ...
     def signals(
         self,
-        signals: dict[str, SignalValue] | Any,
+        key: str | dict[str, SignalValue] | Any,
+        expression: str | None = None,
         *,
         ifmissing: bool = False,
     ) -> dict[str, str]:
         """
         Generate data-signals attribute.
 
-        Accepts:
-        - dict: used directly
-        - dataclass instance: converted via asdict()
-        - Pydantic model: converted via model_dump()
-        - Any object with __dict__
+        Single key-value (expression is a Datastar/JS expression):
+            data.signals("count", "0")
+            data.signals("name", s("hello"))
+            data.signals("count", "0", ifmissing=True)
 
-        Examples:
+        Multiple signals (values are Python values, JSON-encoded):
             data.signals({"count": 0, "name": ""})
 
-            @dataclass
-            class FormState:
-                count: int = 0
-                name: str = ""
+        Also accepts dataclass instances, Pydantic models, etc.:
             data.signals(FormState())
-
-            class MyModel(BaseModel):
-                count: int = 0
-            data.signals(MyModel())
         """
-        signals_dict = _to_dict(signals)
-        key = "data-signals__ifmissing" if ifmissing else "data-signals"
+        if isinstance(key, str):
+            kebab_key, from_case = to_kebab_key(key)
+            mods = ""
+            if from_case != "camel":
+                mods += f"__case.{from_case}"
+            if ifmissing:
+                mods += "__ifmissing"
+            return {f"data-signals:{kebab_key}{mods}": expression or ""}
+        signals_dict = _to_dict(key)
+        attr_key = "data-signals__ifmissing" if ifmissing else "data-signals"
         return {
-            key: json.dumps(signals_dict, separators=(",", ":"), ensure_ascii=False)
+            attr_key: json.dumps(signals_dict, separators=(",", ":"), ensure_ascii=False)
         }
 
-    def style(self, style_dict: dict[str, str]) -> dict[str, str]:
-        return {"data-style": js(style_dict)}
+    @overload
+    def style(self, prop: str, expression: str) -> dict[str, str]: ...
+    @overload
+    def style(self, prop: dict[str, str]) -> dict[str, str]: ...
+    def style(self, prop: str | dict[str, str], expression: str | None = None) -> dict[str, str]:
+        if isinstance(prop, str):
+            return {f"data-style:{prop}": expression or ""}
+        return {"data-style": js(prop)}
 
     def text(self, expression: str) -> dict[str, str]:
         return {"data-text": expression}

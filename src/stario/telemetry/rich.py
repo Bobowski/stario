@@ -381,18 +381,22 @@ class RichTracer:
         Render an event: ◆ +time name  key: value key: value
         Or for exceptions: ✗ +time exception  type: X  message: Y + traceback
 
+        Body content (tracebacks, text output) is rendered below the header
+        with a continuation border.
+
         Args:
             indent_parts: List of (text, style) tuples for colored left border
         """
         indent_parts = indent_parts or []
-        exc = event.attributes.get("exc.stacktrace")
+        body = event.body
+        is_exception = isinstance(body, BaseException)
 
         # Build header line: symbol +time name  key: value key: value
         txt = Text()
         if indent_parts:
             txt.append_text(_build_indent(indent_parts))
 
-        if exc is not None:
+        if is_exception:
             # Exception event - use ✗ symbol and red name
             txt.append("✗ ", style="red")
             txt.append(f"+{_fmt_duration(event.time_ns - parent_start)} ", style="dim")
@@ -403,42 +407,54 @@ class RichTracer:
             txt.append(f"+{_fmt_duration(event.time_ns - parent_start)} ", style="dim")
             txt.append(event.name, style="white")
 
-        # Event attributes: key: value (exclude stacktrace object)
-        attrs = {k: v for k, v in event.attributes.items() if k != "exc.stacktrace"}
-        if attrs:
+        # Event attributes: key: value
+        if event.attributes:
             txt.append("  ")
-            for i, (k, v) in enumerate(attrs.items()):
+            for i, (k, v) in enumerate(event.attributes.items()):
                 if i > 0:
                     txt.append(" ")
                 txt.append(f"{k}: ", style="dim")
                 txt.append(str(v), style="white")
 
-        # If no traceback, return just the text line
-        if exc is None:
+        # If no body, return just the header line
+        if body is None:
             return txt
 
-        # Exception with traceback - build multi-part result
+        # Body content - rendered below header with continuation border
         parts: list[RenderableType] = [txt]
+        tb_border_color = indent_parts[-1][1] if indent_parts else "dim"
 
-        tb = getattr(exc, "__traceback__", None)
-        if tb and isinstance(exc, BaseException):
-            traceback_obj = Traceback.from_exception(type(exc), exc, tb, max_frames=4)
-            # Calculate indent width for traceback width calculation
-            indent_width = sum(len(text) for text, _ in indent_parts)
-            # Render traceback and prefix each line with the border
-            tb_width = max(80, self.console.width - indent_width - 4)
-            temp_console = Console(force_terminal=True, no_color=False, width=tb_width)
-            with temp_console.capture() as capture:
-                temp_console.print(traceback_obj, end="")
-            for line in capture.get().splitlines():
-                tb_line = Text()
+        if is_exception:
+            # Exception body - render as rich traceback
+            tb = getattr(body, "__traceback__", None)
+            if tb and isinstance(body, BaseException):
+                traceback_obj = Traceback.from_exception(
+                    type(body), body, tb, max_frames=4
+                )
+                indent_width = sum(len(text) for text, _ in indent_parts)
+                tb_width = max(80, self.console.width - indent_width - 4)
+                temp_console = Console(
+                    force_terminal=True, no_color=False, width=tb_width
+                )
+                with temp_console.capture() as capture:
+                    temp_console.print(traceback_obj, end="")
+                for line in capture.get().splitlines():
+                    body_line = Text()
+                    if indent_parts:
+                        body_line.append_text(_build_indent(indent_parts))
+                    body_line.append("│ ", style=tb_border_color)
+                    body_line.append_text(Text.from_ansi(line))
+                    parts.append(body_line)
+        else:
+            # Text body - render each line with continuation border
+            body_str = str(body) if not isinstance(body, str) else body
+            for line in body_str.splitlines():
+                body_line = Text()
                 if indent_parts:
-                    tb_line.append_text(_build_indent(indent_parts))
-                # Use last border color for the continuation border, or dim
-                tb_border_color = indent_parts[-1][1] if indent_parts else "dim"
-                tb_line.append("│ ", style=tb_border_color)
-                tb_line.append_text(Text.from_ansi(line))
-                parts.append(tb_line)
+                    body_line.append_text(_build_indent(indent_parts))
+                body_line.append("│ ", style=tb_border_color)
+                body_line.append(line, style="dim")
+                parts.append(body_line)
 
         return Group(*parts) if len(parts) > 1 else parts[0]
 

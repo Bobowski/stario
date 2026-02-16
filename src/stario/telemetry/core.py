@@ -17,11 +17,12 @@ Key Concepts:
     - Error status is ONLY set explicitly via span.error
 
 Core API:
-    span("event")   → Create event (stored in span.events list)
-    span[key]       → Get/set attribute
-    span.step(name) → Create child span
-    span.root(name) → Create new detached root span
-    span.error = x  → Set error status
+    span("event")        → Create event (stored in span.events list)
+    span("event", body=) → Create event with content payload
+    span[key]            → Get/set attribute
+    span.step(name)      → Create child span
+    span.root(name)      → Create new detached root span
+    span.error = x       → Set error status
 """
 
 import time
@@ -59,14 +60,19 @@ class Event:
     """
     A point-in-time occurrence within a span.
 
-    Events are simple - just time, name, and attributes.
+    Events are simple - just time, name, attributes, and optional body.
     They cannot fail (no status) - only spans have status.
     Events don't have IDs - they're stored in a span's events list.
+
+    Fields:
+        attributes → Structured metadata (compact, queryable, filterable)
+        body       → Content payload (tracebacks, output, text — human-readable)
     """
 
     time_ns: int
     name: str
     attributes: dict[str, Any] = field(default_factory=dict)
+    body: Any | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,12 +94,13 @@ class Span:
     An operation with duration, events, and status.
 
     Core API:
-        span("event")   → Create event (stored in span.events)
-        span(exception) → Create exception event (does NOT set error status)
-        span[key]       → Get/set attribute
-        span.step(name) → Create child span
-        span.root(name) → Create new detached root span
-        span.error = x  → Set error status (only way to mark span as failed)
+        span("event")        → Create event (stored in span.events)
+        span("event", body=) → Create event with content payload
+        span(exception)      → Create exception event (body=exc, does NOT set error status)
+        span[key]            → Get/set attribute
+        span.step(name)      → Create child span
+        span.root(name)      → Create new detached root span
+        span.error = x       → Set error status (only way to mark span as failed)
 
     Examples:
         # Create span with events
@@ -160,18 +167,26 @@ class Span:
 
     @overload
     def __call__(
-        self, name_or_exc: str, attributes: dict[str, Any] | None = None
+        self,
+        name_or_exc: str,
+        attributes: dict[str, Any] | None = None,
+        *,
+        body: Any | None = None,
     ) -> Event: ...
 
     @overload
     def __call__(
-        self, name_or_exc: BaseException, attributes: dict[str, Any] | None = None
+        self,
+        name_or_exc: BaseException,
+        attributes: dict[str, Any] | None = None,
     ) -> Event: ...
 
     def __call__(
         self,
         name_or_exc: str | BaseException,
         attributes: dict[str, Any] | None = None,
+        *,
+        body: Any | None = None,
     ) -> Event:
         """
         Create an event and add it to this span.
@@ -179,8 +194,13 @@ class Span:
         Events are stored in span.events list.
         Recording an exception does NOT set error status - use span.error for that.
 
+        Args:
+            attributes: Structured metadata (compact, queryable)
+            body: Content payload (tracebacks, output, text — human-readable)
+
         Examples:
             span("cache.hit", {"key": "users:123"})
+            span("build.step", {"step": 3}, body="RUN apt-get install...")
             span(ValueError("invalid input"))  # Records but doesn't set status
         """
         if isinstance(name_or_exc, BaseException):
@@ -188,13 +208,18 @@ class Span:
             attrs = attributes.copy() if attributes else {}
             attrs["exc.type"] = type(exc).__name__
             attrs["exc.message"] = str(exc)
-            attrs["exc.stacktrace"] = exc  # Tracer serializes to stacktrace
-            event = Event(time_ns=time.time_ns(), name="exception", attributes=attrs)
+            event = Event(
+                time_ns=time.time_ns(),
+                name="exception",
+                attributes=attrs,
+                body=exc,  # Tracer renders: RichTracer uses Traceback, JsonTracer formats frames
+            )
         else:
             event = Event(
                 time_ns=time.time_ns(),
                 name=name_or_exc,
                 attributes=attributes.copy() if attributes else {},
+                body=body,
             )
 
         self._events.append(event)

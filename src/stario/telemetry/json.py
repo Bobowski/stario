@@ -27,16 +27,29 @@ def _json_default(obj: Any) -> Any:
     """
     Default serializer for non-JSON-serializable values.
 
-    - Exceptions: serialize to stacktrace (list of frames)
+    Everything non-serializable: cast to str().
+    """
+    return str(obj)
+
+
+def _serialize_body(body: Any) -> Any:
+    """
+    Serialize event body for JSON output.
+
+    - Exceptions: format as stacktrace string
+    - Strings: pass through
     - Everything else: cast to str()
     """
-    if isinstance(obj, BaseException):
-        tb = getattr(obj, "__traceback__", None)
+    if body is None:
+        return None
+    if isinstance(body, BaseException):
+        tb = getattr(body, "__traceback__", None)
         if tb:
-            return [line.rstrip() for line in traceback.format_tb(tb)]
-        return []
-
-    return str(obj)
+            return "".join(traceback.format_exception(type(body), body, tb))
+        return str(body)
+    if isinstance(body, str):
+        return body
+    return str(body)
 
 
 def _serialize_span(span: Span) -> dict[str, Any]:
@@ -60,14 +73,18 @@ def _serialize_span(span: Span) -> dict[str, Any]:
         result["attributes"] = dict(span.attributes)
 
     if span.events:
-        result["events"] = [
-            {
+        events = []
+        for e in span.events:
+            ev: dict[str, Any] = {
                 "time_ns": e.time_ns,
                 "name": e.name,
-                "attributes": dict(e.attributes) if e.attributes else {},
             }
-            for e in span.events
-        ]
+            if e.attributes:
+                ev["attributes"] = dict(e.attributes)
+            if e.body is not None:
+                ev["body"] = _serialize_body(e.body)
+            events.append(ev)
+        result["events"] = events
 
     if span.links:
         result["links"] = [
