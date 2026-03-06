@@ -5,8 +5,6 @@ This module contains small helper types + functions that are shared by
 Datastar attribute and action builders.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import re
 from collections.abc import Iterable

@@ -2,7 +2,7 @@
 
 import json
 
-from stario.datastar import at, data, sse
+from stario.datastar import DATASTAR_CDN_URL, DatastarScript, at, data, sse
 from stario.datastar.format import js
 from stario.html import Div, P, Span, render
 
@@ -305,3 +305,20 @@ class TestDatastarIntegration:
 
         assert "data-signals" in html
         assert "data-text" in html
+
+
+class TestDatastarScriptTag:
+    """Test the shared Datastar CDN script helper."""
+
+    def test_DatastarScript_uses_cdn(self):
+        html = render(DatastarScript())
+
+        assert 'type="module"' in html
+        assert f'src="{DATASTAR_CDN_URL}"' in html
+
+    def test_top_level_export(self):
+        from stario import DatastarScript as top_level_DatastarScript
+
+        html = render(top_level_DatastarScript())
+
+        assert DATASTAR_CDN_URL in html

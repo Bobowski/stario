@@ -15,7 +15,6 @@ Performance notes:
 - Tag instances pre-compute their start/end strings at creation
 """
 
-
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Callable, Iterable
@@ -98,6 +97,41 @@ def escape_attribute_key(k: str) -> str:
         .replace("`", "&#x60;")
         .replace(" ", "&nbsp;")
     )
+
+
+def Comment(
+    content: str | SafeString | int | float | Decimal | None = "",
+) -> SafeString:
+    """
+    Create an HTML comment node.
+
+    Comment text from regular strings is escaped to prevent accidental
+    comment termination (`-->`) and markup injection.
+    """
+    if content is None:
+        comment_text = ""
+    elif type(content) is SafeString:
+        comment_text = content.safe_str
+    elif type(content) is str:
+        comment_text = faster_escape(content)
+    elif isinstance(content, (int, float, Decimal)):
+        comment_text = str(content)
+    else:
+        raise StarioError(
+            f"Invalid comment content type: {type(content).__name__}",
+            context={
+                "content_type": type(content).__name__,
+                "content_value": str(content)[:100],
+            },
+            help_text="Comment content supports: str, SafeString, int, float, Decimal, or None.",
+            example="""from stario.html import Comment, render
+
+render(Comment("Build marker"))
+render(Comment(42))
+render(Comment())""",
+        )
+
+    return SafeString(f"<!--{comment_text}-->")
 
 
 type HtmlElement = (
@@ -225,7 +259,6 @@ class Tag:
                     _key = key.safe_str
                 else:
                     _key = key
-
 
                 if type(val) is str:
                     append_attribute(f' {_key}="{faster_escape(val)}"')
@@ -434,7 +467,6 @@ Div({"style": {"background-color": "#fff"}})    # str
 # Incorrect:
 # Div({"style": {123: "value"}})  # ERROR: Numbers not allowed""",
                 )
-
 
         # Escape value
         if type(value) is str:

@@ -1,15 +1,13 @@
-"""
-Rich Tracer - Beautiful console output for development.
-
-Uses a background thread to batch updates every 0.1s.
-Open spans render live, closed spans print and get cleaned up.
-"""
+"""Rich console tracer with live span rendering."""
 
 import threading
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid7
 
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
@@ -18,12 +16,83 @@ from rich.table import Table
 from rich.text import Text
 from rich.traceback import Traceback
 
-from .core import Event, Span
+from .core import Span
+
+_REFRESH_INTERVAL_S = 0.125
+
+
+@dataclass(slots=True)
+class _RichState:
+    id: UUID
+    name: str
+    parent_id: UUID | None
+    start_ns: int
+    end_ns: int | None = None
+    error: str | None = None
+    attrs: dict[str, Any] = field(default_factory=dict)
+    events: list["_RichEvent"] = field(default_factory=list)
+    links: list["_RichLink"] = field(default_factory=list)
+
+    @property
+    def started(self) -> bool:
+        return self.start_ns != 0
+
+    @property
+    def attributes_for_tracer(self) -> Mapping[str, Any]:
+        return MappingProxyType(self.attrs)
+
+    @property
+    def events_for_tracer(self) -> tuple["_RichEvent", ...]:
+        return tuple(self.events)
+
+    @property
+    def duration_ns(self) -> int | None:
+        if self.end_ns is None:
+            return None
+        return self.end_ns - self.start_ns
+
+    @property
+    def in_progress(self) -> bool:
+        return self.end_ns is None
+
+    @property
+    def finished(self) -> bool:
+        return self.end_ns is not None
+
+    @property
+    def failed(self) -> bool:
+        return self.error is not None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+@dataclass(slots=True)
+class _RichEvent:
+    time_ns: int
+    name: str
+    attributes: dict[str, Any] = field(default_factory=dict)
+    body: Any | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _RichLink:
+    span_id: UUID
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 def _fmt_duration(ns: int) -> str:
-    """Format nanoseconds as duration with unit."""
+    """Format nanoseconds for display."""
+    if ns < 1_000_000:
+        us = ns / 1e3
+        if us < 10:
+            return f"{us:.1f} us"
+        return f"{us:.0f} us"
+
     ms = ns / 1e6
+    if ms < 10:
+        return f"{ms:.1f} ms"
     if ms < 1000:
         return f"{ms:.0f} ms"
     if ms < 60_000:
@@ -35,22 +104,23 @@ def _fmt_duration(ns: int) -> str:
     return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 
-def _get_status_code(span: Span) -> int | None:
-    """Extract HTTP status code from span attributes."""
+def _get_status_code(span: _RichState) -> int | None:
+    """Read status code from known tag keys."""
+    attrs = span.attributes_for_tracer
     for key in (
         "response.status_code",
         "status_code",
     ):
-        if key in span.attributes:
+        if key in attrs:
             try:
-                return int(span.attributes[key])
+                return int(attrs[key])
             except (ValueError, TypeError):
                 pass
     return None
 
 
-def _border_color(span: Span) -> str:
-    """Determine border color based on span state."""
+def _border_color(span: _RichState) -> str:
+    """Choose color for root span."""
     if span.in_progress:
         return "grey50"
 
@@ -71,8 +141,8 @@ def _border_color(span: Span) -> str:
     return "green" if span.ok else "red"
 
 
-def _span_border_color(span: Span) -> str:
-    """Get border color for nested span based on status."""
+def _span_border_color(span: _RichState) -> str:
+    """Choose color for nested span."""
     if span.in_progress:
         return "grey50"
     if span.failed:
@@ -81,35 +151,15 @@ def _span_border_color(span: Span) -> str:
 
 
 def _build_indent(indent_parts: list[tuple[str, str]]) -> Text:
-    """Build styled Text from indent parts (text, style) tuples."""
+    """Build styled indent text."""
     txt = Text()
     for text, style in indent_parts:
         txt.append(text, style=style)
     return txt
 
 
-def _group_attributes(attrs: dict[str, Any]) -> list[tuple[str, str, bool]]:
-    """
-    Group and format attributes by common prefix for compact tree display.
-
-    All dotted keys are grouped by their prefix (all-but-last segment).
-    Keys without dots are shown as flat entries.
-
-    Returns list of (display_key, value, is_header) tuples:
-    - Headers: (prefix, "", True) - group header with no value
-    - Values: (".suffix", value, False) - indented suffix with value
-    - Flat: (full_key, value, False) - standalone key (no dot prefix)
-
-    Example:
-        server.graceful_timeout: 5.0         →  server                (header)
-        server.workers: 1                          .graceful_timeout  5.0
-        server.worker.0.connections: 1             .workers           1
-        response.status_code: 200                server.worker.0      (header)
-        hello: world                               .connections       1
-                                                 response             (header)
-                                                   .status_code       200
-                                                 hello                world (flat)
-    """
+def _group_attributes(attrs: Mapping[str, Any]) -> list[tuple[str, str, bool]]:
+    """Group dotted keys by prefix for compact output."""
     if not attrs:
         return []
 
@@ -143,30 +193,30 @@ def _group_attributes(attrs: dict[str, Any]) -> list[tuple[str, str, bool]]:
 
 
 class RichTracer:
-    """Pretty console output with batched rendering every 0.1s."""
+    """Render spans live in terminal panels."""
 
     __slots__ = (
         "console",
+        "_spans",
         "_roots",
         "_children",
-        "_dirty",
         "_lock",
         "_thread",
         "_running",
+        "_dirty",
         "_live",
-        "_printed",
     )
 
     def __init__(self) -> None:
         self.console = Console()
-        self._roots: dict[UUID, Span] = {}  # Root spans by ID
-        self._children: dict[UUID, list[Span]] = {}  # Children by parent_id
-        self._dirty: set[Span] = set()  # Spans needing update (double-buffer)
+        self._spans: dict[UUID, _RichState] = {}
+        self._roots: dict[UUID, _RichState] = {}  # Root spans by ID
+        self._children: dict[UUID, list[_RichState]] = {}  # Children by parent_id
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
+        self._dirty = False
         self._live: Live | None = None
-        self._printed: set[UUID] = set()  # Track printed spans to avoid duplicates
 
     def __enter__(self) -> "RichTracer":
         self._start()
@@ -175,117 +225,230 @@ class RichTracer:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self._stop()
 
-    def __call__(self, name: str, attributes: dict[str, Any] | None = None) -> Span:
-        """Create a new root span."""
+    def create(
+        self,
+        name: str,
+        attributes: dict[str, Any] | None = None,
+        parent_id: UUID | None = None,
+    ) -> Span:
+        """Create a stopped span handle."""
         if not self._running:
             self._start()
-        return Span(self, name, attributes)
+        span = Span(id=uuid7(), tracer=self)
+        state = _RichState(
+            id=span.id,
+            name=name,
+            parent_id=parent_id,
+            start_ns=0,
+            attrs=attributes.copy() if attributes else {},
+        )
+        with self._lock:
+            self._spans[span.id] = state
+            if parent_id is None:
+                self._roots[span.id] = state
+            else:
+                self._children.setdefault(parent_id, [])
+                if state not in self._children[parent_id]:
+                    self._children[parent_id].append(state)
+        return span
 
-    def notify(self, span: Span) -> None:
-        """Mark span as needing update (lock-free)."""
-        self._dirty.add(span)
+    def start(self, span_id: UUID) -> None:
+        """Mark span as started if this is first start call."""
+        with self._lock:
+            if state := self._spans.get(span_id):
+                if state.start_ns == 0:
+                    state.start_ns = time.time_ns()
+                    self._dirty = True
+
+    def set_attribute(
+        self,
+        span_id: UUID,
+        name: str,
+        value: Any,
+    ) -> None:
+        with self._lock:
+            if state := self._spans.get(span_id):
+                state.attrs[name] = value
+                self._dirty = True
+
+    def set_attributes(
+        self,
+        span_id: UUID,
+        attributes: dict[str, Any],
+    ) -> None:
+        if not attributes:
+            return
+        with self._lock:
+            if state := self._spans.get(span_id):
+                state.attrs.update(attributes)
+                self._dirty = True
+
+    def add_event(
+        self,
+        span_id: UUID,
+        name: str,
+        attributes: dict[str, Any] | None = None,
+        *,
+        body: Any | None = None,
+    ) -> None:
+        event = _RichEvent(
+            time_ns=time.time_ns(),
+            name=name,
+            attributes=attributes.copy() if attributes else {},
+            body=body,
+        )
+        with self._lock:
+            if state := self._spans.get(span_id):
+                state.events.append(event)
+                self._dirty = True
+
+    def add_link(
+        self,
+        span_id: UUID,
+        target_span_id: UUID,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        link = _RichLink(
+            span_id=target_span_id, attributes=attributes.copy() if attributes else {}
+        )
+        with self._lock:
+            if state := self._spans.get(span_id):
+                state.links.append(link)
+                self._dirty = True
+
+    def fail(self, span_id: UUID, message: str) -> None:
+        with self._lock:
+            if state := self._spans.get(span_id):
+                state.error = message
+                self._dirty = True
+
+    def set_name(self, span_id: UUID, name: str) -> None:
+        with self._lock:
+            if state := self._spans.get(span_id):
+                state.name = name
+                self._dirty = True
+
+    def end(self, span_id: UUID) -> None:
+        with self._lock:
+            if state := self._spans.get(span_id):
+                if state.start_ns == 0:
+                    raise RuntimeError(
+                        "Cannot end a span that was never started. "
+                        "Call span.start() or use the span as a context manager."
+                    )
+                if state.end_ns is None:
+                    state.end_ns = time.time_ns()
+                    self._dirty = True
 
     def _start(self) -> None:
-        """Start background render thread."""
+        """Start the fixed-interval render watcher."""
         with self._lock:
             if self._running:
                 return
             self._running = True
+            self._dirty = True
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
 
     def _stop(self) -> None:
-        """Stop and render any remaining spans."""
-        self._running = False
-        if self._thread:
+        """Stop watcher and flush pending output."""
+        with self._lock:
+            self._running = False
+        if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
-        self._flush_remaining()
+        self.flush()
 
     def flush(self) -> None:
-        """Force render of all pending spans. Call before program exit."""
-        # Give background thread time to pick up recent spans
-        time.sleep(0.15)
-        # Then flush anything remaining
-        self._flush_remaining()
-
-    def _flush_remaining(self) -> None:
-        """Process and print any remaining dirty spans."""
-        if self._live:
-            self._live.stop()
-            self._live = None
-        # Process any remaining dirty spans
-        for span in self._dirty:
-            if span.parent_id is None:
-                self._roots[span.id] = span
-        # Print remaining roots (skip already printed)
-        for span in self._roots.values():
-            if span.id not in self._printed:
-                self.console.print(self._panel(span))
-        self._roots.clear()
-        self._children.clear()
-        self._dirty.clear()
-        self._printed.clear()
+        """Flush pending output."""
+        with self._lock:
+            self._stop_live_locked()
+            remaining = [span for span in self._roots.values() if span.started]
+            self._print_roots_locked(remaining)
+            self._roots.clear()
+            self._children.clear()
+            self._spans.clear()
+            self._dirty = False
 
     def _loop(self) -> None:
-        """Background thread: render every 0.1s."""
-        while self._running:
-            start = time.perf_counter()
-
-            # Swap dirty set (double-buffer, only lock during swap)
+        """Render dirty state on a fixed interval."""
+        while True:
+            started_at = time.perf_counter()
             with self._lock:
-                dirty = self._dirty
-                self._dirty = set()
+                if not self._running:
+                    return
+                if self._dirty:
+                    self._render_locked()
 
-            if dirty:
-                # Update tracking from dirty spans (now single-threaded)
-                for span in dirty:
-                    if span.parent_id is None:
-                        self._roots[span.id] = span
-                    else:
-                        self._children.setdefault(span.parent_id, [])
-                        if span not in self._children[span.parent_id]:
-                            self._children[span.parent_id].append(span)
-                self._render()
-
-            # Sleep remaining time to maintain 0.1s interval
-            elapsed = time.perf_counter() - start
-            if (remaining := 0.1 - elapsed) > 0:
+            if (remaining := _REFRESH_INTERVAL_S - (time.perf_counter() - started_at)) > 0:
                 time.sleep(remaining)
 
     def _render(self) -> None:
-        """Render: print closed roots, live-update open ones."""
-        # Stop live before printing (avoids duplicate output)
-        if self._live:
+        """Render one watcher tick."""
+        with self._lock:
+            self._render_locked()
+
+    def _render_locked(self) -> None:
+        """Print finished roots and keep only in-progress roots live."""
+        closed_roots = [
+            span for span in self._roots.values() if span.started and span.finished
+        ]
+        open_roots = [
+            span for span in self._roots.values() if span.started and span.in_progress
+        ]
+
+        if open_roots or closed_roots or self._live is not None:
+            renderable = self._live_renderable(open_roots)
+            if self._live is None:
+                self._live = Live(
+                    renderable,
+                    console=self.console,
+                    transient=True,
+                    auto_refresh=False,
+                )
+                self._live.start()
+            else:
+                self._live.update(renderable, refresh=True)
+
+        if closed_roots:
+            closed_panels = [(span, self._panel(span)) for span in closed_roots]
+            self._print_roots_locked(closed_roots, panels=closed_panels)
+
+        self._dirty = False
+
+    def _live_renderable(self, open_roots: list[_RichState]) -> RenderableType:
+        """Build the live region, keeping a single blank line when idle."""
+        if not open_roots:
+            return Text(" ")
+        return Group(*(self._panel(span) for span in open_roots))
+
+    def _stop_live_locked(self) -> None:
+        """Stop the active live region, if any."""
+        if self._live is not None:
             self._live.stop()
             self._live = None
 
-        # Print and cleanup closed roots
-        for span_id in list(self._roots.keys()):
-            span = self._roots[span_id]
-            if span.finished and span_id not in self._printed:
-                self.console.print(self._panel(span))
-                self._printed.add(span_id)
-                self._cleanup(span_id)
-
-        # Live display for open roots
-        open_roots = [s for s in self._roots.values() if s.in_progress]
-        if open_roots:
-            self._live = Live(
-                Group(*[self._panel(s) for s in open_roots]),
-                console=self.console,
-                transient=True,
-            )
-            self._live.start()
+    def _print_roots_locked(
+        self,
+        spans: list[_RichState],
+        *,
+        panels: list[tuple[_RichState, Panel]] | None = None,
+    ) -> None:
+        """Print root panels and forget their tracked subtrees."""
+        panel_map = {span.id: panel for span, panel in panels or []}
+        for span in spans:
+            self.console.print(panel_map.get(span.id) or self._panel(span))
+            self._cleanup(span.id)
 
     def _cleanup(self, span_id: UUID) -> None:
-        """Remove span and its children from tracking."""
+        """Drop a root subtree from tracking."""
         self._roots.pop(span_id, None)
+        self._spans.pop(span_id, None)
         for child in self._children.pop(span_id, []):
             self._cleanup(child.id)
 
-    def _panel(self, span: Span) -> Panel:
-        """Build panel for a root span."""
+    def _panel(self, span: _RichState) -> Panel:
+        """Build root panel."""
         color = _border_color(span)
         time_str = datetime.fromtimestamp(span.start_ns / 1e9).strftime("%H:%M:%S.%f")[
             :-3
@@ -314,13 +477,14 @@ class RichTracer:
             padding=(0, 1),
         )
 
-    def _root_content(self, span: Span) -> RenderableType:
-        """Build content for root span panel."""
+    def _root_content(self, span: _RichState) -> RenderableType:
+        """Build root panel body."""
         parts: list[RenderableType] = []
 
         # Grouped attributes in 2-column layout
-        if span.attributes:
-            parts.append(self._attributes_table(span.attributes))
+        attrs = span.attributes_for_tracer
+        if attrs:
+            parts.append(self._attributes_table(attrs))
 
         # Events and child spans sorted by time
         nested = self._nested_items(span)
@@ -329,8 +493,8 @@ class RichTracer:
 
         return Group(*parts) if len(parts) > 1 else (parts[0] if parts else Text(""))
 
-    def _attributes_table(self, attrs: dict[str, Any]) -> Table:
-        """Build 2-column table with grouped attributes in compact tree format."""
+    def _attributes_table(self, attrs: Mapping[str, Any]) -> Table:
+        """Build two-column attributes table."""
         table = Table.grid(padding=(0, 2))
         table.add_column(style="dim", no_wrap=True)  # Keys in dim
         table.add_column(style="white")  # Values in white
@@ -348,11 +512,13 @@ class RichTracer:
 
         return table
 
-    def _nested_items(self, span: Span) -> RenderableType | None:
-        """Build nested events and child spans sorted by timestamp."""
-        items: list[tuple[int, Event | Span]] = []
-        items.extend((e.time_ns, e) for e in span.events)
-        items.extend((c.start_ns, c) for c in self._children.get(span.id, []))
+    def _nested_items(self, span: _RichState) -> RenderableType | None:
+        """Build nested children and events sorted by time."""
+        items: list[tuple[int, _RichEvent | _RichState]] = []
+        items.extend((e.time_ns, e) for e in span.events_for_tracer)
+        items.extend(
+            (c.start_ns, c) for c in self._children.get(span.id, []) if c.started
+        )
 
         if not items:
             return None
@@ -361,7 +527,7 @@ class RichTracer:
         parts: list[RenderableType] = []
 
         for _, item in items:
-            if isinstance(item, Event):
+            if isinstance(item, _RichEvent):
                 # Root level events - no indent
                 parts.append(self._event_block(item, span.start_ns, indent_parts=[]))
             else:
@@ -373,20 +539,11 @@ class RichTracer:
 
     def _event_block(
         self,
-        event: Event,
+        event: _RichEvent,
         parent_start: int,
         indent_parts: list[tuple[str, str]] | None = None,
     ) -> RenderableType:
-        """
-        Render an event: ◆ +time name  key: value key: value
-        Or for exceptions: ✗ +time exception  type: X  message: Y + traceback
-
-        Body content (tracebacks, text output) is rendered below the header
-        with a continuation border.
-
-        Args:
-            indent_parts: List of (text, style) tuples for colored left border
-        """
+        """Render one event line (plus optional body)."""
         indent_parts = indent_parts or []
         body = event.body
         is_exception = isinstance(body, BaseException)
@@ -460,25 +617,11 @@ class RichTracer:
 
     def _nested_span_block(
         self,
-        span: Span,
+        span: _RichState,
         parent_start: int,
         indent_parts: list[tuple[str, str]] | None = None,
     ) -> RenderableType:
-        """
-        Render a nested span: ● +time name (duration)
-        With colored left border for nested content (attributes, events, sub-spans).
-
-        Args:
-            indent_parts: List of (text, style) tuples for colored left border
-
-        Structure:
-        ● +0 ms db.connect (55 ms)
-        │ db.host: localhost          (│ colored by span status)
-        │ db.type: postgres
-        │ ◆ +10 ms query.executed  rows: 1
-        │ ● +20 ms sub.span (30 ms)
-        │ │ ...nested content...      (inner │ colored by sub.span status)
-        """
+        """Render a nested span block recursively."""
         indent_parts = indent_parts or []
 
         # Shape and color based on status
@@ -512,8 +655,9 @@ class RichTracer:
         child_indent_parts = indent_parts + [("│ ", border_color)]
 
         # Attributes with colored left border in compact tree format
-        if span.attributes:
-            for display_key, value, is_header in _group_attributes(span.attributes):
+        attrs = span.attributes_for_tracer
+        if attrs:
+            for display_key, value, is_header in _group_attributes(attrs):
                 attr_line = Text()
                 attr_line.append_text(_build_indent(child_indent_parts))
                 if is_header:
@@ -530,15 +674,15 @@ class RichTracer:
                 parts.append(attr_line)
 
         # Events and child spans sorted by time
-        children = self._children.get(span.id, [])
-        items: list[tuple[int, Event | Span]] = []
-        items.extend((e.time_ns, e) for e in span.events)
+        children = [child for child in self._children.get(span.id, []) if child.started]
+        items: list[tuple[int, _RichEvent | _RichState]] = []
+        items.extend((e.time_ns, e) for e in span.events_for_tracer)
         items.extend((c.start_ns, c) for c in children)
 
         if items:
             items.sort(key=lambda x: x[0])
             for _, item in items:
-                if isinstance(item, Event):
+                if isinstance(item, _RichEvent):
                     # Events get the child indent
                     event_block = self._event_block(
                         item, span.start_ns, indent_parts=child_indent_parts

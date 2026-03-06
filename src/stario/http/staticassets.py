@@ -1,8 +1,6 @@
 """
 StaticAssets - Serve static files with fingerprinted URLs.
 
-Global asset() function for easy URL lookup from anywhere.
-
 Features:
 - Fingerprinted URLs for cache busting
 - In-memory caching for small files (< 1MB by default)
@@ -11,19 +9,10 @@ Features:
 - Immutable cache headers
 
 Usage:
-    from stario.http.staticassets import StaticAssets, asset
+    app.assets("/static", "./static", name="static")
 
-    # Create and mount (registers to global lookup)
-    static = StaticAssets("./static", collection="static")
-    app.get("/static/*", static)
-
-    # Use anywhere in your code
-    asset("style.css")  # "style.abc123.css"
-    asset("js/app.js")  # "js/app.def456.js"
-
-    # Multiple collections
-    uploads = StaticAssets("./uploads", collection="uploads")
-    asset("photo.jpg", collection="uploads")
+    # Build the final public URL from the app:
+    app.url_for("static", "style.css")  # "/static/style.abc123.css"
 """
 
 import zlib
@@ -108,9 +97,6 @@ _DEFAULT_CACHE_MAX_SIZE: Final = 1 << 20  # 1MB
 _DEFAULT_COMPRESS_MIN_SIZE: Final = 256  # Don't compress tiny files
 _DEFAULT_FILESYSTEM_CHUNK_SIZE: Final = 65536
 
-# Global registry: collection name -> StaticAssets instance
-_collections: dict[str, "StaticAssets"] = {}
-
 
 @dataclass(slots=True)
 class CachedFile:
@@ -131,34 +117,6 @@ class CachedFile:
     zstd: bytes | None = None
     brotli: bytes | None = None
     gzip: bytes | None = None
-
-
-def asset(filename: str, collection: str = "static") -> str:
-    """
-    Get the fingerprinted filename for a static asset.
-
-    Args:
-        filename: Original filename relative to collection root
-        collection: Collection name (default "static")
-
-    Returns:
-        Fingerprinted filename (e.g., "style.abc123.css")
-
-    Raises:
-        KeyError: If collection is not registered
-        ValueError: If file not found in collection
-
-    Example:
-        asset("style.css")  # "style.abc123.css"
-        asset("js/app.js")  # "js/app.def456.js"
-        asset("photo.jpg", collection="uploads")
-    """
-    if collection not in _collections:
-        raise KeyError(
-            f"Collection '{collection}' not registered. "
-            f"Available: {list(_collections.keys())}"
-        )
-    return _collections[collection].url(filename)
 
 
 def fingerprint(path: Path, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) -> str:
@@ -183,15 +141,10 @@ class StaticAssets:
     Usage:
         static = StaticAssets("./static")
         app.get("/static/*", static)
-
-        # In templates/anywhere:
-        from stario.http.staticassets import asset
-        asset("style.css")  # "style.abc123.css"
     """
 
     __slots__ = (
         "directory",
-        "collection",
         "cache_max_size",
         "_cache_control_bytes",
         "_path_to_hash",
@@ -201,12 +154,10 @@ class StaticAssets:
     def __init__(
         self,
         directory: Path | str = "./static",
-        collection: str = "static",
         cache_control: str = "public, max-age=31536000, immutable",
         cache_max_size: int = _DEFAULT_CACHE_MAX_SIZE,
     ) -> None:
         self.directory = Path(directory).resolve()
-        self.collection = collection
         self.cache_max_size = cache_max_size
         self._cache_control_bytes = cache_control.encode()
 
@@ -235,9 +186,6 @@ class StaticAssets:
 
             self._path_to_hash[relative_path.as_posix()] = hashed_name
             self._cache[hashed_key] = self._create_cached_file(p)
-
-        # Register to global lookup
-        _collections[collection] = self
 
     def _create_cached_file(self, path: Path) -> CachedFile:
         """Create cached file entry - in-memory for small, metadata-only for large."""
@@ -378,6 +326,6 @@ class StaticAssets:
         available = list(self._path_to_hash.keys())[:5]
         raise StarioError(
             f"Static file not found: '{filename}'",
-            context={"filename": filename, "collection": self.collection},
+            context={"filename": filename},
             help_text=f"Available files: {available}{'...' if len(self._path_to_hash) > 5 else ''}",
         )

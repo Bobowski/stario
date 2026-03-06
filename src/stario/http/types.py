@@ -1,10 +1,10 @@
-import json
-from contextlib import contextmanager
+import asyncio
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, overload
+from typing import TYPE_CHECKING, Any, Protocol
 
 from stario.datastar.parse import parse_signals
-from stario.telemetry.core import Event, Span
+from stario.telemetry.core import Span
 
 from .request import Request
 from .writer import Writer
@@ -13,112 +13,62 @@ if TYPE_CHECKING:
     from .app import Stario
 
 
+class CreateTask(Protocol):
+    def __call__[T](
+        self,
+        coro: Coroutine[Any, Any, T],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[T]: ...
+
+
+type UrlQueryScalar = str | int | float | bool
+type UrlQueryValue = UrlQueryScalar | list[UrlQueryScalar] | tuple[UrlQueryScalar, ...]
+type UrlQueryParams = Mapping[str, UrlQueryValue]
+
+
+class UrlFor(Protocol):
+    def __call__(
+        self,
+        name: str,
+        path: str | None = None,
+        queries: UrlQueryParams | None = None,
+    ) -> str: ...
+
+
 @dataclass(slots=True)
 class Context:
     """Context for HTTP requests."""
 
-    app: Stario
+    app: "Stario"
     req: Request
     span: Span
     state: dict[str, Any]
-    _span_stack: list[Span] = field(default_factory=list, repr=False)
-
-    # =========================================================================
-    # Telemetry convenience (explicit, no ambient "magic")
-    # =========================================================================
-
-    @property
-    def current(self) -> Span:
-        """The current span target (request span if not in a step)."""
-        if self._span_stack:
-            return self._span_stack[-1]
-        return self.span
-
-    @overload
-    def __call__(
-        self, name_or_exc: str, attributes: dict[str, Any] | None = None
-    ) -> Event: ...
-
-    @overload
-    def __call__(
-        self, name_or_exc: BaseException, attributes: dict[str, Any] | None = None
-    ) -> Event: ...
-
-    def __call__(
-        self,
-        name_or_exc: str | BaseException,
-        attributes: dict[str, Any] | None = None,
-    ) -> Event:
-        """
-        Record an event (or exception) on the *current* span.
-
-        The request-level span is always available as `c.span`.
-        """
-        return self.current(name_or_exc, attributes)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        """Set an attribute on the *current* span."""
-        self.current[key] = value
-
-    @contextmanager
-    def step(
-        self, name: str, attributes: dict[str, Any] | None = None
-    ) -> Iterator[Span]:
-        """
-        Create a child span and make it current within the block.
-
-        Example:
-            with c.step("db.query", {"sql": "..."}) as s:
-                c("cache.miss")
-                c["rows"] = 10
-        """
-        child = self.current.step(name, attributes)
-        self._span_stack.append(child)
-        try:
-            with child:
-                yield child
-        finally:
-            # Always pop even if the child span recorded an exception in __exit__
-            if self._span_stack and self._span_stack[-1] is child:
-                self._span_stack.pop()
-            else:
-                # Defensive: keep stack consistent even if mis-nested.
-                try:
-                    self._span_stack.remove(child)
-                except ValueError:
-                    pass
+    # Create a server-managed task tied to this worker's shutdown lifecycle.
+    create_task: CreateTask = field(repr=False)
 
     # =========================================================================
     # Datastar Signals
     # =========================================================================
 
-    @overload
-    async def signals(self) -> dict[str, Any]: ...
+    def url_for(
+        self,
+        name: str,
+        path: str | None = None,
+        queries: UrlQueryParams | None = None,
+    ) -> str:
+        """Resolve a named route or asset URL through the current app."""
+        return self.app.url_for(name, path, queries=queries)
 
-    @overload
-    async def signals[T](self, schema: type[T]) -> T: ...
-
-    async def signals[T](self, schema: type[T] | None = None) -> T | dict[str, Any]:
+    async def signals[T](self, schema: type[T] = dict[str, Any]) -> T:
         """Get Datastar signals from request."""
+
         if self.req.method == "GET":
-            # GET: signals in query string
-            data = self.req.query.get("datastar")
-            if data is not None:
-                signals_data = json.loads(data)
-            else:
-                signals_data = {}
+            raw = self.req.query.get("datastar", "")
         else:
-            # POST/PUT/etc: signals in JSON body
-            try:
-                signals_data = await self.req.json()
-            except (json.JSONDecodeError, ValueError):
-                signals_data = {}
+            raw = await self.req.body()
 
-        if schema is None:
-            return signals_data
-
-        return parse_signals(signals_data, schema)
-
+        return parse_signals(raw, schema)
 
 type Handler = Callable[[Context, Writer], Awaitable[None]]
 

@@ -4,6 +4,7 @@ Query Parameters - Parsed query string with consistent access.
 .get() for first value, .getlist() for all. Always returns str.
 """
 
+from typing import overload
 from urllib.parse import unquote_plus as _unquote_plus
 
 
@@ -54,7 +55,13 @@ class QueryParams:
     def __init__(self, raw: bytes) -> None:
         self._data = _parse_query(raw)
 
-    def get(self, key: str, default: str | None = None) -> str | None:
+    @overload
+    def get(self, key: str) -> str | None: ...
+
+    @overload
+    def get[T](self, key: str, default: T) -> str | T: ...
+
+    def get[T](self, key: str, default: T | None = None) -> str | T | None:
         """First value for key, or default."""
         vals = self._data.get(key)
         return vals[0] if vals else default

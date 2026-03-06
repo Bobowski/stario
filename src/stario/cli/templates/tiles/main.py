@@ -1,6 +1,4 @@
-import asyncio
 import random
-import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,18 +8,19 @@ from pathlib import Path
 # - Writer: response writer (html, sse patches, redirects, status codes)
 # - Stario: the app instance - register routes and serve
 # - at/data: Datastar helpers for reactive attributes (@get, @post, data-*)
-# - asset: fingerprinted static file names for cache busting
+# - UrlFor: typed callable for reverse routing in views/components
 # - Relay: in-process pub/sub for broadcasting between connections
 from stario import (
     Context,
-    JsonTracer,
     Relay,
-    RichTracer,
     Stario,
+    UrlFor,
     Writer,
-    asset,
     at,
     data,
+)
+from stario import (
+    Span as TraceSpan,
 )
 
 # HTML elements - call like functions, first arg is attrs dict (optional)
@@ -96,8 +95,8 @@ def color_for_user(user_id: str) -> str:
 # Datastar patches the DOM efficiently, so re-rendering the whole page is cheap.
 
 
-def page(*children):
-    """Base HTML page with Datastar and styles."""
+def page(url_for: UrlFor, *children):
+    """Base HTML page with Datastar and styles served from static assets."""
     return Html(
         {"lang": "en"},
         Head(
@@ -106,10 +105,8 @@ def page(*children):
                 {"name": "viewport", "content": "width=device-width, initial-scale=1"}
             ),
             Title("Tiles - Stario App"),
-            # asset() returns fingerprinted filename (e.g., style.abc123.css)
-            # for cache busting - files change, URLs change, caches invalidate
-            Link({"rel": "stylesheet", "href": "/static/" + asset("css/style.css")}),
-            Script({"type": "module", "src": "/static/" + asset("js/datastar.js")}),
+            Link({"rel": "stylesheet", "href": url_for("static", "css/style.css")}),
+            Script({"type": "module", "src": url_for("static", "js/datastar.js")}),
         ),
         Body(*children),
     )
@@ -129,7 +126,7 @@ def cell_view(cell_id: int, color: str | None):
     return Div({"class": "cell", "data-cell-id": str(cell_id)})
 
 
-def board_view():
+def board_view(url_for: UrlFor):
     """The game board - a grid of cells."""
     rows = []
     for row in range(GRID_SIZE):
@@ -150,9 +147,9 @@ def board_view():
         {"id": "board", "class": board_class},
         data.on(
             "click",
-            """
+            f"""
             let id = evt.target.dataset.cellId;
-            if (id) @post(`/click?cellId=${id}`);
+            if (id) {{ @post(`{url_for("click")}?cellId=${{id}}`); }}
             """,
         ),
         *rows,
@@ -190,9 +187,10 @@ def info_panel_view(user_id: str):
     )
 
 
-def home_view(user_id: str):
+def home_view(user_id: str, url_for: UrlFor):
     """Full home page - user_id passed via signals for SSE."""
     return page(
+        url_for,
         Div(
             {"id": "home", "class": "container"},
             # Signals: client-side reactive state synced with server.
@@ -200,7 +198,7 @@ def home_view(user_id: str):
             # Signals are automatically sent with every @get/@post request.
             data.signals({"user_id": user_id}, ifmissing=True),
             # data.init() runs on element mount - here it opens SSE connection.
-            data.init(at.get("/subscribe", retry="always")),
+            data.init(at.get(url_for("subscribe"), retry="always")),
             # Main content
             H1("Tiles - Stario App"),
             P(
@@ -208,7 +206,7 @@ def home_view(user_id: str):
                 "Click cells to paint. Everyone sees changes live!",
             ),
             info_panel_view(user_id),
-            board_view(),
+            board_view(url_for),
             toy_inspector("bottom-right"),
         ),
     )
@@ -236,10 +234,10 @@ async def home(c: Context, w: Writer) -> None:
     # Generate unique user_id, passed to client via signals
     user_id = str(uuid.uuid4())[:8]
     # Set context state for reactive attributes
-    c["user_id"] = user_id
+    c.span.attr("user_id", user_id)
 
     # w.html() sends a full HTML response (Content-Type: text/html)
-    w.html(home_view(user_id))
+    w.html(home_view(user_id, c.url_for))
 
 
 async def subscribe(c: Context, w: Writer) -> None:
@@ -256,32 +254,34 @@ async def subscribe(c: Context, w: Writer) -> None:
     # c.signals() parses signals from request (sent automatically by Datastar @get/@post)
     signals = await c.signals(HomeSignals)
     if not signals.user_id:
-        c("No user id", {"hint": "user had to change some thing manually"})
-        w.redirect("/")
+        c.span.event(
+            "No user id", attributes={"hint": "user had to change some thing manually"}
+        )
+        w.redirect(c.url_for("home"))
         return
 
     # Add user and notify everyone (including this new user)
     users.add(signals.user_id)
     relay.publish("join", signals.user_id)
-    c("on_join", {"user_id": signals.user_id})
-    c["user_id"] = signals.user_id
+    c.span.event("on_join", attributes={"user_id": signals.user_id})
+    c.span.attr("user_id", signals.user_id)
 
     # w.patch() sends SSE with Datastar merge fragments
     # Elements matched by id are updated in-place
-    w.patch(home_view(signals.user_id))
-    c("onload patch")
+    w.patch(home_view(signals.user_id, c.url_for))
+    c.span.event("onload patch")
 
     # w.alive() wraps an async iterator and yields until client disconnects.
     # relay.subscribe() yields each time someone publishes to "update" topic.
     # When client disconnects, the loop exits cleanly (no exception).
     async for event, user_id in w.alive(relay.subscribe("*")):
-        c("on_event", {"event": event, "user_id": user_id})
-        w.patch(home_view(signals.user_id))
+        c.span.event("on_event", attributes={"event": event, "user_id": user_id})
+        w.patch(home_view(signals.user_id, c.url_for))
 
     # Code after the loop runs on disconnect - perfect for cleanup
     users.discard(signals.user_id)
     relay.publish("leave", signals.user_id)
-    c("on_leave", {"user_id": signals.user_id})
+    c.span.event("on_leave", attributes={"user_id": signals.user_id})
 
 
 async def click(c: Context, w: Writer) -> None:
@@ -289,22 +289,25 @@ async def click(c: Context, w: Writer) -> None:
     # Signals come from Datastar (auto-included in @post requests)
     signals = await c.signals(HomeSignals)
     if not signals.user_id or signals.user_id not in users:
-        c("No user id or user not connected", {"user_id": signals.user_id})
-        w.redirect("/")
+        c.span.event(
+            "No user id or user not connected", attributes={"user_id": signals.user_id}
+        )
+        w.redirect(c.url_for("home"))
         return
 
     # Query params accessed via c.req.query
     cell_id_param = c.req.query.get("cellId")
     if cell_id_param is None:
-        c("No cell id", {"hint": "pass cellId as query parameter"})
-        w.redirect("/")
+        c.span.event(
+            "No cell id", attributes={"hint": "pass cellId as query parameter"}
+        )
+        w.redirect(c.url_for("home"))
         return
 
     cell_id = int(cell_id_param)
 
     # Set context state for reactive attributes
-    c["user_id"] = signals.user_id
-    c["cell_id"] = cell_id
+    c.span.attrs({"user_id": signals.user_id, "cell_id": cell_id})
 
     # Respond immediately with 204 No Content.
     # Important: code after w.empty() still runs! The response is sent,
@@ -324,38 +327,16 @@ async def click(c: Context, w: Writer) -> None:
     relay.publish("click", signals.user_id)
 
 
-async def main():
-    # Pick tracer based on environment:
-    # - RichTracer: pretty console output for local dev
-    # - JsonTracer: structured JSON logs for production
-    if "--local" in sys.argv or sys.stdout.isatty():
-        tracer = RichTracer()
-        host = "127.0.0.1"
-        port = 8000
-        workers = 1
-    else:
-        tracer = JsonTracer()
-        host = "0.0.0.0"
-        port = 8000
-        workers = 4
+async def bootstrap(app: Stario, span: TraceSpan) -> None:
 
-    # Create app with tracer for observability
-    with tracer:
-        app = Stario(tracer)
+    # Static files: app.assets(url_prefix, directory, name="...")
+    static_dir = Path(__file__).parent / "static"
+    static_dir_display = static_dir.relative_to(Path.cwd())
+    span.attr("static_dir", str(static_dir_display))
+    app.assets("/static", static_dir, name="static")
 
-        # Static files: app.assets(url_prefix, directory)
-        # Files are fingerprinted - use asset("path") to get versioned URL
-        app.assets("/static", Path(__file__).parent / "static")
-
-        # Register routes: app.{method}(path, handler)
-        # Handler signature is always: async def handler(c: Context, w: Writer)
-        app.get("/", home)
-        app.get("/subscribe", subscribe)  # SSE endpoint for real-time
-        app.post("/click", click)
-
-        # Start the server - blocks until shutdown
-        await app.serve(host=host, port=port, workers=workers)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Register routes: app.{method}(path, handler, name="...")
+    # Handler signature is always: async def handler(c: Context, w: Writer)
+    app.get("/", home, name="home")
+    app.get("/subscribe", subscribe, name="subscribe")  # SSE endpoint for real-time
+    app.post("/click", click, name="click")

@@ -1,6 +1,6 @@
 [project]
 name = "stario"
-version = "2.2.1"
+version = "2.3.0"
 description = "Stario - High-performance Python web framework"
 readme = "README.md"
 authors = [
@@ -12,8 +12,10 @@ dependencies = [
     "brotli>=1.1.0",
     "click>=8.1.0",
     "httptools>=0.7.1",
+    "pydantic>=2.12.5",
     "rich>=14.1.0",
     "xxhash>=3.5.0",
+    "watchfiles>=1.1.0",
 ]
 
 [project.scripts]

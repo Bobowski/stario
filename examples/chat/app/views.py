@@ -17,7 +17,7 @@ Datastar attributes (data.*) add reactivity:
 
 import time
 
-from stario import asset, at, data
+from stario import UrlFor, at, data
 from stario.html import (
     Body,
     Button,
@@ -42,13 +42,8 @@ from .state import Message, User
 # =============================================================================
 
 
-def page(*children):
-    """
-    Base HTML shell with Datastar loaded.
-
-    asset() returns fingerprinted filenames (e.g., style.a1b2c3.css)
-    for automatic cache busting when files change.
-    """
+def page(url_for: UrlFor, *children):
+    """Base HTML shell with Datastar and styles served from static assets."""
     return Html(
         {"lang": "en"},
         Head(
@@ -57,8 +52,8 @@ def page(*children):
                 {"name": "viewport", "content": "width=device-width, initial-scale=1"}
             ),
             Title("Chat - Stario"),
-            Link({"rel": "stylesheet", "href": "/static/" + asset("css/style.css")}),
-            Script({"type": "module", "src": "/static/" + asset("js/datastar.js")}),
+            Link({"rel": "stylesheet", "href": url_for("static", "css/style.css")}),
+            Script({"type": "module", "src": url_for("static", "js/datastar.js")}),
         ),
         Body(*children),
     )
@@ -174,7 +169,7 @@ def online_users_view(users: dict[str, User]):
     )
 
 
-def input_form_view():
+def input_form_view(url_for: UrlFor):
     """
     Message input with keyboard and button support.
 
@@ -183,6 +178,9 @@ def input_form_view():
     - data.on("keydown", ...): runs JS on keypress, @post triggers server request
     - data.attr({disabled: "!$message"}): reactively disables button when empty
     """
+    send_url = url_for("send")
+    typing_url = url_for("typing")
+
     return Form(
         {"id": "input-form", "class": "input-form"},
         data.on("submit", "evt.preventDefault()"),
@@ -198,15 +196,15 @@ def input_form_view():
             data.bind("message"),
             data.on(
                 "keydown",
-                """
-                if (evt.key === 'Enter' && !evt.shiftKey && $message.trim()) {
+                f"""
+                if (evt.key === 'Enter' && !evt.shiftKey && $message.trim()) {{
                     evt.preventDefault();
-                    @post('/send');
+                    @post('{send_url}');
                     $message = '';
-                }
+                }}
                 """,
             ),
-            data.on("input", at.post("/typing")),
+            data.on("input", at.post(typing_url)),
         ),
         Button(
             {
@@ -216,12 +214,12 @@ def input_form_view():
             data.attr({"disabled": "!$message"}),
             data.on(
                 "click",
-                """
-                if ($message.trim()) {
-                    @post('/send');
+                f"""
+                if ($message.trim()) {{
+                    @post('{send_url}');
                     $message = '';
                     document.getElementById('message-input').focus();
-                }
+                }}
                 """,
             ),
             Span(
@@ -240,6 +238,7 @@ def input_form_view():
 
 
 def chat_view(
+    url_for: UrlFor,
     user_id: str,
     username: str,
     color: str,
@@ -262,9 +261,10 @@ def chat_view(
 
     Key setup:
     - data.signals({...}, ifmissing=True): initializes client state (only if not set)
-    - data.init(at.get("/subscribe")): opens SSE connection on page load
+    - data.init(at.get(url_for("subscribe"))): opens SSE connection on page load
     """
     return page(
+        url_for,
         toy_inspector(),  # Dev tool: shows current signals state
         Div(
             {"class": "chat-container"},
@@ -277,7 +277,7 @@ def chat_view(
                 },
                 ifmissing=True,
             ),
-            data.init(at.get("/subscribe")),
+            data.init(at.get(url_for("subscribe"))),
             Div(
                 {"class": "chat-header"},
                 Div({"class": "chat-title"}, "Stario Chat 🐾"),
@@ -290,7 +290,7 @@ def chat_view(
             ),
             Div(
                 {"class": "chat-footer"},
-                input_form_view(),
+                input_form_view(url_for),
             ),
         ),
     )

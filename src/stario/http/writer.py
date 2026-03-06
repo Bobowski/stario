@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from email.utils import format_datetime
 from functools import lru_cache
+from types import TracebackType
 from typing import (
     Any,
     AsyncIterator,
@@ -31,6 +32,7 @@ from typing import (
     ClassVar,
     Literal,
     Self,
+    cast,
     overload,
 )
 from urllib.parse import quote
@@ -139,7 +141,7 @@ class _Gzip(Compressor):
 @dataclass(slots=True, frozen=True)
 class CompressionConfig:
     """
-    Application-level compression configuration.
+    Server-level compression configuration.
 
     Set level to negative to disable a specific algorithm.
     Level 0 is valid for brotli (fastest).
@@ -150,7 +152,7 @@ class CompressionConfig:
         CompressionConfig(zstd_level=-1, brotli_level=-1)  # Only gzip
     """
 
-    min_size: int = 256
+    min_size: int = 512
     zstd_level: int = 3  # 1-22, negative to disable
     brotli_level: int = 4  # 0-11, negative to disable
     gzip_level: int = 6  # 1-9, negative to disable
@@ -278,38 +280,15 @@ class Writer:
         return self._shutdown.done()
 
     @overload
-    def alive(self, source: None = None) -> _Alive[None]: ...
+    def alive(self, source: None = None) -> "_Alive[None]": ...
 
     @overload
-    def alive[T](self, source: AsyncIterator[T]) -> _Alive[T]: ...
+    def alive[T](self, source: AsyncIterator[T]) -> "_Alive[T]": ...
 
     def alive[T](
         self, source: AsyncIterator[T] | None = None
-    ) -> _Alive[T] | _Alive[None]:
-        """
-        Async iterator and context manager for connection lifecycle.
-
-        Three usage patterns:
-        1. Infinite loop (await inside):
-            async for _ in w.alive():
-                msg = await queue.get()
-                w.patch(render(msg))
-            cleanup()
-
-        2. Iterate async source:
-            async for msg in w.alive(message_stream):
-                w.patch(render(msg))
-            cleanup()
-
-        3. One-shot operation:
-            async with w.alive():
-                result = await slow_api_call()
-                w.patch(render(result))
-            cleanup()
-
-        All patterns exit cleanly on disconnect or server shutdown.
-        Code after the block always runs for cleanup.
-        """
+    ) -> "_Alive[T] | _Alive[None]":
+        """Async iterator/context manager that exits on disconnect or shutdown."""
         return _Alive(self, source)
 
     # =========================================================================
@@ -682,39 +661,27 @@ class Writer:
         self._completed = True
 
 
-# =============================================================================
-# Alive Helper
-# =============================================================================
-
-
+@dataclass(slots=True)
 class _Alive[T]:
-    """
-    Connection lifecycle helper.
+    """Connection lifecycle helper bound to response writer."""
 
-    Works as both async iterator and async context manager.
-    Exits cleanly on disconnect or server shutdown.
-    """
-
-    __slots__ = ("_w", "_source", "_watcher")
-
-    def __init__(self, w: Writer, source: AsyncIterator[T] | None = None) -> None:
-        self._w = w
-        self._source = source
-        self._watcher: asyncio.Task[None] | None = None
+    w: Writer
+    source: AsyncIterator[T] | None = None
+    watcher: asyncio.Task[None] | None = None
 
     async def __aiter__(self) -> AsyncIterator[T]:
-        """Iterate until disconnect/shutdown."""
         async with self:
-            if self._source is None:
+            if self.source is None:
                 while True:
-                    yield None  # type: ignore[misc]
+                    yield cast(T, None)
             else:
-                async for item in self._source:
+                async for item in self.source:
                     yield item
 
-    async def __aenter__(self) -> Self:
-        """Start watching for disconnect."""
+    async def __aenter__(self) -> "_Alive[T]":
         current_task = asyncio.current_task()
+        disconnect = self.w._disconnect
+        shutdown = self.w._shutdown
 
         async def watcher() -> None:
             either = asyncio.Future[None]()
@@ -723,31 +690,30 @@ class _Alive[T]:
                 if not either.done():
                     either.set_result(None)
 
-            self._w._disconnect.add_done_callback(trigger)
-            self._w._shutdown.add_done_callback(trigger)
+            disconnect.add_done_callback(trigger)
+            shutdown.add_done_callback(trigger)
 
             try:
                 await either
                 if current_task:
                     current_task.cancel()
             finally:
-                self._w._disconnect.remove_done_callback(trigger)
-                self._w._shutdown.remove_done_callback(trigger)
+                disconnect.remove_done_callback(trigger)
+                shutdown.remove_done_callback(trigger)
 
-        self._watcher = asyncio.create_task(watcher())
+        self.watcher = asyncio.create_task(watcher())
         return self
 
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: Any,
+        exc_tb: TracebackType | None,
     ) -> bool:
-        """Clean up watcher, swallow expected cancellations."""
-        if self._watcher:
-            self._watcher.cancel()
+        if self.watcher:
+            self.watcher.cancel()
             try:
-                await self._watcher
+                await self.watcher
             except asyncio.CancelledError:
                 pass
 

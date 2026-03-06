@@ -62,16 +62,34 @@ class TestRouterBasic:
     def test_register_all_methods(self):
         router = Router()
 
-        async def handler(c: Context, w: Writer) -> None:
+        async def get_handler(c: Context, w: Writer) -> None:
             pass
 
-        router.get("/a", handler)
-        router.post("/b", handler)
-        router.put("/c", handler)
-        router.delete("/d", handler)
-        router.patch("/e", handler)
-        router.head("/f", handler)
-        router.options("/g", handler)
+        async def post_handler(c: Context, w: Writer) -> None:
+            pass
+
+        async def put_handler(c: Context, w: Writer) -> None:
+            pass
+
+        async def delete_handler(c: Context, w: Writer) -> None:
+            pass
+
+        async def patch_handler(c: Context, w: Writer) -> None:
+            pass
+
+        async def head_handler(c: Context, w: Writer) -> None:
+            pass
+
+        async def options_handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/a", get_handler)
+        router.post("/b", post_handler)
+        router.put("/c", put_handler)
+        router.delete("/d", delete_handler)
+        router.patch("/e", patch_handler)
+        router.head("/f", head_handler)
+        router.options("/g", options_handler)
 
         assert "GET" in router._exact["/a"]
         assert "POST" in router._exact["/b"]
@@ -221,6 +239,91 @@ class TestRouterMount:
         main.mount("/api", api)
 
         assert "/api" in main._exact
+
+
+class TestRouterUrlFor:
+    """Test named route URL lookup."""
+
+    def test_url_for_requires_explicit_name(self):
+        router = Router()
+
+        async def home(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/", home)
+
+        with pytest.raises(StarioError, match="Register the route or asset first with name='home'"):
+            router.url_for("home")
+
+    def test_url_for_exact_route(self):
+        router = Router()
+
+        async def home(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/", home, name="home")
+
+        assert router.url_for("home") == "/"
+
+    def test_url_for_mounted_router_includes_prefix(self):
+        app = Router()
+        chat = Router()
+
+        async def home(c: Context, w: Writer) -> None:
+            pass
+
+        chat.get("/", home, name="home")
+        app.mount("/chat", chat)
+
+        assert app.url_for("home") == "/chat"
+
+    def test_duplicate_names_raise(self):
+        router = Router()
+
+        async def home(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/", home, name="home")
+
+        async def other(c: Context, w: Writer) -> None:
+            pass
+
+        with pytest.raises(StarioError, match="Reverse route name already exists"):
+            router.get("/other", other, name="home")
+
+    def test_url_for_wildcard_route_appends_path(self):
+        router = Router()
+
+        async def file(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/files/*", file, name="files")
+
+        assert router.url_for("files", "docs/readme.txt") == "/files/docs/readme.txt"
+
+    def test_url_for_wildcard_route_accepts_queries(self):
+        router = Router()
+
+        async def search(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/search/*", search, name="search")
+
+        assert (
+            router.url_for("search", "docs", queries={"page": 2, "tags": ["a", "b"]})
+            == "/search/docs?page=2&tags=a&tags=b"
+        )
+
+    def test_exact_route_rejects_path_argument(self):
+        router = Router()
+
+        async def home(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/", home, name="home")
+
+        with pytest.raises(StarioError, match="Exact routes do not accept a path argument"):
+            router.url_for("home", "extra")
 
     def test_mount_catchall(self):
         main = Router()

@@ -5,10 +5,11 @@ This module handles the low-level HTTP/1.1 parsing and connection management.
 Uses httptools (http-parser via Cython) for parsing.
 
 Design decisions:
-- Task tracking: Handler tasks are registered in a per-worker set shared with
-  the server. During shutdown, connections are closed first (graceful timeout),
-  then any remaining handler tasks are cancelled. Only stario-managed tasks
-  are affected; external tasks on the same loop are never touched.
+- Task tracking: Handler tasks and `Context.create_task()` work are registered
+  in a per-worker set shared with the server. During shutdown, the server gives
+  those tasks a grace window to finish before cancelling any that remain. Only
+  stario-managed tasks are affected; external tasks on the same loop are never
+  touched.
 - Pipelining support: Requests are queued if the prior response isn't complete.
   This is rare in practice (browsers mostly use concurrent connections), but
   required for HTTP/1.1 compliance.
@@ -22,18 +23,24 @@ import asyncio
 from collections import deque
 from collections.abc import Coroutine
 from functools import lru_cache
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import unquote as unquote_url
 
 import httptools
 
+from stario.telemetry.core import Tracer
+
 from .headers import Headers
 from .request import BodyReader, Request
+from .types import Context
 from .writer import (
-    Compressor,
+    CompressionConfig,
     Writer,
     _get_status_line,
 )
+
+if TYPE_CHECKING:
+    from .app import Stario
 
 KEEP_ALIVE_TIMEOUT = 5.0
 
@@ -60,16 +67,17 @@ class HttpProtocol(asyncio.Protocol):
 
     __slots__ = (  # type: ignore[assignment]
         "loop",
-        "request_handler",
+        "app",
+        "tracer",
         "get_date_header",
-        "get_compressor",
+        "compression",
         "parser",
         "transport",
         "timeout_handle",
         "_reading_headers",
         "_reading_body",
         "_reading_url_bytes",
-        "_active_request",
+        "_active_context",
         "_active_writer",
         "_disconnect",
         "_shutdown",
@@ -81,22 +89,26 @@ class HttpProtocol(asyncio.Protocol):
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        request_handler: Callable[[Request, Writer], Coroutine[Any, Any, None]],
+        app: "Stario",
+        tracer: Tracer,
         get_date_header: Callable[[], bytes],
-        get_compressor: Callable[[str | None], Compressor | None],
+        compression: CompressionConfig,
         shutdown: asyncio.Future,
         connections: set["HttpProtocol"],
-        tasks: set[asyncio.Task[None]],
+        tasks: set[asyncio.Task[Any]],
     ) -> None:
         self.loop = loop
-        self.request_handler = request_handler
+        self.app = app
+        self.tracer = tracer
         self.get_date_header = get_date_header
-        self.get_compressor = get_compressor
+        self.compression = compression
         self._shutdown = shutdown
         self._connections = connections
         self._tasks = tasks
 
-        self.parser = httptools.HttpRequestParser(self)
+        self.parser: httptools.HttpRequestParser | None = httptools.HttpRequestParser(
+            self
+        )
         self.transport: asyncio.Transport | None = None
         self.timeout_handle: asyncio.TimerHandle | None = None
 
@@ -106,13 +118,13 @@ class HttpProtocol(asyncio.Protocol):
         self._reading_url_bytes: bytes = b""
 
         # State of the request currently being handled by the application
-        self._active_request: Request | None = None
+        self._active_context: Context | None = None
         self._active_writer: Writer | None = None
 
         # Common disconnect info for all requests on this connection
         self._disconnect = asyncio.Future()
 
-        self._pipeline: deque[tuple[Request, Writer]] | None = None
+        self._pipeline: deque[tuple[Context, Writer]] | None = None
 
     # =========================================================================
     # Timeout
@@ -153,7 +165,7 @@ class HttpProtocol(asyncio.Protocol):
             self._reading_body.abort()
 
         self.transport = None
-        self.parser = None  # type: ignore
+        self.parser = None
 
     def eof_received(self) -> None:
         pass
@@ -236,23 +248,31 @@ class HttpProtocol(asyncio.Protocol):
             on_completed    = self.on_response_completed,
             disconnect      = self._disconnect,
             shutdown        = self._shutdown,
-            compress        = self.get_compressor(headers.get(b"accept-encoding")),
+            compress        = self.compression.select(headers.get(b"accept-encoding")),
+        )
+
+        context = Context(
+            app         = self.app,
+            req         = request,
+            span        = self.tracer.create(request.method),
+            state       = {},
+            create_task = self._create_task,
         )
         # fmt: on
 
-        if self._active_request is None:
+        if self._active_context is None:
             # There are no active requests on this connection yet
-            self._active_request = request
+            self._active_context = context
             self._active_writer = writer
 
-            self._spawn_handler(request, writer)
+            self._spawn_handler(context, writer)
 
         else:
             # Earlier request has not responded yet, queue it for later
             transport.pause_reading()
             if self._pipeline is None:
                 self._pipeline = deque()
-            self._pipeline.append((request, writer))
+            self._pipeline.append((context, writer))
 
     def on_body(self, body: bytes) -> None:
         if self._reading_body:
@@ -273,43 +293,52 @@ class HttpProtocol(asyncio.Protocol):
     def on_response_completed(self) -> None:
         t = self.transport
         w = self._active_writer
-        r = self._active_request
+        c = self._active_context
 
-        if t is None or w is None or r is None or t.is_closing() or w.disconnected:
-            self._active_request = None
+        if t is None or w is None or c is None or t.is_closing() or w.disconnected:
+            self._active_context = None
             self._active_writer = None
             return
 
         if (
             w.headers.rget(b"connection") == b"close"
-            or not r.keep_alive
+            or not c.req.keep_alive
             or self._shutdown.done()
         ):
             t.close()
-            self._active_request = None
+            self._active_context = None
             self._active_writer = None
             return
 
         # Next pipelined request
         if self._pipeline:
-            next_r, next_w = self._pipeline.popleft()
+            next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
-            self._active_request = next_r
+            self._active_context = next_c
 
-            self._spawn_handler(next_r, next_w)
+            self._spawn_handler(next_c, next_w)
             self._cancel_timeout()
             t.resume_reading()
         else:
-            self._active_request = None
+            self._active_context = None
             self._active_writer = None
             self._reset_timeout()
             t.resume_reading()
 
-    def _spawn_handler(self, request: Request, writer: Writer) -> None:
+    def _spawn_handler(self, context: Context, writer: Writer) -> None:
         """Create a handler task and register it in the worker's task set."""
-        task = self.loop.create_task(self.request_handler(request, writer))
+        self._create_task(self.app.handle_request(context, writer))
+
+    def _create_task[T](
+        self,
+        coro: Coroutine[Any, Any, T],
+        name: str | None = None,
+    ) -> asyncio.Task[T]:
+        """Create and track a server-managed task for this worker."""
+        task = self.loop.create_task(coro, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     # =========================================================================
     # Errors

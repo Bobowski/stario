@@ -1,13 +1,11 @@
 """
-Stario CLI - Initialize Stario projects.
+Stario CLI.
 
 Usage:
-    stario init            # Interactive project setup
-    stario init myproject  # Create project with name
-    stario init -t hello-world  # Specify template
+    stario init
+    stario serve main:bootstrap
+    stario watch main:bootstrap
 """
-
-from __future__ import annotations
 
 import json
 import os
@@ -19,6 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
+
+from stario.http.writer import CompressionConfig
+
+from .runtime import serve_once, watch_app
 
 # Path to bundled templates (relative to this file)
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -138,11 +140,234 @@ def _walk_github_contents(items: list) -> list:
     return result
 
 
-@click.group()
+@click.group(
+    epilog=(
+        "\b\n"
+        "Examples:\n"
+        "  stario init\n"
+        "  stario serve main:bootstrap\n"
+        "  stario watch main:bootstrap\n"
+        "  stario watch main:bootstrap --watch-path src"
+    )
+)
 @click.version_option(package_name="stario")
 def main() -> None:
-    """Stario - High-performance Python web framework."""
+    """Create, serve, and watch Stario apps."""
     pass
+
+
+def _resolve_compression_config(
+    *,
+    min_size: int,
+    zstd_level: int,
+    brotli_level: int,
+    gzip_level: int,
+) -> CompressionConfig:
+    if min_size < 0:
+        raise click.ClickException("--compress-min-size must be 0 or greater.")
+    if zstd_level >= 0 and not 1 <= zstd_level <= 22:
+        raise click.ClickException(
+            "--compress-zstd-level must be negative or between 1 and 22."
+        )
+    if brotli_level >= 0 and not 0 <= brotli_level <= 11:
+        raise click.ClickException(
+            "--compress-brotli-level must be negative or between 0 and 11."
+        )
+    if gzip_level >= 0 and not 1 <= gzip_level <= 9:
+        raise click.ClickException(
+            "--compress-gzip-level must be negative or between 1 and 9."
+        )
+    return CompressionConfig(
+        min_size=min_size,
+        zstd_level=zstd_level,
+        brotli_level=brotli_level,
+        gzip_level=gzip_level,
+    )
+
+
+@main.command(
+    name="serve",
+    epilog="\b\nExample:\n  stario serve main:bootstrap",
+)
+@click.argument("app", metavar="MODULE:CALLABLE")
+@click.option(
+    "--tracer",
+    "tracer_spec",
+    help="Telemetry output: auto, rich, json, or custom <module>:<callable>",
+)
+@click.option(
+    "--unix-socket",
+    help="Listen on a Unix domain socket instead of TCP",
+)
+@click.option(
+    "--port",
+    default=8000,
+    show_default=True,
+    type=int,
+    help="TCP port to bind when not using a Unix socket",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="TCP host to bind when not using a Unix socket",
+)
+@click.option(
+    "--compress-min-size",
+    default=512,
+    show_default=True,
+    type=int,
+    help="Minimum response size in bytes before compression applies",
+)
+@click.option(
+    "--compress-zstd-level",
+    "zstd_level",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Zstd compression level; any negative value disables",
+)
+@click.option(
+    "--compress-brotli-level",
+    "brotli_level",
+    default=4,
+    show_default=True,
+    type=int,
+    help="Brotli compression level; any negative value disables",
+)
+@click.option(
+    "--compress-gzip-level",
+    "gzip_level",
+    default=6,
+    show_default=True,
+    type=int,
+    help="Gzip compression level; any negative value disables",
+)
+def serve_command(
+    app: str,
+    tracer_spec: str | None,
+    host: str,
+    port: int,
+    unix_socket: str | None,
+    compress_min_size: int,
+    zstd_level: int,
+    brotli_level: int,
+    gzip_level: int,
+) -> None:
+    """Start a Stario app once."""
+    compression = _resolve_compression_config(
+        min_size=compress_min_size,
+        zstd_level=zstd_level,
+        brotli_level=brotli_level,
+        gzip_level=gzip_level,
+    )
+    serve_once(
+        app,
+        tracer_spec=tracer_spec,
+        host=host,
+        port=port,
+        unix_socket=unix_socket,
+        compression=compression,
+    )
+
+
+@main.command(
+    name="watch",
+    epilog=(
+        "\b\n"
+        "Examples:\n"
+        "  stario watch main:bootstrap\n"
+        "  stario watch main:bootstrap --watch-path src"
+    ),
+)
+@click.option(
+    "--watch-path",
+    "watch_paths",
+    multiple=True,
+    help="Path to watch for changes; can be passed multiple times",
+)
+@click.argument("app", metavar="MODULE:CALLABLE")
+@click.option(
+    "--tracer",
+    "tracer_spec",
+    help="Telemetry output: auto, rich, json, or custom <module>:<callable>",
+)
+@click.option(
+    "--unix-socket",
+    help="Listen on a Unix domain socket instead of TCP",
+)
+@click.option(
+    "--port",
+    default=8000,
+    show_default=True,
+    type=int,
+    help="TCP port to bind when not using a Unix socket",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="TCP host to bind when not using a Unix socket",
+)
+@click.option(
+    "--compress-min-size",
+    default=512,
+    show_default=True,
+    type=int,
+    help="Minimum response size in bytes before compression applies",
+)
+@click.option(
+    "--compress-zstd-level",
+    "zstd_level",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Zstd compression level; any negative value disables",
+)
+@click.option(
+    "--compress-brotli-level",
+    "brotli_level",
+    default=4,
+    show_default=True,
+    type=int,
+    help="Brotli compression level; any negative value disables",
+)
+@click.option(
+    "--compress-gzip-level",
+    "gzip_level",
+    default=6,
+    show_default=True,
+    type=int,
+    help="Gzip compression level; any negative value disables",
+)
+def watch_command(
+    app: str,
+    tracer_spec: str | None,
+    host: str,
+    port: int,
+    unix_socket: str | None,
+    compress_min_size: int,
+    zstd_level: int,
+    brotli_level: int,
+    gzip_level: int,
+    watch_paths: tuple[str, ...],
+) -> None:
+    """Start a Stario app and restart it on changes."""
+    compression = _resolve_compression_config(
+        min_size=compress_min_size,
+        zstd_level=zstd_level,
+        brotli_level=brotli_level,
+        gzip_level=gzip_level,
+    )
+    watch_app(
+        app,
+        tracer_spec=tracer_spec,
+        host=host,
+        port=port,
+        unix_socket=unix_socket,
+        compression=compression,
+        watch_paths=watch_paths or (".",),
+    )
 
 
 @main.command()
@@ -155,9 +380,9 @@ def main() -> None:
 )
 def init(name: str | None, template_name: str | None) -> None:
     """
-    Create a new Stario project.
+    Create a new Stario project from a template.
 
-    NAME: Project directory name (prompted if not provided)
+    NAME sets the project directory. If omitted, Stario prompts for it.
     """
     click.echo()
     click.echo(click.style("⭐ Stario", fg="yellow", bold=True))
@@ -295,7 +520,7 @@ def init(name: str | None, template_name: str | None) -> None:
     click.echo()
 
     if click.confirm(
-        click.style("  ? Start the server now?", fg="cyan", bold=True),
+        click.style("  ? Start the app now?", fg="cyan", bold=True),
         default=True,
     ):
         click.echo()
@@ -308,7 +533,7 @@ def init(name: str | None, template_name: str | None) -> None:
 
         # Run the server in the project directory
         os.chdir(project_dir)
-        subprocess.run(["uv", "run", "main.py"])
+        subprocess.run(["uv", "run", "stario", "watch", "main:bootstrap"])
 
         # After server stops, show how to get back
         click.echo()
@@ -319,11 +544,10 @@ def init(name: str | None, template_name: str | None) -> None:
         )
         click.echo()
         click.echo(click.style(f"     cd {name}", fg="cyan"))
-        click.echo(click.style("     uv run main.py", fg="cyan"))
+        click.echo(click.style("     uv run stario watch main:bootstrap", fg="cyan"))
         click.echo()
-        click.echo(click.style("     # Or with auto-reload", dim=True))
-        click.echo(click.style('     uv add --dev watchfiles', fg="cyan"))
-        click.echo(click.style('     uv run watchfiles "python main.py" .', fg="cyan"))
+        click.echo(click.style("     # Or start it once without file watching", dim=True))
+        click.echo(click.style("     uv run stario serve main:bootstrap", fg="cyan"))
         click.echo()
     else:
         # Show manual instructions
@@ -333,11 +557,10 @@ def init(name: str | None, template_name: str | None) -> None:
         )
         click.echo()
         click.echo(click.style(f"     cd {name}", fg="cyan"))
-        click.echo(click.style("     uv run main.py", fg="cyan"))
+        click.echo(click.style("     uv run stario watch main:bootstrap", fg="cyan"))
         click.echo()
-        click.echo(click.style("     # Or with auto-reload", dim=True))
-        click.echo(click.style('     uv add --dev watchfiles', fg="cyan"))
-        click.echo(click.style('     uv run watchfiles "python main.py" .', fg="cyan"))
+        click.echo(click.style("     # Or start it once without file watching", dim=True))
+        click.echo(click.style("     uv run stario serve main:bootstrap", fg="cyan"))
         click.echo()
         click.echo(click.style("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", dim=True))
         click.echo()

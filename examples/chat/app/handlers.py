@@ -48,7 +48,16 @@ async def home(c: Context, w: Writer) -> None:
     color = generate_color()
 
     # Pass empty collections - user will get real data after subscribing
-    w.html(chat_view(user_id, username, color, messages=[], users={}))
+    w.html(
+        chat_view(
+            c.url_for,
+            user_id,
+            username,
+            color,
+            messages=[],
+            users={},
+        )
+    )
 
 
 def subscribe(db: Database, relay: Relay[str]):
@@ -71,7 +80,7 @@ def subscribe(db: Database, relay: Relay[str]):
         signals = await c.signals(ChatSignals)
 
         if not signals.user_id:
-            w.redirect("/")
+            w.redirect(c.url_for("home"))
             return
 
         # Add user to database
@@ -81,7 +90,10 @@ def subscribe(db: Database, relay: Relay[str]):
             color=signals.color,
         )
         db.add_user(user)
-        c("User connected", {"user_id": signals.user_id, "username": signals.username})
+        c.span.event(
+            "User connected",
+            attributes={"user_id": signals.user_id, "username": signals.username},
+        )
 
         # Tell everyone that someone joined
         relay.publish("update", "presence")
@@ -89,6 +101,7 @@ def subscribe(db: Database, relay: Relay[str]):
         # Send current state immediately
         w.patch(
             chat_view(
+                c.url_for,
                 signals.user_id,
                 signals.username,
                 signals.color,
@@ -99,9 +112,10 @@ def subscribe(db: Database, relay: Relay[str]):
 
         # Main loop: wait for events, send patches
         async for _, event_type in w.alive(relay.subscribe("update")):
-            c("event_type", {"event_type": event_type})
+            c.span.event("event_type", attributes={"event_type": event_type})
             w.patch(
                 chat_view(
+                    c.url_for,
                     signals.user_id,
                     signals.username,
                     signals.color,
@@ -111,7 +125,7 @@ def subscribe(db: Database, relay: Relay[str]):
             )
 
         # Cleanup on disconnect
-        c("User disconnected", {"user_id": signals.user_id})
+        c.span.event("User disconnected", attributes={"user_id": signals.user_id})
         db.remove_user(signals.user_id)
         relay.publish("update", "presence")
 
@@ -130,7 +144,7 @@ def send_message(db: Database, relay: Relay[str]):
         signals = await c.signals(ChatSignals)
 
         if not signals.user_id or not db.user_exists(signals.user_id):
-            w.redirect("/")
+            w.redirect(c.url_for("home"))
             return
 
         text = signals.message.strip()
@@ -149,7 +163,10 @@ def send_message(db: Database, relay: Relay[str]):
         db.add_message(msg)
         db.set_user_typing(signals.user_id, False)
 
-        c("Message sent", {"user_id": signals.user_id, "text": text[:50]})
+        c.span.event(
+            "Message sent",
+            attributes={"user_id": signals.user_id, "text": text[:50]},
+        )
 
         w.empty(204)
         relay.publish("update", "message")

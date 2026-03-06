@@ -5,9 +5,13 @@ Exception types:
 - StarioError: Framework errors with rich context for debugging
 - HttpException: Expected errors that become HTTP responses
 - ClientDisconnected: Client closed connection (for streaming handlers)
+- SignalValidationError: Datastar signals validation error
 """
 
 from typing import TYPE_CHECKING, Any
+
+from pydantic import ValidationError
+from pydantic_core import InitErrorDetails
 
 if TYPE_CHECKING:
     from stario.http.writer import Writer
@@ -109,3 +113,35 @@ class ClientDisconnected(Exception):
     """
 
     pass
+
+
+class SignalValidationError(ValidationError):
+    """
+    Validation error scoped specifically to Datastar signals parsing.
+
+    This is intentionally a subclass of pydantic's ValidationError so callers
+    can inspect `.errors()`, `.json()`, and all standard validation internals,
+    while still being able to catch signals-specific validation failures only.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def from_validation_error(cls, error: ValidationError) -> "SignalValidationError":
+        """Clone a pydantic ValidationError as SignalValidationError."""
+        line_errors: list[InitErrorDetails] = []
+        for item in error.errors(include_url=False):
+            line_error: InitErrorDetails = {
+                "type": item["type"],
+                "input": item["input"],
+            }
+            if "loc" in item:
+                line_error["loc"] = item["loc"]
+            if "ctx" in item:
+                line_error["ctx"] = item["ctx"]
+            line_errors.append(line_error)
+
+        return cls.from_exception_data(
+            title=error.title,
+            line_errors=line_errors,
+        )

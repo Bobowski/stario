@@ -30,6 +30,7 @@ Datastar helpers (import from stario.datastar):
 - data: Attribute builders (data.signals(), data.on())
 """
 
+from .core import Comment as Comment
 from .core import HtmlElement as HtmlElement
 from .core import SafeString as SafeString
 from .core import Tag as Tag
@@ -205,6 +206,7 @@ Wbr = Tag("wbr")
 __all__ = [
     # Core exports
     "HtmlElement",
+    "Comment",
     "SafeString",
     "Tag",
     "TagAttributes",

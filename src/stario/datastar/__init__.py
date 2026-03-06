@@ -24,10 +24,13 @@ Security notes:
 
 This module provides:
 - SSE formatters: sse.patch(), sse.signals(), sse.redirect(), sse.script()
+- HTML helpers: DatastarScript()
 - Attribute helpers: data.signals(), data.on(), data.bind()
 - Action helpers: at.get(), at.post()
 - Signal parsing: parse_signals(), r.signals()
 """
+
+from stario.html import HtmlElement, Script
 
 # SSE event formatters (simple functions → bytes)
 from . import sse as sse
@@ -39,9 +42,18 @@ from .format import js as js
 from .format import s as s
 
 # Signals parsing
+from .parse import FileSignal as FileSignal
 from .parse import parse_signals as parse_signals
-from .signals import FileSignal as FileSignal
-from .signals import get_signals as get_signals
+
+DATASTAR_CDN_URL = (
+    "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.8/bundles/datastar.js"
+)
+
+
+def DatastarScript() -> HtmlElement:
+    """Return the standard Datastar module script tag."""
+    return Script({"type": "module", "src": DATASTAR_CDN_URL})
+
 
 # Attribute and action builders (singletons)
 data = DatastarAttributes()

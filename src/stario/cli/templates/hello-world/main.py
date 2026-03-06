@@ -2,15 +2,21 @@
 Stario Hello World.
 
 Minimal starter with Datastar.
-Run with: uv run main.py
+Run with: uv run stario watch main:bootstrap
+      or: uv run stario serve main:bootstrap
 """
 
 import asyncio
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from stario import Context, RichTracer, Stario, Writer, asset, at, data
+from stario import Context, JsonTracer, RichTracer, Stario, UrlFor, Writer, at, data
+from stario import Span as TraceSpan
 from stario.html import H1, Body, Button, Div, Head, Html, Meta, P, Script, Title
+from stario.http.server import Server
 from stario.toys import toy_inspector
 
 # =============================================================================
@@ -18,8 +24,8 @@ from stario.toys import toy_inspector
 # =============================================================================
 
 
-def page(*children):
-    """Base HTML page with Datastar."""
+def page(url_for: UrlFor, *children):
+    """Base HTML page with Datastar served from fingerprinted assets."""
     return Html(
         {"lang": "en"},
         Head(
@@ -28,7 +34,7 @@ def page(*children):
                 {"name": "viewport", "content": "width=device-width, initial-scale=1"}
             ),
             Title("Hello World - Stario App"),
-            Script({"type": "module", "src": "/static/" + asset("js/datastar.js")}),
+            Script({"type": "module", "src": url_for("static", "js/datastar.js")}),
         ),
         Body(
             {
@@ -39,9 +45,10 @@ def page(*children):
     )
 
 
-def home_view(count: int):
+def home_view(count: int, url_for: UrlFor):
     """Home page with a counter example."""
     return page(
+        url_for,
         toy_inspector(),
         Div(
             # Signals: client-side reactive state
@@ -84,7 +91,7 @@ def home_view(count: int):
                 "Or fetch from server: ",
                 Button(
                     {"style": "padding: 0.25rem 0.5rem; cursor: pointer;"},
-                    data.on("click", at.get("/increment")),
+                    data.on("click", at.get(url_for("increment"))),
                     "Server +1",
                 ),
             ),
@@ -99,7 +106,7 @@ def home_view(count: int):
 
 async def home(c: Context, w: Writer) -> None:
     """Serve the home page."""
-    w.html(home_view(count=0))
+    w.html(home_view(count=0, url_for=c.url_for))
 
 
 @dataclass
@@ -120,19 +127,27 @@ async def increment(c: Context, w: Writer) -> None:
 
 
 async def main():
+    tracer_factory = RichTracer if sys.stdout.isatty() else JsonTracer
 
-    with RichTracer() as tracer:
-        app = Stario(tracer)
+    with tracer_factory() as tracer:
+        server = Server(bootstrap, tracer)
+        await server.run()
 
-        # Static files with fingerprinting
-        app.assets("/static", Path(__file__).parent / "static")
 
-        # Routes
-        app.get("/", home)
-        app.get("/increment", increment)
+@asynccontextmanager
+async def bootstrap(app: Stario, span: TraceSpan) -> AsyncIterator[None]:
+    static_dir = Path(__file__).parent / "static"
+    static_dir_display = (
+        static_dir.relative_to(Path.cwd()) if static_dir.is_relative_to(Path.cwd()) else static_dir
+    )
+    span.attr("static_dir", str(static_dir_display))
+    app.assets("/static", static_dir, name="static")
 
-        # Start server
-        await app.serve(host="127.0.0.1", port=8000)
+    # Routes
+    app.get("/", home, name="home")
+    app.get("/increment", increment, name="increment")
+
+    yield
 
 
 if __name__ == "__main__":

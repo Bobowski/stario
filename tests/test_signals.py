@@ -1,137 +1,121 @@
-"""Tests for stario.datastar.parse - Signal parsing."""
+"""Tests for stario.datastar.parse - pydantic based signals parsing."""
 
+import json
 from dataclasses import dataclass
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import pytest
+from pydantic import BaseModel, ValidationError
 
-from stario.datastar.parse import _coerce, parse_signals
-from stario.exceptions import StarioError
-
-
-class TestCoerce:
-    """Test type coercion."""
-
-    def test_string_to_int(self):
-        assert _coerce("42", int) == 42
-
-    def test_string_to_float(self):
-        assert _coerce("3.14", float) == 3.14
-
-    def test_string_true_to_bool(self):
-        assert _coerce("true", bool) is True
-
-    def test_string_false_to_bool(self):
-        assert _coerce("false", bool) is False
-
-    def test_string_1_to_bool(self):
-        assert _coerce("1", bool) is True
-
-    def test_string_0_to_bool(self):
-        assert _coerce("0", bool) is False
-
-    def test_int_to_string(self):
-        assert _coerce(42, str) == "42"
-
-    def test_none_returns_none(self):
-        assert _coerce(None, int) is None
-
-    def test_already_correct_type(self):
-        assert _coerce(42, int) == 42
-        assert _coerce("hello", str) == "hello"
-        assert _coerce(True, bool) is True
+from stario.datastar.parse import _adapter_for, parse_signals
+from stario.exceptions import SignalValidationError
 
 
-class TestParseSignalsDataclass:
-    """Test parsing signals into dataclasses."""
+def _raw(data: dict[str, Any]) -> str:
+    return json.dumps(data)
 
-    def test_simple_dataclass(self):
+
+class TestParseSignalsNoSchema:
+    def test_returns_dict_for_valid_json_object(self):
+        result = parse_signals(_raw({"name": "test", "count": 42}))
+        assert result == {"name": "test", "count": 42}
+
+    def test_missing_payload_returns_empty_dict(self):
+        with pytest.raises(SignalValidationError) as exc:
+            parse_signals(None)
+        assert exc.value.errors(include_url=False)[0]["type"] == "json_type"
+
+    def test_invalid_json_raises_signal_validation_error(self):
+        with pytest.raises(SignalValidationError) as exc:
+            parse_signals("{invalid")
+        assert exc.value.errors(include_url=False)[0]["type"] == "json_invalid"
+
+    def test_non_object_json_raises_signal_validation_error(self):
+        with pytest.raises(SignalValidationError) as exc:
+            parse_signals(json.dumps([1, 2, 3]))
+        assert exc.value.errors(include_url=False)[0]["type"] == "dict_type"
+
+
+class TestParseSignalsDataclassAndTypedDict:
+    def test_dataclass_parsing_and_coercion(self):
         @dataclass
         class FormData:
-            name: str = ""
-            count: int = 0
-
-        result = parse_signals({"name": "test", "count": 42}, FormData)
-
-        assert isinstance(result, FormData)
-        assert result.name == "test"
-        assert result.count == 42
-
-    def test_coercion(self):
-        @dataclass
-        class Data:
-            count: int = 0
+            count: int
             active: bool = False
 
-        result = parse_signals({"count": "42", "active": "true"}, Data)
-
+        result = parse_signals(_raw({"count": "42", "active": "true"}), FormData)
+        assert isinstance(result, FormData)
         assert result.count == 42
         assert result.active is True
 
-    def test_missing_uses_default(self):
-        @dataclass
-        class Data:
-            name: str = "default"
-            count: int = 100
-
-        result = parse_signals({}, Data)
-
-        assert result.name == "default"
-        assert result.count == 100
-
-    def test_extra_fields_ignored(self):
-        @dataclass
-        class Data:
-            name: str = ""
-
-        result = parse_signals({"name": "test", "extra": "ignored"}, Data)
-
-        assert result.name == "test"
-        assert not hasattr(result, "extra")
-
-
-class TestParseSignalsTypedDict:
-    """Test parsing signals into TypedDicts."""
-
-    def test_simple_typeddict(self):
+    def test_typeddict_parsing_and_coercion(self):
         class FormData(TypedDict):
-            name: str
+            count: int
+            nickname: NotRequired[str]
+
+        result = parse_signals(_raw({"count": "42", "nickname": "ada"}), FormData)
+        assert result["count"] == 42
+        assert result["nickname"] == "ada"
+
+    def test_nested_dataclass_and_typeddict(self):
+        class ProfileDict(TypedDict):
+            age: int
+            nickname: NotRequired[str]
+
+        @dataclass
+        class Payload:
+            profile: ProfileDict
+
+        result = parse_signals(
+            _raw({"profile": {"age": "41", "nickname": "ada"}}),
+            Payload,
+        )
+        assert result.profile["age"] == 41
+        assert result.profile["nickname"] == "ada"
+
+    def test_nested_validation_error_has_path(self):
+        @dataclass
+        class Profile:
+            age: int
+
+        @dataclass
+        class Payload:
+            profile: Profile
+
+        with pytest.raises(SignalValidationError) as exc:
+            parse_signals(_raw({"profile": {"age": "not-int"}}), Payload)
+
+        first = exc.value.errors(include_url=False)[0]
+        assert first["loc"] == ("profile", "age")
+
+
+class TestParseSignalsPydantic:
+    def test_pydantic_model_parse(self):
+        class Payload(BaseModel):
             count: int
 
-        result = parse_signals({"name": "test", "count": 42}, FormData)
+        result = parse_signals(_raw({"count": "42"}), Payload)
+        assert result.count == 42
 
-        assert result["name"] == "test"
-        assert result["count"] == 42
-
-    def test_optional_fields(self):
-        class Data(TypedDict):
-            required: str
-            optional: NotRequired[str]
-
-        result = parse_signals({"required": "yes"}, Data)
-
-        assert result["required"] == "yes"
-        assert "optional" not in result
-
-    def test_coercion(self):
-        class Data(TypedDict):
+    def test_pydantic_validation_error_passthrough(self):
+        class Payload(BaseModel):
             count: int
 
-        result = parse_signals({"count": "42"}, Data)
+        with pytest.raises(SignalValidationError):
+            parse_signals(_raw({"count": "not-int"}), Payload)
 
-        assert result["count"] == 42
+    def test_signal_validation_error_is_still_validation_error(self):
+        class Payload(BaseModel):
+            count: int
+
+        with pytest.raises(ValidationError):
+            parse_signals(_raw({"count": "not-int"}), Payload)
 
 
-class TestParseSignalsUnsupported:
-    """Test error handling for unsupported types."""
+class TestAdapterCaching:
+    def test_adapter_is_cached_by_schema_type(self):
+        @dataclass
+        class Payload:
+            count: int
 
-    def test_plain_class_raises(self):
-        class PlainClass:
-            pass
-
-        with pytest.raises(StarioError, match="Unsupported schema type"):
-            parse_signals({}, PlainClass)
-
-    def test_primitive_raises(self):
-        with pytest.raises(StarioError, match="Unsupported schema type"):
-            parse_signals({}, int)
+        assert _adapter_for(Payload) is _adapter_for(Payload)

@@ -13,7 +13,7 @@ Design:
 """
 
 import re
-from typing import Self
+from typing import Self, overload
 
 # =============================================================================
 # COMMON HEADERS - Defined as canonical strings
@@ -475,9 +475,15 @@ class Headers:
         raw = existing if isinstance(existing, bytes) else existing[0]
         return raw.decode("latin-1")
 
-    def get[T: str | None = None](
-        self, name: str | bytes, default: T = None
-    ) -> T | str:
+    @overload
+    def get(self, name: str | bytes) -> str | None: ...
+
+    @overload
+    def get[T](self, name: str | bytes, default: T) -> str | T: ...
+
+    def get[T](
+        self, name: str | bytes, default: T | None = None
+    ) -> str | T | None:
         """Get first value for header, decoded as string."""
         value = self._data.get(name if isinstance(name, bytes) else HEADER_LOOKUP[name])
         if value is None:

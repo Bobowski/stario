@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from stario.exceptions import StarioError
-from stario.http.staticassets import StaticAssets, _collections, asset, fingerprint
+from stario.http.router import Router
+from stario.http.staticassets import StaticAssets, fingerprint
 
 
 class TestFingerprint:
@@ -75,19 +76,10 @@ class TestStaticAssetsInit:
             (Path(tmpdir) / "test.txt").write_text("Hello")
             (Path(tmpdir) / "style.css").write_text("body {}")
 
-            static = StaticAssets(tmpdir, collection="test_init")
+            static = StaticAssets(tmpdir)
 
             assert len(static._cache) == 2
             assert len(static._path_to_hash) == 2
-
-    def test_registers_collection(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "file.txt").write_text("content")
-
-            static = StaticAssets(tmpdir, collection="test_register")
-
-            assert "test_register" in _collections
-            assert _collections["test_register"] is static
 
 
 class TestStaticAssetsUrl:
@@ -97,7 +89,7 @@ class TestStaticAssetsUrl:
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "app.js").write_text("console.log('hello');")
 
-            static = StaticAssets(tmpdir, collection="test_url")
+            static = StaticAssets(tmpdir)
             url = static.url("app.js")
 
             # Should be like "app.{hash}.js"
@@ -111,7 +103,7 @@ class TestStaticAssetsUrl:
             subdir.mkdir()
             (subdir / "main.css").write_text("* { margin: 0; }")
 
-            static = StaticAssets(tmpdir, collection="test_nested")
+            static = StaticAssets(tmpdir)
             url = static.url("css/main.css")
 
             assert "css/" in url
@@ -122,28 +114,67 @@ class TestStaticAssetsUrl:
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "exists.txt").write_text("I exist")
 
-            static = StaticAssets(tmpdir, collection="test_notfound")
+            static = StaticAssets(tmpdir)
 
             with pytest.raises(StarioError, match="not found"):
                 static.url("missing.txt")
 
 
-class TestAssetFunction:
-    """Test global asset() function."""
+class TestUrlForAssets:
+    """Test asset URL resolution through url_for()."""
 
-    def test_asset_returns_url(self):
+    def test_default_collection_resolves_full_public_url(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "style.css").write_text("body {}")
 
-            StaticAssets(tmpdir, collection="test_asset_fn")
+            app = Router()
+            app.assets("/static", tmpdir, name="static")
 
-            url = asset("style.css", collection="test_asset_fn")
-            assert "style." in url
-            assert ".css" in url
+            url = app.url_for("static", "style.css")
+            assert url.startswith("/static/style.")
+            assert url.endswith(".css")
 
-    def test_asset_unknown_collection_raises(self):
-        with pytest.raises(KeyError, match="not registered"):
-            asset("file.txt", collection="nonexistent_collection")
+    def test_mounted_router_resolves_prefixed_asset_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            chat = Router()
+            chat.assets("/static", tmpdir, name="chat")
+
+            app = Router()
+            app.mount("/chat", chat)
+
+            url = app.url_for("chat", "style.css")
+
+            assert url.startswith("/chat/static/style.")
+            assert url.endswith(".css")
+
+    def test_unknown_collection_raises(self):
+        app = Router()
+
+        with pytest.raises(StarioError, match="Register the route or asset first with name='missing'"):
+            app.url_for("missing", "style.css")
+
+    def test_asset_routes_require_path_argument(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = Router()
+            app.assets("/static", tmpdir, name="static")
+
+            with pytest.raises(StarioError, match="Named asset mounts require a path argument"):
+                app.url_for("static")
+
+    def test_asset_routes_append_queries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = Router()
+            app.assets("/static", tmpdir, name="static")
+
+            url = app.url_for("static", "style.css", queries={"v": 1, "debug": True})
+            assert url.startswith("/static/style.")
+            assert url.endswith('.css?v=1&debug=True')
 
 
 class TestStaticAssetsCaching:
@@ -154,7 +185,7 @@ class TestStaticAssetsCaching:
             content = "Small file content"
             (Path(tmpdir) / "small.txt").write_text(content)
 
-            static = StaticAssets(tmpdir, collection="test_small")
+            static = StaticAssets(tmpdir)
 
             # Get the fingerprinted key
             hashed_name = static._path_to_hash["small.txt"]
@@ -169,7 +200,7 @@ class TestStaticAssetsCaching:
             content = "x" * 1000  # 1KB of repeated chars
             (Path(tmpdir) / "compressible.txt").write_text(content)
 
-            static = StaticAssets(tmpdir, collection="test_compress")
+            static = StaticAssets(tmpdir)
 
             hashed_name = static._path_to_hash["compressible.txt"]
             cached = static._cache[hashed_name]
@@ -185,7 +216,7 @@ class TestStaticAssetsCaching:
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 500)
 
-            static = StaticAssets(tmpdir, collection="test_nocompress")
+            static = StaticAssets(tmpdir)
 
             hashed_name = static._path_to_hash["image.png"]
             cached = static._cache[hashed_name]

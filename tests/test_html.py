@@ -1,11 +1,11 @@
 """Tests for stario.html module - HTML generation and rendering."""
 
-
 from stario.html import (
     A,
     Body,
     Br,
     Button,
+    Comment,
     Div,
     Head,
     Html,
@@ -82,6 +82,18 @@ class TestSafeString:
     def test_regular_string_escaped(self):
         result = render(Div("<b>bold</b>"))
         assert "&lt;b&gt;" in result
+
+
+class TestComment:
+    """Test HTML comment node helper."""
+
+    def test_comment_renders_in_tree(self):
+        result = render(Div(Comment("server-note"), P("Hello")))
+        assert result == "<div><!--server-note--><p>Hello</p></div>"
+
+    def test_comment_escapes_dangerous_sequences(self):
+        result = render(Comment("--><script>alert(1)</script>"))
+        assert result == "<!----&gt;&lt;script&gt;alert(1)&lt;/script&gt;-->"
 
 
 class TestTagCreation:
