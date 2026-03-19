@@ -23,6 +23,7 @@ def patch(
     *,
     mode: str = "outer",
     selector: str | None = None,
+    namespace: str | None = None,
     use_view_transition: bool = False,
 ) -> bytes:
     """
@@ -47,6 +48,9 @@ def patch(
 
     if use_view_transition:
         lines.append("data: useViewTransition true")
+
+    if namespace:
+        lines.append(f"data: namespace {namespace}")
 
     # Render element and handle multiline
     html = render(element)
