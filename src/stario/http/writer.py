@@ -328,6 +328,11 @@ class Writer:
             "after",
         ] = "outer",
         selector: str | None = None,
+        namespace: Literal[
+            "svg",
+            "mathml",
+            None,
+        ] = None,
         use_view_transition: bool = False,
     ) -> None:
         """Patch DOM elements via SSE (compressed if configured)."""
@@ -337,6 +342,7 @@ class Writer:
                 element,
                 mode=mode,
                 selector=selector,
+                namespace=namespace,
                 use_view_transition=use_view_transition,
             )
         )
