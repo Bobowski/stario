@@ -31,7 +31,7 @@ class UrlFor(Protocol):
     def __call__(
         self,
         name: str,
-        path: str | None = None,
+        path: str | dict[str, str] | None = None,
         queries: UrlQueryParams | None = None,
     ) -> str: ...
 
@@ -54,7 +54,7 @@ class Context:
     def url_for(
         self,
         name: str,
-        path: str | None = None,
+        path: str | dict[str, str] | None = None,
         queries: UrlQueryParams | None = None,
     ) -> str:
         """Resolve a named route or asset URL through the current app."""
@@ -69,6 +69,7 @@ class Context:
             raw = await self.req.body()
 
         return parse_signals(raw, schema)
+
 
 type Handler = Callable[[Context, Writer], Awaitable[None]]
 

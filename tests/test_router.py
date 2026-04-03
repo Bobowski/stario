@@ -192,7 +192,9 @@ class TestRouterMiddleware:
         def mw(handler: Handler) -> Handler:
             return handler
 
-        with pytest.raises(StarioError, match="Middleware must be registered before routes"):
+        with pytest.raises(
+            StarioError, match="Middleware must be registered before routes"
+        ):
             router.use(mw)
 
     def test_per_route_middleware(self):
@@ -252,7 +254,9 @@ class TestRouterUrlFor:
 
         router.get("/", home)
 
-        with pytest.raises(StarioError, match="Register the route or asset first with name='home'"):
+        with pytest.raises(
+            StarioError, match="Register the route or asset first with name='home'"
+        ):
             router.url_for("home")
 
     def test_url_for_exact_route(self):
@@ -322,7 +326,9 @@ class TestRouterUrlFor:
 
         router.get("/", home, name="home")
 
-        with pytest.raises(StarioError, match="Exact routes do not accept a path argument"):
+        with pytest.raises(
+            StarioError, match="Exact routes do not accept a path argument"
+        ):
             router.url_for("home", "extra")
 
     def test_mount_catchall(self):
@@ -360,3 +366,89 @@ class TestRouterUrlFor:
         api.get("/test", handler)
         main.mount("/api", api)
         # Parent middleware should wrap mounted routes
+
+
+class TestRouterParams:
+    """Test parameterized route registration and dispatch."""
+
+    def test_param_registration(self):
+        router = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/games/{gameId}", handler)
+        assert len(router._param_routes) == 1
+        assert router._param_routes[0][0] == "/games"
+        assert router._param_routes[0][3] == {"GET": handler}
+
+    def test_nested_params(self):
+        router = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/games/{gameId}/players/{playerId}", handler)
+        assert len(router._param_routes) == 1
+        assert router._param_routes[0][0] == "/games"
+
+    def test_param_sorted_by_prefix_length(self):
+        router = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/a/{x}", handler)
+        router.get("/a/b/{x}/{y}", handler)
+        router.get("/a/c/{z}", handler)
+
+        prefixes = [p for p, _, _, _ in router._param_routes]
+        assert prefixes[0] == "/a/b"
+        assert prefixes[1] == "/a/c"
+        assert prefixes[2] == "/a"
+
+    def test_param_url_for(self):
+        router = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/games/{gameId}", handler, name="game")
+
+        url = router.url_for("game", {"gameId": "123"})
+        assert url == "/games/123"
+
+    def test_nested_param_url_for(self):
+        router = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/games/{gameId}/players/{playerId}", handler, name="player")
+
+        url = router.url_for("player", {"gameId": "abc", "playerId": "xyz"})
+        assert url == "/games/abc/players/xyz"
+
+    def test_param_url_for_missing_param_raises(self):
+        router = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        router.get("/games/{gameId}", handler, name="game")
+
+        with pytest.raises(StarioError, match="Missing parameter"):
+            router.url_for("game", {})
+
+    def test_param_mount_prefix(self):
+        main = Router()
+        api = Router()
+
+        async def handler(c: Context, w: Writer) -> None:
+            pass
+
+        api.get("/games/{gameId}", handler)
+        main.mount("/api", api)
+
+        prefixes = [p for p, _, _, _ in main._param_routes]
+        assert "/api/games" in prefixes

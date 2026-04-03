@@ -231,6 +231,7 @@ class Request:
         "path",
         "tail",
         "subhost",
+        "params",
         "headers",
         "protocol_version",
         "keep_alive",
@@ -261,6 +262,7 @@ class Request:
         self.subhost = (
             ""  # The matched wildcard portion for host routing (*.example.com)
         )
+        self.params: dict[str, str] = {}  # Extracted path parameters
         self.headers = headers
         self.protocol_version = protocol_version
         self.keep_alive = keep_alive

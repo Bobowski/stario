@@ -13,6 +13,7 @@ Usage:
     router.assets("/static", "./static", name="static")
 """
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
@@ -51,6 +52,44 @@ def _append_queries(url: str, queries: UrlQueryParams | None) -> str:
     if not queries:
         return url
     return f"{url}?{urlencode(queries, doseq=True)}"
+
+
+_PARAM_PATTERN = re.compile(r"\{(\w+)\}")
+
+
+def _has_param_syntax(path: str) -> bool:
+    """Check if path contains {param} style parameters."""
+    return "{" in path and "}" in path
+
+
+def _convert_param_path(path: str) -> tuple[str, list[str], re.Pattern[str]]:
+    """
+    Convert {param} style path to regex pattern.
+
+    Returns:
+        tuple of (prefix_without_params, list of param names, compiled regex pattern)
+    """
+    param_names: list[str] = []
+    regex_parts: list[str] = []
+    last_end = 0
+
+    for match in _PARAM_PATTERN.finditer(path):
+        param_names.append(match.group(1))
+        before = path[last_end : match.start()]
+        regex_parts.append(re.escape(before) + r"(?P<" + match.group(1) + r">[^/]+)")
+        last_end = match.end()
+
+    if last_end < len(path):
+        regex_parts.append(re.escape(path[last_end:]))
+
+    regex_str = "".join(regex_parts) + "$"
+    pattern = re.compile(regex_str)
+
+    prefix = path[: path.find("{")].rstrip("/") if "{" in path else path
+    if not prefix:
+        prefix = "/"
+
+    return prefix, param_names, pattern
 
 
 @dataclass(slots=True, frozen=True)
@@ -97,7 +136,43 @@ class _AssetRoute:
         return self.static.url(path)
 
 
-type _ReverseRoute = _ExactRoute | _WildcardRoute | _AssetRoute
+@dataclass(slots=True, frozen=True)
+class _ParamRoute:
+    """Reverse route for a parameterized path."""
+
+    prefix: str
+    param_names: list[str]
+    pattern: re.Pattern[str]
+    path_template: str = ""
+
+    def url(self, path: dict[str, str] | None) -> str:
+        if path is None:
+            raise StarioError(
+                "Parameterized routes require a path argument",
+                help_text="Pass a dict with param values, for example url_for('game', {'gameId': '123'}).",
+            )
+        for name in self.param_names:
+            if name not in path:
+                raise StarioError(
+                    f"Missing parameter: '{name}'",
+                    context={
+                        "route_params": self.param_names,
+                        "provided": list(path.keys()),
+                    },
+                    help_text=f"All route parameters must be provided: {self.param_names}",
+                )
+        if self.path_template:
+            result = self.path_template
+            for name in self.param_names:
+                result = result.replace("{" + name + "}", path[name])
+            return result[len(self.prefix) :]  # Return only the part after prefix
+        url = ""
+        for name in self.param_names:
+            url = f"{url}/{path[name]}"
+        return url
+
+
+type _ReverseRoute = _ExactRoute | _WildcardRoute | _AssetRoute | _ParamRoute
 
 
 class Router:
@@ -132,6 +207,7 @@ class Router:
         "_middlewares",
         "_exact",
         "_catchall",
+        "_param_routes",
         "_reverse_routes",
     )
 
@@ -139,12 +215,15 @@ class Router:
         self._middlewares: list[Middleware] = []
         self._exact: dict[str, dict[str, Handler]] = {}
         self._catchall: list[tuple[str, dict[str, Handler]]] = []
+        self._param_routes: list[
+            tuple[str, list[str], re.Pattern[str], dict[str, Handler]]
+        ] = []
         self._reverse_routes: dict[str, _ReverseRoute] = {}
 
     @property
     def empty(self) -> bool:
         """True if no routes have been registered."""
-        return not self._exact and not self._catchall
+        return not self._exact and not self._catchall and not self._param_routes
 
     # =========================================================================
     # Configuration
@@ -197,6 +276,13 @@ router.get("/", home)        # Then: routes""",
             if name is not None:
                 self._register_reverse_route(name, _WildcardRoute(prefix))
             self._add_catchall(prefix, method, wrapped)
+        elif _has_param_syntax(path):
+            prefix, param_names, pattern = _convert_param_path(path)
+            if name is not None:
+                self._register_reverse_route(
+                    name, _ParamRoute(prefix, param_names, pattern, path)
+                )
+            self._add_param_route(prefix, method, wrapped, param_names, pattern)
         else:
             if name is not None:
                 self._register_reverse_route(name, _ExactRoute(path))
@@ -229,6 +315,30 @@ router.get("/", home)        # Then: routes""",
         self._catchall.append((prefix, {method: handler}))
         # Sort by prefix length (longest first)
         self._catchall.sort(key=lambda x: len(x[0]), reverse=True)
+
+    def _add_param_route(
+        self,
+        prefix: str,
+        method: str,
+        handler: Handler,
+        param_names: list[str],
+        pattern: re.Pattern[str],
+    ) -> None:
+        """Add parameterized route."""
+        for p, _, existing_pattern, methods in self._param_routes:
+            if p == prefix and existing_pattern.pattern == pattern.pattern:
+                if method in methods:
+                    raise StarioError(
+                        f"Route already registered: {method} {pattern.pattern}",
+                        context={"method": method, "pattern": pattern.pattern},
+                        help_text="Each method + path combination can only have one handler.",
+                    )
+                methods[method] = handler
+                return
+
+        self._param_routes.append((prefix, param_names, pattern, {method: handler}))
+        # Sort by prefix length (longest first)
+        self._param_routes.sort(key=lambda x: len(x[0]), reverse=True)
 
     def _register_reverse_route(self, name: str, route: _ReverseRoute) -> None:
         """Register a reverse route in the flat name registry."""
@@ -336,12 +446,25 @@ router.get("/", home)        # Then: routes""",
                 wrapped = self._wrap_handler(handler)
                 self._add_catchall(full_prefix, method, wrapped)
 
+        # Copy param routes with prefix, applying parent middleware
+        for sub_prefix, param_names, pattern, methods in router._param_routes:
+            full_prefix = _normalize_path(prefix + sub_prefix)
+            for method, handler in methods.items():
+                wrapped = self._wrap_handler(handler)
+                self._add_param_route(
+                    full_prefix, method, wrapped, param_names, pattern
+                )
+
         for name, route in router._reverse_routes.items():
             full_path = _normalize_path(prefix + route.prefix)
             if isinstance(route, _ExactRoute):
                 mounted = _ExactRoute(full_path)
             elif isinstance(route, _WildcardRoute):
                 mounted = _WildcardRoute(full_path)
+            elif isinstance(route, _ParamRoute):
+                mounted = _ParamRoute(
+                    full_path, route.param_names, route.pattern, route.path_template
+                )
             else:
                 mounted = _AssetRoute(full_path, route.static)
             self._register_reverse_route(name, mounted)
@@ -388,7 +511,7 @@ router.get("/", home)        # Then: routes""",
     def url_for(
         self,
         name: str,
-        path: str | None = None,
+        path: str | dict[str, str] | None = None,
         queries: UrlQueryParams | None = None,
     ) -> str:
         """
@@ -397,6 +520,7 @@ router.get("/", home)        # Then: routes""",
         Exact routes ignore `path`.
         Wildcard routes append `path` to the registered prefix.
         Asset mounts fingerprint and resolve the logical asset `path`.
+        Parameterized routes require a dict of param values.
         """
         route = self._reverse_routes.get(name)
         if route is None:
@@ -411,7 +535,24 @@ router.get("/", home)        # Then: routes""",
 app.assets("/static", "./static", name="static")""",
             )
 
-        return _append_queries(_join_subpath(route.prefix, route.url(path)), queries)
+        if isinstance(route, _ParamRoute):
+            if isinstance(path, dict):
+                resolved_path = route.url(path)
+            elif path is None:
+                resolved_path = route.url(None)
+            else:
+                raise StarioError(
+                    "Parameterized routes require a dict of param values",
+                    help_text="Pass a dict, for example url_for('game', {'gameId': '123'}).",
+                )
+        else:
+            if isinstance(path, dict):
+                raise StarioError(
+                    "Non-parameterized routes do not accept dict path",
+                    help_text="Pass a string path or use parameterized routes.",
+                )
+            resolved_path = route.url(path)
+        return _append_queries(_join_subpath(route.prefix, resolved_path), queries)
 
     # =========================================================================
     # Dispatch
@@ -441,14 +582,24 @@ app.assets("/static", "./static", name="static")""",
         for prefix, methods in self._catchall:
             if path.startswith(prefix):
                 if handler := methods.get(method):
-                    # Set param to rest of path
                     c.req.tail = path[len(prefix) :].lstrip("/")
                     await handler(c, w)
                     return
-                # Method not allowed
                 w.headers.set(b"allow", ", ".join(methods.keys()))
                 w.text("Method Not Allowed", 405)
                 return
+
+        # Try parameterized routes
+        for prefix, _, pattern, methods in self._param_routes:
+            if path.startswith(prefix):
+                if match := pattern.match(path):
+                    if handler := methods.get(method):
+                        c.req.params = match.groupdict()
+                        await handler(c, w)
+                        return
+                    w.headers.set(b"allow", ", ".join(methods.keys()))
+                    w.text("Method Not Allowed", 405)
+                    return
 
         # Not found
         w.text("Not Found", 404)
