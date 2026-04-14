@@ -423,7 +423,7 @@ app.assets("/static", "./static", name="static")""",
         method = c.req.method
 
         # Strip trailing slash (redirect)
-        if path != "/" and path.endswith("/"):
+        if path != "/" and path.endswith("/") and (not path.startswith("//")):
             w.redirect(path.rstrip("/"), 301)
             return
 
