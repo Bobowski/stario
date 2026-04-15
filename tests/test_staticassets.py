@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from stario import App
 from stario.exceptions import StarioError
 from stario.http.router import Router
 from stario.http.staticassets import StaticAssets, fingerprint
+from stario.testing import TestClient
 
 
 class TestFingerprint:
@@ -82,55 +84,37 @@ class TestStaticAssetsInit:
             assert len(static._path_to_hash) == 2
 
 
-class TestStaticAssetsUrl:
-    """Test URL generation."""
-
-    def test_returns_fingerprinted_name(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "app.js").write_text("console.log('hello');")
-
-            static = StaticAssets(tmpdir)
-            url = static.url("app.js")
-
-            # Should be like "app.{hash}.js"
-            assert url.startswith("app.")
-            assert url.endswith(".js")
-            assert len(url) > len("app.js")
-
-    def test_nested_file(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            subdir = Path(tmpdir) / "css"
-            subdir.mkdir()
-            (subdir / "main.css").write_text("* { margin: 0; }")
-
-            static = StaticAssets(tmpdir)
-            url = static.url("css/main.css")
-
-            assert "css/" in url
-            assert "main." in url
-            assert ".css" in url
-
-    def test_not_found_raises(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "exists.txt").write_text("I exist")
-
-            static = StaticAssets(tmpdir)
-
-            with pytest.raises(StarioError, match="not found"):
-                static.url("missing.txt")
-
-
 class TestUrlForAssets:
     """Test asset URL resolution through url_for()."""
 
-    def test_default_collection_resolves_full_public_url(self):
+    def test_assets_reject_missing_leading_slash(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "style.css").write_text("body {}")
 
-            app = Router()
-            app.assets("/static", tmpdir, name="static")
+            app = App()
 
-            url = app.url_for("static", "style.css")
+            with pytest.raises(StarioError, match=r"Expected '/static'"):
+                app.mount("static", StaticAssets(tmpdir, name="static"))
+
+    def test_assets_reject_mounts_that_conflict_with_internal_catchall(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = App()
+
+            with pytest.raises(
+                StarioError, match="Catchall mount prefix cannot have child routes"
+            ):
+                app.mount("/static/{existing...}", StaticAssets(tmpdir, name="static"))
+
+    def test_named_asset_resolves_full_public_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            url = app.url_for("static:style.css")
             assert url.startswith("/static/style.")
             assert url.endswith(".css")
 
@@ -139,42 +123,94 @@ class TestUrlForAssets:
             (Path(tmpdir) / "style.css").write_text("body {}")
 
             chat = Router()
-            chat.assets("/static", tmpdir, name="chat")
+            chat.mount("/static", StaticAssets(tmpdir, name="chat"))
 
-            app = Router()
+            app = App()
             app.mount("/chat", chat)
 
-            url = app.url_for("chat", "style.css")
+            url = app.url_for("chat:style.css")
 
             assert url.startswith("/chat/static/style.")
             assert url.endswith(".css")
 
-    def test_unknown_collection_raises(self):
-        app = Router()
-
-        with pytest.raises(StarioError, match="Register the route or asset first with name='missing'"):
-            app.url_for("missing", "style.css")
-
-    def test_asset_routes_require_path_argument(self):
+    def test_host_asset_name_includes_host_and_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "style.css").write_text("body {}")
 
-            app = Router()
-            app.assets("/static", tmpdir, name="static")
+            app = App()
+            app.mount("cdn.example.com/static", StaticAssets(tmpdir, name="static"))
 
-            with pytest.raises(StarioError, match="Named asset mounts require a path argument"):
+            url = app.url_for("static:style.css")
+
+            assert url.startswith("cdn.example.com/static/style.")
+            assert url.endswith(".css")
+
+    def test_root_asset_name_does_not_add_double_slash(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = App()
+            app.mount("/", StaticAssets(tmpdir, name="static"))
+
+            url = app.url_for("static:style.css")
+
+            assert url.startswith("/style.")
+            assert not url.startswith("//")
+            assert url.endswith(".css")
+
+    def test_nested_asset_name_preserves_relative_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            css_dir = Path(tmpdir) / "css"
+            css_dir.mkdir()
+            (css_dir / "style.css").write_text("body {}")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            url = app.url_for("static:css/style.css")
+            assert url.startswith("/static/css/style.")
+            assert url.endswith(".css")
+
+    def test_unknown_asset_name_raises(self):
+        app = App()
+
+        with pytest.raises(
+            StarioError,
+            match="Register the route or asset first with name='missing:style.css'",
+        ):
+            app.url_for("missing:style.css")
+
+    def test_asset_mount_name_is_not_registered_as_collection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            with pytest.raises(StarioError, match="Reverse route not registered"):
                 app.url_for("static")
 
     def test_asset_routes_append_queries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "style.css").write_text("body {}")
 
-            app = Router()
-            app.assets("/static", tmpdir, name="static")
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
 
-            url = app.url_for("static", "style.css", queries={"v": 1, "debug": True})
+            url = app.url_for("static:style.css", query={"v": 1, "debug": True})
             assert url.startswith("/static/style.")
-            assert url.endswith('.css?v=1&debug=True')
+            assert url.endswith(".css?v=1&debug=True")
+
+    def test_static_assets_mount_directly_as_subtree(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "style.css").write_text("body {}")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            url = app.url_for("static:style.css")
+            assert url.startswith("/static/style.")
+            assert url.endswith(".css")
 
 
 class TestStaticAssetsCaching:
@@ -207,10 +243,24 @@ class TestStaticAssetsCaching:
 
             # Should have pre-compressed variants
             assert cached.zstd is not None
+            assert cached.brotli is not None
             assert cached.gzip is not None
             assert cached.content is not None
             # Compressed should be smaller
             assert len(cached.zstd) < len(cached.content)
+
+    def test_select_body_prefers_brotli_then_zstd_then_gzip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            content = "x" * 1000
+            (Path(tmpdir) / "compressible.txt").write_text(content)
+
+            static = StaticAssets(tmpdir)
+            hashed_name = static._path_to_hash["compressible.txt"]
+            cached = static._cache[hashed_name]
+
+            assert static._select_body(cached, b"gzip, zstd, br")[1] == b"br"
+            assert static._select_body(cached, b"gzip, zstd")[1] == b"zstd"
+            assert static._select_body(cached, b"gzip")[1] == b"gzip"
 
     def test_already_compressed_not_precompressed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -224,3 +274,61 @@ class TestStaticAssetsCaching:
             # PNG is already compressed, should skip pre-compression
             assert cached.zstd is None
             assert cached.gzip is None
+
+
+@pytest.mark.asyncio
+class TestStaticAssetsRedirect:
+    """Test that unfingerprinted URLs redirect to their fingerprinted equivalents."""
+
+    async def test_root_file_redirect_is_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "app.js").write_text("console.log('hi');")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            async with TestClient(app) as client:
+                resp = await client.get("/static/app.js", follow_redirects=False)
+
+            assert resp.status_code == 307
+            location = resp.headers.get("location")
+            # Must be an absolute path (starts with /) not just a filename
+            assert location is not None
+            assert location.startswith("/static/")
+            assert location.endswith(".js")
+
+    async def test_subdirectory_file_redirect_preserves_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            js_dir = Path(tmpdir) / "js"
+            js_dir.mkdir()
+            (js_dir / "app.js").write_text("console.log('hi');")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            async with TestClient(app) as client:
+                resp = await client.get("/static/js/app.js", follow_redirects=False)
+
+            assert resp.status_code == 307
+            location = resp.headers.get("location")
+            # Must preserve the js/ subdirectory prefix
+            assert location is not None
+            assert location.startswith("/static/js/")
+            assert location.endswith(".js")
+
+    async def test_fingerprinted_url_serves_directly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            js_dir = Path(tmpdir) / "js"
+            js_dir.mkdir()
+            (js_dir / "app.js").write_text("console.log('hi');")
+
+            app = App()
+            app.mount("/static", StaticAssets(tmpdir, name="static"))
+
+            fingerprinted_url = app.url_for("static:js/app.js")
+
+            async with TestClient(app) as client:
+                resp = await client.get(fingerprinted_url)
+
+            assert resp.status_code == 200
+            assert b"console.log" in resp.content

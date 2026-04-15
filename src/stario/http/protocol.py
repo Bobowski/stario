@@ -1,46 +1,30 @@
 """
-HTTP/1.1 Protocol - Simple, fast.
+Per-connection HTTP/1.1: httptools parses bytes; handlers run as tasks so this layer never blocks the event loop.
 
-This module handles the low-level HTTP/1.1 parsing and connection management.
-Uses httptools (http-parser via Cython) for parsing.
-
-Design decisions:
-- Task tracking: Handler tasks and `Context.create_task()` work are registered
-  in a per-worker set shared with the server. During shutdown, the server gives
-  those tasks a grace window to finish before cancelling any that remain. Only
-  stario-managed tasks are affected; external tasks on the same loop are never
-  touched.
-- Pipelining support: Requests are queued if the prior response isn't complete.
-  This is rare in practice (browsers mostly use concurrent connections), but
-  required for HTTP/1.1 compliance.
-- Keep-alive timeout: 5 seconds of idle before closing. This balances resource
-  usage against connection reuse. Most real traffic comes with Connection: keep-alive.
-- Disconnect future: Shared across all requests on a connection. When the client
-  disconnects, all SSE streams and body readers are notified immediately.
+Shared ``disconnect`` futures tie body reads and long responses to the same socket lifetime. Pipelining and keep-alive
+follow RFC behavior even when common clients use parallel connections instead. App work is scheduled via ``app.create_task``
+so shutdown can observe the same task set the app registered.
 """
 
 import asyncio
 from collections import deque
-from collections.abc import Coroutine
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import Callable, cast
 from urllib.parse import unquote as unquote_url
 
 import httptools
 
 from stario.telemetry.core import Tracer
 
+from .app import App
+from .context import Context
 from .headers import Headers
 from .request import BodyReader, Request
-from .types import Context
 from .writer import (
     CompressionConfig,
     Writer,
     _get_status_line,
 )
-
-if TYPE_CHECKING:
-    from .app import Stario
 
 KEEP_ALIVE_TIMEOUT = 5.0
 
@@ -60,9 +44,9 @@ def _decode_path(path_bytes: bytes) -> str:
 
 class HttpProtocol(asyncio.Protocol):
     """
-    HTTP/1.1 protocol handler.
+    ``asyncio.Protocol`` for one TCP (or Unix) connection: parse requests with httptools, run ``app`` per message, pipeline safely.
 
-    One instance per connection.
+    Pipelined requests queue until the prior response finishes; ``BodyReader`` and ``Writer`` share one disconnect future per connection.
     """
 
     __slots__ = (  # type: ignore[assignment]
@@ -83,28 +67,35 @@ class HttpProtocol(asyncio.Protocol):
         "_shutdown",
         "_pipeline",
         "_connections",
-        "_tasks",
+        "_max_request_header_bytes",
+        "_max_request_body_bytes",
+        "_request_head_bytes",
     )
 
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        app: "Stario",
+        app: App,
         tracer: Tracer,
         get_date_header: Callable[[], bytes],
         compression: CompressionConfig,
         shutdown: asyncio.Future,
         connections: set["HttpProtocol"],
-        tasks: set[asyncio.Task[Any]],
+        *,
+        max_request_header_bytes: int,
+        max_request_body_bytes: int,
     ) -> None:
         self.loop = loop
         self.app = app
         self.tracer = tracer
         self.get_date_header = get_date_header
         self.compression = compression
+        # Process-wide: when set, new responses close the socket after send (see on_response_completed).
         self._shutdown = shutdown
         self._connections = connections
-        self._tasks = tasks
+        self._max_request_header_bytes = max_request_header_bytes
+        self._max_request_body_bytes = max_request_body_bytes
+        self._request_head_bytes = 0
 
         self.parser: httptools.HttpRequestParser | None = httptools.HttpRequestParser(
             self
@@ -121,9 +112,10 @@ class HttpProtocol(asyncio.Protocol):
         self._active_context: Context | None = None
         self._active_writer: Writer | None = None
 
-        # Common disconnect info for all requests on this connection
-        self._disconnect = asyncio.Future()
+        # One Future per TCP connection: BodyReader, Writer, and SSE loops all await this.
+        self._disconnect = loop.create_future()
 
+        # Lazy: only allocated when a second full request parses while the first response is still in flight.
         self._pipeline: deque[tuple[Context, Writer]] | None = None
 
     # =========================================================================
@@ -157,7 +149,7 @@ class HttpProtocol(asyncio.Protocol):
         self._cancel_timeout()
         self._connections.discard(self)
 
-        # Notify response writer and body reader that connection is lost
+        # Wake anyone awaiting Writer/BodyReader disconnect (same Future as abrupt close).
         if not self._disconnect.done():
             self._disconnect.set_result(None)
 
@@ -182,6 +174,7 @@ class HttpProtocol(asyncio.Protocol):
             self._close_with_error(400, "Upgrade not supported")
 
     def pause_writing(self) -> None:
+        # Kernel / transport asked us to stop sending; stop reading to apply backpressure upstream.
         if self.transport and not self.transport.is_closing():
             self.transport.pause_reading()
 
@@ -195,18 +188,29 @@ class HttpProtocol(asyncio.Protocol):
 
     def on_message_begin(self) -> None:
         assert self.transport is not None
+        # Reserve bytes for ``METHOD SP`` and `` HTTP/x.x\\r\\n`` (URL fragments arrive via ``on_url``).
+        self._request_head_bytes = 40
         self._reading_headers = Headers()
         self._reading_body = BodyReader(
             pause=self.transport.pause_reading,
             resume=self.transport.resume_reading,
             disconnect=self._disconnect,
+            max_size=self._max_request_body_bytes,
         )
 
     def on_url(self, url: bytes) -> None:
+        self._request_head_bytes += len(url)
+        if self._request_head_bytes > self._max_request_header_bytes:
+            self._close_with_error(431, "Request header fields too large")
+            return
         self._reading_url_bytes += url
 
     def on_header(self, name: bytes, value: bytes) -> None:
         assert self._reading_headers is not None
+        self._request_head_bytes += len(name) + len(value)
+        if self._request_head_bytes > self._max_request_header_bytes:
+            self._close_with_error(431, "Request header fields too large")
+            return
         self._reading_headers.add(name, value)
 
     def on_headers_complete(self) -> None:
@@ -231,10 +235,17 @@ class HttpProtocol(asyncio.Protocol):
 
             body_reader.send_100_continue = send_100
 
+        # Hand off to the app: one Request + Writer per message; handler runs in a task (see on_response_completed).
+        try:
+            path_str = _decode_path(parsed_url.path)
+        except UnicodeDecodeError:
+            self._close_with_error(400, "Invalid request path")
+            return
+
         # fmt: off
         request = Request(
             method           = _decode_method(parser.get_method()),
-            path             = _decode_path(parsed_url.path),
+            path             = path_str,
             query_bytes      = parsed_url.query or b"",
             protocol_version = parser.get_http_version(),
             keep_alive       = parser.should_keep_alive(),
@@ -248,27 +259,25 @@ class HttpProtocol(asyncio.Protocol):
             on_completed    = self.on_response_completed,
             disconnect      = self._disconnect,
             shutdown        = self._shutdown,
-            compress        = self.compression.select(headers.get(b"accept-encoding")),
+            compression     = self.compression,
+            accept_encoding = headers.get(b"accept-encoding"),
         )
 
         context = Context(
-            app         = self.app,
-            req         = request,
-            span        = self.tracer.create(request.method),
-            state       = {},
-            create_task = self._create_task,
+            app  = self.app,
+            req  = request,
+            span = self.tracer.create(request.method),
         )
         # fmt: on
 
         if self._active_context is None:
-            # There are no active requests on this connection yet
             self._active_context = context
             self._active_writer = writer
 
-            self._spawn_handler(context, writer)
+            self.app.create_task(self.app(context, writer))
 
         else:
-            # Earlier request has not responded yet, queue it for later
+            # Pipeline queue: must not run the next handler until bytes are fully written.
             transport.pause_reading()
             if self._pipeline is None:
                 self._pipeline = deque()
@@ -310,13 +319,13 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = None
             return
 
-        # Next pipelined request
+        # FIFO: pipeline order matches arrival order; each handler still runs only after prior body is written.
         if self._pipeline:
             next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
             self._active_context = next_c
 
-            self._spawn_handler(next_c, next_w)
+            self.app.create_task(self.app(next_c, next_w))
             self._cancel_timeout()
             t.resume_reading()
         else:
@@ -324,21 +333,6 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = None
             self._reset_timeout()
             t.resume_reading()
-
-    def _spawn_handler(self, context: Context, writer: Writer) -> None:
-        """Create a handler task and register it in the worker's task set."""
-        self._create_task(self.app.handle_request(context, writer))
-
-    def _create_task[T](
-        self,
-        coro: Coroutine[Any, Any, T],
-        name: str | None = None,
-    ) -> asyncio.Task[T]:
-        """Create and track a server-managed task for this worker."""
-        task = self.loop.create_task(coro, name=name)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        return task
 
     # =========================================================================
     # Errors

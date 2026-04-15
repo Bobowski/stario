@@ -1,126 +1,29 @@
 """
-Stario - Real-time Hypermedia for Python.
+HTTP apps as explicit routes + plain HTML trees; wire protocol and rendering stay visible (no magic request globals).
 
-Core:
-    from stario import Stario, Router, Request, Writer
+The package root re-exports the types most handlers touch; use submodules (``stario.responses``, ``stario.datastar``, …) for helpers.
 
-Types:
-    from stario import Handler, Middleware, Context, UrlFor
-
-Static files:
-    from stario import StaticAssets
-
-Pub/Sub:
-    from stario import Relay
-
-Telemetry:
-    from stario import Tracer, Span, RichTracer, JsonTracer
-
-Datastar (hypermedia):
-    from stario import DatastarScript, at, data
-
-HTML (separate module):
-    from stario.html import Div, Span, render
+Prefer ``from stario import …`` by name—for markup, ``from stario import html as h`` and ``from stario import svg`` are the usual entry points (both are the same modules as ``stario.html`` and ``stario.html.svg``). Import tag helpers explicitly (for example ``from stario.html import Div, P``) or use the submodule ``from stario.html import tags as tags`` when you want the full catalog without a long import list. **Datastar** helpers use ``from stario import datastar as ds`` (the ``stario.datastar`` package). **Intentional HTTP outcomes** use ``HttpException`` for bodies (4xx/5xx) and ``RedirectException`` for redirects (3xx), both from ``stario.exceptions`` and re-exported here.
 """
 
-from importlib.metadata import version
+from importlib.metadata import version as _package_version
 
-__version__ = version("stario")
+__version__ = _package_version("stario")
 
-# =============================================================================
-# Core - App and routing
-# =============================================================================
-# =============================================================================
-# Datastar - Hypermedia helpers
-# =============================================================================
-from stario.datastar import DatastarScript as DatastarScript
-from stario.datastar import at as at
-from stario.datastar import data as data
-
-# =============================================================================
-# Exceptions
-# =============================================================================
-from stario.exceptions import ClientDisconnected as ClientDisconnected
+from stario import cookies as cookies
+from stario import html as html
+from stario import responses as responses
 from stario.exceptions import HttpException as HttpException
-from stario.exceptions import SignalValidationError as SignalValidationError
-from stario.exceptions import StarioError as StarioError
-from stario.http.app import Stario as Stario
-
-# =============================================================================
-# Request/Response - Handler parameters
-# =============================================================================
+from stario.exceptions import RedirectException as RedirectException
+from stario.html import svg as svg
+from stario.http.app import App as App
+from stario.http.context import Context as Context
+from stario.http.context import Handler as Handler
+from stario.http.context import Middleware as Middleware
 from stario.http.request import Request as Request
 from stario.http.router import Router as Router
-
-# =============================================================================
-# Static Files - Fingerprinted asset serving
-# =============================================================================
 from stario.http.staticassets import StaticAssets as StaticAssets
-
-# =============================================================================
-# Types - Handler signatures
-# =============================================================================
-from stario.http.types import Context as Context
-from stario.http.types import Handler as Handler
-from stario.http.types import Middleware as Middleware
-from stario.http.types import UrlFor as UrlFor
-from stario.http.writer import CompressionConfig as CompressionConfig
 from stario.http.writer import Writer as Writer
-
-# =============================================================================
-# Pub/Sub - In-process messaging
-# =============================================================================
 from stario.relay import Relay as Relay
-
-# =============================================================================
-# Telemetry - Tracing and observability
-# =============================================================================
-from stario.telemetry import JsonTracer as JsonTracer
-from stario.telemetry import RichTracer as RichTracer
+from stario.relay import RelaySubscription as RelaySubscription
 from stario.telemetry import Span as Span
-from stario.telemetry import Tracer as Tracer
-
-# =============================================================================
-# Testing
-# =============================================================================
-from stario.testing import ResponseRecorder as ResponseRecorder
-from stario.testing import TestRequest as TestRequest
-
-# =============================================================================
-# __all__ - Public API
-# =============================================================================
-__all__ = [
-    # Core
-    "Stario",
-    "Router",
-    # Request/Response
-    "Request",
-    "Writer",
-    "CompressionConfig",
-    "Context",
-    # Types
-    "Handler",
-    "Middleware",
-    "UrlFor",
-    # Static Files
-    "StaticAssets",
-    # Pub/Sub
-    "Relay",
-    # Telemetry
-    "Tracer",
-    "Span",
-    "RichTracer",
-    "JsonTracer",
-    # Datastar
-    "DatastarScript",
-    "at",
-    "data",
-    # Exceptions
-    "HttpException",
-    "ClientDisconnected",
-    "SignalValidationError",
-    "StarioError",
-    # Testing
-    "TestRequest",
-    "ResponseRecorder",
-]

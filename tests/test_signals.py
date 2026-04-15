@@ -1,121 +1,74 @@
-"""Tests for stario.datastar.parse - pydantic based signals parsing."""
+"""Tests for Datastar signal parsing via ``stario.datastar.read_signals``."""
 
 import json
-from dataclasses import dataclass
-from typing import Any, NotRequired, TypedDict
+from urllib.parse import urlencode
 
 import pytest
-from pydantic import BaseModel, ValidationError
 
-from stario.datastar.parse import _adapter_for, parse_signals
-from stario.exceptions import SignalValidationError
-
-
-def _raw(data: dict[str, Any]) -> str:
-    return json.dumps(data)
+from stario import datastar as ds
+from stario.http.headers import Headers
+from stario.http.request import BodyReader, Request
 
 
-class TestParseSignalsNoSchema:
-    def test_returns_dict_for_valid_json_object(self):
-        result = parse_signals(_raw({"name": "test", "count": 42}))
+def _make_request(
+    *,
+    method: str = "GET",
+    path: str = "/",
+    headers: dict[str, str] | None = None,
+    body: bytes = b"",
+    query: dict[str, object] | None = None,
+) -> Request:
+    hdrs = Headers()
+    if headers:
+        hdrs.update(headers)
+
+    reader = BodyReader(
+        pause=lambda: None,
+        resume=lambda: None,
+        disconnect=None,
+    )
+    reader._cached = body
+    reader._complete = True
+
+    return Request(
+        method=method,
+        path=path,
+        query_bytes=urlencode(query or {}, doseq=True).encode("ascii"),
+        headers=hdrs,
+        body=reader,
+    )
+
+
+class TestReadSignals:
+    async def test_returns_dict_for_valid_post_body(self):
+        req = _make_request(method="POST", body=b'{"name":"test","count":42}')
+
+        result = await ds.read_signals(req)
+
         assert result == {"name": "test", "count": 42}
 
-    def test_missing_payload_returns_empty_dict(self):
-        with pytest.raises(SignalValidationError) as exc:
-            parse_signals(None)
-        assert exc.value.errors(include_url=False)[0]["type"] == "json_type"
+    async def test_reads_get_query_datastar_payload(self):
+        req = _make_request(method="GET", query={"datastar": '{"name":"test","count":42}'})
 
-    def test_invalid_json_raises_signal_validation_error(self):
-        with pytest.raises(SignalValidationError) as exc:
-            parse_signals("{invalid")
-        assert exc.value.errors(include_url=False)[0]["type"] == "json_invalid"
+        result = await ds.read_signals(req)
 
-    def test_non_object_json_raises_signal_validation_error(self):
-        with pytest.raises(SignalValidationError) as exc:
-            parse_signals(json.dumps([1, 2, 3]))
-        assert exc.value.errors(include_url=False)[0]["type"] == "dict_type"
+        assert result == {"name": "test", "count": 42}
 
+    async def test_missing_payload_defaults_to_empty_dict(self):
+        req = _make_request(method="GET")
 
-class TestParseSignalsDataclassAndTypedDict:
-    def test_dataclass_parsing_and_coercion(self):
-        @dataclass
-        class FormData:
-            count: int
-            active: bool = False
+        result = await ds.read_signals(req)
 
-        result = parse_signals(_raw({"count": "42", "active": "true"}), FormData)
-        assert isinstance(result, FormData)
-        assert result.count == 42
-        assert result.active is True
+        assert result == {}
 
-    def test_typeddict_parsing_and_coercion(self):
-        class FormData(TypedDict):
-            count: int
-            nickname: NotRequired[str]
+    async def test_invalid_json_raises_json_decode_error(self):
+        req = _make_request(method="POST", body=b"{invalid")
 
-        result = parse_signals(_raw({"count": "42", "nickname": "ada"}), FormData)
-        assert result["count"] == 42
-        assert result["nickname"] == "ada"
+        with pytest.raises(json.JSONDecodeError):
+            await ds.read_signals(req)
 
-    def test_nested_dataclass_and_typeddict(self):
-        class ProfileDict(TypedDict):
-            age: int
-            nickname: NotRequired[str]
+    async def test_non_object_json_raises_type_error(self):
+        req = _make_request(method="POST", body=b"[1,2,3]")
 
-        @dataclass
-        class Payload:
-            profile: ProfileDict
-
-        result = parse_signals(
-            _raw({"profile": {"age": "41", "nickname": "ada"}}),
-            Payload,
-        )
-        assert result.profile["age"] == 41
-        assert result.profile["nickname"] == "ada"
-
-    def test_nested_validation_error_has_path(self):
-        @dataclass
-        class Profile:
-            age: int
-
-        @dataclass
-        class Payload:
-            profile: Profile
-
-        with pytest.raises(SignalValidationError) as exc:
-            parse_signals(_raw({"profile": {"age": "not-int"}}), Payload)
-
-        first = exc.value.errors(include_url=False)[0]
-        assert first["loc"] == ("profile", "age")
-
-
-class TestParseSignalsPydantic:
-    def test_pydantic_model_parse(self):
-        class Payload(BaseModel):
-            count: int
-
-        result = parse_signals(_raw({"count": "42"}), Payload)
-        assert result.count == 42
-
-    def test_pydantic_validation_error_passthrough(self):
-        class Payload(BaseModel):
-            count: int
-
-        with pytest.raises(SignalValidationError):
-            parse_signals(_raw({"count": "not-int"}), Payload)
-
-    def test_signal_validation_error_is_still_validation_error(self):
-        class Payload(BaseModel):
-            count: int
-
-        with pytest.raises(ValidationError):
-            parse_signals(_raw({"count": "not-int"}), Payload)
-
-
-class TestAdapterCaching:
-    def test_adapter_is_cached_by_schema_type(self):
-        @dataclass
-        class Payload:
-            count: int
-
-        assert _adapter_for(Payload) is _adapter_for(Payload)
+        with pytest.raises(TypeError, match="Signals must decode to a JSON object"):
+            await ds.read_signals(req)

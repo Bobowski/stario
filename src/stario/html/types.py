@@ -1,306 +1,94 @@
-"""
-HTML Type definitions.
+"""HTML types and small helpers."""
 
-These types define what values are valid for HTML attributes and styles.
-
-The COMMON_SAFE_* frozensets are performance optimizations:
-- If an attribute name is in COMMON_SAFE_ATTRIBUTE_NAMES, we skip escaping
-- Same for CSS property names in COMMON_SAFE_CSS_PROPS
-- This avoids running escape functions on ~90% of real-world attributes
-"""
-
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import (
-    Final,
-    Literal,
-    get_args,
-)
+from inspect import cleandoc
 
-from .safestring import SafeString
+from stario.exceptions import StarioError
 
-# Basic primitive types that can be attribute values
+from .escape import escape_text
+
+
+@dataclass(frozen=True, slots=True)
+class SafeString:
+    """Markup inserted verbatim into rendered HTML (no escaping)."""
+
+    safe_str: str
+
+    def __repr__(self) -> str:
+        return f"SafeString({self.safe_str!r})"
+
+
+# Attribute values
 type AttributeValue = (
-    str | SafeString | bool | int | float | Decimal | None | list[AttributeValue]
+    str | SafeString | bool | int | float | Decimal | None | Sequence[AttributeValue]
 )
 
-# Nested attribute dictionaries (e.g. {"data": {...}}, {"aria": {...}}, {"style": {...}})
-#
-# Important typing note:
-# `Mapping` is invariant in its key type, so using `Mapping[str | SafeString, ...]` would
-# make a plain `dict[str, ...]` (the common case) *not* assignable. We therefore type
-# nested attribute dict keys as `str` only. (Values can still be `SafeString`.)
+# Nested mappings keep plain ``dict[str, ...]`` assignable.
 type AttributeDict = Mapping[str, AttributeValue]
 
-# Main attributes dictionary type
+# Tag call arguments
 type TagAttributes = Mapping[str, AttributeValue | AttributeDict]
 
 
-CommonSafeAttributeName = Literal[
-    "alt",
-    "autoplay",
-    "charset",
-    "checked",
-    "class",
-    "colspan",
-    "content",
-    "contenteditable",
-    "dir",
-    "draggable",
-    "enctype",
-    "for",
-    "height",
-    "hidden",
-    "href",
-    "hreflang",
-    "http-equiv",
-    "id",
-    "itemprop",
-    "itemscope",
-    "itemtype",
-    "lang",
-    "loadable",
-    "method",
-    "name",
-    "onblur",
-    "onclick",
-    "onfocus",
-    "onkeydown",
-    "onkeyup",
-    "onload",
-    "onselect",
-    "onsubmit",
-    "placeholder",
-    "poster",
-    "property",
-    "rel",
-    "rowspan",
-    "sizes",
-    "spellcheck",
-    "src",
-    "style",
-    "target",
-    "title",
-    "type",
-    "value",
-    "width",
-    "data",
-    "aria",
-]
-
-CommonSafeCSSProps = Literal[
-    "color",
-    "border",
-    "margin",
-    "font-style",
-    "transform",
-    "background-color",
-    "align-content",
-    "align-items",
-    "align-self",
-    "all",
-    "animation",
-    "animation-delay",
-    "animation-direction",
-    "animation-duration",
-    "animation-fill-mode",
-    "animation-iteration-count",
-    "animation-name",
-    "animation-play-state",
-    "animation-timing-function",
-    "backface-visibility",
-    "background",
-    "background-attachment",
-    "background-blend-mode",
-    "background-clip",
-    "background-color",
-    "background-image",
-    "background-origin",
-    "background-position",
-    "background-repeat",
-    "background-size",
-    "border",
-    "border-bottom",
-    "border-bottom-color",
-    "border-bottom-left-radius",
-    "border-bottom-right-radius",
-    "border-bottom-style",
-    "border-bottom-width",
-    "border-collapse",
-    "border-color",
-    "border-image",
-    "border-image-outset",
-    "border-image-repeat",
-    "border-image-slice",
-    "border-image-source",
-    "border-image-width",
-    "border-left",
-    "border-left-color",
-    "border-left-style",
-    "border-left-width",
-    "border-radius",
-    "border-right",
-    "border-right-color",
-    "border-right-style",
-    "border-right-width",
-    "border-spacing",
-    "border-style",
-    "border-top",
-    "border-top-color",
-    "border-top-left-radius",
-    "border-top-right-radius",
-    "border-top-style",
-    "border-top-width",
-    "border-width",
-    "bottom",
-    "box-shadow",
-    "box-sizing",
-    "caption-side",
-    "caret-color",
-    "@charset",
-    "clear",
-    "clip",
-    "clip-path",
-    "color",
-    "column-count",
-    "column-fill",
-    "column-gap",
-    "column-rule",
-    "column-rule-color",
-    "column-rule-style",
-    "column-rule-width",
-    "column-span",
-    "column-width",
-    "columns",
-    "content",
-    "counter-increment",
-    "counter-reset",
-    "cursor",
-    "direction",
-    "display",
-    "empty-cells",
-    "filter",
-    "flex",
-    "flex-basis",
-    "flex-direction",
-    "flex-flow",
-    "flex-grow",
-    "flex-shrink",
-    "flex-wrap",
-    "float",
-    "font",
-    "@font-face",
-    "font-family",
-    "font-kerning",
-    "font-size",
-    "font-size-adjust",
-    "font-stretch",
-    "font-style",
-    "font-variant",
-    "font-weight",
-    "grid",
-    "grid-area",
-    "grid-auto-columns",
-    "grid-auto-flow",
-    "grid-auto-rows",
-    "grid-column",
-    "grid-column-end",
-    "grid-column-gap",
-    "grid-column-start",
-    "grid-gap",
-    "grid-row",
-    "grid-row-end",
-    "grid-row-gap",
-    "grid-row-start",
-    "grid-template",
-    "grid-template-areas",
-    "grid-template-columns",
-    "grid-template-rows",
-    "height",
-    "hyphens",
-    "@import",
-    "justify-content",
-    "@keyframes",
-    "left",
-    "letter-spacing",
-    "line-height",
-    "list-style",
-    "list-style-image",
-    "list-style-position",
-    "list-style-type",
-    "margin",
-    "margin-bottom",
-    "margin-left",
-    "margin-right",
-    "margin-top",
-    "max-height",
-    "max-width",
-    "@media",
-    "min-height",
-    "min-width",
-    "object-fit",
-    "object-position",
-    "opacity",
-    "order",
-    "outline",
-    "outline-color",
-    "outline-offset",
-    "outline-style",
-    "outline-width",
-    "overflow",
-    "overflow-x",
-    "overflow-y",
-    "padding",
-    "padding-bottom",
-    "padding-left",
-    "padding-right",
-    "padding-top",
-    "page-break-after",
-    "page-break-before",
-    "page-break-inside",
-    "perspective",
-    "perspective-origin",
-    "pointer-events",
-    "position",
-    "quotes",
-    "right",
-    "scroll-behavior",
-    "table-layout",
-    "text-align",
-    "text-align-last",
-    "text-decoration",
-    "text-decoration-color",
-    "text-decoration-line",
-    "text-decoration-style",
-    "text-indent",
-    "text-justify",
-    "text-overflow",
-    "text-shadow",
-    "text-transform",
-    "top",
-    "transform",
-    "transform-origin",
-    "transform-style",
-    "transition",
-    "transition-delay",
-    "transition-duration",
-    "transition-property",
-    "transition-timing-function",
-    "user-select",
-    "vertical-align",
-    "visibility",
-    "white-space",
-    "width",
-    "word-break",
-    "word-spacing",
-    "word-wrap",
-    "writing-mode",
-    "z-index",
-]
-
-
-COMMON_SAFE_ATTRIBUTE_NAMES: Final[frozenset[str]] = frozenset(
-    get_args(CommonSafeAttributeName)
+# Render tree
+type HtmlElementTuple = tuple[str, list[HtmlElement], str]
+type HtmlElement = (
+    str
+    | int
+    | float
+    | Decimal
+    | SafeString
+    | list[HtmlElement]
+    | HtmlElementTuple
 )
 
-COMMON_SAFE_CSS_PROPS: Final[frozenset[str]] = frozenset(get_args(CommonSafeCSSProps))
+
+def Comment(
+    content: str | SafeString | int | float | Decimal | None = "",
+) -> SafeString:
+    """``<!-- ... -->`` with textual content escaped so ``-->`` cannot break out."""
+    if content is None:
+        comment_text = ""
+    elif type(content) is bool:
+        raise StarioError(
+            "Invalid comment content type: bool",
+            context={
+                "content_type": type(content).__name__,
+                "content_value": str(content)[:100],
+            },
+            help_text="Comment content supports: str, SafeString, int, float, Decimal, or None. Convert bool to text explicitly if needed.",
+            example=cleandoc(
+                """
+                from stario.html import Comment, render
+
+                render(Comment(str(is_enabled)))
+                """
+            ),
+        )
+    elif type(content) is SafeString:
+        comment_text = content.safe_str
+    elif type(content) is str:
+        # Escape the body so ``-->`` stays inert.
+        comment_text = escape_text(content)
+    elif isinstance(content, (int, float, Decimal)):
+        comment_text = str(content)
+    else:
+        raise StarioError(
+            f"Invalid comment content type: {type(content).__name__}",
+            context={
+                "content_type": type(content).__name__,
+                "content_value": str(content)[:100],
+            },
+            help_text="Comment content supports: str, SafeString, int, float, Decimal, or None.",
+            example=cleandoc(
+                """
+                from stario.html import Comment, render
+
+                render(Comment("Build marker"))
+                """
+            ),
+        )
+
+    return SafeString(f"<!--{comment_text}-->")

@@ -1,15 +1,50 @@
 """Tests for server-managed request tasks and shutdown handling."""
 
 import asyncio
+import os
+import stat
+import tempfile
 from collections.abc import Coroutine
 from contextlib import asynccontextmanager
 from io import StringIO
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlencode
 
+from stario import App
+from stario.http.context import Context
+from stario.http.headers import Headers
+from stario.http.request import BodyReader, Request
 from stario.http.server import Server
-from stario.http.types import Context
-from stario.telemetry import JsonTracer
-from stario.testing import TestRequest
+from stario.telemetry import JsonTracer, Span
+
+
+def _make_request(
+    *,
+    method: str = "GET",
+    path: str = "/",
+    headers: dict[str, str] | None = None,
+    body: bytes = b"",
+    query: dict[str, object] | None = None,
+) -> Request:
+    hdrs = Headers()
+    if headers:
+        hdrs.update(headers)
+
+    reader = BodyReader(
+        pause=lambda: None,
+        resume=lambda: None,
+        disconnect=None,
+    )
+    reader._cached = body
+    reader._complete = True
+
+    return Request(
+        method=method,
+        path=path,
+        query_bytes=urlencode(query or {}, doseq=True).encode("ascii"),
+        headers=hdrs,
+        body=reader,
+    )
 
 
 @asynccontextmanager
@@ -21,14 +56,14 @@ def make_server(*, graceful_timeout: float) -> Server:
     return Server(bootstrap, JsonTracer(StringIO()), graceful_timeout=graceful_timeout)
 
 
-def make_context(tasks: set[asyncio.Task[Any]]) -> Context:
+def make_context() -> Context:
     tracer = JsonTracer(StringIO())
+    app = App()
     return Context(
-        app=object(),
-        req=TestRequest(),
+        app=app,
+        req=_make_request(),
         span=tracer.create("request"),
         state={},
-        create_task=lambda coro, name=None: track_task(tasks, coro, name=name),
     )
 
 
@@ -46,21 +81,20 @@ def track_task[T](
 
 class TestContextCreateTask:
     async def test_registers_task_and_removes_it_after_completion(self) -> None:
-        tasks: set[asyncio.Task[Any]] = set()
-        context = make_context(tasks)
+        context = make_context()
 
         async def worker() -> int:
             await asyncio.sleep(0)
             return 42
 
-        task = context.create_task(worker(), name="managed-worker")
+        task = context.app.create_task(worker(), name="managed-worker")
 
-        assert task in tasks
+        assert task in context.app._tasks
         assert task.get_name() == "managed-worker"
         assert await task == 42
 
         await asyncio.sleep(0)
-        assert not tasks
+        assert not context.app._tasks
 
 
 class TestServerShutdownTasks:
@@ -108,3 +142,60 @@ class TestServerShutdownTasks:
 
         await asyncio.sleep(0)
         assert not tasks
+
+
+def test_record_startup_attrs_includes_event_loop_name() -> None:
+    server = Server(
+        bootstrap,
+        JsonTracer(StringIO()),
+        graceful_timeout=5.0,
+        event_loop_name="uvloop",
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeSpan:
+        def attrs(self, attributes: dict[str, object]) -> None:
+            captured.update(attributes)
+
+    server._record_startup_attrs(cast(Span, FakeSpan()))
+
+    assert captured["server.event_loop"] == "uvloop"
+
+
+def test_record_startup_attrs_include_unix_socket_mode() -> None:
+    server = Server(
+        bootstrap,
+        JsonTracer(StringIO()),
+        unix_socket="/tmp/stario.sock",
+        unix_socket_mode=0o640,
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeSpan:
+        def attrs(self, attributes: dict[str, object]) -> None:
+            captured.update(attributes)
+
+    server._record_startup_attrs(cast(Span, FakeSpan()))
+
+    assert captured["server.listen_mode"] == "unix_socket"
+    assert captured["server.unix_socket_mode"] == "0o640"
+
+
+def test_create_unix_socket_uses_hardened_default_mode() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "stario.sock")
+        server = Server(
+            bootstrap,
+            JsonTracer(StringIO()),
+            unix_socket=path,
+        )
+
+        sock = server._create_unix_socket()
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            assert mode == 0o660
+        finally:
+            sock.close()
+            server._cleanup_unix_socket()

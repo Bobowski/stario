@@ -1,11 +1,11 @@
 """
-Stario Chat - Database Layer
+Stario Chat — SQLite persistence
 
-SQLite-based persistence with connection pooling for async context.
-Uses in-memory DB for development, file-based for production.
+``Database`` is a plain object created in ``main.bootstrap`` and passed into
+``build_router`` / handler factories. Handlers never import a global singleton.
 
-This module demonstrates passing database dependencies into handlers
-using closures (Go-style dependency injection).
+Thread-local connections suit SQLite’s threading model in a simple server; swap
+this type for a pool or async driver when you outgrow the example.
 """
 
 import sqlite3
@@ -13,7 +13,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from .state import Message, User
+from .models import Message, User
 
 
 @dataclass

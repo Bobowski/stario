@@ -260,3 +260,26 @@ class TestRelayRaceConditions:
 
         assert unsubscribed[0] == 5
         assert "concurrent.*" not in relay._subs
+
+
+class TestRelaySubscriptionOrdering:
+    """Subscribe is active before the first ``queue.get()`` — safe to publish after ``async with``."""
+
+    async def test_events_after_enter_not_missed(self):
+        relay = Relay[str]()
+        received: list[str] = []
+
+        async def subscriber():
+            async with relay.subscribe("room.*") as sub:
+                relay.publish("room.a", "during-setup")
+                async for subject, data in sub:
+                    received.append(data)
+                    if len(received) >= 2:
+                        break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("room.b", "after-loop-start")
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert received == ["during-setup", "after-loop-start"]

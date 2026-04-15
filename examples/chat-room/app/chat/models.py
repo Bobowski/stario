@@ -1,23 +1,19 @@
 """
-Stario Chat - Data Models & Configuration
+Domain types for chat (dataclasses) plus demo-only identity helpers.
 
-This module contains:
-- Data models (dataclasses for User and Message)
-- Configuration constants (username words, avatar colors)
-- Helper functions for generating user identities
-
-Note: Storage has been moved to db.py (SQLite-based).
-This module now contains only pure data definitions and helpers.
+Persistence uses these types in ``db.py``; handlers construct them from requests;
+``views`` only render them. We keep types and small generators together here so
+the example stays one short file — a larger app might split ``identity`` or
+``seed_data`` out once this grows.
 """
 
 import random
 from dataclasses import dataclass
 
 # =============================================================================
-# Configuration
+# Demo word lists (not product config — swap for auth-provided names in prod)
 # =============================================================================
 
-# Words for generating fun usernames like "HappyPanda" or "SneakyFox"
 ADJECTIVES = [
     "Happy",
     "Sleepy",
@@ -64,7 +60,6 @@ ANIMALS = [
     "Falcon",
 ]
 
-# User avatar colors
 COLORS = [
     "#e74c3c",  # red
     "#e67e22",  # orange
@@ -80,7 +75,7 @@ COLORS = [
 
 
 # =============================================================================
-# Data Models
+# Data models
 # =============================================================================
 
 
@@ -107,7 +102,7 @@ class User:
 
 
 # =============================================================================
-# Helpers
+# Demo identity (new visitor on GET /)
 # =============================================================================
 
 

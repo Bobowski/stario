@@ -1,61 +1,50 @@
 """
-Stario Chat - HTML Views
+Stario Chat — HTML views
 
-Views are pure functions: data in, HTML out.
-They receive messages and users as parameters - no global state access.
-This makes them easy to test and enables the closure-based dependency injection.
+Pure functions: data in, HTML out. No reads from ``db`` or ``relay`` here — handlers
+fetch data, then pass lists/dicts into these functions (easy to unit test).
 
-Stario's HTML helpers work like function calls:
-  Div({"class": "foo"}, "child1", child2)  →  <div class="foo">child1...</div>
+Tag constructors live in ``stario.html``; this module imports that package as ``h``
+(``h.Div``, ``h.Span``, …) so names stay distinct from unrelated symbols elsewhere.
 
-Datastar attributes (data.*) add reactivity:
-  data.signals({...})  - client-side reactive state
-  data.bind("field")   - two-way binding to signal
-  data.on("event", "code")  - event handler
-  at.get/at.post       - trigger server requests
+Datastar (``ds.*``) attaches reactive attributes: signals, binds, ``@get`` / ``@post``.
 """
 
 import time
 
-from stario import UrlFor, at, data
-from stario.html import (
-    Body,
-    Button,
-    Div,
-    Form,
-    Head,
-    Html,
-    Input,
-    Link,
-    Meta,
-    SafeString,
-    Script,
-    Span,
-    Title,
-)
+import stario.html as h
+from stario import App
+from stario import datastar as ds
 from stario.toys import toy_inspector
 
-from .state import Message, User
+from .models import Message, User
 
 # =============================================================================
 # Base Layout
 # =============================================================================
 
 
-def page(url_for: UrlFor, *children):
+def page(app: App, *children):
     """Base HTML shell with Datastar and styles served from static assets."""
-    return Html(
+    return h.HtmlDocument(
         {"lang": "en"},
-        Head(
-            Meta({"charset": "UTF-8"}),
-            Meta(
+        h.Head(
+            h.Meta({"charset": "UTF-8"}),
+            h.Meta(
                 {"name": "viewport", "content": "width=device-width, initial-scale=1"}
             ),
-            Title("Chat - Stario"),
-            Link({"rel": "stylesheet", "href": url_for("static", "css/style.css")}),
-            Script({"type": "module", "src": url_for("static", "js/datastar.js")}),
+            h.Title("Chat - Stario"),
+            h.Link(
+                {"rel": "stylesheet", "href": app.url_for("static:css/style.css")}
+            ),
+            h.Script(
+                {
+                    "type": "module",
+                    "src": app.url_for("static:js/datastar.js"),
+                }
+            ),
         ),
-        Body(*children),
+        h.Body(*children),
     )
 
 
@@ -70,17 +59,17 @@ def message_view(msg: Message, current_user_id: str):
     bubble_class = "message own" if is_own else "message"
     msg_time = time.strftime("%H:%M", time.localtime(msg.timestamp))
 
-    return Div(
+    return h.Div(
         {"class": bubble_class, "data-msg-id": msg.id},
-        Div(
+        h.Div(
             {"class": "message-header"},
-            Span(
+            h.Span(
                 {"class": "username", "style": {"color": msg.color}},
                 msg.username,
             ),
-            Span({"class": "timestamp"}, msg_time),
+            h.Span({"class": "timestamp"}, msg_time),
         ),
-        Div({"class": "message-text"}, msg.text),
+        h.Div({"class": "message-text"}, msg.text),
     )
 
 
@@ -88,18 +77,18 @@ def messages_view(current_user_id: str, messages: list[Message]):
     """
     Message list container.
 
-    The data.on("load", ...) scrolls to bottom when new content loads.
+    The ds.on("load", ...) scrolls to bottom when new content loads.
     This runs client-side after Datastar merges the patch into the DOM.
     """
     if not messages:
-        return Div(
+        return h.Div(
             {"id": "messages", "class": "messages empty"},
-            Div({"class": "empty-state"}, "No messages yet. Say hello!"),
+            h.Div({"class": "empty-state"}, "No messages yet. Say hello!"),
         )
 
-    return Div(
+    return h.Div(
         {"id": "messages", "class": "messages"},
-        data.on("load", "setTimeout(() => this.scrollTop = this.scrollHeight, 10)"),
+        ds.on("load", "setTimeout(() => this.scrollTop = this.scrollHeight, 10)"),
         *[message_view(msg, current_user_id) for msg in messages],
     )
 
@@ -116,7 +105,7 @@ def typing_indicator_view(current_user_id: str, users: dict[str, User]):
     ]
 
     if not typing_users:
-        return Div({"id": "typing", "class": "typing-indicator hidden"})
+        return h.Div({"id": "typing", "class": "typing-indicator hidden"})
 
     if len(typing_users) == 1:
         text = f"{typing_users[0].username} is typing"
@@ -127,14 +116,14 @@ def typing_indicator_view(current_user_id: str, users: dict[str, User]):
             f"{typing_users[0].username} and {len(typing_users) - 1} others are typing"
         )
 
-    return Div(
+    return h.Div(
         {"id": "typing", "class": "typing-indicator"},
-        Span({"class": "typing-text"}, text),
-        Span(
+        h.Span({"class": "typing-text"}, text),
+        h.Span(
             {"class": "typing-dots"},
-            Span({"class": "dot"}, "."),
-            Span({"class": "dot"}, "."),
-            Span({"class": "dot"}, "."),
+            h.Span({"class": "dot"}, "."),
+            h.Span({"class": "dot"}, "."),
+            h.Span({"class": "dot"}, "."),
         ),
     )
 
@@ -142,15 +131,15 @@ def typing_indicator_view(current_user_id: str, users: dict[str, User]):
 def online_users_view(users: dict[str, User]):
     """Shows online user avatars. Caps at 8 with a +N overflow indicator."""
     if not users:
-        return Div({"id": "online", "class": "online-users"})
+        return h.Div({"id": "online", "class": "online-users"})
 
-    return Div(
+    return h.Div(
         {"id": "online", "class": "online-users"},
-        Span({"class": "online-label"}, f"{len(users)} online"),
-        Div(
+        h.Span({"class": "online-label"}, f"{len(users)} online"),
+        h.Div(
             {"class": "avatars"},
             *[
-                Span(
+                h.Span(
                     {
                         "class": "avatar",
                         "style": {"background-color": user.color},
@@ -161,7 +150,7 @@ def online_users_view(users: dict[str, User]):
                 for user in list(users.values())[:8]
             ],
             *(
-                [Span({"class": "avatar more"}, f"+{len(users) - 8}")]
+                [h.Span({"class": "avatar more"}, f"+{len(users) - 8}")]
                 if len(users) > 8
                 else []
             ),
@@ -169,22 +158,22 @@ def online_users_view(users: dict[str, User]):
     )
 
 
-def input_form_view(url_for: UrlFor):
+def input_form_view(app: App):
     """
     Message input with keyboard and button support.
 
     Key Datastar patterns used here:
-    - data.bind("message"): two-way binds input value to $message signal
-    - data.on("keydown", ...): runs JS on keypress, @post triggers server request
-    - data.attr({disabled: "!$message"}): reactively disables button when empty
+    - ds.bind("message"): two-way binds input value to $message signal
+    - ds.on("keydown", ...): runs JS on keypress, @post triggers server request
+    - ds.attrs({"disabled": "!$message"}): reactively disables button when empty
     """
-    send_url = url_for("send")
-    typing_url = url_for("typing")
+    send_url = app.url_for("send")
+    typing_url = app.url_for("typing")
 
-    return Form(
+    return h.Form(
         {"id": "input-form", "class": "input-form"},
-        data.on("submit", "evt.preventDefault()"),
-        Input(
+        ds.on("submit", "evt.preventDefault()"),
+        h.Input(
             {
                 "id": "message-input",
                 "type": "text",
@@ -193,8 +182,8 @@ def input_form_view(url_for: UrlFor):
                 "autocomplete": "off",
                 "autofocus": True,
             },
-            data.bind("message"),
-            data.on(
+            ds.bind("message"),
+            ds.on(
                 "keydown",
                 f"""
                 if (evt.key === 'Enter' && !evt.shiftKey && $message.trim()) {{
@@ -204,15 +193,15 @@ def input_form_view(url_for: UrlFor):
                 }}
                 """,
             ),
-            data.on("input", at.post(typing_url)),
+            ds.on("input", ds.post(typing_url)),
         ),
-        Button(
+        h.Button(
             {
                 "type": "button",
                 "class": "send-button",
             },
-            data.attr({"disabled": "!$message"}),
-            data.on(
+            ds.attrs({"disabled": "!$message"}),
+            ds.on(
                 "click",
                 f"""
                 if ($message.trim()) {{
@@ -222,9 +211,9 @@ def input_form_view(url_for: UrlFor):
                 }}
                 """,
             ),
-            Span(
+            h.Span(
                 {"class": "send-icon"},
-                SafeString(
+                h.SafeString(
                     """<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></svg>"""
                 ),
             ),
@@ -238,7 +227,7 @@ def input_form_view(url_for: UrlFor):
 
 
 def chat_view(
-    url_for: UrlFor,
+    app: App,
     user_id: str,
     username: str,
     color: str,
@@ -260,15 +249,15 @@ def chat_view(
         users: Dict of online users
 
     Key setup:
-    - data.signals({...}, ifmissing=True): initializes client state (only if not set)
-    - data.init(at.get(url_for("subscribe"))): opens SSE connection on page load
+    - ds.signals({...}, ifmissing=True): initializes client state (only if not set)
+    - ds.init(ds.get(url_for("subscribe"))): opens SSE connection on page load
     """
     return page(
-        url_for,
+        app,
         toy_inspector(),  # Dev tool: shows current signals state
-        Div(
+        h.Div(
             {"class": "chat-container"},
-            data.signals(
+            ds.signals(
                 {
                     "user_id": user_id,
                     "username": username,
@@ -277,20 +266,20 @@ def chat_view(
                 },
                 ifmissing=True,
             ),
-            data.init(at.get(url_for("subscribe"))),
-            Div(
+            ds.init(ds.get(app.url_for("subscribe"))),
+            h.Div(
                 {"class": "chat-header"},
-                Div({"class": "chat-title"}, "Stario Chat 🐾"),
+                h.Div({"class": "chat-title"}, "Stario Chat 🐾"),
                 online_users_view(users),
             ),
-            Div(
+            h.Div(
                 {"class": "chat-body"},
                 messages_view(user_id, messages),
                 typing_indicator_view(user_id, users),
             ),
-            Div(
+            h.Div(
                 {"class": "chat-footer"},
-                input_form_view(url_for),
+                input_form_view(app),
             ),
         ),
     )

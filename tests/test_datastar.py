@@ -1,174 +1,350 @@
 """Tests for stario.datastar module - SSE events, attributes, and signals."""
 
+import asyncio
 import json
 
-from stario.datastar import DATASTAR_CDN_URL, DatastarScript, at, data, sse
-from stario.datastar.format import js
+import pytest
+
+from stario import datastar as ds
+from stario.datastar import DATASTAR_CDN_URL, js, s, sse
 from stario.html import Div, P, Span, render
+from stario.http.writer import Writer
+
+
+def _make_writer() -> tuple[Writer, bytearray, asyncio.AbstractEventLoop]:
+    loop = asyncio.new_event_loop()
+    sink = bytearray()
+    writer = Writer(
+        transport_write=sink.extend,
+        get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
+        on_completed=lambda: None,
+        disconnect=loop.create_future(),
+        shutdown=loop.create_future(),
+    )
+    return writer, sink, loop
+
+
+def _split_response(raw: bytes) -> tuple[bytes, bytes]:
+    head, _, body = raw.partition(b"\r\n\r\n")
+    return head, body
+
+
+def _decode_chunked(body: bytes) -> bytes:
+    remaining = body
+    decoded = bytearray()
+    while remaining:
+        size_line, _, rest = remaining.partition(b"\r\n")
+        if not rest:
+            break
+        size = int(size_line.split(b";", 1)[0], 16)
+        if size == 0:
+            break
+        decoded.extend(rest[:size])
+        remaining = rest[size + 2 :]
+    return bytes(decoded)
 
 
 class TestSseSignals:
-    """Test sse.signals() SSE event formatter."""
+    """Test writer-bound signal patching helpers."""
 
     def test_basic_signals(self):
-        result = sse.signals({"count": 42, "name": "test"})
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_signals(w, {"count": 42, "name": "test"})
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"event: datastar-patch-signals" in result
-        assert b"data: signals" in result
-        assert b'"count"' in result
-        assert b"42" in result
-        assert b'"name"' in result
-        assert b'"test"' in result
-        assert result.endswith(b"\n\n")
+            assert b"event: datastar-patch-signals" in result
+            assert b"data: signals" in result
+            assert b'"count"' in result
+            assert b"42" in result
+            assert b'"name"' in result
+            assert b'"test"' in result
+            assert result.endswith(b"\n\n")
+        finally:
+            loop.close()
 
     def test_signals_only_if_missing(self):
-        result = sse.signals({"new": "value"}, only_if_missing=True)
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_signals(w, b'{"new":"value"}', only_if_missing=True)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"data: onlyIfMissing true" in result
+            assert b"data: onlyIfMissing true" in result
+        finally:
+            loop.close()
 
 
 class TestSsePatch:
-    """Test sse.patch() SSE event formatter."""
+    """Test writer-bound HTML patch helpers."""
 
     def test_basic_patch(self):
-        result = sse.patch(Div("Hello"))
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(w, Div("Hello"))
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"event: datastar-patch-elements" in result
-        assert b"data: elements <div>Hello</div>" in result
+            assert b"event: datastar-patch-elements" in result
+            assert b"data: elements <div>Hello</div>" in result
+        finally:
+            loop.close()
 
     def test_patch_with_mode(self):
-        result = sse.patch(Span("Updated"), mode="inner")
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(w, Span("Updated"), mode="inner")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"data: mode inner" in result
-        assert b"<span>Updated</span>" in result
+            assert b"data: mode inner" in result
+            assert b"<span>Updated</span>" in result
+        finally:
+            loop.close()
 
     def test_patch_with_selector(self):
-        result = sse.patch(P("New content"), selector="#target")
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(w, P("New content"), selector="#target")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"data: selector #target" in result
+            assert b"data: selector #target" in result
+        finally:
+            loop.close()
+
+    def test_patch_with_namespace(self):
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(
+                w,
+                b"<circle cx='10' cy='10' r='5'></circle>",
+                selector="#icon",
+                namespace="svg",
+            )
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert b"data: selector #icon" in result
+            assert b"data: namespace svg" in result
+        finally:
+            loop.close()
 
     def test_patch_append_mode(self):
-        result = sse.patch(Div("item"), mode="append", selector="#list")
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(w, Div("item"), mode="append", selector="#list")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"data: mode append" in result
-        assert b"data: selector #list" in result
+            assert b"data: mode append" in result
+            assert b"data: selector #list" in result
+        finally:
+            loop.close()
 
     def test_patch_with_view_transition(self):
-        result = sse.patch(Div("content"), use_view_transition=True)
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(w, Div("content"), use_view_transition=True)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"data: useViewTransition true" in result
+            assert b"data: useViewTransition true" in result
+        finally:
+            loop.close()
+
+    def test_patch_html_accepts_str_options(self):
+        w, sink, loop = _make_writer()
+        try:
+            sse.patch_elements(w, b"<div>Hello</div>", mode="inner", selector="#target")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert b"data: mode inner" in result
+            assert b"data: selector #target" in result
+            assert b"data: elements <div>Hello</div>" in result
+        finally:
+            loop.close()
 
 
 class TestSseScript:
-    """Test sse.script() SSE event formatter."""
+    """Test script execution SSE helper."""
 
     def test_basic_script(self):
-        result = sse.script("console.log('hello');")
+        w, sink, loop = _make_writer()
+        try:
+            sse.execute(w, "console.log('hello');")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"event: datastar-patch-elements" in result
-        assert b"console.log" in result
+            assert b"event: datastar-patch-elements" in result
+            assert b"console.log" in result
+        finally:
+            loop.close()
 
     def test_script_with_auto_remove(self):
-        result = sse.script("alert('hi');", auto_remove=True)
+        w, sink, loop = _make_writer()
+        try:
+            sse.execute(w, "alert('hi');", auto_remove=True)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"data-effect" in result
+            assert b"data-effect" in result
+        finally:
+            loop.close()
 
     def test_script_without_auto_remove(self):
-        result = sse.script("persist();", auto_remove=False)
+        w, sink, loop = _make_writer()
+        try:
+            sse.execute(w, "persist();", auto_remove=False)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        # Should not have auto-remove effect
-        assert b"data-effect" not in result
+            assert b"data-effect" not in result
+        finally:
+            loop.close()
 
 
 class TestSseRedirect:
-    """Test sse.redirect() SSE event formatter."""
+    """Test redirect SSE helper."""
 
     def test_basic_redirect(self):
-        result = sse.redirect("/new-page")
+        w, sink, loop = _make_writer()
+        try:
+            sse.redirect(w, "/new-page")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"event: datastar-patch-elements" in result
-        assert b"/new-page" in result
-        assert b"window.location" in result
+            assert b"event: datastar-patch-elements" in result
+            assert b"/new-page" in result
+            assert b"window.location" in result
+        finally:
+            loop.close()
 
     def test_redirect_with_special_chars(self):
         """Test URL with quotes and special characters is properly escaped."""
-        result = sse.redirect("/page?name=O'Brien")
+        w, sink, loop = _make_writer()
+        try:
+            sse.redirect(w, "/page?name=O'Brien")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        # Should be JSON-escaped, not raw string with quote injection
-        assert b"event: datastar-patch-elements" in result
-        # The URL should be properly escaped in JSON
-        assert b"O'Brien" in result or b"O\\'Brien" in result
-        # Should not have broken JavaScript from unescaped quotes
-        assert b"window.location" in result
+            assert b"event: datastar-patch-elements" in result
+            assert b"O'Brien" in result or b"O\\'Brien" in result
+            assert b"window.location" in result
+        finally:
+            loop.close()
 
     def test_redirect_with_query_params(self):
         """Test URL with query parameters."""
-        result = sse.redirect("/search?q=hello&page=1")
+        w, sink, loop = _make_writer()
+        try:
+            sse.redirect(w, "/search?q=hello&page=1")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"/search?q=hello&page=1" in result
+            assert b"/search?q=hello&page=1" in result
+        finally:
+            loop.close()
 
     def test_redirect_with_unicode(self):
         """Test URL with unicode characters."""
-        result = sse.redirect("/users/日本語")
+        w, sink, loop = _make_writer()
+        try:
+            sse.redirect(w, "/users/日本語")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"event: datastar-patch-elements" in result
-        # Unicode is escaped in JSON format (\uXXXX)
-        # This is safe and valid - browsers handle it correctly
-        assert b"/users/" in result
-        assert b"window.location" in result
+            assert b"event: datastar-patch-elements" in result
+            assert b"/users/" in result
+            assert b"window.location" in result
+        finally:
+            loop.close()
 
 
 class TestSseRemove:
-    """Test sse.remove() SSE event formatter."""
+    """Test remove helper."""
 
     def test_basic_remove(self):
-        result = sse.remove("#old-item")
+        w, sink, loop = _make_writer()
+        try:
+            sse.remove(w, "#old-item")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
-        assert b"event: datastar-patch-elements" in result
-        assert b"data: mode remove" in result
-        assert b"data: selector #old-item" in result
+            assert b"event: datastar-patch-elements" in result
+            assert b"data: mode remove" in result
+            assert b"data: selector #old-item" in result
+        finally:
+            loop.close()
 
 
 class TestDatastarAttributes:
-    """Test DatastarAttributes helper (data.*)."""
+    """Test module-level Datastar attribute helpers."""
 
     def test_bind(self):
-        attrs = data.bind("username")
+        attrs = ds.bind("username")
         assert attrs == {"data-bind": "username"}
 
     def test_show(self):
-        attrs = data.show("isVisible")
+        attrs = ds.show("isVisible")
         assert attrs == {"data-show": "isVisible"}
 
     def test_text(self):
-        attrs = data.text("message")
+        attrs = ds.text("message")
         assert attrs == {"data-text": "message"}
 
     def test_ref(self):
-        attrs = data.ref("myElement")
+        attrs = ds.ref("myElement")
         assert attrs == {"data-ref": "myElement"}
 
     def test_effect(self):
-        attrs = data.effect("console.log($count)")
+        attrs = ds.effect("console.log($count)")
         assert attrs == {"data-effect": "console.log($count)"}
 
-    def test_class_dict(self):
-        attrs = data.class_({"active": "$isActive", "hidden": "!$visible"})
+    def test_classes_mapping(self):
+        attrs = ds.classes({"active": "$isActive", "hidden": "!$visible"})
         assert "data-class" in attrs
         # Should be JSON-like
         assert "active" in attrs["data-class"]
 
     def test_on_click(self):
-        attrs = data.on("click", "@get('/api/data')")
+        attrs = ds.on("click", "@get('/api/data')")
         assert "data-on:click" in attrs
 
     def test_on_with_modifiers(self):
-        attrs = data.on("submit", "@post('/form')", prevent=True)
+        attrs = ds.on("submit", "@post('/form')", prevent=True)
         key = list(attrs.keys())[0]
         assert "prevent" in key
 
+    def test_signal_single_key(self):
+        attrs = ds.signal("count", "0")
+        # "count" is all-lowercase → classified as kebab-case, modifier added
+        assert attrs == {"data-signals:count__case.kebab": "0"}
+
+    def test_signal_camel_key(self):
+        attrs = ds.signal("myCount", "0")
+        # camelCase keys get no case modifier (Datastar default)
+        assert attrs == {"data-signals:my-count": "0"}
+
+    def test_signal_with_string_literal(self):
+        attrs = ds.signal("name", s("hello"))
+        # "name" is all-lowercase → kebab modifier
+        assert attrs == {"data-signals:name__case.kebab": "'hello'"}
+
+    def test_signal_ifmissing(self):
+        attrs = ds.signal("count", "0", ifmissing=True)
+        key = list(attrs.keys())[0]
+        assert "ifmissing" in key
+        assert attrs[key] == "0"
+
+    def test_signals_rejects_str_payload(self):
+        with pytest.raises(TypeError, match=r"signal\(name"):
+            ds.signals("count")  # type: ignore[arg-type]
+
     def test_signals(self):
-        attrs = data.signals({"count": 0, "name": "test"})
+        attrs = ds.signals({"count": 0, "name": "test"})
         assert "data-signals" in attrs
         value = attrs["data-signals"]
         parsed = json.loads(value)
@@ -176,7 +352,7 @@ class TestDatastarAttributes:
         assert parsed["name"] == "test"
 
     def test_signals_ifmissing(self):
-        attrs = data.signals({"new": 1}, ifmissing=True)
+        attrs = ds.signals({"new": 1}, ifmissing=True)
         assert "data-signals__ifmissing" in attrs
 
     def test_signals_from_dataclass(self):
@@ -187,7 +363,7 @@ class TestDatastarAttributes:
             count: int = 0
             name: str = ""
 
-        attrs = data.signals(FormState())
+        attrs = ds.signals(FormState())
         assert "data-signals" in attrs
         value = attrs["data-signals"]
         parsed = json.loads(value)
@@ -195,38 +371,38 @@ class TestDatastarAttributes:
         assert parsed["name"] == ""
 
     def test_indicator(self):
-        attrs = data.indicator("isLoading")
+        attrs = ds.indicator("isLoading")
         assert attrs == {"data-indicator": "isLoading"}
 
     def test_ignore(self):
-        attrs = data.ignore()
+        attrs = ds.ignore()
         assert attrs == {"data-ignore": True}
 
     def test_ignore_self_only(self):
-        attrs = data.ignore(self_only=True)
+        attrs = ds.ignore(self_only=True)
         assert attrs == {"data-ignore__self": True}
 
 
 class TestDatastarActions:
-    """Test DatastarActions helper (at.*)."""
+    """Test module-level Datastar action helpers."""
 
     def test_get_simple(self):
-        action = at.get("/api/data")
+        action = ds.get("/api/data")
         assert action == "@get('/api/data')"
 
     def test_get_with_query(self):
-        action = at.get("/search", {"q": "test"})
+        action = ds.get("/search", {"q": "test"})
         assert "@get" in action
         assert "/search" in action
 
     def test_post_simple(self):
-        action = at.post("/api/submit")
+        action = ds.post("/api/submit")
         assert action == "@post('/api/submit')"
 
     def test_post_with_options(self):
         payload = {"extra": 123}
 
-        action = at.post(
+        action = ds.post(
             "/api/submit",
             include="form.*",
             selector="#result",
@@ -243,28 +419,28 @@ class TestDatastarActions:
         assert "retry: 'error'" in action
 
     def test_put(self):
-        action = at.put("/api/item/123")
+        action = ds.put("/api/item/123")
         assert action == "@put('/api/item/123')"
 
     def test_patch(self):
-        action = at.patch("/api/item/123")
+        action = ds.patch("/api/item/123")
         assert "@patch" in action
 
     def test_delete(self):
-        action = at.delete("/api/item/123")
+        action = ds.delete("/api/item/123")
         assert action == "@delete('/api/item/123')"
 
     def test_peek(self):
-        action = at.peek("$count")
+        action = ds.peek("$count")
         assert "@peek" in action
         assert "$count" in action
 
     def test_set_all(self):
-        action = at.set_all("false")
+        action = ds.set_all("false")
         assert "@setAll" in action
 
     def test_toggle_all(self):
-        action = at.toggle_all()
+        action = ds.toggle_all()
         assert "@toggleAll" in action
 
 
@@ -275,7 +451,7 @@ class TestDatastarIntegration:
         from stario.html import Button
 
         btn = Button(
-            data.on("click", at.get("/api/increment")),
+            ds.on("click", ds.get("/api/increment")),
             "Click me",
         )
         html = render(btn)
@@ -289,7 +465,7 @@ class TestDatastarIntegration:
 
         inp = Input(
             {"type": "text"},
-            data.bind("username"),
+            ds.bind("username"),
         )
         html = render(inp)
 
@@ -297,9 +473,9 @@ class TestDatastarIntegration:
 
     def test_div_with_signals(self):
         d = Div(
-            data.signals({"count": 0}),
+            ds.signals({"count": 0}),
             {"id": "app"},
-            Span(data.text("$count")),
+            Span(ds.text("$count")),
         )
         html = render(d)
 
@@ -310,15 +486,20 @@ class TestDatastarIntegration:
 class TestDatastarScriptTag:
     """Test the shared Datastar CDN script helper."""
 
-    def test_DatastarScript_uses_cdn(self):
-        html = render(DatastarScript())
+    def test_ModuleScript_uses_cdn(self):
+        html = render(ds.ModuleScript())
 
         assert 'type="module"' in html
         assert f'src="{DATASTAR_CDN_URL}"' in html
 
-    def test_top_level_export(self):
-        from stario import DatastarScript as top_level_DatastarScript
+    def test_ModuleScript_accepts_custom_src(self):
+        html = render(ds.ModuleScript("/static/vendor/datastar.js"))
 
-        html = render(top_level_DatastarScript())
+        assert 'src="/static/vendor/datastar.js"' in html
 
-        assert DATASTAR_CDN_URL in html
+    def test_module_still_exports_low_level_helpers(self):
+        assert callable(s)
+        assert callable(js)
+        assert hasattr(sse, "patch_signals")
+        assert callable(ds.read_signals)
+        assert DATASTAR_CDN_URL.endswith("/datastar.js")

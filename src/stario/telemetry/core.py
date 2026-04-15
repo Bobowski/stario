@@ -1,4 +1,8 @@
-"""Span-based telemetry primitives."""
+"""
+``Tracer`` protocol and ``Span`` handle: span state is owned by the tracer backend, not module globals.
+
+Start/end are explicit so nested or concurrent asyncio work does not rely on implicit context propagation for timing.
+"""
 
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -6,22 +10,19 @@ from uuid import UUID
 
 
 class Tracer(Protocol):
-    """Tracer contract used by `Span` handles.
-
-    `create()` returns a stopped `Span`. Call `span.start()` explicitly or use
-    `with tracer.create(... ) as span:` to start timing.
-    """
+    """Backend that owns span records; ``Span`` is a thin handle keyed by ``id`` (explicit ``start``/``end`` timing)."""
 
     # Tracer lifecycle (open / close)
     def __enter__(self) -> Tracer: ...
     def __exit__(self, exc_type, exc_val, exc_tb) -> None: ...
 
-    # Span creation and management.
-    # `create()` allocates a span handle only; it does not start timing.
+    # Span creation and management
     def create(
         self,
         name: str,
         attributes: dict[str, Any] | None = None,
+        /,
+        *,
         parent_id: UUID | None = None,
     ) -> Span: ...
     def start(self, span_id: UUID) -> None: ...
@@ -41,6 +42,7 @@ class Tracer(Protocol):
         span_id: UUID,
         name: str,
         attributes: dict[str, Any] | None = None,
+        /,
         *,
         body: Any | None = None,
     ) -> None: ...
@@ -49,6 +51,7 @@ class Tracer(Protocol):
         span_id: UUID,
         target_span_id: UUID,
         attributes: dict[str, Any] | None = None,
+        /,
     ) -> None: ...
     def set_name(self, span_id: UUID, name: str) -> None: ...
     def fail(self, span_id: UUID, message: str) -> None: ...
@@ -57,10 +60,9 @@ class Tracer(Protocol):
 
 @dataclass(slots=True)
 class Span:
-    """Write-only span handle. State lives in tracer.
+    """Handle for one logical unit of work: attributes, events, child spans, links, fail/end—all forwarded to ``tracer``.
 
-    Spans are created in a stopped state. Start them explicitly with `start()`
-    or by using the span as a context manager.
+    As a context manager: starts on enter, records exceptions and ends on exit.
     """
 
     id: UUID
@@ -94,6 +96,7 @@ class Span:
         self,
         name: str,
         attributes: dict[str, Any] | None = None,
+        /,
         *,
         body: Any | None = None,
     ) -> None:
@@ -101,7 +104,7 @@ class Span:
         self.tracer.add_event(
             self.id,
             name,
-            attributes=attributes,
+            attributes,
             body=body,
         )
 
@@ -109,6 +112,7 @@ class Span:
         self,
         exc: BaseException,
         attributes: dict[str, Any] | None = None,
+        /,
         *,
         body: Any | None = None,
     ) -> None:
@@ -119,7 +123,7 @@ class Span:
         self.tracer.add_event(
             self.id,
             "exception",
-            attributes=attrs,
+            attrs,
             body=exc if body is None else body,
         )
 
@@ -141,24 +145,24 @@ class Span:
     # Child and root spans
     # -------------------------------------------------------------------------
 
-    def step(self, name: str, attributes: dict[str, Any] | None = None) -> Span:
+    def step(self, name: str, attributes: dict[str, Any] | None = None, /) -> Span:
         """Create a child span in a stopped state."""
-        return self.tracer.create(name, attributes=attributes, parent_id=self.id)
+        return self.tracer.create(name, attributes, parent_id=self.id)
 
-    def create(self, name: str, attributes: dict[str, Any] | None = None) -> Span:
+    def create(self, name: str, attributes: dict[str, Any] | None = None, /) -> Span:
         """Create a detached root span in a stopped state."""
-        return self.tracer.create(name, attributes=attributes)
+        return self.tracer.create(name, attributes)
 
     # -------------------------------------------------------------------------
     # Cross-span references
     # -------------------------------------------------------------------------
 
     def link(
-        self, span_or_id: Span | UUID, attributes: dict[str, Any] | None = None
+        self, span_or_id: Span | UUID, attributes: dict[str, Any] | None = None, /
     ) -> None:
         """Link this span to another span ID."""
         target_id = span_or_id.id if isinstance(span_or_id, Span) else span_or_id
-        self.tracer.add_link(self.id, target_id, attributes=attributes)
+        self.tracer.add_link(self.id, target_id, attributes)
 
     # -------------------------------------------------------------------------
     # Completion

@@ -1,34 +1,27 @@
 """
-StaticAssets - Serve static files with fingerprinted URLs.
+Static files as a route handler: content-hashed filenames plus aggressive caching headers so pages can pin immutable URLs.
 
-Features:
-- Fingerprinted URLs for cache busting
-- In-memory caching for small files (< 1MB by default)
-- Pre-compression (zstd, brotli, gzip) at startup
-- Large file streaming with aiofiles
-- Immutable cache headers
-
-Usage:
-    app.assets("/static", "./static", name="static")
-
-    # Build the final public URL from the app:
-    app.url_for("static", "style.css")  # "/static/style.abc123.css"
+Small files may be read into memory (with optional pre-compression); large files stream from disk to keep RAM bounded for
+asset-heavy static sites without a separate origin tier.
 """
 
 import zlib
 from compression import zstd
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final
 
 import aiofiles
 import brotli
 import xxhash
 
+import stario.responses as responses
 from stario.exceptions import StarioError
 
-from .types import Context
-from .writer import Writer
+from .context import Context
+from .router import Node, _wrap_path_segments, default_not_found
+from .writer import Writer, _merge_vary, _parse_accept_encoding
 
 CONTENT_TYPES: dict[str, bytes] = {
     ".html": b"text/html; charset=utf-8",
@@ -92,11 +85,6 @@ _PRECOMPRESSED_EXTENSIONS: Final = frozenset(
     }
 )
 
-_DEFAULT_CHUNK_SIZE: Final = 4 << 20
-_DEFAULT_CACHE_MAX_SIZE: Final = 1 << 20  # 1MB
-_DEFAULT_COMPRESS_MIN_SIZE: Final = 256  # Don't compress tiny files
-_DEFAULT_FILESYSTEM_CHUNK_SIZE: Final = 65536
-
 
 @dataclass(slots=True)
 class CachedFile:
@@ -119,8 +107,8 @@ class CachedFile:
     gzip: bytes | None = None
 
 
-def fingerprint(path: Path, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) -> str:
-    """Generate a 16-character hash of file contents using xxHash64."""
+def fingerprint(path: Path, *, chunk_size: int = 4 << 20) -> str:
+    """xxHash64 of file bytes (hex digest) for fingerprinted static URLs."""
     hasher = xxhash.xxh64()
     with path.open("rb") as f:
         while chunk := f.read(chunk_size):
@@ -130,36 +118,61 @@ def fingerprint(path: Path, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) -> str:
 
 class StaticAssets:
     """
-    Serve static files with fingerprinted URLs.
+    Scan a directory at init: fingerprint filenames, cache small files (optional pre-compression), stream large files.
 
-    Features:
-    - Files hashed at startup for cache-busting URLs
-    - Small files (< cache_max_size) cached in memory
-    - Pre-compression (zstd, brotli, gzip) for text-based files
-    - Immutable cache headers for aggressive browser caching
-
-    Usage:
-        static = StaticAssets("./static")
-        app.get("/static/*", static)
+    Mount with ``app.mount("/static", static)``; exposes ``root`` / ``named_routes`` like a router subtree. Non-fingerprint paths 307 to hashed URLs.
     """
 
     __slots__ = (
         "directory",
+        "name",
+        "named_routes",
         "cache_max_size",
+        "hash_chunk_size",
+        "compress_min_size",
+        "filesystem_chunk_size",
+        "zstd_level",
+        "zstd_window_log",
+        "brotli_level",
+        "brotli_window_log",
+        "gzip_level",
+        "gzip_window_bits",
         "_cache_control_bytes",
         "_path_to_hash",
         "_cache",
+        "root",
     )
 
     def __init__(
         self,
         directory: Path | str = "./static",
+        *,
         cache_control: str = "public, max-age=31536000, immutable",
-        cache_max_size: int = _DEFAULT_CACHE_MAX_SIZE,
+        cache_max_size: int = 1 << 20,
+        name: str | None = None,
+        hash_chunk_size: int = 4 << 20,
+        compress_min_size: int = 256,
+        filesystem_chunk_size: int = 65536,
+        zstd_level: int = 9,
+        zstd_window_log: int = 21,
+        brotli_level: int = 9,
+        brotli_window_log: int = 22,
+        gzip_level: int = 7,
+        gzip_window_bits: int = 15,
     ) -> None:
         self.directory = Path(directory).resolve()
+        self.name = name
         self.cache_max_size = cache_max_size
-        self._cache_control_bytes = cache_control.encode()
+        self.hash_chunk_size = hash_chunk_size
+        self.compress_min_size = compress_min_size
+        self.filesystem_chunk_size = filesystem_chunk_size
+        self.zstd_level = zstd_level
+        self.zstd_window_log = zstd_window_log
+        self.brotli_level = brotli_level
+        self.brotli_window_log = brotli_window_log
+        self.gzip_level = gzip_level
+        self.gzip_window_bits = gzip_window_bits
+        self._cache_control_bytes = cache_control.encode("ascii")
 
         if not self.directory.is_dir():
             raise StarioError(
@@ -168,8 +181,8 @@ class StaticAssets:
                     "path": str(self.directory),
                     "exists": self.directory.exists(),
                 },
-                help_text="Create the directory or check the path in your app.assets() call.",
-                example='app.assets("/static", Path(__file__).parent / "static")',
+                help_text="Create the directory or check the path before mounting StaticAssets.",
+                example='app.mount("/static", StaticAssets(Path(__file__).parent / "static", name="static"))',
             )
 
         self._path_to_hash: dict[str, str] = {}
@@ -179,13 +192,42 @@ class StaticAssets:
             if not p.is_file():
                 continue
 
-            hashed_name = f"{p.stem}.{fingerprint(p)}{p.suffix}"
+            hashed_name = (
+                f"{p.stem}.{fingerprint(p, chunk_size=self.hash_chunk_size)}{p.suffix}"
+            )
             relative_path = p.relative_to(self.directory)
             hashed_path = relative_path.with_name(hashed_name)
             hashed_key = hashed_path.as_posix()
 
-            self._path_to_hash[relative_path.as_posix()] = hashed_name
+            self._path_to_hash[relative_path.as_posix()] = hashed_key
             self._cache[hashed_key] = self._create_cached_file(p)
+
+        if self.name is None:
+            named_routes = {}
+        else:
+            named_routes = {
+                f"{self.name}:{relative_path}": f"/{hashed_path}"
+                for relative_path, hashed_path in self._path_to_hash.items()
+            }
+        self.named_routes = MappingProxyType(named_routes)
+
+        root = Node(
+            kind="path",
+            not_found_handler=default_not_found,
+            exact={
+                "GET": Node(
+                    kind="method",
+                    route_handler=self,
+                    not_found_handler=default_not_found,
+                ),
+                "HEAD": Node(
+                    kind="method",
+                    route_handler=self,
+                    not_found_handler=default_not_found,
+                ),
+            },
+        )
+        self.root = _wrap_path_segments(root, ["{path...}"], default_not_found)
 
     def _create_cached_file(self, path: Path) -> CachedFile:
         """Create cached file entry - in-memory for small, metadata-only for large."""
@@ -202,14 +244,28 @@ class StaticAssets:
         # Skip compression for already-compressed file types or tiny files
         if (
             path.suffix.lower() in _PRECOMPRESSED_EXTENSIONS
-            or size < _DEFAULT_COMPRESS_MIN_SIZE
+            or size < self.compress_min_size
         ):
             return CachedFile(size=size, content_type=content_type, content=content)
 
-        # Pre-compress with available algorithms
-        zstd_data = zstd.compress(content, level=3)
-        brotli_data = brotli.compress(content, quality=4)
-        cobj = zlib.compressobj(6, zlib.DEFLATED, 31)
+        # Startup compression can spend a little more CPU to shrink long-lived assets.
+        zstd_data = zstd.compress(
+            content,
+            options={
+                zstd.CompressionParameter.compression_level: self.zstd_level,
+                zstd.CompressionParameter.window_log: self.zstd_window_log,
+            },
+        )
+        brotli_data = brotli.compress(
+            content,
+            quality=self.brotli_level,
+            lgwin=self.brotli_window_log,
+        )
+        cobj = zlib.compressobj(
+            self.gzip_level,
+            zlib.DEFLATED,
+            16 + self.gzip_window_bits,
+        )
         gzip_data = cobj.compress(content) + cobj.flush()
 
         return CachedFile(
@@ -230,17 +286,38 @@ class StaticAssets:
         """
         assert f.content is not None, "Cannot select body for large file"
 
-        if f.zstd and b"zstd" in accept:
-            return f.zstd, b"zstd"
-        if f.brotli and b"br" in accept:
-            return f.brotli, b"br"
-        if f.gzip and b"gzip" in accept:
-            return f.gzip, b"gzip"
-        return f.content, None
+        if not accept:
+            return f.content, None
+
+        try:
+            header = accept.decode("latin-1")
+        except UnicodeDecodeError:
+            return f.content, None
+
+        q = _parse_accept_encoding(header)
+
+        def qtok(tok: str) -> float:
+            return max(0.0, min(1.0, q.get(tok, q.get("*", 0.0))))
+
+        candidates: list[tuple[float, bytes, bytes]] = []
+        if f.brotli:
+            candidates.append((qtok("br"), b"br", f.brotli))
+        if f.zstd:
+            candidates.append((qtok("zstd"), b"zstd", f.zstd))
+        if f.gzip:
+            candidates.append((qtok("gzip"), b"gzip", f.gzip))
+
+        if not candidates:
+            return f.content, None
+
+        best_q, enc, body = max(candidates, key=lambda x: x[0])
+        if best_q <= 0.0:
+            return f.content, None
+        return body, enc
 
     async def __call__(self, c: Context, w: Writer) -> None:
-        """Serve a static file."""
-        tail = c.req.tail or ""
+        """GET/HEAD handler: resolve ``{path...}`` against the startup index, redirect, 404, or send bytes from memory or disk."""
+        path = c.route.params.get("path", "").strip("/")
 
         # Security: Path traversal is prevented by design - we only serve files that
         # exist in our pre-built _cache dict, which was populated at startup by
@@ -250,17 +327,23 @@ class StaticAssets:
         # HTTP parser before reaching here.
 
         # Try fingerprinted path first (cache hit)
-        f = self._cache.get(tail)
+        f = self._cache.get(path)
 
         # Try original path → redirect to fingerprinted
-        if f is None and (hashed := self._path_to_hash.get(tail)):
+        if f is None and (hashed := self._path_to_hash.get(path)):
             # Use 307 (not 301) to avoid browser caching stale redirects
             # When file changes, hash changes, so redirect destination changes
-            w.redirect(hashed, 307)
+            #
+            # Derive the absolute-path redirect from the request URL so that
+            # subdirectory assets redirect correctly.  e.g. requesting
+            # "/static/js/app.js" (path="js/app.js") redirects to
+            # "/static/js/app.abc123.js", not the relative "app.abc123.js".
+            req_path = c.req.path
+            responses.redirect(w, req_path[: -len(path)] + hashed, 307)
             return
 
         if f is None:
-            w.text("Not Found", 404)
+            responses.text(w, "Not Found", 404)
             return
 
         # Serve file - from memory cache or disk
@@ -281,7 +364,7 @@ class StaticAssets:
             w.write_headers(200)
 
             async with aiofiles.open(f.path, "rb") as fp:
-                while chunk := await fp.read(_DEFAULT_FILESYSTEM_CHUNK_SIZE):
+                while chunk := await fp.read(self.filesystem_chunk_size):
                     if w.disconnected:
                         return
                     w.write(chunk)
@@ -295,7 +378,7 @@ class StaticAssets:
 
         if encoding:
             h.rset(b"content-encoding", encoding)
-            h.rset(b"vary", b"accept-encoding")
+            _merge_vary(h, b"accept-encoding")
 
         h.rset(b"content-length", b"%d" % len(body))
 
@@ -304,28 +387,3 @@ class StaticAssets:
             return
 
         w.write_headers(200).end(body)
-
-    def url(self, filename: str) -> str:
-        """
-        Get the fingerprinted filename for a file.
-
-        Args:
-            filename: Original filename relative to directory
-
-        Returns:
-            Fingerprinted filename with path preserved
-            e.g., "js/app.js" -> "js/app.abc123.js"
-        """
-        filename = filename.strip("/")
-        if hashed_name := self._path_to_hash.get(filename):
-            parts = filename.rsplit("/", 1)
-            if len(parts) == 2:
-                return f"{parts[0]}/{hashed_name}"
-            return hashed_name
-
-        available = list(self._path_to_hash.keys())[:5]
-        raise StarioError(
-            f"Static file not found: '{filename}'",
-            context={"filename": filename},
-            help_text=f"Available files: {available}{'...' if len(self._path_to_hash) > 5 else ''}",
-        )

@@ -1,8 +1,4 @@
-"""
-Query Parameters - Parsed query string with consistent access.
-
-.get() for first value, .getlist() for all. Always returns str.
-"""
+"""Parsed query strings: repeated keys become lists; ``QueryParams`` exposes first-value and multi-value APIs."""
 
 from typing import overload
 from urllib.parse import unquote_plus as _unquote_plus
@@ -48,11 +44,14 @@ def _parse_query(raw: bytes) -> dict[str, list[str]]:
 
 
 class QueryParams:
-    """Parsed query string with consistent access patterns."""
+    """View over a parsed query string preserving repeated keys."""
 
     __slots__ = ("_data",)
 
     def __init__(self, raw: bytes) -> None:
+        """Parameters:
+            raw: Query bytes from the URL (no leading ``?``), Latin-1 decoded then split on ``&``.
+        """
         self._data = _parse_query(raw)
 
     @overload
@@ -62,18 +61,38 @@ class QueryParams:
     def get[T](self, key: str, default: T) -> str | T: ...
 
     def get[T](self, key: str, default: T | None = None) -> str | T | None:
-        """First value for key, or default."""
+        """First value for ``key``, or ``default`` when the key is absent."""
         vals = self._data.get(key)
         return vals[0] if vals else default
 
     def getlist(self, key: str) -> list[str]:
-        """All values for key."""
+        """Every value for ``key`` (empty list if missing), preserving duplicates from the query string."""
         vals = self._data.get(key)
         return list(vals) if vals else []
 
     def items(self) -> list[tuple[str, str]]:
         """All key-value pairs, flattened."""
         return [(k, v) for k, vals in self._data.items() for v in vals]
+
+    def as_dict(self, *, last: bool = True) -> dict[str, str]:
+        """One string per key, suitable for Pydantic ``model_validate`` and similar.
+
+        Repeated keys (``?a=1&a=2``) keep the **first** or **last** value; most
+        UIs send at most one value per key. For every value as a list, use
+        ``as_lists``.
+        """
+        if not self._data:
+            return {}
+        i = -1 if last else 0
+        return {k: vals[i] for k, vals in self._data.items()}
+
+    def as_lists(self) -> dict[str, list[str]]:
+        """All keys with every repeated value preserved (copy of each list).
+
+        Use with schemas whose fields are ``list[str]`` (or similar) for
+        ``?tag=a&tag=b``-style parameters.
+        """
+        return {k: list(v) for k, v in self._data.items()}
 
     def __contains__(self, key: object) -> bool:
         return key in self._data

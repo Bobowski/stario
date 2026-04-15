@@ -1,14 +1,17 @@
-"""JSON line tracer for finished spans."""
+"""Emits finished spans as newline-delimited JSON suitable for log pipelines and stdout collectors."""
 
 import json
+import logging
 import sys
 import threading
 import time
-import traceback
 from typing import Any, TextIO
 from uuid import UUID, uuid7
 
 from .core import Span
+from .tracebacks import format_exception_for_telemetry
+
+_logger = logging.getLogger("stario.telemetry.json")
 
 
 class _JsonState:
@@ -83,10 +86,7 @@ def _serialize_body(body: Any) -> Any:
     if body is None:
         return None
     if isinstance(body, BaseException):
-        tb = getattr(body, "__traceback__", None)
-        if tb:
-            return "".join(traceback.format_exception(type(body), body, tb))
-        return str(body)
+        return format_exception_for_telemetry(body)
     if isinstance(body, str):
         return body
     return str(body)
@@ -139,12 +139,7 @@ def _serialize_state(state: _JsonState) -> dict[str, Any]:
 
 
 class JsonTracer:
-    """Write finished spans as JSON lines.
-
-    Inside ``with tracer:``, completed spans are batched and written by a
-    background thread so request handling only mutates in-memory state.
-    Outside tracer scope, writes stay synchronous for compatibility.
-    """
+    """NDJSON span sink: under ``with tracer`` a background thread batches flushes; outside, ``end()`` writes synchronously."""
 
     __slots__ = (
         "_output",
@@ -161,6 +156,8 @@ class JsonTracer:
         "_thread",
         "_running",
         "_dropped_spans",
+        "_serialize_errors",
+        "_spans_lock",
     )
 
     def __init__(
@@ -193,6 +190,8 @@ class JsonTracer:
         self._thread: threading.Thread | None = None
         self._running = False
         self._dropped_spans = 0
+        self._serialize_errors = 0
+        self._spans_lock = threading.Lock()
 
     def __enter__(self) -> JsonTracer:
         self._start_writer()
@@ -203,13 +202,21 @@ class JsonTracer:
         with self._write_lock:
             self._output.flush()
 
+    @property
+    def serialize_errors(self) -> int:
+        """Spans skipped because JSON serialization failed (see ``_write_batch``)."""
+        with self._pending_lock:
+            return self._serialize_errors
+
     def create(
         self,
         name: str,
         attributes: dict[str, Any] | None = None,
+        /,
+        *,
         parent_id: UUID | None = None,
     ) -> Span:
-        """Create a stopped span handle."""
+        """Create a span handle; call ``start()`` or use the span as a context manager."""
 
         span = Span(id=uuid7(), tracer=self)
         state = _JsonState(
@@ -218,13 +225,15 @@ class JsonTracer:
             parent_id,
             attributes=attributes,
         )
-        self._spans[span.id] = state
+        with self._spans_lock:
+            self._spans[span.id] = state
         return span
 
     def start(self, span_id: UUID) -> None:
-        if state := self._spans.get(span_id):
-            if state.start_ns == 0:
-                state.start_ns = time.time_ns()
+        with self._spans_lock:
+            if state := self._spans.get(span_id):
+                if state.start_ns == 0:
+                    state.start_ns = time.time_ns()
 
     def set_attribute(
         self,
@@ -232,78 +241,87 @@ class JsonTracer:
         name: str,
         value: Any,
     ) -> None:
-        if state := self._spans.get(span_id):
-            if state.attrs is None:
-                state.attrs = {name: value}
-            else:
-                state.attrs[name] = value
+        with self._spans_lock:
+            if state := self._spans.get(span_id):
+                if state.attrs is None:
+                    state.attrs = {name: value}
+                else:
+                    state.attrs[name] = value
 
     def set_attributes(
         self,
         span_id: UUID,
         attributes: dict[str, Any],
     ) -> None:
-        if attributes and (state := self._spans.get(span_id)):
-            if state.attrs is None:
-                state.attrs = attributes.copy()
-            else:
-                state.attrs.update(attributes)
+        with self._spans_lock:
+            if attributes and (state := self._spans.get(span_id)):
+                if state.attrs is None:
+                    state.attrs = attributes.copy()
+                else:
+                    state.attrs.update(attributes)
 
     def add_event(
         self,
         span_id: UUID,
         name: str,
         attributes: dict[str, Any] | None = None,
+        /,
         *,
         body: Any | None = None,
     ) -> None:
-        if state := self._spans.get(span_id):
-            event = _JsonEvent(
-                time.time_ns(),
-                name,
-                attributes=attributes.copy() if attributes else None,
-                body=body,
-            )
-            if state.events is None:
-                state.events = [event]
-            else:
-                state.events.append(event)
+        with self._spans_lock:
+            if state := self._spans.get(span_id):
+                event = _JsonEvent(
+                    time.time_ns(),
+                    name,
+                    attributes=attributes.copy() if attributes else None,
+                    body=body,
+                )
+                if state.events is None:
+                    state.events = [event]
+                else:
+                    state.events.append(event)
 
     def add_link(
         self,
         span_id: UUID,
         target_span_id: UUID,
         attributes: dict[str, Any] | None = None,
+        /,
     ) -> None:
-        if state := self._spans.get(span_id):
-            link = _JsonLink(
-                target_span_id,
-                attributes=attributes.copy() if attributes else None,
-            )
-            if state.links is None:
-                state.links = [link]
-            else:
-                state.links.append(link)
+        with self._spans_lock:
+            if state := self._spans.get(span_id):
+                link = _JsonLink(
+                    target_span_id,
+                    attributes=attributes.copy() if attributes else None,
+                )
+                if state.links is None:
+                    state.links = [link]
+                else:
+                    state.links.append(link)
 
     def fail(self, span_id: UUID, message: str) -> None:
-        if state := self._spans.get(span_id):
-            state.error = message
+        with self._spans_lock:
+            if state := self._spans.get(span_id):
+                state.error = message
 
     def set_name(self, span_id: UUID, name: str) -> None:
-        if state := self._spans.get(span_id):
-            state.name = name
+        with self._spans_lock:
+            if state := self._spans.get(span_id):
+                state.name = name
 
     def end(self, span_id: UUID) -> None:
-        if not (state := self._spans.get(span_id)):
-            return
-        if state.end_ns is not None:
-            return
-        if state.start_ns == 0:
-            raise RuntimeError(
-                "Cannot end a span that was never started. "
-                "Call span.start() or use the span as a context manager."
-            )
-        self._spans.pop(span_id, None)
+        with self._spans_lock:
+            if not (state := self._spans.get(span_id)):
+                return
+            if state.end_ns is not None:
+                return
+            if state.start_ns == 0:
+                raise RuntimeError(
+                    "Cannot end a span that was never started. "
+                    "Call span.start() or use the span as a context manager."
+                )
+            self._spans.pop(span_id, None)
         state.end_ns = time.time_ns()
         if self._running:
             self._enqueue_finished(state)
@@ -340,6 +358,12 @@ class JsonTracer:
         with self._pending_lock:
             if len(self._pending) >= self._max_pending_spans:
                 self._dropped_spans += 1
+                _logger.warning(
+                    "JsonTracer pending queue full (max=%s); dropping finished span %s (%r)",
+                    self._max_pending_spans,
+                    state.id,
+                    state.name,
+                )
                 return
             self._pending.append(state)
             should_wake = len(self._pending) >= self._wake_batch_spans
@@ -385,6 +409,13 @@ class JsonTracer:
                     )
                 )
             except Exception:
+                with self._pending_lock:
+                    self._serialize_errors += 1
+                _logger.exception(
+                    "JsonTracer failed to serialize span %s (%r); span omitted from output",
+                    state.id,
+                    state.name,
+                )
                 continue
 
         if not lines:

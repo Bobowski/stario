@@ -1,7 +1,7 @@
 [project]
 name = "stario"
-version = "2.3.0"
-description = "Stario - High-performance Python web framework"
+version = "3.0.1"
+description = "Stario - Bringing back the joy of web development"
 readme = "README.md"
 authors = [
     { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
@@ -10,10 +10,7 @@ requires-python = ">=3.14"
 dependencies = [
     "aiofiles>=24.1.0",
     "brotli>=1.1.0",
-    "click>=8.1.0",
     "httptools>=0.7.1",
-    "pydantic>=2.12.5",
-    "rich>=14.1.0",
     "xxhash>=3.5.0",
     "watchfiles>=1.1.0",
 ]
@@ -34,5 +31,6 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

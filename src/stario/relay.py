@@ -1,38 +1,38 @@
 """
-Relay - Lightweight In-Process Pub/Sub.
+Process-local pub/sub with dotted subjects: enough for fan-out between handlers and tasks in one interpreter.
 
-NATS-inspired subject-based messaging for CQRS patterns.
-Fire-and-forget publishing, async subscription with auto-cleanup.
-
-Subject Patterns:
-    room.123        - Exact match only
-    room.123.*      - Catch-all: anything starting with "room.123."
-    room.*          - Catch-all: anything starting with "room."
-    *               - Match everything
-
-Usage:
-    relay = Relay()
-
-    # Publish (sync, fire-and-forget)
-    relay.publish("room.123.moves", None)
-    relay.publish("room.123.moves", move_data)
-
-    # Subscribe (async iterator, auto-cleanup)
-    async for subject, data in relay.subscribe("room.123.*"):
-        print(subject, data)
+``publish`` is synchronous and thread-safe so non-async code can signal asyncio subscribers; scope stops at process
+boundary—use an external broker when you need cross-machine delivery or persistence guarantees.
 """
 
 from asyncio import AbstractEventLoop, Queue, get_running_loop
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 # Message: (subject, data)
 type Msg[T = Any] = tuple[str, T]
 
-# Subscriber: (queue, loop)
+# Subscriber: (queue, loop) — loop is where ``call_soon_threadsafe`` must schedule puts
 type _Sub[T] = tuple[Queue[Msg[T]], AbstractEventLoop]
+
+
+def _no_running_event_loop(exc: RuntimeError) -> bool:
+    """True when ``get_running_loop()`` failed because this thread has no loop."""
+    return "no running event loop" in str(exc).lower()
+
+
+def _closed_loop_enqueue_error(exc: RuntimeError) -> bool:
+    """True when enqueue failed because the subscriber's loop is closed (shutdown)."""
+    msg = str(exc).lower()
+    if "event loop is closed" in msg:
+        return True
+    if "cannot schedule" in msg and "closed" in msg:
+        return True
+    return False
 
 
 @lru_cache(maxsize=1024)
@@ -50,23 +50,74 @@ def _matching_patterns(subject: str) -> tuple[str, ...]:
     return tuple(patterns)
 
 
+@dataclass(slots=True)
+class RelaySubscription[T = Any]:
+    """Registered queue on a ``Relay``: ``async with`` then ``async for``, or ``async for`` alone (auto enter/exit for the loop)."""
+
+    _relay: Relay[T]
+    pattern: str
+    _queue: Queue[Msg[T]] = field(default_factory=Queue, init=False, repr=False)
+    # Set while registered in ``Relay._subs``; used as (queue, loop) identity for removal
+    _entry: _Sub[T] | None = field(default=None, init=False, repr=False)
+
+    def _register(self) -> None:
+        if self._entry is not None:
+            raise RuntimeError("RelaySubscription is already active")
+        loop = get_running_loop()
+        entry: _Sub[T] = (self._queue, loop)
+        self._entry = entry
+        with self._relay._lock:
+            if self.pattern not in self._relay._subs:
+                self._relay._subs[self.pattern] = []
+            self._relay._subs[self.pattern].append(entry)
+
+    def _unregister(self) -> None:
+        entry = self._entry
+        if entry is None:
+            return
+        pattern = self.pattern
+        with self._relay._lock:
+            if pattern in self._relay._subs:
+                try:
+                    self._relay._subs[pattern].remove(entry)
+                except ValueError:
+                    # Another path already removed us (defensive; should be rare)
+                    pass
+                if not self._relay._subs[pattern]:
+                    del self._relay._subs[pattern]
+        self._entry = None
+
+    async def __aenter__(self) -> Self:
+        self._register()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
+        self._unregister()
+        return False
+
+    async def __aiter__(self) -> AsyncIterator[Msg[T]]:
+        if self._entry is None:
+            # ``async for relay.subscribe(...)`` without ``async with``: one enter/exit around the whole loop
+            async with self:
+                while True:
+                    yield await self._queue.get()
+        else:
+            # ``async with`` already registered this queue; do not nest ``__aenter__`` again
+            while True:
+                yield await self._queue.get()
+
+
 class Relay[T = Any]:
     """
-    In-process pub/sub. Thread-safe, minimal locking.
+    In-process pub/sub: dotted subjects, ``*`` wildcards, sync ``publish`` safe from any thread (``threading.Lock``).
 
-    Threading model:
-    - Lock is held only for dict/list operations (microseconds).
-    - Queue delivery happens outside the lock via loop.call_soon_threadsafe().
-    - This allows publish() to be called from any thread (e.g., background workers).
-
-    Why threading.Lock instead of asyncio.Lock?
-    - publish() must be callable from sync code (fire-and-forget pattern).
-    - asyncio.Lock requires await, which would force publish() to be async.
-    - The lock hold time is negligible (just dict operations), so no contention.
-
-    Memory management:
-    - Subscribers are cleaned up automatically when the async iterator exits.
-    - Empty pattern lists are removed to prevent memory leaks from unused patterns.
+    Each subscription binds to its loop. ``publish`` uses ``put_nowait`` when called on that loop's thread; otherwise
+    it uses ``call_soon_threadsafe`` so other threads can enqueue safely.
     """
 
     __slots__ = ("_lock", "_subs")
@@ -76,55 +127,42 @@ class Relay[T = Any]:
         self._subs: dict[str, list[_Sub[T]]] = {}
 
     def publish(self, subject: str, data: T) -> None:
-        """
-        Publish to a subject. Fire-and-forget.
-
-        Thread-safe. Lock held only to collect subscribers.
-        """
+        """Copy subscriber list under lock; enqueue on the loop (direct or ``call_soon_threadsafe``) outside it."""
         msg: Msg[T] = (subject, data)
 
-        # Short lock - just collect subscribers
+        # Match both exact segments and ``*`` wildcards, then snapshot who to notify
         with self._lock:
             to_notify: list[_Sub[T]] = []
             for pattern in _matching_patterns(subject):
                 if subs := self._subs.get(pattern):
                     to_notify.extend(subs)
 
-        # Deliver outside lock
+        # If this thread is inside an asyncio task, remember which loop is running here (small fixed cost per publish).
+        # Worker threads, synchronous code, or "no loop in this thread" → RuntimeError → running stays None and
+        # every subscriber is notified via call_soon_threadsafe below (no loop object needed in the publisher).
+        try:
+            running = get_running_loop()
+        except RuntimeError as exc:
+            if not _no_running_event_loop(exc):
+                raise
+            running = None
+
+        # Never call subscriber code while holding the lock
         for queue, loop in to_notify:
             try:
-                loop.call_soon_threadsafe(queue.put_nowait, msg)
-            except RuntimeError:
-                pass  # Loop closed
+                # asyncio.Queue is only safe to touch directly on its loop's thread; from anywhere else we must
+                # schedule put_nowait on that loop (call_soon_threadsafe). Same thread + same loop → skip scheduling.
+                if running is loop:
+                    queue.put_nowait(msg)
+                else:
+                    loop.call_soon_threadsafe(queue.put_nowait, msg)
+            except RuntimeError as exc:
+                if not _closed_loop_enqueue_error(exc):
+                    raise
 
-    async def subscribe(self, pattern: str) -> AsyncIterator[Msg[T]]:
+    def subscribe(self, pattern: str) -> RelaySubscription[T]:
         """
-        Subscribe to a pattern. Auto-cleanup on exit.
-
-        Patterns:
-            "room.123"   - Exact match
-            "room.123.*" - Catch-all
-            "*"          - Everything
+        Return a subscription handle: register with ``async with``, then ``async for`` messages,
+        or ``async for`` directly (registers on first iteration, unsubscribes when the loop ends).
         """
-        queue: Queue[Msg[T]] = Queue()
-        loop = get_running_loop()
-        entry: _Sub[T] = (queue, loop)
-
-        with self._lock:
-            if pattern not in self._subs:
-                self._subs[pattern] = []
-            self._subs[pattern].append(entry)
-
-        try:
-            while True:
-                yield await queue.get()
-        finally:
-            with self._lock:
-                # Safe removal - handle race conditions where entry may already be gone
-                if pattern in self._subs:
-                    try:
-                        self._subs[pattern].remove(entry)
-                    except ValueError:
-                        pass  # Already removed (race condition)
-                    if not self._subs[pattern]:
-                        del self._subs[pattern]
+        return RelaySubscription(self, pattern)

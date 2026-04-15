@@ -1,33 +1,33 @@
-"""Single-threaded HTTP server lifecycle and networking."""
+"""
+Runs ``App`` behind an asyncio listener: signal handling, bootstrap context, graceful drain, then socket teardown.
+
+Bootstrap completes before ``start_serving``; exceptions there fail startup loudly. Transport policy (TCP vs Unix, backlog,
+compression defaults) lives here so ``Router``/``App`` stay free of process-level concerns.
+"""
 
 import asyncio
 import os
 import signal
 import socket
+import stat
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from types import FrameType
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    AsyncContextManager,
-    Literal,
-)
+from typing import Any, AsyncContextManager, Literal
 
 from stario.exceptions import StarioError
 from stario.telemetry import Tracer
 from stario.telemetry.core import Span
 
+from .app import App
 from .protocol import HttpProtocol
+from .request import DEFAULT_MAX_BODY_SIZE, DEFAULT_MAX_HEADER_BYTES
 from .writer import CompressionConfig
 
-if TYPE_CHECKING:
-    from .app import Stario
-
-type StarioBootstrap = Callable[["Stario", Span], AsyncContextManager[None]]
-type StarioFactory = Callable[[], "Stario"]
+type AppBootstrap = Callable[[App, Span], AsyncContextManager[None]]
+type AppFactory = Callable[[], App]
 
 
 type RunState = Literal[
@@ -47,23 +47,55 @@ type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
 
 
 class Server:
+    """Binds a listener, runs the bootstrap context around a fresh app, serves until SIGINT/SIGTERM, then drains."""
+
     def __init__(
         self,
-        bootstrap: StarioBootstrap,
+        bootstrap: AppBootstrap,
         tracer: Tracer,
         *,
-        app_factory: StarioFactory | None = None,
+        app_factory: AppFactory | None = None,
         host: str = "127.0.0.1",
         port: int = 8000,
         graceful_timeout: float = 5.0,
         backlog: int = 2048,
         unix_socket: str | None = None,
+        unix_socket_mode: int = 0o660,
         compression: CompressionConfig = CompressionConfig(),
+        event_loop_name: str | None = None,
+        max_request_header_bytes: int = DEFAULT_MAX_HEADER_BYTES,
+        max_request_body_bytes: int = DEFAULT_MAX_BODY_SIZE,
     ) -> None:
-        if app_factory is None:
-            from .app import Stario
+        """Configure listening, bootstrap, telemetry, and per-connection compression.
 
-            app_factory = Stario
+        Parameters:
+            bootstrap: Async context manager factory ``(app, span)`` run around the serving loop.
+            tracer: Telemetry backend implementing the ``Tracer`` protocol.
+            app_factory: Builds each run's ``App``; defaults to ``App``.
+            host: TCP bind address (ignored when ``unix_socket`` is set).
+            port: TCP port.
+            graceful_timeout: Seconds to wait for open connections and ``App.create_task`` work during shutdown.
+            backlog: Socket listen backlog.
+            unix_socket: Filesystem path for a Unix domain listener; removes stale socket files before bind.
+            unix_socket_mode: Mode applied after bind on the Unix socket path (e.g. group read for a proxy user).
+            compression: Copied into each new ``Writer`` for the lifetime of the connection.
+            event_loop_name: Optional span attribute for identifying the chosen event loop implementation.
+            max_request_header_bytes: Maximum combined size of the request line (method + URL) and all
+                request headers before the body; larger requests receive ``431`` and the connection closes.
+            max_request_body_bytes: Maximum bytes buffered for the request body (``413`` when exceeded).
+        """
+        if max_request_header_bytes < 256:
+            raise StarioError(
+                "max_request_header_bytes must be at least 256",
+                help_text="Increase the limit or use the default Server settings.",
+            )
+        if max_request_body_bytes < 1:
+            raise StarioError(
+                "max_request_body_bytes must be at least 1",
+                help_text="Use a positive byte limit for request bodies.",
+            )
+        if app_factory is None:
+            app_factory = App
         self.bootstrap = bootstrap
         self.app_factory = app_factory
         self.host = host
@@ -71,14 +103,26 @@ class Server:
         self.graceful_timeout = graceful_timeout
         self.backlog = backlog
         self.unix_socket = unix_socket
+        self.unix_socket_mode = unix_socket_mode
         self.compression = compression
         self.tracer = tracer
+        self.event_loop_name = event_loop_name
+        self.max_request_header_bytes = max_request_header_bytes
+        self.max_request_body_bytes = max_request_body_bytes
 
         self._state: RunState = "ready"
         self._sock: socket.socket | None = None
         self._date_header = b""
 
     async def run(self) -> None:
+        """Block until SIGINT/SIGTERM (or fatal error): create app, enter bootstrap, serve, drain, tear down.
+
+        Raises:
+            StarioError: If ``run`` is called twice on the same instance, or bootstrap suppresses startup errors.
+
+        Notes:
+            Requires an already-running event loop. Signals are temporarily replaced for SIGINT/SIGTERM during the call.
+        """
         if self._state != "ready":
             raise StarioError(
                 "Server already running",
@@ -101,12 +145,12 @@ class Server:
             shutdown_span.link(span)
             shutdown_span.attr("server.shutdown.trigger", trigger)
             shutdown_span.start()
-            # Keep a single handle for users while switching to shutdown span.
+            # External code may hold the original startup span id; repoint it so end()/metrics close shutdown.
             span.id = shutdown_span.id
             self._state = "shutting_down"
 
-        # READY -> STARTING -> RUNNING -> SHUTTING_DOWN -> STOPPED.
-        # One state value drives both run-guarding and error-path decisions.
+        # Single ``_state``: guards re-entrancy, chooses which span ends on error,
+        # and distinguishes "bootstrap failed" from "server was running".
 
         with self._signal_handlers(loop, shutdown_future):
             try:
@@ -159,12 +203,11 @@ class Server:
         *,
         loop: asyncio.AbstractEventLoop,
         span: Span,
-        app: "Stario",
+        app: "App",
         shutdown_future: asyncio.Future[None],
     ) -> AsyncIterator[None]:
         # Shared sets let protocol instances report active connections/tasks for shutdown.
         connections: set[HttpProtocol] = set()
-        tasks: set[asyncio.Task[Any]] = set()
         server: asyncio.Server | None = None
         server_started = False
 
@@ -179,7 +222,8 @@ class Server:
                     self.compression,
                     shutdown_future,
                     connections,
-                    tasks,
+                    max_request_header_bytes=self.max_request_header_bytes,
+                    max_request_body_bytes=self.max_request_body_bytes,
                 )
 
             if self.unix_socket:
@@ -209,7 +253,7 @@ class Server:
                     server,
                     server_started,
                     connections,
-                    tasks,
+                    app._tasks,
                     span,
                 )
             finally:
@@ -259,9 +303,7 @@ class Server:
         while (connections or self._pending_tasks(tasks)) and loop.time() < deadline:
             await asyncio.sleep(0.1)
 
-    async def _force_close_open_transports(
-        self, connections: set[HttpProtocol]
-    ) -> int:
+    async def _force_close_open_transports(self, connections: set[HttpProtocol]) -> int:
         transports = [
             protocol.transport
             for protocol in connections
@@ -319,13 +361,19 @@ class Server:
         """Create and bind Unix socket."""
         assert self.unix_socket is not None
         if os.path.exists(self.unix_socket):
-            # Stale socket files from previous runs prevent bind().
-            os.unlink(self.unix_socket)
+            st_mode = os.stat(self.unix_socket).st_mode
+            if stat.S_ISSOCK(st_mode):
+                os.unlink(self.unix_socket)
+            else:
+                raise StarioError(
+                    f"Unix socket path exists and is not a socket: {self.unix_socket}",
+                    help_text="Remove the file or choose a different --unix-socket path.",
+                )
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.setblocking(False)
         sock.bind(self.unix_socket)
-        # Keep perms permissive so reverse proxies and local tools can connect.
-        os.chmod(self.unix_socket, 0o666)
+        # Group-writable by default so a reverse proxy can share access without world write.
+        os.chmod(self.unix_socket, self.unix_socket_mode)
         sock.listen(self.backlog)
         return sock
 
@@ -345,7 +393,7 @@ class Server:
             line = [b"date: ", b"", b"\r\n"]
             while True:
                 now = datetime.now(timezone.utc)
-                line[1] = format_datetime(now, usegmt=True).encode()
+                line[1] = format_datetime(now, usegmt=True).encode("ascii")
                 self._date_header = b"".join(line)
                 await asyncio.sleep(1)
 
@@ -366,11 +414,28 @@ class Server:
             "server.compression.brotli_level": self.compression.brotli_level,
             "server.compression.gzip_level": self.compression.gzip_level,
         }
+        if self.event_loop_name is not None:
+            attrs["server.event_loop"] = self.event_loop_name
+        if self.compression.zstd_window_log is not None:
+            attrs["server.compression.zstd_window_log"] = (
+                self.compression.zstd_window_log
+            )
+        if self.compression.brotli_window_log is not None:
+            attrs["server.compression.brotli_window_log"] = (
+                self.compression.brotli_window_log
+            )
+        if self.compression.gzip_window_bits is not None:
+            attrs["server.compression.gzip_window_bits"] = (
+                self.compression.gzip_window_bits
+            )
         if self.unix_socket:
             attrs["server.listen_mode"] = "unix_socket"
             attrs["server.unix_socket"] = self.unix_socket
+            attrs["server.unix_socket_mode"] = oct(self.unix_socket_mode)
         else:
             attrs["server.listen_mode"] = "tcp"
             attrs["server.host"] = self.host
             attrs["server.port"] = self.port
+        attrs["server.limits.max_request_header_bytes"] = self.max_request_header_bytes
+        attrs["server.limits.max_request_body_bytes"] = self.max_request_body_bytes
         span.attrs(attrs)

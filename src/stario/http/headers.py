@@ -1,18 +1,12 @@
 """
-HTTP Headers - Fast, cached header handling.
+Case-folded header map using bytes (Latin-1) to match on-the-wire form and avoid repeated encoding in hot paths.
 
-Headers are stored as lowercased bytes internally for O(1) comparison.
-Common headers and values are pre-encoded at import time.
-
-Design:
-- Bytes internally: avoids repeated encoding in hot paths
-- Lowercase keys: HTTP headers are case-insensitive, normalize once
-- Separate header/value lookups: "Accept" is both a header and a Vary value
-- HEADER_LOOKUP caches custom header names on miss via __missing__
-- VALUE_LOOKUP uses .get() without caching (values may carry sensitive data)
+``set``/``add`` validate names and values; ``rset``/``radd`` assume callers already produced safe lowercased names for paths
+that have duplicated that work (e.g. cookie serialization). Validation targets CRLF/injection issues, not application semantics.
 """
 
 import re
+from collections.abc import Mapping
 from typing import Self, overload
 
 # =============================================================================
@@ -409,21 +403,33 @@ def encode_value(value: str | bytes) -> bytes:
 
 
 class Headers:
-    """HTTP Headers container. Keys stored as lowercased bytes."""
+    """HTTP header map: validated ``str``/``bytes`` API plus ``r*`` helpers for already-normalized wire bytes."""
 
     __slots__ = ("_data",)
 
     def __init__(
         self, raw_header_data: dict[bytes, bytes | list[bytes]] | None = None
     ) -> None:
-        """
-        WARNING: raw_header_data is used as-is with no validation or normalization.
-        Caller must provide lowercased ASCII bytes keys and valid byte values.
+        """Build an empty map or wrap pre-parsed wire-form headers.
+
+        Parameters:
+            raw_header_data: Optional internal dict (lowercased ASCII ``bytes`` keys; values are ``bytes`` or lists for duplicates).
+
+        Notes:
+            The fast path from the HTTP parser uses this constructor; application code should prefer ``set`` / ``add``.
         """
         self._data = raw_header_data or {}
 
     def add(self, name: str | bytes, value: str | bytes) -> Self:
-        """Add a header (allows multiple values for same name)."""
+        """Append a value, allowing duplicates (e.g. multiple ``Set-Cookie``).
+
+        Parameters:
+            name: Header name (canonical names are validated against known tokens when using ``str``).
+            value: Header value; encoded for wire form.
+
+        Returns:
+            ``self`` for chaining.
+        """
         key = HEADER_LOOKUP[name]
         val = encode_value(value)
         if (existing := self._data.setdefault(key, val)) is not val:
@@ -434,7 +440,15 @@ class Headers:
         return self
 
     def set(self, name: str | bytes, value: str | bytes) -> Self:
-        """Set a header (replaces existing)."""
+        """Replace any existing values for this header name.
+
+        Parameters:
+            name: Header name.
+            value: New value.
+
+        Returns:
+            ``self`` for chaining.
+        """
         self._data[HEADER_LOOKUP[name]] = encode_value(value)
         return self
 
@@ -443,7 +457,7 @@ class Headers:
     # -------------------------------------------------------------------------
 
     def radd(self, name: bytes, value: bytes) -> Self:
-        """Add raw header. Caller must provide lowercased name and valid value bytes."""
+        """Like ``add`` but assumes ``name`` is already lowercased header-name bytes (no validation)."""
         if (existing := self._data.setdefault(name, value)) is not value:
             if isinstance(existing, list):
                 existing.append(value)
@@ -452,11 +466,19 @@ class Headers:
         return self
 
     def rset(self, name: bytes, value: bytes) -> Self:
-        """Set raw header. Caller must provide lowercased name and valid value bytes."""
+        """Like ``set`` for pre-lowercased name bytes (response helpers use this in hot paths)."""
         self._data[name] = value
         return self
 
-    def update(self, other: dict[str | bytes, str | bytes] | None) -> Self:
+    def update(
+        self,
+        other: (
+            Mapping[str, str]
+            | Mapping[bytes, bytes]
+            | Mapping[str | bytes, str | bytes]
+            | None
+        ),
+    ) -> Self:
         if other is None:
             return self
         # Directly add items to _data (faster than calling set repeatedly)
@@ -481,19 +503,19 @@ class Headers:
     @overload
     def get[T](self, name: str | bytes, default: T) -> str | T: ...
 
-    def get[T](
-        self, name: str | bytes, default: T | None = None
-    ) -> str | T | None:
-        """Get first value for header, decoded as string."""
-        value = self._data.get(name if isinstance(name, bytes) else HEADER_LOOKUP[name])
+    def get[T](self, name: str | bytes, default: T | None = None) -> str | T | None:
+        """First header value as ``str`` (Latin-1 decoded), or ``default``."""
+        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
+        value = self._data.get(key)
         if value is None:
             return default
         raw = value if isinstance(value, bytes) else value[0]
         return raw.decode("latin-1")
 
     def getlist(self, name: str | bytes) -> list[str]:
-        """Get all values for header, decoded as strings."""
-        value = self._data.get(name if isinstance(name, bytes) else HEADER_LOOKUP[name])
+        """Every value for a possibly multi-valued header, as strings."""
+        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
+        value = self._data.get(key)
         if value is None:
             return []
         if isinstance(value, bytes):
@@ -505,14 +527,14 @@ class Headers:
     # -------------------------------------------------------------------------
 
     def rget[T: bytes | None = None](self, name: bytes, default: T = None) -> T | bytes:
-        """Get first value for header as raw bytes."""
+        """First value as wire ``bytes`` (``name`` must be lowercased header bytes)."""
         value = self._data.get(name)
         if value is None:
             return default
         return value if isinstance(value, bytes) else value[0]
 
     def rgetlist(self, name: bytes) -> list[bytes]:
-        """Get all values for header as raw bytes."""
+        """All values as wire ``bytes`` (for duplicated headers such as ``Set-Cookie``)."""
         value = self._data.get(name)
         if value is None:
             return []
@@ -520,7 +542,8 @@ class Headers:
 
     def remove(self, name: str | bytes) -> Self:
         """Remove a header."""
-        self._data.pop(name if isinstance(name, bytes) else HEADER_LOOKUP[name], None)
+        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
+        self._data.pop(key, None)
         return self
 
     def items(self) -> list[tuple[bytes, bytes]]:
@@ -539,7 +562,7 @@ class Headers:
         self._data.clear()
 
     def __contains__(self, name: str | bytes) -> bool:
-        key = name if isinstance(name, bytes) else HEADER_LOOKUP[name]
+        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
         return key in self._data
 
     def __len__(self) -> int:

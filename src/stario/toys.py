@@ -1,8 +1,7 @@
 from typing import Literal
 
-from stario.datastar import data
-from stario.html import B, Div, Pre
-from stario.html.core import HtmlElement
+from stario import datastar as ds
+from stario.html import B, Div, HtmlElement, Pre
 
 
 def toy_inspector(
@@ -10,19 +9,7 @@ def toy_inspector(
         "top-left", "top-right", "bottom-left", "bottom-right"
     ] = "top-right",
 ) -> HtmlElement:
-    """
-    A floating debug panel that shows current Datastar signals.
-
-    Uses data-json-signals attribute to display reactive state.
-    Useful when debugging signal updates.
-    Draggable - hover to see grab cursor, click and drag to move.
-
-    :param position: Initial corner to place the inspector.
-
-    Implementation notes:
-    - Uses Datastar events for drag (no inline JS)
-    - All drag state in el.dataset (element-local, no signals)
-    """
+    """Debug overlay: renders signal JSON and draggable via Datastar events (state in ``dataset``)."""
     style = {
         "position": "fixed",
         "opacity": "0.95",
@@ -49,7 +36,7 @@ def toy_inspector(
 
     return Div(
         # Mousedown: start drag, store offsets in dataset
-        data.on(
+        ds.on(
             "mousedown",
             """
             if (evt.target.tagName !== 'PRE') {
@@ -61,7 +48,7 @@ def toy_inspector(
             """,
         ),
         # Mousemove on window: update position while dragging
-        data.on(
+        ds.on(
             "mousemove",
             """
             if (el.dataset.drag) {
@@ -73,7 +60,7 @@ def toy_inspector(
             """,
         ),
         # Mouseup on window: stop drag
-        data.on(
+        ds.on(
             "mouseup",
             "delete el.dataset.drag; el.style.cursor = 'grab'",
         ),
@@ -86,7 +73,7 @@ def toy_inspector(
             "Signals Inspector",
         ),
         Pre(
-            data.json_signals(),
+            ds.json_signals(),
             {
                 "style": {
                     "background": "#f4f4f4",

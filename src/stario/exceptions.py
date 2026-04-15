@@ -1,38 +1,22 @@
 """
-Stario Exceptions.
+Three kinds of failures: intentional HTTP responses (``HttpException`` / ``RedirectException``), framework usage errors (``StarioError``), and dropped connections (``ClientDisconnected``).
 
-Exception types:
-- StarioError: Framework errors with rich context for debugging
-- HttpException: Expected errors that become HTTP responses
-- ClientDisconnected: Client closed connection (for streaming handlers)
-- SignalValidationError: Datastar signals validation error
+``HttpException`` and ``RedirectException`` are re-exported from the ``stario`` package root; prefer ``from stario import HttpException`` or ``RedirectException`` in application code.
+
+Separating them keeps default error handling from treating programmer mistakes like normal 404s, and lets stream handlers distinguish clean disconnects.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from pydantic import ValidationError
-from pydantic_core import InitErrorDetails
-
-if TYPE_CHECKING:
-    from stario.http.writer import Writer
+from stario.http.writer import Writer
 
 
 class StarioError(Exception):
     """
-    Framework error with context for debugging.
+    Prefer this over bare ``Exception`` when the fix is in application/framework usage.
 
-    Provides structured error info for both humans and AI agents:
-    - message: What went wrong
-    - context: Key-value pairs with relevant data
-    - help_text: How to fix it
-    - example: Working code example
-
-    Example:
-        raise StarioError(
-            "Invalid attribute type",
-            context={"attr": "class", "got": type(val).__name__},
-            help_text="Attributes must be str, int, or bool.",
-        )
+    ``context`` / ``help_text`` / ``example`` are folded into ``str(exc)`` so logs
+    and trace events stay actionable without a custom formatter.
     """
 
     __slots__ = ("message", "context", "help_text", "example")
@@ -52,7 +36,7 @@ class StarioError(Exception):
         super().__init__(self._format())
 
     def _format(self) -> str:
-        """Format error message with context."""
+        """Single string for logging and re-raising."""
         parts = [self.message]
 
         if self.context:
@@ -68,17 +52,24 @@ class StarioError(Exception):
         return "\n".join(parts)
 
 
+class StarioRuntime(StarioError):
+    """
+    Raised when the framework is in a runtime state that makes the requested
+    operation invalid.
+
+    Typical examples are writing after the response finished or trying to send
+    SSE events after a helper already finalized the response.
+    """
+
+
 class HttpException(Exception):
     """
-    HTTP exception - becomes an HTTP response.
+    Intentional HTTP outcome: ``detail`` is the response body for 4xx/5xx, or ``Location`` for 3xx.
 
-    For errors:
-        raise HttpException(404, "Not found")
-        raise HttpException(401, "Please log in")
+    Prefer ``RedirectException`` for redirects so call sites distinguish URL from body text.
 
-    For redirects:
-        raise HttpException(302, "/login")
-        raise HttpException(307, "/new-location")
+    Registered on ``App`` so handlers can ``raise`` instead of branching on
+    ``Writer`` after partial output (still only safe before headers are sent).
     """
 
     __slots__ = ("status_code", "detail")
@@ -88,60 +79,33 @@ class HttpException(Exception):
         self.detail = detail
         super().__init__(detail)
 
-    def respond(self, w: "Writer") -> None:
+    def respond(self, w: Writer) -> None:
+        import stario.responses as responses
+
         if 300 <= self.status_code < 400:
-            w.redirect(self.detail, self.status_code)
+            responses.redirect(w, self.detail, self.status_code)
         else:
-            w.text(self.detail or "Error", self.status_code)
+            responses.text(w, self.detail or "Error", self.status_code)
+
+
+class RedirectException(HttpException):
+    """HTTP redirect (3xx); ``detail`` is the ``Location`` URL or path (not a response body)."""
+
+    def __init__(self, status_code: int, location: str) -> None:
+        if not (300 <= status_code < 400):
+            raise StarioError(
+                f"RedirectException requires a 3xx status_code, got {status_code}",
+                help_text="Use HttpException for response bodies (4xx/5xx).",
+            )
+        super().__init__(status_code, location)
 
 
 class ClientDisconnected(Exception):
     """
-    Client disconnected during request handling.
+    The protocol sets a per-connection ``disconnect`` future; ``Writer`` aligns with it.
 
-    Raised by Writer.write() when client is gone.
-    Streaming handlers can catch this for cleanup.
-
-    Usage:
-        async def sse_handler(c: Context, w: Writer) -> None:
-            try:
-                while True:
-                    w.write(b"data: ping\\n\\n")
-                    await asyncio.sleep(1)
-            except ClientDisconnected:
-                pass  # Client closed browser - cleanup if needed
+    Long-running handlers (SSE, chunked) should expect the stream to end without a
+    thrown error in some paths—check ``w.disconnected`` / ``w.alive()`` too.
     """
 
     pass
-
-
-class SignalValidationError(ValidationError):
-    """
-    Validation error scoped specifically to Datastar signals parsing.
-
-    This is intentionally a subclass of pydantic's ValidationError so callers
-    can inspect `.errors()`, `.json()`, and all standard validation internals,
-    while still being able to catch signals-specific validation failures only.
-    """
-
-    __slots__ = ()
-
-    @classmethod
-    def from_validation_error(cls, error: ValidationError) -> "SignalValidationError":
-        """Clone a pydantic ValidationError as SignalValidationError."""
-        line_errors: list[InitErrorDetails] = []
-        for item in error.errors(include_url=False):
-            line_error: InitErrorDetails = {
-                "type": item["type"],
-                "input": item["input"],
-            }
-            if "loc" in item:
-                line_error["loc"] = item["loc"]
-            if "ctx" in item:
-                line_error["ctx"] = item["ctx"]
-            line_errors.append(line_error)
-
-        return cls.from_exception_data(
-            title=error.title,
-            line_errors=line_errors,
-        )

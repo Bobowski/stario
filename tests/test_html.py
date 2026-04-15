@@ -1,14 +1,22 @@
 """Tests for stario.html module - HTML generation and rendering."""
 
+import dataclasses
+from typing import Any, cast
+
+import pytest
+
+from stario.exceptions import StarioError
 from stario.html import (
     A,
     Body,
     Br,
     Button,
+    Col,
     Comment,
     Div,
     Head,
     Html,
+    HtmlDocument,
     Img,
     Input,
     Li,
@@ -20,31 +28,38 @@ from stario.html import (
     Tag,
     Title,
     Ul,
+    baked,
     render,
 )
-from stario.html.core import escape_attribute_key, faster_escape, render_styles
+from stario.html.attributes import render_styles
+from stario.html.baked import _BakeSlot
+from stario.html.escape import (
+    escape_attribute_key,
+    escape_attribute_value,
+    escape_text,
+)
 
 
-class TestFasterEscape:
-    """Test HTML escaping function."""
+class TestEscapeAttributeValue:
+    """Test attribute-value escaping helper."""
 
     def test_escape_ampersand(self):
-        assert faster_escape("a & b") == "a &amp; b"
+        assert escape_attribute_value("a & b") == "a &amp; b"
 
     def test_escape_less_than(self):
-        assert faster_escape("a < b") == "a &lt; b"
+        assert escape_attribute_value("a < b") == "a &lt; b"
 
     def test_escape_greater_than(self):
-        assert faster_escape("a > b") == "a &gt; b"
+        assert escape_attribute_value("a > b") == "a &gt; b"
 
     def test_escape_double_quote(self):
-        assert faster_escape('say "hello"') == "say &quot;hello&quot;"
+        assert escape_attribute_value('say "hello"') == "say &quot;hello&quot;"
 
     def test_escape_single_quote(self):
-        assert faster_escape("say 'hello'") == "say &#x27;hello&#x27;"
+        assert escape_attribute_value("say 'hello'") == "say &#x27;hello&#x27;"
 
     def test_escape_all_characters(self):
-        result = faster_escape("<script>alert('\"XSS\" & bad')</script>")
+        result = escape_attribute_value("<script>alert('\"XSS\" & bad')</script>")
         assert "&lt;" in result
         assert "&gt;" in result
         assert "&amp;" in result
@@ -52,7 +67,17 @@ class TestFasterEscape:
         assert "&#x27;" in result
 
     def test_no_escape_needed(self):
-        assert faster_escape("hello world") == "hello world"
+        assert escape_attribute_value("hello world") == "hello world"
+
+
+class TestEscapeText:
+    """Test text-node escaping helper."""
+
+    def test_text_escapes_markup_chars(self):
+        assert escape_text("a < b & c > d") == "a &lt; b &amp; c &gt; d"
+
+    def test_text_leaves_quotes_literal(self):
+        assert escape_text('say "hello" and \'bye\'') == 'say "hello" and \'bye\''
 
 
 class TestEscapeAttributeKey:
@@ -71,8 +96,25 @@ class TestEscapeAttributeKey:
         assert "&nbsp;" in escape_attribute_key("class name")
 
 
+class TestSvgNamespace:
+    """SVG tags live on ``stario.html.svg`` (not package top level)."""
+
+    def test_svg_submodule(self):
+        from stario.html import svg
+
+        assert (
+            render(svg.Svg(svg.Circle()))
+            == "<svg><circle/></svg>"
+        )
+
+
 class TestSafeString:
     """Test SafeString for unescaped content."""
+
+    def test_safestring_is_frozen(self):
+        s = SafeString("x")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            s.safe_str = "y"  # type: ignore[misc]
 
     def test_safestring_not_escaped(self):
         safe = SafeString("<b>bold</b>")
@@ -95,6 +137,10 @@ class TestComment:
         result = render(Comment("--><script>alert(1)</script>"))
         assert result == "<!----&gt;&lt;script&gt;alert(1)&lt;/script&gt;-->"
 
+    def test_comment_rejects_boolean_content(self):
+        with pytest.raises(StarioError, match="Invalid comment content type: bool"):
+            Comment(True)
+
 
 class TestTagCreation:
     """Test Tag class and element creation."""
@@ -108,6 +154,10 @@ class TestTagCreation:
         my_br = Tag("br", True)
         result = render(my_br())
         assert result == "<br/>"
+
+    def test_raw_tag_requires_call(self):
+        with pytest.raises(StarioError, match="Tag object directly"):
+            render(cast(Any, Tag("div")))
 
     def test_tag_with_attributes(self):
         result = render(Div({"class": "test", "id": "main"}, "content"))
@@ -167,10 +217,38 @@ class TestAttributeTypes:
         assert "color:red;" in result
         assert "font-size:16px;" in result
 
+    def test_style_dict_rejects_invalid_values(self):
+        with pytest.raises(StarioError, match="Invalid CSS value type"):
+            render(Div({"style": {"color": ["red", "blue"]}}))
+
+    def test_style_dict_rejects_css_separators_in_keys(self):
+        with pytest.raises(StarioError, match="Invalid CSS property name"):
+            render(Div({"style": {"x;background:red": "1"}}))
+
+    def test_style_dict_rejects_at_rules(self):
+        with pytest.raises(StarioError, match="do not support at-rules"):
+            render(Div({"style": {"@media": "screen"}}))
+
     def test_nested_data_attributes(self):
         result = render(Div({"data": {"user-id": "123", "role": "admin"}}))
         assert 'data-user-id="123"' in result
         assert 'data-role="admin"' in result
+
+    def test_nested_attribute_key_uses_key_escaping(self):
+        result = render(Div({"data": {"bad key=1": "x"}}))
+        assert "data-bad&nbsp;key&#x3D;1" in result
+
+    def test_nested_attribute_key_rejects_non_strings(self):
+        with pytest.raises(StarioError, match="Invalid nested attribute name type"):
+            render(Div(cast(Any, {"data": {object(): "x"}})))
+
+    def test_attribute_list_rejects_invalid_items(self):
+        with pytest.raises(StarioError, match="Invalid list item type for attribute"):
+            render(Div(cast(Any, {"class": ["btn", object()]})))
+
+    def test_nested_attribute_list_rejects_invalid_items(self):
+        with pytest.raises(StarioError, match="Invalid list item type for nested attribute"):
+            render(Div(cast(Any, {"data": {"ids": ["123", object()]}})))
 
 
 class TestRender:
@@ -201,6 +279,12 @@ class TestRender:
         result = render(Span(3.14))
         assert result == "<span>3.14</span>"
 
+    def test_render_rejects_boolean_child(self):
+        with pytest.raises(
+            StarioError, match="Boolean values are not valid HTML child content"
+        ):
+            render(Span(True))
+
 
 class TestRenderStyles:
     """Test style dictionary rendering."""
@@ -219,13 +303,18 @@ class TestRenderStyles:
 class TestHtmlTags:
     """Test predefined HTML tags."""
 
-    def test_html_has_doctype(self):
-        result = render(Html(Head(Title("Test")), Body(P("Hello"))))
+    def test_html_document_has_doctype(self):
+        result = render(HtmlDocument(Head(Title("Test")), Body(P("Hello"))))
         assert result.startswith("<!doctype html>")
         assert "<html>" in result
 
+    def test_html_is_plain_html_tag(self):
+        result = render(Html(Head(Title("Test")), Body(P("Hello"))))
+        assert result == "<html><head><title>Test</title></head><body><p>Hello</p></body></html>"
+
     def test_self_closing_tags(self):
         assert render(Br()) == "<br/>"
+        assert render(Col()) == "<col/>"
         assert 'src="test.png"' in render(Img({"src": "test.png"}))
         assert render(Input({"type": "text"})) == '<input type="text"/>'
         assert "<meta" in render(Meta({"charset": "utf-8"}))
@@ -265,7 +354,7 @@ class TestComplexElements:
 
     def test_script_with_content(self):
         result = render(Script("console.log('hello');"))
-        assert "<script>console.log(&#x27;hello&#x27;);</script>" == result
+        assert "<script>console.log('hello');</script>" == result
 
     def test_nested_conditional_content(self):
         show_extra = True
@@ -277,6 +366,85 @@ class TestComplexElements:
         )
         assert "<p>Always shown</p>" in result
         assert "<p>Extra content</p>" in result
+
+
+class TestBakedDecorator:
+    """@baked: dynamic builders return segment lists; static ones return SafeString."""
+
+    def test_positional_and_render(self):
+        @baked
+        def layout(title, body):
+            return Div(Title(title), body)
+
+        assert render(layout("Hi", P("w"))) == "<div><title>Hi</title><p>w</p></div>"
+
+    def test_keyword_arguments(self):
+        @baked
+        def layout(title, body):
+            return Div(Title(title), body)
+
+        assert render(layout(body=P("x"), title="T")) == "<div><title>T</title><p>x</p></div>"
+
+    def test_keyword_only_parameters(self):
+        @baked
+        def layout(*, title, body):
+            return Div(Title(title), body)
+
+        assert render(layout(title="A", body=P("b"))) == "<div><title>A</title><p>b</p></div>"
+
+    def test_default_none_omits_child(self):
+        @baked
+        def block(inner=None):
+            return Div(P("pre"), inner)
+
+        assert render(block()) == "<div><p>pre</p></div>"
+        assert render(block(P("mid"))) == "<div><p>pre</p><p>mid</p></div>"
+
+    def test_static_only_no_slots(self):
+        @baked
+        def shell():
+            return Div(P("fixed"))
+
+        assert shell() == SafeString("<div><p>fixed</p></div>")
+        assert render(shell()) == "<div><p>fixed</p></div>"
+
+    def test_rejects_static_boolean_child(self):
+        def bad():
+            return Div(True)
+
+        with pytest.raises(
+            StarioError,
+            match="@baked: boolean values are not valid HTML child content",
+        ):
+            baked(bad)
+
+    def test_rejects_var_positional(self):
+
+        def bad(*a):
+            return Div()
+
+        with pytest.raises(StarioError, match="\\*args"):
+            baked(bad)
+
+    def test_rejects_var_keyword(self):
+
+        def bad(**kw):
+            return Div()
+
+        with pytest.raises(StarioError, match="\\*\\*kwargs"):
+            baked(bad)
+
+    def test_rejects_positional_only(self):
+
+        def bad(x, /):
+            return Div(str(x))
+
+        with pytest.raises(StarioError, match="positional-only"):
+            baked(bad)
+
+    def test_bakeslot_left_in_tree_raises(self):
+        with pytest.raises(StarioError, match="Unfilled @baked slot"):
+            render(Div(cast(Any, _BakeSlot("t"))))
 
 
 class TestEdgeCases:
@@ -291,16 +459,30 @@ class TestEdgeCases:
         assert result == "<div>text</div>"
 
     def test_mixed_attributes_and_children(self):
-        result = render(Div({"id": "1"}, "text", {"class": "test"}))
-        # Both attribute dicts should be processed
-        assert 'id="1"' in result
-        assert 'class="test"' in result
-        assert ">text</div>" in result
+        with pytest.raises(StarioError, match="attributes must be passed before children"):
+            render(Div({"id": "1"}, "text", {"class": "test"}))
 
     def test_attribute_value_with_quotes(self):
         result = render(Div({"data-json": '{"key":"value"}'}))
         assert "&quot;" in result  # Quotes should be escaped
 
+    def test_text_content_keeps_quotes_literal(self):
+        result = render(P('say "hello" and \'bye\''))
+        assert result == '<p>say "hello" and \'bye\'</p>'
+
     def test_safestring_attribute(self):
         result = render(Div({"data-raw": SafeString("raw<>value")}))
         assert 'data-raw="raw<>value"' in result
+
+
+def test_html_package_reexports_full_tag_catalog():
+    """Guards ``from .tags import *`` in ``stario.html`` against a drifting ``tags`` catalog."""
+    import stario.html as html
+    from stario.html import tags as tags_mod
+
+    for name in sorted(
+        n
+        for n in tags_mod.__dict__
+        if not n.startswith("_") and n not in {"_Tag", "_SafeString"}
+    ):
+        assert getattr(html, name) is getattr(tags_mod, name), name

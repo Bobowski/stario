@@ -1,39 +1,55 @@
 """
-Stario application routing and request handling.
+Single entrypoint for request handling above the router: error surface, tracing, and ``writer.end()`` guarantees.
+
+The protocol dispatches a callable; this class is where policy lives so the route trie stays a pure match/registration
+structure. ``create_task`` registers work the server can wait on during shutdown—use it instead of orphan ``asyncio.create_task`` calls for request-adjacent work.
 """
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from functools import lru_cache
+from inspect import cleandoc
 from typing import Any
+from urllib.parse import urlencode
 
-from stario.exceptions import HttpException, SignalValidationError, StarioError
-from stario.http.types import Context
+import stario.responses as responses
+from stario.exceptions import HttpException, StarioError
+from stario.http.context import Context, Middleware
 
-from .router import Router
-from .types import ErrorHandler
+from .router import Router, _normalize_path
 from .writer import Writer
 
-# =============================================================================
-# Application
-# =============================================================================
+type UrlQueryScalar = str | int | float | bool
+type UrlQueryValue = UrlQueryScalar | list[UrlQueryScalar] | tuple[UrlQueryScalar, ...]
+type UrlQueryParams = Mapping[str, UrlQueryValue]
+type ErrorHandler[E: Exception] = Callable[[Context, Writer, E], None | Awaitable[None]]
+
+_app_logger = logging.getLogger("stario.http.app")
 
 
-class Stario(Router):
-    """HTTP application: routing and request handling."""
+class App(Router):
+    """Concrete app type: everything on ``Router`` plus errors, reverse URLs, and shutdown-aware tasks.
 
-    def __init__(self) -> None:
-        super().__init__()
+    Uncaught exceptions become HTTP responses only before headers are sent; after that, telemetry still records the failure.
+    Use ``create_task`` for work tied to a running server so graceful shutdown can observe it.
+    """
+
+    def __init__(self, *, middleware: Sequence[Middleware] = ()) -> None:
+        """Create an application (a ``Router`` with error handling and tasks) with optional router middleware.
+
+        Parameters:
+            middleware: Forwarded to the base ``Router``: wrappers around handlers registered on this app (see ``Router.push_middleware``).
+        """
+        super().__init__(middleware=middleware)
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._error_handlers: dict[type[Exception], ErrorHandler[Any]] = {
             HttpException: lambda c, w, exc: exc.respond(w),
-            SignalValidationError: lambda c, w, exc: w.text("Invalid signals", 422),
         }
-
-        # Host-based routing
-        self._hosts_exact: dict[str, Router] = {}
-        self._hosts_wildcard: list[tuple[str, Router]] = []  # (suffix, router)
 
         @lru_cache(maxsize=64)
         def find_handler(exc_type: type[Exception]) -> ErrorHandler[Any] | None:
+            # Most-specific registered type wins by walking the MRO.
             for t in exc_type.__mro__:
                 if t is Exception:
                     return None
@@ -46,118 +62,160 @@ class Stario(Router):
     def on_error(
         self, exc_type: type[Exception], handler: ErrorHandler[Exception]
     ) -> None:
-        """Register custom error handler for exception type."""
+        """Register a handler for uncaught exceptions of type ``exc_type`` (subclasses use MRO; most specific wins).
+
+        Parameters:
+            exc_type: Exception class to match.
+            handler: Receives ``(context, writer, exc)``; may return ``None`` or an awaitable.
+
+        Notes:
+            Only runs while the writer has not started (``w.started`` is false); ``HttpException`` is registered by default.
+        """
         self._error_handlers[exc_type] = handler
         self._find_error_handler.cache_clear()
 
-    # =========================================================================
-    # Host-based routing
-    # =========================================================================
+    def create_task[T](
+        self,
+        coro: Coroutine[Any, Any, T],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[T]:
+        """Schedule a coroutine on the running loop and retain the task until it completes.
 
-    def host(self, pattern: str, router: Router) -> None:
+        Parameters:
+            coro: Coroutine to run.
+            name: Optional task name for debuggers.
+
+        Returns:
+            The new ``asyncio.Task``.
+
+        Raises:
+            StarioError: If no event loop is running (call from async request or app code only).
         """
-        Route requests to a router based on Host header.
-
-        Supports exact matches and wildcard prefixes:
-        - "api.example.com" - exact match
-        - "*.example.com" - wildcard, sets request.subhost to matched portion
-
-        Precedence: exact hosts first, then wildcards (longest suffix first),
-        then fallback to routes registered directly on the app.
-
-        Example:
-            api = Router()
-            api.get("/users", list_users)
-            app.host("api.example.com", api)
-
-            tenant = Router()
-            tenant.get("/dashboard", dashboard)
-            app.host("*.example.com", tenant)  # request.subhost = "acme"
-
-        Host matching is checked before path routing. Routes registered
-        directly on the app act as fallback for unmatched hosts.
-        """
-        pattern = pattern.lower()
-
-        # Reject bare "*" - users should use fallback routes instead
-        if pattern == "*":
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
             raise StarioError(
-                "Invalid host pattern: '*'",
-                context={"pattern": pattern},
-                help_text="Use '*.domain.com' for wildcard subdomains. "
-                "Routes registered directly on the app serve as fallback for unmatched hosts.",
+                "app.create_task() requires a running event loop",
+                help_text="Call app.create_task() from async code while the app is running.",
+            ) from exc
+        task = loop.create_task(coro, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def join_tasks(self) -> None:
+        """Await until every task created with ``create_task`` has finished (including nested scheduling).
+
+        Useful in tests to wait for background work after the HTTP response has been sent. Do not call from
+        inside a coroutine that is itself tracked in ``create_task`` or you risk deadlock.
+        """
+        while True:
+            pending = set(self._tasks)
+            if not pending:
+                return
+            await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+
+    def url_for(
+        self,
+        name: str,
+        *,
+        params: dict[str, str] | None = None,
+        query: UrlQueryParams | None = None,
+    ) -> str:
+        """Build a path (and optional query string) from a registered ``name``.
+
+        Parameters:
+            name: Value passed as ``name=`` to ``get``/``handle`` or from mounted ``StaticAssets``.
+            params: ``str.format`` mapping for ``{placeholders}`` in the stored pattern.
+            query: Values merged with ``urllib.parse.urlencode`` (lists/tuples repeat the key).
+
+        Returns:
+            A path starting with ``/``, or ``host/...`` style when the route used host matching, plus ``?...`` when ``query`` is set.
+
+        Raises:
+            StarioError: If ``name`` is unknown or placeholders are missing from ``params``.
+        """
+        path = self.named_routes.get(name)
+        if path is None:
+            raise StarioError(
+                f"Reverse route not registered: '{name}'",
+                context={
+                    "name": name,
+                    "available": list(self.named_routes.keys())[:10],
+                },
+                help_text=f"Register the route or asset first with name='{name}' before calling url_for().",
+                example=cleandoc(
+                    """
+                    app.get("/", home, name="home")
+                    app.mount("/static", StaticAssets("./static", name="static"))
+                    """
+                ),
             )
 
-        if pattern.startswith("*."):
-            suffix = pattern[1:]  # "*.example.com" -> ".example.com"
-            # Check for duplicate wildcard
-            for existing_suffix, _ in self._hosts_wildcard:
-                if existing_suffix == suffix:
-                    raise StarioError(
-                        f"Wildcard host already registered: {pattern}",
-                        context={"pattern": pattern},
-                        help_text="Each wildcard pattern can only have one router.",
-                    )
-            self._hosts_wildcard.append((suffix, router))
-            # Longest suffix first for most specific match
-            self._hosts_wildcard.sort(key=lambda x: len(x[0]), reverse=True)
-        else:
-            if pattern in self._hosts_exact:
+        if params:
+            try:
+                path = path.format(**params)
+            except (KeyError, ValueError) as exc:
                 raise StarioError(
-                    f"Host already registered: {pattern}",
-                    context={"pattern": pattern},
-                    help_text="Each host pattern can only have one router.",
-                )
-            self._hosts_exact[pattern] = router
+                    f"url_for() could not fill placeholders in route '{name}'",
+                    context={"name": name, "pattern": path, "params": params},
+                    help_text="Ensure every `{name}` in the pattern has a matching key in params.",
+                ) from exc
 
-    async def dispatch(self, c: Context, w: Writer) -> None:
-        """Dispatch request, checking host routing first."""
-        # Fast path: skip if no host routing configured
-        if self._hosts_exact or self._hosts_wildcard:
-            host = c.req.host
+        if not query:
+            return path
+        return f"{path}?{urlencode(query, doseq=True)}"
 
-            # O(1) exact match
-            if router := self._hosts_exact.get(host):
-                await router.dispatch(c, w)
-                return
+    async def __call__(self, c: Context, w: Writer) -> None:
+        """Protocol entrypoint: open a span, resolve routes, handle errors, always call ``w.end()``.
 
-            # Wildcard match (typically 1-3 patterns)
-            for suffix, router in self._hosts_wildcard:
-                if host.endswith(suffix):
-                    c.req.subhost = host[: -len(suffix)]
-                    await router.dispatch(c, w)
-                    return
+        Parameters:
+            c: Request context (``app``, ``req``, ``span``, ``route``, ``state``).
+            w: Response writer for this message on the connection.
 
-        # Fallback to regular path routing
-        await Router.dispatch(self, c, w)
-
-    async def handle_request(self, c: Context, w: Writer) -> None:
-        """Handle request with tracing and error handling."""
-
+        Notes:
+            Trailing slashes (except ``/``) get ``308`` to the router-normalized path (same rules as
+            ``find_handler``); wrong method on a matching path yields ``405``. If a registered error handler
+            raises, the failure is logged and a 500 is sent when no response has started yet.
+        """
         span = c.span
         span.start()
         span.attr("request.method", c.req.method)
         span.attr("request.path", c.req.path)
 
         try:
-            await self.dispatch(c, w)
+            path = c.req.path
+            if path != "/" and path.endswith("/"):
+                responses.redirect(w, _normalize_path(path), 308)
+            else:
+                handler, c.route = self._find_handler(c.req.host, path, c.req.method)
+                await handler(c, w)
         except Exception as exc:
-            handled = False
+            # Error surface: try registered handlers; if they do not start a response, send 500.
+            handler_responded = False
             if not w.started:
                 if handler := self._find_error_handler(type(exc)):
                     try:
                         result = handler(c, w, exc)
                         if asyncio.iscoroutine(result):
                             await result
-                        handled = True
-                    except Exception:
-                        pass
-                if not handled:
-                    w.text("Internal Server Error", 500)
-            if not handled:
+                        handler_responded = w.started
+                    except Exception as handler_exc:
+                        _app_logger.error(
+                            "Error handler failed while handling %s (original: %r); "
+                            "the handler should recover and send a response, but raised.",
+                            type(exc).__name__,
+                            exc,
+                            exc_info=handler_exc,
+                        )
+                if not w.started:
+                    responses.text(w, "Internal Server Error", 500)
+            if not handler_responded:
                 span.fail(str(exc))
                 span.exception(exc)
         finally:
+            # ``HttpProtocol`` completion / keep-alive depends on ``end()``.
             w.end()
-            span.attr("response.status_code", w._status_code)
+            span.attr("response.status_code", w.status_code)
             span.end()
