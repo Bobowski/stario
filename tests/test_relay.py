@@ -2,20 +2,37 @@
 
 import asyncio
 
-from stario.relay import Relay, _matching_patterns
+import pytest
+
+from stario.relay import Relay, _deduplicate_patterns, _matching_patterns
+
+
+def _pattern_cleared(relay: Relay, pattern: str) -> bool:
+    """True when no subscribers remain at this pattern string."""
+    return pattern not in relay._subs
+
+
+def _naive_pattern_enumeration(subject: str) -> tuple[str, ...]:
+    """Reference list of pattern strings (tests only; not used by ``Relay.publish``)."""
+    parts = subject.split(".")
+    patterns = [subject]
+    for i in range(len(parts) - 1, 0, -1):
+        patterns.append(".".join(parts[:i]) + ".*")
+    patterns.append("*")
+    return tuple(patterns)
 
 
 class TestMatchingPatterns:
-    """Test pattern generation for subject matching."""
+    """Naive pattern enumeration stays aligned with relay semantics (documentation / regression)."""
 
     def test_simple_subject(self):
-        patterns = _matching_patterns("room.123")
+        patterns = _naive_pattern_enumeration("room.123")
         assert "room.123" in patterns
         assert "room.*" in patterns
         assert "*" in patterns
 
     def test_deep_subject(self):
-        patterns = _matching_patterns("room.123.moves.1")
+        patterns = _naive_pattern_enumeration("room.123.moves.1")
         assert "room.123.moves.1" in patterns
         assert "room.123.moves.*" in patterns
         assert "room.123.*" in patterns
@@ -23,20 +40,68 @@ class TestMatchingPatterns:
         assert "*" in patterns
 
     def test_single_segment(self):
-        patterns = _matching_patterns("simple")
+        patterns = _naive_pattern_enumeration("simple")
         assert "simple" in patterns
         assert "*" in patterns
 
     def test_order_most_specific_first(self):
-        patterns = _matching_patterns("a.b.c")
+        patterns = _naive_pattern_enumeration("a.b.c")
         # Exact match should be first
         assert patterns[0] == "a.b.c"
         # Wildcard should be last
         assert patterns[-1] == "*"
 
+    def test_matching_patterns_same_as_naive_as_set(self):
+        """``_matching_patterns`` is the same key set as the naive tuple (order not defined)."""
+        subject = "room.123.moves"
+        assert _matching_patterns(subject) == frozenset(_naive_pattern_enumeration(subject))
+
+    def test_matching_patterns_literal_star_segment_no_duplicate_row(self):
+        """Last segment ``*``: loop must not repeat the full subject before ``frozenset``."""
+        assert _matching_patterns("room.123.*") == frozenset({"room.123.*", "room.*", "*"})
+
+
+class TestDeduplicatePatterns:
+    def test_star_subsumes_all(self):
+        assert _deduplicate_patterns(("users.*", "*")) == frozenset({"*"})
+
+    def test_users_wildcard_subsumes_exact_user_id(self):
+        assert _deduplicate_patterns(("users.*", "users.user1234")) == frozenset({"users.*"})
+
+    def test_independent_exact_patterns_kept(self):
+        assert _deduplicate_patterns(("users.a", "users.b")) == frozenset({"users.a", "users.b"})
+
+    def test_order_independent_same_result(self):
+        a = _deduplicate_patterns(("users.a", "users.b", "users.*"))
+        b = _deduplicate_patterns(("users.*", "users.b", "users.a"))
+        assert a == b == frozenset({"users.*"})
+
+    def test_wildcard_prefix_chain_keeps_broadest(self):
+        assert _deduplicate_patterns(("room.123.moves.*", "room.*", "room.123.*")) == frozenset({"room.*"})
+
+    def test_idempotent(self):
+        once = _deduplicate_patterns(("a.*", "a.b", "a.b.c"))
+        assert _deduplicate_patterns(tuple(once)) == once
+
+    def test_invariant_redundant_patterns_skipped(self):
+        """Every dropped pattern has some kept key in its ``_matching_patterns`` chain."""
+        raw = ("users.*", "users.x", "room.123.*", "room.*", "*")
+        out = set(_deduplicate_patterns(raw))
+        assert out == {"*"}
+        for q in raw:
+            if q in out:
+                continue
+            chain = set(_matching_patterns(q))
+            assert chain & out
+
 
 class TestRelayBasic:
     """Test basic Relay functionality."""
+
+    def test_subscribe_requires_at_least_one_pattern(self):
+        relay = Relay()
+        with pytest.raises(TypeError, match="at least one pattern"):
+            relay.subscribe()  # type: ignore[call-arg]
 
     def test_create_relay(self):
         relay = Relay()
@@ -167,7 +232,7 @@ class TestRelayCleanup:
         await task
 
         # After subscriber exits, pattern should be removed
-        assert "cleanup.test" not in relay._subs
+        assert _pattern_cleared(relay, "cleanup.test")
 
 
 class TestRelayMultipleSubscribers:
@@ -228,7 +293,7 @@ class TestRelayRaceConditions:
         await asyncio.wait_for(cleanup_complete.wait(), timeout=1.0)
 
         # Pattern should be cleaned up
-        assert "race.test" not in relay._subs
+        assert _pattern_cleared(relay, "race.test")
 
     async def test_concurrent_unsubscribe(self):
         """Test that concurrent unsubscribes don't cause issues."""
@@ -259,7 +324,40 @@ class TestRelayRaceConditions:
         )
 
         assert unsubscribed[0] == 5
-        assert "concurrent.*" not in relay._subs
+        assert _pattern_cleared(relay, "concurrent.*")
+
+
+class TestRelaySubscribeMultiplePatterns:
+    async def test_one_delivery_when_patterns_overlap(self):
+        relay = Relay()
+        received: list[tuple[str, int]] = []
+
+        async def subscriber():
+            async for subject, data in relay.subscribe("*", "users.*"):
+                received.append((subject, data))
+                if len(received) >= 2:
+                    break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("users.a.b", 1)
+        relay.publish("other.x", 2)
+        await asyncio.wait_for(task, timeout=1.0)
+        assert received == [("users.a.b", 1), ("other.x", 2)]
+
+    async def test_unsubscribe_removes_all_patterns(self):
+        relay = Relay()
+
+        async def subscriber():
+            async with relay.subscribe("chat.*", "room.*") as sub:
+                relay.publish("chat.msg", None)
+                async for _ in sub:
+                    break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.wait_for(task, timeout=1.0)
+        assert _pattern_cleared(relay, "chat.*")
+        assert _pattern_cleared(relay, "room.*")
 
 
 class TestRelaySubscriptionOrdering:

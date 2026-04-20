@@ -54,6 +54,25 @@ class TestReadSignals:
 
         assert result == {"name": "test", "count": 42}
 
+    async def test_reads_delete_query_datastar_payload(self):
+        req = _make_request(method="DELETE", query={"datastar": '{"id":7,"ok":true}'})
+
+        result = await ds.read_signals(req)
+
+        assert result == {"id": 7, "ok": True}
+
+    async def test_delete_ignores_body_uses_query(self):
+        """DELETE signals ride the query; body is not used (Datastar PR #1146)."""
+        req = _make_request(
+            method="DELETE",
+            query={"datastar": '{"from":"query"}'},
+            body=b'{"from":"body"}',
+        )
+
+        result = await ds.read_signals(req)
+
+        assert result == {"from": "query"}
+
     async def test_missing_payload_defaults_to_empty_dict(self):
         req = _make_request(method="GET")
 

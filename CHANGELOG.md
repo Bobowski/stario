@@ -4,6 +4,23 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+## 3.1.0 - 2026-04-20
+
+### Datastar 1.0 compatibility
+
+Stario’s **`stario.datastar`** helpers, the default bundled script, and **`read_signals`** are aligned with upstream **Datastar 1.0** (attribute names, signal wire format, and the **`ModuleScript()`** pin).
+
+- **`datastar.read_signals`** — **DELETE** requests now read signals from the **`datastar`** query parameter, like **GET**, instead of the body. This matches Datastar’s client after [PR #1146](https://github.com/starfederation/datastar/pull/1146) (signals are only sent in the body for methods other than GET and DELETE).
+- **Bundled Datastar** — Default **`ModuleScript()`** / **`DATASTAR_CDN_URL`** and vendored **`datastar.js`** in CLI templates and the **chat-room** example track **Datastar v1.0.0** (was **v1.0.0-RC.8**).
+- **Datastar Pro attribute helpers** — **`animate`**, **`custom_validity`**, **`match_media`**, **`on_raf`**, **`on_resize`**, **`persist`**, **`query_string`**, **`replace_url`**, **`scroll_into_view`**, **`view_transition`** (commercial Pro wire format; the open-source client ignores them unless Pro is enabled).
+- **Attribute helpers** — **`bind`** accepts optional **`case`**, **`prop`**, and **`event`**; **`on_intersect`** accepts **`threshold`** and no longer takes **`half`** or **`viewtransition`**; **`on()`** emits compact **`data-on:`** keys when only the event name and expression are needed; docstrings link to **[data-star.dev](https://data-star.dev/reference)**.
+
+### Relay
+
+- **`Relay.subscribe`** — Accepts **one or more** patterns (**`*patterns`**); overlapping patterns are **deduplicated** to a minimal equivalent set. Calling **`subscribe()`** with **no** patterns raises **`TypeError`**.
+
 ## 3.0.1 - 2026-04-15
 
 ### Changed

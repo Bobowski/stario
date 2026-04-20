@@ -21,6 +21,7 @@ from .actions import put as put
 from .actions import set_all as set_all
 from .actions import toggle_all as toggle_all
 from .attributes import JSEvent as JSEvent
+from .attributes import animate as animate
 from .attributes import attr as attr
 from .attributes import attrs as attrs
 from .attributes import bind as bind
@@ -28,28 +29,40 @@ from .attributes import class_ as class_
 from .attributes import classes as classes
 from .attributes import computed as computed
 from .attributes import computeds as computeds
+from .attributes import custom_validity as custom_validity
 from .attributes import effect as effect
 from .attributes import ignore as ignore
 from .attributes import ignore_morph as ignore_morph
 from .attributes import indicator as indicator
 from .attributes import init as init
 from .attributes import json_signals as json_signals
+from .attributes import match_media as match_media
 from .attributes import on as on
 from .attributes import on_intersect as on_intersect
 from .attributes import on_interval as on_interval
+from .attributes import on_raf as on_raf
+from .attributes import on_resize as on_resize
 from .attributes import on_signal_patch as on_signal_patch
+from .attributes import persist as persist
 from .attributes import preserve_attr as preserve_attr
+from .attributes import query_string as query_string
 from .attributes import ref as ref
+from .attributes import replace_url as replace_url
+from .attributes import scroll_into_view as scroll_into_view
 from .attributes import show as show
 from .attributes import signal as signal
 from .attributes import signals as signals
 from .attributes import style as style
 from .attributes import styles as styles
 from .attributes import text as text
+from .attributes import view_transition as view_transition
+from .format import Case as Case
 from .format import js as js
 from .format import s as s
 
-DATASTAR_CDN_URL = "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-RC.8/bundles/datastar.js"
+DATASTAR_CDN_URL = (
+    "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"
+)
 
 
 class FileSignal(TypedDict):
@@ -86,14 +99,18 @@ def ModuleScript(src: str = DATASTAR_CDN_URL) -> HtmlElement:
     from stario.html import HtmlDocument, Head, Body, P
 
     HtmlDocument(Head(ds.ModuleScript()), Body(P("Hello")))
-    # <!doctype html><html><head><script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-RC.8/bundles/datastar.js"></script></head><body><p>Hello</p></body></html>
+    # <!doctype html><html><head><script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"></script></head><body><p>Hello</p></body></html>
     ```
     """
     return Script({"type": "module", "src": src})
 
 
 async def read_signals(req: Request) -> dict[str, Any]:
-    """Parse the JSON signals blob Datastar sends (``GET``: ``datastar`` query param; else body).
+    """Parse the JSON signals blob Datastar sends.
+
+    ``GET`` and ``DELETE`` use the ``datastar`` query parameter; all other methods use the
+    request body, matching upstream Datastar after
+    https://github.com/starfederation/datastar/pull/1146.
 
     Convenience only: this uses the stdlib ``json`` module on the raw bytes or query string.
     Incoming signals are untrusted; validate types, sizes, and nested shapes
@@ -114,7 +131,9 @@ async def read_signals(req: Request) -> dict[str, Any]:
         TypeError: If the decoded JSON value is not an object.
         json.JSONDecodeError: If the query string or body is not valid JSON.
     """
-    if req.method == "GET":
+    # Datastar only serializes signals into the body for methods other than GET and DELETE
+    # (see https://github.com/starfederation/datastar/pull/1146).
+    if req.method in ("GET", "DELETE"):
         raw = req.query.get("datastar", "")
     else:
         raw = await req.body()

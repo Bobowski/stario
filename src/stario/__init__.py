@@ -25,5 +25,4 @@ from stario.http.router import Router as Router
 from stario.http.staticassets import StaticAssets as StaticAssets
 from stario.http.writer import Writer as Writer
 from stario.relay import Relay as Relay
-from stario.relay import RelaySubscription as RelaySubscription
 from stario.telemetry import Span as Span

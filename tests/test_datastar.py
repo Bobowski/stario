@@ -287,6 +287,35 @@ class TestDatastarAttributes:
         attrs = ds.bind("username")
         assert attrs == {"data-bind": "username"}
 
+    def test_bind_prop_event(self):
+        assert ds.bind("isChecked", prop="checked", event="change") == {
+            "data-bind:is-checked__prop.checked__event.change": "isChecked"
+        }
+
+    def test_bind_explicit_case(self):
+        assert ds.bind("mySignal", case="kebab") == {
+            "data-bind:my-signal__case.kebab": "mySignal"
+        }
+
+    def test_on_intersect_threshold_and_example_modifiers(self):
+        attrs = ds.on_intersect("$x = true", threshold=0.25, once=True, full=True)
+        key = next(iter(attrs))
+        assert key == "data-on-intersect__threshold.25__once__full"
+        assert attrs[key] == "$x = true"
+
+    def test_on_intersect_threshold_string(self):
+        attrs = ds.on_intersect("tick()", threshold="0.5")
+        assert list(attrs.keys())[0] == "data-on-intersect__threshold.0.5"
+
+    def test_pro_match_media(self):
+        attrs = ds.match_media("isDark", "'prefers-color-scheme: dark'")
+        assert attrs == {"data-match-media:is-dark": "'prefers-color-scheme: dark'"}
+
+    def test_pro_persist_key_session(self):
+        assert ds.persist(storage_key="mykey", session=True) == {
+            "data-persist:mykey__session": True
+        }
+
     def test_show(self):
         attrs = ds.show("isVisible")
         assert attrs == {"data-show": "isVisible"}

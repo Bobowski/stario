@@ -177,18 +177,24 @@ def to_kebab_key(key: str) -> tuple[str, Case]:
         return key, "kebab"
 
     if key[0].isupper():
-        return (
-            "".join(
-                (
-                    ("-" if i != 0 and c.isupper() else "") + c.lower()
-                    for i, c in enumerate(key)
-                )
-            ),
-            "pascal",
-        )
+        parts: list[str] = []
+        append = parts.append
+        for i, c in enumerate(key):
+            if c.isupper():
+                if i:
+                    append("-")
+                append(c.lower())
+            else:
+                append(c)
+        return "".join(parts), "pascal"
 
-    return (
-        "".join((("-" + c.lower()) if c.isupper() else c for c in key)),
-        "camel",
-    )
+    parts = []
+    append = parts.append
+    for c in key:
+        if c.isupper():
+            append("-")
+            append(c.lower())
+        else:
+            append(c)
+    return "".join(parts), "camel"
 
