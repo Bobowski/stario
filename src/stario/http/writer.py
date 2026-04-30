@@ -529,15 +529,20 @@ class Writer:
         """``True`` when the server is draining (shared shutdown future per process)."""
         return self._shutdown.done()
 
-    @overload
-    def alive(self, source: None = None) -> "_Alive[None]": ...
+    @property
+    def closing(self) -> bool:
+        """``True`` when this response should stop because the client left or the server is draining."""
+        return self.disconnected or self.shutting_down
 
     @overload
-    def alive[T](self, source: AsyncIterable[T]) -> "_Alive[T]": ...
+    def alive(self, source: None = None) -> _Alive[None]: ...
+
+    @overload
+    def alive[T](self, source: AsyncIterable[T]) -> _Alive[T]: ...
 
     def alive[T](
         self, source: AsyncIterable[T] | None = None
-    ) -> "_Alive[T] | _Alive[None]":
+    ) -> _Alive[T] | _Alive[None]:
         """Watch disconnect and shutdown; cancel the current task when either fires.
 
         Parameters:
@@ -547,7 +552,7 @@ class Writer:
             An async context manager; also iterable so ``async for x in w.alive(gen):`` works.
 
         Notes:
-            Prefer this over polling ``disconnected`` for long-lived streams.
+            Use ``closing`` for explicit loop boundaries; use ``alive()`` when the block should stop promptly.
         """
         return _Alive(self, source)
 
@@ -733,6 +738,7 @@ class _Alive[T]:
     w: Writer
     source: AsyncIterable[T] | None = None
     watcher: asyncio.Task[None] | None = None
+    cancelled_current_task: bool = False
 
     async def __aiter__(self) -> AsyncIterator[T]:
         async with self:
@@ -743,30 +749,21 @@ class _Alive[T]:
                 async for item in self.source:
                     yield item
 
-    async def __aenter__(self) -> "_Alive[T]":
+    async def __aenter__(self) -> _Alive[T]:
         current_task = asyncio.current_task()
         disconnect = self.w._disconnect
         shutdown = self.w._shutdown
 
         async def watcher() -> None:
-            either = asyncio.Future[None]()
+            await asyncio.wait(
+                {disconnect, shutdown},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if current_task and not current_task.done():
+                self.cancelled_current_task = True
+                current_task.cancel()
 
-            def trigger(_) -> None:
-                if not either.done():
-                    either.set_result(None)
-
-            disconnect.add_done_callback(trigger)
-            shutdown.add_done_callback(trigger)
-
-            try:
-                await either
-                if current_task:
-                    current_task.cancel()
-            finally:
-                disconnect.remove_done_callback(trigger)
-                shutdown.remove_done_callback(trigger)
-
-        self.watcher = asyncio.create_task(watcher())
+        self.watcher = asyncio.create_task(watcher(), name="stario.writer.alive")
         return self
 
     async def __aexit__(
@@ -782,4 +779,8 @@ class _Alive[T]:
             except asyncio.CancelledError:
                 pass
 
-        return exc_type is asyncio.CancelledError
+        return (
+            exc_type is not None
+            and issubclass(exc_type, asyncio.CancelledError)
+            and self.cancelled_current_task
+        )

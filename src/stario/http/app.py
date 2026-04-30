@@ -43,6 +43,7 @@ class App(Router):
         """
         super().__init__(middleware=middleware)
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown: asyncio.Future[None] | None = None
         self._error_handlers: dict[type[Exception], ErrorHandler[Any]] = {
             HttpException: lambda c, w, exc: exc.respond(w),
         }
@@ -58,6 +59,21 @@ class App(Router):
             return None
 
         self._find_error_handler = find_handler
+
+    @property
+    def shutting_down(self) -> bool:
+        """``True`` once the server has started draining this app."""
+        return self._shutdown is not None and self._shutdown.done()
+
+    async def wait_shutdown(self) -> None:
+        """Block until the server starts draining this app."""
+        if self._shutdown is not None:
+            await self._shutdown
+            return
+        raise StarioError(
+            "app.wait_shutdown() requires a running server",
+            help_text="Call app.wait_shutdown() from code running under Server, TestClient, or aload_app.",
+        )
 
     def on_error(
         self, exc_type: type[Exception], handler: ErrorHandler[Exception]

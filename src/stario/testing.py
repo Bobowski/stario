@@ -690,6 +690,7 @@ class TestClient:
         self.compression = compression
         self.request_timeout = request_timeout
         self._async_app_cm: AbstractAsyncContextManager[App] | None = None
+        self._owns_app_shutdown = False
 
     async def __aenter__(self) -> Self:
         if self._bootstrap is not None:
@@ -697,19 +698,34 @@ class TestClient:
                 self._bootstrap, app_factory=self._app_factory, tracer=self.tracer
             )
             self._app = await self._async_app_cm.__aenter__()
+        elif self._app is not None and self._app._shutdown is None:
+            self._app._shutdown = asyncio.get_running_loop().create_future()
+            self._owns_app_shutdown = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        for ex in self.exchanges:
-            fut = ex.response._disconnect_future
-            if not fut.done():
-                fut.set_result(None)
-        if self._app is not None:
-            await self.drain_tasks()
-        if self._async_app_cm is not None:
-            await self._async_app_cm.__aexit__(exc_type, exc_val, exc_tb)
-            self._async_app_cm = None
-            self._app = None
+        try:
+            for ex in self.exchanges:
+                fut = ex.response._disconnect_future
+                if not fut.done():
+                    fut.set_result(None)
+            if self._app is not None:
+                if self._async_app_cm is not None or self._owns_app_shutdown:
+                    if self._app._shutdown is not None and not self._app._shutdown.done():
+                        self._app._shutdown.set_result(None)
+                await self.drain_tasks()
+            if self._async_app_cm is not None:
+                await self._async_app_cm.__aexit__(exc_type, exc_val, exc_tb)
+                self._async_app_cm = None
+                self._app = None
+        finally:
+            if (
+                self._owns_app_shutdown
+                and self._app is not None
+                and self._app._shutdown is not None
+            ):
+                self._app._shutdown = None
+                self._owns_app_shutdown = False
 
     async def drain_tasks(self) -> None:
         """Wait until ``App.join_tasks`` is quiet and ``tracer`` has no open spans.
@@ -1393,6 +1409,8 @@ async def aload_app(
     """
     app = app_factory() if app_factory is not None else App()
     t = tracer if tracer is not None else TestTracer()
+    shutdown_future = asyncio.get_running_loop().create_future()
+    app._shutdown = shutdown_future
     span = t.create("server.startup")
     span.start()
     span.attr("test.aload_app", True)
@@ -1418,8 +1436,16 @@ async def aload_app(
         async with normalize_bootstrap(bootstrap)(app, span):
             span.end()
             state = "running"
-            yield app
-            start_shutdown_span("expected_stop")
+            try:
+                yield app
+            except BaseException:
+                if not shutdown_future.done():
+                    shutdown_future.set_result(None)
+                raise
+            else:
+                if not shutdown_future.done():
+                    shutdown_future.set_result(None)
+                start_shutdown_span("expected_stop")
     except BaseException as exc:
         if state == "running":
             start_shutdown_span("runtime_failure")
@@ -1428,8 +1454,14 @@ async def aload_app(
         raise
     finally:
         if state == "starting":
+            if not shutdown_future.done():
+                shutdown_future.set_result(None)
             span.end()
         elif state == "running" and not shutting_down:
+            if not shutdown_future.done():
+                shutdown_future.set_result(None)
             start_shutdown_span("fallback_cleanup")
         if shutting_down:
             span.end()
+        if app._shutdown is shutdown_future:
+            app._shutdown = None

@@ -6,6 +6,18 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 3.2.0 - 2026-04-30
+
+### Added
+
+- **`Writer.closing`** — True when **`disconnected`** or **`shutting_down`** applies; convenient guard for loops that exit on explicit breakpoints instead of task cancellation alone.
+- **`App.wait_shutdown()`** and **`App.shutting_down`** — Observe when the server (or equivalent test lifecycle) begins draining **`app.create_task`** work **without** a **`Writer`**. **`Server`** links the runtime shutdown future to **`App`**; **`stario.testing.TestClient`** (plain **`App`** or bootstrap) and **`aload_app`** complete that signal before **`drain_tasks`** / bootstrap teardown so background tasks unblock like production.
+
+### Changed
+
+- **`Writer.alive()`** — Implements the disconnect/shutdown waiter with **`asyncio.wait`**; exiting the manager only suppresses **`CancelledError`** when **`alive()`** requested cancellation (**not** when another caller cancelled the task).
+- **Bundled Datastar** — Default **`ModuleScript()`** / **`DATASTAR_CDN_URL`** and vendored **`datastar.js`** in CLI **`hello-world`** and **`tiles`** templates and the **chat-room** example track **Datastar v1.0.1** (see [getting started](https://data-star.dev/guide/getting_started)).
+
 ## 3.1.0 - 2026-04-20
 
 ### Datastar 1.0 compatibility

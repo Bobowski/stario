@@ -283,6 +283,25 @@ class TestClientBasics:
             await client.drain_tasks()
             assert state["n"] == 1
 
+    async def test_client_exit_signals_app_shutdown_before_draining_tasks(self):
+        app = App()
+        stopped = asyncio.Event()
+
+        async def handler(c, w):
+            async def bg():
+                await c.app.wait_shutdown()
+                stopped.set()
+
+            c.app.create_task(bg())
+            responses.text(w, "ok")
+
+        app.get("/", handler)
+        async with asyncio.timeout(0.5):
+            async with TestClient(app) as client:
+                await client.get("/")
+
+        assert stopped.is_set()
+
     async def test_client_decompresses_compressed_responses(self):
         compression = CompressionConfig(
             min_size=1,
@@ -391,6 +410,74 @@ class TestTestClient:
 
 
 class TestWriterRaw:
+    async def test_closing_combines_disconnect_and_shutdown(self):
+        loop = asyncio.get_running_loop()
+        writer = Writer(
+            transport_write=bytearray().extend,
+            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
+            on_completed=lambda: None,
+            disconnect=loop.create_future(),
+            shutdown=loop.create_future(),
+        )
+
+        assert not writer.closing
+
+        writer._disconnect.set_result(None)
+
+        assert writer.disconnected
+        assert writer.closing
+
+    async def test_alive_exits_when_connection_closes(self):
+        loop = asyncio.get_running_loop()
+        writer = Writer(
+            transport_write=bytearray().extend,
+            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
+            on_completed=lambda: None,
+            disconnect=loop.create_future(),
+            shutdown=loop.create_future(),
+        )
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        never = asyncio.Event()
+
+        async def worker() -> None:
+            async with writer.alive():
+                started.set()
+                await never.wait()
+            stopped.set()
+
+        task = asyncio.create_task(worker())
+        await started.wait()
+
+        writer._disconnect.set_result(None)
+        await asyncio.wait_for(stopped.wait(), timeout=0.1)
+        await task
+
+    async def test_alive_does_not_swallow_unrelated_cancellation(self):
+        loop = asyncio.get_running_loop()
+        writer = Writer(
+            transport_write=bytearray().extend,
+            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
+            on_completed=lambda: None,
+            disconnect=loop.create_future(),
+            shutdown=loop.create_future(),
+        )
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def worker() -> None:
+            async with writer.alive():
+                started.set()
+                await never.wait()
+
+        task = asyncio.create_task(worker())
+        await started.wait()
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
     def test_patch_writes_namespace_sse_line(self):
         w, sink, loop = _make_writer()
         try:

@@ -96,6 +96,36 @@ class TestContextCreateTask:
         await asyncio.sleep(0)
         assert not context.app._tasks
 
+    async def test_app_wait_shutdown_returns_when_shutdown_begins(self) -> None:
+        context = make_context()
+        shutdown = asyncio.get_running_loop().create_future()
+        context.app._shutdown = shutdown
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def worker() -> None:
+            started.set()
+            await context.app.wait_shutdown()
+            stopped.set()
+
+        try:
+            task = context.app.create_task(worker(), name="shutdown-aware-worker")
+            await started.wait()
+
+            assert not context.app.shutting_down
+
+            shutdown.set_result(None)
+            await asyncio.wait_for(stopped.wait(), timeout=0.1)
+            await task
+
+            assert context.app.shutting_down
+        finally:
+            if context.app._shutdown is shutdown:
+                context.app._shutdown = None
+
+        await asyncio.sleep(0)
+        assert not context.app._tasks
+
 
 class TestServerShutdownTasks:
     async def test_waits_for_managed_tasks_to_finish_within_grace_period(self) -> None:

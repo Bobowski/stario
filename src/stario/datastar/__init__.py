@@ -61,7 +61,7 @@ from .format import js as js
 from .format import s as s
 
 DATASTAR_CDN_URL = (
-    "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"
+    "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.1/bundles/datastar.js"
 )
 
 
@@ -99,7 +99,7 @@ def ModuleScript(src: str = DATASTAR_CDN_URL) -> HtmlElement:
     from stario.html import HtmlDocument, Head, Body, P
 
     HtmlDocument(Head(ds.ModuleScript()), Body(P("Hello")))
-    # <!doctype html><html><head><script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"></script></head><body><p>Hello</p></body></html>
+    # <!doctype html><html><head><script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.1/bundles/datastar.js"></script></head><body><p>Hello</p></body></html>
     ```
     """
     return Script({"type": "module", "src": src})

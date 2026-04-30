@@ -152,9 +152,11 @@ class Server:
         # Single ``_state``: guards re-entrancy, chooses which span ends on error,
         # and distinguishes "bootstrap failed" from "server was running".
 
+        app: App | None = None
         with self._signal_handlers(loop, shutdown_future):
             try:
                 app = self.app_factory()
+                app._shutdown = shutdown_future
                 async with (
                     self.bootstrap(app, span),
                     self._server_scope(
@@ -196,6 +198,11 @@ class Server:
                 if self._state == "shutting_down":
                     span.end()
                 self._state = "stopped"
+                if app is not None:
+                    if not shutdown_future.done():
+                        shutdown_future.set_result(None)
+                    if app._shutdown is shutdown_future:
+                        app._shutdown = None
 
     @asynccontextmanager
     async def _server_scope(
@@ -253,7 +260,7 @@ class Server:
                     server,
                     server_started,
                     connections,
-                    app._tasks,
+                    app,
                     span,
                 )
             finally:
@@ -264,9 +271,11 @@ class Server:
         server: asyncio.Server | None,
         server_started: bool,
         connections: set[HttpProtocol],
-        tasks: set[asyncio.Task[Any]],
+        app: App,
         span: Span,
     ) -> None:
+        if app._shutdown is not None and not app._shutdown.done():
+            app._shutdown.set_result(None)
         if server is None:
             return
 
@@ -278,9 +287,9 @@ class Server:
             return
 
         open_connections = len(connections)
-        await self._wait_for_managed_work_to_drain(connections, tasks)
+        await self._wait_for_managed_work_to_drain(connections, app._tasks)
         force_closed = await self._force_close_open_transports(connections)
-        cancelled_tasks = await self._cancel_pending_tasks(tasks)
+        cancelled_tasks = await self._cancel_pending_tasks(app._tasks)
 
         span.attrs(
             {

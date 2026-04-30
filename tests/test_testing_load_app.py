@@ -55,6 +55,45 @@ async def test_aload_app_runs_teardown_for_async_context_bootstrap() -> None:
 
 
 @pytest.mark.asyncio
+async def test_aload_app_signals_app_shutdown_before_bootstrap_teardown() -> None:
+    shutdown_seen = False
+
+    @asynccontextmanager
+    async def bootstrap(app: App, span):
+        nonlocal shutdown_seen
+        yield
+        shutdown_seen = app.shutting_down
+
+    async with aload_app(bootstrap):
+        pass
+
+    assert shutdown_seen
+
+
+@pytest.mark.asyncio
+async def test_test_client_inside_aload_app_does_not_own_app_shutdown() -> None:
+    shutdown_seen = False
+
+    @asynccontextmanager
+    async def bootstrap(app: App, span):
+        nonlocal shutdown_seen
+
+        async def ping(c, w):
+            responses.text(w, "pong")
+
+        app.get("/ping", ping)
+        yield
+        shutdown_seen = app.shutting_down
+
+    async with aload_app(bootstrap) as app:
+        async with TestClient(app) as client:
+            assert (await client.get("/ping")).text == "pong"
+        assert not app.shutting_down
+
+    assert shutdown_seen
+
+
+@pytest.mark.asyncio
 async def test_aload_app_emits_server_startup_and_shutdown_like_cli() -> None:
     """Match ``Server`` startup/shutdown: startup span ends after the yielded body; shutdown is separate."""
 
