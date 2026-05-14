@@ -211,6 +211,45 @@ class TestAttributeTypes:
         result = render(Div({"class": ["btn", "primary", "large"]}))
         assert 'class="btn primary large"' in result
 
+    def test_list_attribute_skips_none_and_false(self):
+        result = render(
+            Div(
+                {
+                    "class": [
+                        "btn",
+                        None,
+                        False,
+                        "primary",
+                    ]
+                }
+            )
+        )
+        assert 'class="btn primary"' in result
+
+    def test_list_attribute_conditional_and_pattern(self):
+        is_active = False
+        result = render(Div({"class": ["tab", is_active and "active"]}))
+        assert 'class="tab"' in result
+        is_active = True
+        result = render(Div({"class": ["tab", is_active and "active"]}))
+        assert 'class="tab active"' in result
+
+    def test_list_attribute_rejects_true_item(self):
+        with pytest.raises(StarioError, match="bool True is not a token"):
+            render(Div({"class": ["btn", True]}))
+
+    def test_list_attribute_all_skipped_yields_empty_value(self):
+        result = render(Div({"class": [None, False]}))
+        assert 'class=""' in result
+
+    def test_nested_list_attribute_skips_none_and_false(self):
+        result = render(Div({"data": {"roles": ["a", None, False, "b"]}}))
+        assert 'data-roles="a b"' in result
+
+    def test_nested_list_attribute_rejects_true_item(self):
+        with pytest.raises(StarioError, match="bool True is not a token"):
+            render(Div({"data": {"roles": ["x", True]}}))
+
     def test_style_dict_attribute(self):
         result = render(Div({"style": {"color": "red", "font-size": "16px"}}))
         assert 'style="' in result
@@ -284,6 +323,10 @@ class TestRender:
             StarioError, match="Boolean values are not valid HTML child content"
         ):
             render(Span(True))
+
+    def test_render_rejects_invalid_tuple_shape(self):
+        with pytest.raises(StarioError, match="Invalid tuple shape for HTML element"):
+            render(cast(Any, ("<div>", [])))
 
 
 class TestRenderStyles:

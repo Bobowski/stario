@@ -2,22 +2,25 @@
 
 from functools import lru_cache
 
-from .constants import COMMON_SAFE_ATTRIBUTE_NAMES
-
 
 def escape_text(s: str) -> str:
-    """Escape ``&``, ``<``, ``>`` for text nodes (quotes stay literal)."""
-    # Fast path: most copy has no entities; avoids allocating a new string.
+    """Escape ``&``, ``<``, ``>`` for text nodes (quotes stay literal).
+
+    Not LRU-cached: text nodes are usually high-cardinality user copy, so cache
+    misses and eviction would dominate versus short-circuit + replace work.
+    """
     if "&" not in s and "<" not in s and ">" not in s:
         return s
 
-    # ``&`` first — otherwise ``&lt;`` would become ``&amp;lt;``.
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+@lru_cache(maxsize=512)
 def escape_attribute_value(s: str) -> str:
-    """Escape for double-quoted attribute values (includes quotes)."""
-    # Straight replaces beat html.escape on hot paths we measured.
+    """Escape for double-quoted attribute values (includes quotes).
+
+    Memoized for repeated values (classes, ``type``, ``role``, Datastar paths, etc.).
+    """
     if (
         "&" not in s
         and "<" not in s
@@ -36,8 +39,13 @@ def escape_attribute_value(s: str) -> str:
     )
 
 
+@lru_cache(maxsize=256)
 def escape_attribute_key(k: str) -> str:
-    """Escape unusual attribute *names* (dynamic keys, not common static ones)."""
+    """Escape attribute *names* for the wire format (dynamic keys, ``data-*`` suffixes, …).
+
+    Cached so tag rendering and nested ``data``/``aria`` dicts share one memoization
+    path for each distinct key string.
+    """
     return (
         escape_attribute_value(k)
         .replace("=", "&#x3D;")
@@ -45,11 +53,3 @@ def escape_attribute_key(k: str) -> str:
         .replace("`", "&#x60;")
         .replace(" ", "&nbsp;")
     )
-
-
-@lru_cache(maxsize=256)
-def _normalize_attribute_key(key: str) -> str:
-    # Known-safe names skip escaping; everything else goes through escape_attribute_key.
-    if key in COMMON_SAFE_ATTRIBUTE_NAMES:
-        return key
-    return escape_attribute_key(key)

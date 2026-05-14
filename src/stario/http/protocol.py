@@ -187,16 +187,10 @@ class HttpProtocol(asyncio.Protocol):
     # =========================================================================
 
     def on_message_begin(self) -> None:
-        assert self.transport is not None
         # Reserve bytes for ``METHOD SP`` and `` HTTP/x.x\\r\\n`` (URL fragments arrive via ``on_url``).
         self._request_head_bytes = 40
         self._reading_headers = Headers()
-        self._reading_body = BodyReader(
-            pause=self.transport.pause_reading,
-            resume=self.transport.resume_reading,
-            disconnect=self._disconnect,
-            max_size=self._max_request_body_bytes,
-        )
+        self._reading_body = None
 
     def on_url(self, url: bytes) -> None:
         self._request_head_bytes += len(url)
@@ -211,23 +205,34 @@ class HttpProtocol(asyncio.Protocol):
         if self._request_head_bytes > self._max_request_header_bytes:
             self._close_with_error(431, "Request header fields too large")
             return
-        self._reading_headers.add(name, value)
+
+        self._reading_headers.radd(name.lower(), value)
 
     def on_headers_complete(self) -> None:
         parser = self.parser
         transport = self.transport
         headers = self._reading_headers
-        body_reader = self._reading_body
 
         assert parser is not None
         assert transport is not None
         assert headers is not None
-        assert body_reader is not None
 
         parsed_url = httptools.parse_url(self._reading_url_bytes)
+        body_reader = self._reading_body
+        if (
+            headers.rget(b"content-length") not in (None, b"0")
+            or headers.rget(b"transfer-encoding") is not None
+        ):
+            body_reader = BodyReader(
+                pause=transport.pause_reading,
+                resume=transport.resume_reading,
+                disconnect=self._disconnect,
+                max_size=self._max_request_body_bytes,
+            )
+            self._reading_body = body_reader
 
         # Send 100 Continue response if expected
-        if headers.get(b"expect") == b"100-continue":
+        if body_reader is not None and headers.rget(b"expect") == b"100-continue":
 
             def send_100() -> None:
                 if transport and not transport.is_closing():
@@ -260,7 +265,7 @@ class HttpProtocol(asyncio.Protocol):
             disconnect      = self._disconnect,
             shutdown        = self._shutdown,
             compression     = self.compression,
-            accept_encoding = headers.get(b"accept-encoding"),
+            accept_encoding = headers.rget(b"accept-encoding"),
         )
 
         context = Context(
@@ -274,7 +279,8 @@ class HttpProtocol(asyncio.Protocol):
             self._active_context = context
             self._active_writer = writer
 
-            self.app.create_task(self.app(context, writer))
+            # Reuse the protocol loop here; this is one task per request.
+            self.app.create_task(self.app(context, writer), loop=self.loop)
 
         else:
             # Pipeline queue: must not run the next handler until bytes are fully written.
@@ -291,9 +297,9 @@ class HttpProtocol(asyncio.Protocol):
         if self._reading_body:
             self._reading_body.complete()
 
-            self._reading_body = None
-            self._reading_headers = None
-            self._reading_url_bytes = b""
+        self._reading_body = None
+        self._reading_headers = None
+        self._reading_url_bytes = b""
 
     # =========================================================================
     # Request Handling
@@ -325,7 +331,8 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = next_w
             self._active_context = next_c
 
-            self.app.create_task(self.app(next_c, next_w))
+            # Same loop as the connection; avoids an extra lookup for pipelined requests too.
+            self.app.create_task(self.app(next_c, next_w), loop=self.loop)
             self._cancel_timeout()
             t.resume_reading()
         else:

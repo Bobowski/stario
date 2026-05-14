@@ -148,7 +148,12 @@ class BodyReader:
         self._complete = True
         if self._abort_reason is None:
             # Small/medium bodies: one contiguous byte string for fast ``body()``.
-            self._cached = b"".join(self._chunks)
+            if not self._chunks:
+                self._cached = b""
+            elif len(self._chunks) == 1:
+                self._cached = self._chunks[0]
+            else:
+                self._cached = b"".join(self._chunks)
         if self._streaming:
             # Streaming consumer may be blocked in ``wait_for``; wake it to exit.
             self._data_ready.set()
@@ -279,7 +284,7 @@ class Request:
         protocol_version: str = "1.1",
         keep_alive: bool = True,
         headers: Headers,
-        body: BodyReader,
+        body: BodyReader | None,
     ) -> None:
         self.method = method
         self.path = path

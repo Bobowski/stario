@@ -705,6 +705,18 @@ class TestWriterRaw:
 
         assert compression.select("abracadabra") is None
 
+    def test_select_uses_wildcard_accept_encoding(self):
+        compression = CompressionConfig(min_size=1)
+
+        compressor = compression.select(
+            "*;q=0.5",
+            data=b"x" * 2048,
+            content_type=b"text/plain; charset=utf-8",
+        )
+
+        assert compressor is not None
+        assert compressor.encoding == b"br"
+
     def test_select_returns_none_immediately_when_all_codecs_disabled(self):
         compression = CompressionConfig(
             zstd_level=-1,
@@ -719,3 +731,32 @@ class TestWriterRaw:
             )
             is None
         )
+
+    def test_respond_does_not_duplicate_vary_accept_encoding_case_insensitive(self):
+        compression = CompressionConfig(
+            min_size=1,
+            zstd_level=-1,
+            brotli_level=-1,
+            gzip_level=6,
+        )
+        loop = asyncio.new_event_loop()
+        sink = bytearray()
+        writer = Writer(
+            transport_write=sink.extend,
+            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
+            on_completed=lambda: None,
+            disconnect=loop.create_future(),
+            shutdown=loop.create_future(),
+            compression=compression,
+            accept_encoding=b"gzip",
+        )
+
+        try:
+            writer.headers.rset(b"vary", b"Accept-Encoding")
+            writer.respond(b"x" * 2048, b"text/plain; charset=utf-8", 200)
+            head, _ = _split_response(bytes(sink))
+
+            assert head.count(b"vary:") == 1
+            assert b"vary: Accept-Encoding\r\n" in head
+        finally:
+            loop.close()

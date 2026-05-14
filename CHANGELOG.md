@@ -6,6 +6,21 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 3.3.0 - 2026-05-14
+
+This release focuses on server-side performance: reducing per-request allocations,
+keeping hot HTTP paths byte-native, and making it easier to run or benchmark without
+telemetry overhead.
+
+### Added
+
+- **`NoOpTracer`** — A no-op telemetry backend for high-throughput runs and benchmarks, available from **`stario.telemetry`** and via **`--tracer noop`** in the CLI.
+
+### Changed
+
+- **HTTP hot paths** — Request parsing and response writing do less work for common server paths: lazy request body readers, byte-native **`Accept-Encoding`** negotiation with a bounded cache, faster one-shot responses, and cheaper compression/Vary handling.
+- **HTML rendering internals** — Attribute and style rendering now rely on cached validation and simpler token-list handling, keeping conditional list values ergonomic while removing the large internal constants table.
+
 ## 3.2.0 - 2026-04-30
 
 ### Added

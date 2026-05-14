@@ -23,6 +23,7 @@ from stario.http.server import AppBootstrap, Server
 from stario.http.writer import CompressionConfig
 from stario.telemetry.core import Tracer
 from stario.telemetry.json import JsonTracer
+from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.sqlite import SqliteTracer
 from stario.telemetry.tty import TTYTracer
 
@@ -114,13 +115,15 @@ def default_tracer_factory() -> TracerFactory:
 
 
 def resolve_tracer_factory(spec: str | None) -> TracerFactory:
-    """Map ``auto``/``tty``/``json``/``sqlite`` or ``module:factory`` to a zero-arg tracer constructor."""
+    """Map ``auto``/``tty``/``json``/``noop``/``sqlite`` or ``module:factory`` to a zero-arg tracer constructor."""
     if spec in (None, "", "auto"):
         return default_tracer_factory()
     if spec == "tty":
         return TTYTracer
     if spec == "json":
         return JsonTracer
+    if spec == "noop":
+        return NoOpTracer
     if spec == "sqlite":
         return SqliteTracer
 

@@ -94,12 +94,14 @@ class App(Router):
         self,
         coro: Coroutine[Any, Any, T],
         *,
+        loop: asyncio.AbstractEventLoop | None = None,
         name: str | None = None,
     ) -> asyncio.Task[T]:
         """Schedule a coroutine on the running loop and retain the task until it completes.
 
         Parameters:
             coro: Coroutine to run.
+            loop: Optional loop to schedule on when the caller already has it.
             name: Optional task name for debuggers.
 
         Returns:
@@ -108,13 +110,16 @@ class App(Router):
         Raises:
             StarioError: If no event loop is running (call from async request or app code only).
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError as exc:
-            raise StarioError(
-                "app.create_task() requires a running event loop",
-                help_text="Call app.create_task() from async code while the app is running.",
-            ) from exc
+        if loop is None:
+            # Public API path: app code usually should not need to carry a loop around.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError as exc:
+                raise StarioError(
+                    "app.create_task() requires a running event loop",
+                    help_text="Call app.create_task() from async code while the app is running.",
+                ) from exc
+        # Protocol code passes its known loop to avoid a per-request running-loop lookup.
         task = loop.create_task(coro, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -197,15 +202,15 @@ class App(Router):
         """
         span = c.span
         span.start()
-        span.attr("request.method", c.req.method)
-        span.attr("request.path", c.req.path)
+        span.attrs({"request.method": c.req.method, "request.path": c.req.path})
 
         try:
             path = c.req.path
             if path != "/" and path.endswith("/"):
                 responses.redirect(w, _normalize_path(path), 308)
             else:
-                handler, c.route = self._find_handler(c.req.host, path, c.req.method)
+                host = c.req.host if self.root.kind == "host" else ""
+                handler, c.route = self._find_handler(host, path, c.req.method)
                 await handler(c, w)
         except Exception as exc:
             # Error surface: try registered handlers; if they do not start a response, send 500.

@@ -289,31 +289,43 @@ class StaticAssets:
         if not accept:
             return f.content, None
 
-        try:
-            header = accept.decode("latin-1")
-        except UnicodeDecodeError:
+        if f.brotli is None and f.zstd is None and f.gzip is None:
             return f.content, None
 
-        q = _parse_accept_encoding(header)
+        q = _parse_accept_encoding(accept)
+        wildcard_q = q.get(b"*", 0.0)
+        best_q = 0.0
+        best_encoding: bytes | None = None
 
-        def qtok(tok: str) -> float:
-            return max(0.0, min(1.0, q.get(tok, q.get("*", 0.0))))
-
-        candidates: list[tuple[float, bytes, bytes]] = []
         if f.brotli:
-            candidates.append((qtok("br"), b"br", f.brotli))
+            br_q = q.get(b"br", wildcard_q)
+            if br_q > best_q:
+                best_q = br_q
+                best_encoding = b"br"
+
         if f.zstd:
-            candidates.append((qtok("zstd"), b"zstd", f.zstd))
+            zstd_q = q.get(b"zstd", wildcard_q)
+            if zstd_q > 0.0 and (best_encoding is None or zstd_q > best_q):
+                best_q = zstd_q
+                best_encoding = b"zstd"
+
         if f.gzip:
-            candidates.append((qtok("gzip"), b"gzip", f.gzip))
+            gzip_q = q.get(b"gzip", wildcard_q)
+            if gzip_q > 0.0 and (best_encoding is None or gzip_q > best_q):
+                best_q = gzip_q
+                best_encoding = b"gzip"
 
-        if not candidates:
+        if best_encoding is None:
             return f.content, None
 
-        best_q, enc, body = max(candidates, key=lambda x: x[0])
-        if best_q <= 0.0:
-            return f.content, None
-        return body, enc
+        if best_encoding == b"br":
+            assert f.brotli is not None
+            return f.brotli, b"br"
+        if best_encoding == b"zstd":
+            assert f.zstd is not None
+            return f.zstd, b"zstd"
+        assert f.gzip is not None
+        return f.gzip, b"gzip"
 
     async def __call__(self, c: Context, w: Writer) -> None:
         """GET/HEAD handler: resolve ``{path...}`` against the startup index, redirect, 404, or send bytes from memory or disk."""
@@ -373,7 +385,7 @@ class StaticAssets:
             return
 
         # Small file: serve from memory with content negotiation
-        accept = c.req.headers.rget(b"accept-encoding", b"").lower()
+        accept = c.req.headers.rget(b"accept-encoding", b"")
         body, encoding = self._select_body(f, accept)
 
         if encoding:

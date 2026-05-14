@@ -39,42 +39,52 @@ _BROTLI_WINDOW_LOG_MIN = 10
 _BROTLI_WINDOW_LOG_MAX = 24
 _GZIP_WINDOW_BITS_MIN = 9
 _GZIP_WINDOW_BITS_MAX = 15
+_ACCEPT_ENCODING_CACHE_MAX_BYTES = 512
 
 
-def _parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
-    """Parse ``Accept-Encoding`` into lowercased token → q-value."""
-    parsed: dict[str, float] = {}
-    for raw_part in accept_encoding.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
+def _parse_accept_encoding_uncached(accept_encoding: bytes) -> dict[bytes, float]:
+    parsed: dict[bytes, float] = {}
 
-        token, *params = [segment.strip() for segment in part.split(";")]
+    if b";" not in accept_encoding:
+        for raw_part in accept_encoding.split(b","):
+            token = raw_part.strip().lower()
+            if token:
+                parsed[token] = 1.0
+        return parsed
+
+    for raw_part in accept_encoding.split(b","):
+        token, sep, params = raw_part.partition(b";")
+        token = token.strip().lower()
         if not token:
             continue
 
         q = 1.0
-        for param in params:
-            if not param:
-                continue
-            key, _, value = param.partition("=")
-            if key.strip().lower() != "q":
-                continue
-            try:
-                q = float(value)
-            except ValueError:
-                q = 0.0
-            break
+        while sep:
+            param, sep, params = params.partition(b";")
+            key, eq, value = param.partition(b"=")
+            if eq and key.strip().lower() == b"q":
+                try:
+                    q = float(value)
+                except ValueError:
+                    q = 0.0
+                break
 
-        parsed[token.lower()] = max(0.0, min(1.0, q))
+        parsed[token] = max(0.0, min(1.0, q))
     return parsed
 
 
-def _encoding_qvalue(parsed: dict[str, float], token: str) -> float:
-    if token in parsed:
-        return parsed[token]
-    return parsed.get("*", 0.0)
+@lru_cache(maxsize=64)
+def _parse_accept_encoding_cached(accept_encoding: bytes) -> dict[bytes, float]:
+    return _parse_accept_encoding_uncached(accept_encoding)
 
+
+def _parse_accept_encoding(accept_encoding: str | bytes) -> dict[bytes, float]:
+    """Parse ``Accept-Encoding`` into lowercased token bytes → q-value."""
+    if isinstance(accept_encoding, str):
+        accept_encoding = accept_encoding.encode("latin-1")
+    if len(accept_encoding) > _ACCEPT_ENCODING_CACHE_MAX_BYTES:
+        return _parse_accept_encoding_uncached(accept_encoding)
+    return _parse_accept_encoding_cached(accept_encoding)
 
 _NONCOMPRESSIBLE_CONTENT_TYPE_PREFIXES = (
     b"image/",
@@ -85,18 +95,32 @@ _NONCOMPRESSIBLE_CONTENT_TYPE_PREFIXES = (
 
 def _merge_vary(headers: Headers, token: bytes) -> None:
     """Append ``token`` to ``Vary`` without dropping existing field names."""
-    if headers.rget(b"vary") == b"*":
-        return
     existing = headers.rget(b"vary")
     if existing is None:
         headers.rset(b"vary", token)
         return
-    parts = [p.strip() for p in existing.decode("latin-1").split(",") if p.strip()]
-    new_tok = token.decode("latin-1")
-    if new_tok in parts or "*" in parts:
+
+    stripped = existing.strip()
+    if not stripped:
+        headers.rset(b"vary", token)
         return
-    merged = ", ".join(parts + [new_tok])
-    headers.rset(b"vary", merged.encode("latin-1"))
+    if stripped == b"*":
+        return
+
+    token_lower = token.lower()
+    has_value = False
+    for raw_part in existing.split(b","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        has_value = True
+        if part == b"*" or part.lower() == token_lower:
+            return
+
+    if has_value:
+        headers.rset(b"vary", existing.rstrip() + b", " + token)
+    else:
+        headers.rset(b"vary", token)
 
 
 _NONCOMPRESSIBLE_CONTENT_TYPES = (
@@ -117,10 +141,7 @@ _NONCOMPRESSIBLE_CONTENT_TYPES = (
 )
 
 
-def _content_type_is_compressible(content_type: bytes | None) -> bool:
-    if content_type is None:
-        return True
-
+def _content_type_is_compressible(content_type: bytes) -> bool:
     media_type = content_type.split(b";", 1)[0].strip().lower()
     if not media_type:
         return True
@@ -161,7 +182,7 @@ class Compressor:
         streaming: bool = False,
     ) -> bool:
         """Return True if size/type make compression worthwhile."""
-        if not _content_type_is_compressible(content_type):
+        if content_type is not None and not _content_type_is_compressible(content_type):
             return False
         if streaming:
             return True
@@ -328,7 +349,7 @@ class CompressionConfig:
 
     def select(
         self,
-        accept_encoding: str | None,
+        accept_encoding: str | bytes | None,
         *,
         data: bytes | None = None,
         content_type: bytes | None = None,
@@ -354,65 +375,60 @@ class CompressionConfig:
         if accept_encoding is None:
             return None
 
+        if content_type is not None and not _content_type_is_compressible(content_type):
+            return None
+
+        if not streaming:
+            if data is not None and len(data) < self.min_size:
+                return None
+            if data is None and content_type is not None:
+                return None
+
         accepted = _parse_accept_encoding(accept_encoding)
-        choices: list[tuple[float, Compressor]] = []
+        wildcard_q = accepted.get(b"*", 0.0)
+        best_q = 0.0
+        best_encoding: bytes | None = None
 
         if self.brotli_level >= 0:
-            q = _encoding_qvalue(accepted, "br")
-            if q > 0:
-                choices.append(
-                    (
-                        q,
-                        _Brotli(
-                            self.brotli_level,
-                            self.min_size,
-                            window=self.brotli_window_log,
-                        ),
-                    )
-                )
+            q = accepted.get(b"br", wildcard_q)
+            if q > best_q:
+                best_q = q
+                best_encoding = b"br"
 
         if self.zstd_level >= 0:
-            q = _encoding_qvalue(accepted, "zstd")
+            q = accepted.get(b"zstd", wildcard_q)
             if q > 0:
-                choices.append(
-                    (
-                        q,
-                        _Zstd(
-                            self.zstd_level,
-                            self.min_size,
-                            window=self.zstd_window_log,
-                        ),
-                    )
-                )
+                if best_encoding is None or q > best_q:
+                    best_q = q
+                    best_encoding = b"zstd"
 
         if self.gzip_level >= 0:
-            q = _encoding_qvalue(accepted, "gzip")
+            q = accepted.get(b"gzip", wildcard_q)
             if q > 0:
-                choices.append(
-                    (
-                        q,
-                        _Gzip(
-                            self.gzip_level,
-                            self.min_size,
-                            window=self.gzip_window_bits,
-                        ),
-                    )
-                )
+                if best_encoding is None or q > best_q:
+                    best_q = q
+                    best_encoding = b"gzip"
 
-        if not choices:
+        if best_encoding is None:
             return None
 
-        best_q, best = max(choices, key=lambda item: item[0])
-        if best_q <= 0:
-            return None
-        if data is not None or content_type is not None or streaming:
-            if not best.compressible(
-                data or b"",
-                content_type,
-                streaming=streaming,
-            ):
-                return None
-        return best
+        if best_encoding == b"br":
+            return _Brotli(
+                self.brotli_level,
+                self.min_size,
+                window=self.brotli_window_log,
+            )
+        if best_encoding == b"zstd":
+            return _Zstd(
+                self.zstd_level,
+                self.min_size,
+                window=self.zstd_window_log,
+            )
+        return _Gzip(
+            self.gzip_level,
+            self.min_size,
+            window=self.gzip_window_bits,
+        )
 
 
 _DEFAULT_COMPRESSION = CompressionConfig()
@@ -471,7 +487,7 @@ class Writer:
         disconnect: asyncio.Future,
         shutdown: asyncio.Future,
         compression: CompressionConfig = _DEFAULT_COMPRESSION,
-        accept_encoding: str | None = None,
+        accept_encoding: str | bytes | None = None,
     ) -> None:
         """Bind the writer to transport I/O and shared disconnect/shutdown futures.
 
@@ -567,22 +583,76 @@ class Writer:
         Notes:
             Skips negotiation if ``Content-Encoding`` is already set on ``headers``. Uses the whole-body compression path, not per-chunk.
         """
-        h = self.headers
-        # Whole-response path: pick one codec before framing (chunked path uses block compression in write()).
-        if h.rget(b"content-encoding") is None:
-            compressor = self._compression.select(
-                self._accept_encoding,
-                data=body,
-                content_type=content_type,
-            )
-            if compressor is not None:
-                body = compressor.frame(body)
-                h.rset(b"content-encoding", compressor.encoding)
-                _merge_vary(h, b"accept-encoding")
+        if self.disconnected:
+            return
 
-        h.set(b"content-type", content_type)
-        h.rset(b"content-length", b"%d" % len(body))
-        self.write_headers(status).end(body)
+        if self._status_code is not None:
+            raise RuntimeError(
+                "Response already started (headers sent). "
+                "Cannot call write_headers() twice. Headers are sent on first write or when calling one-shot methods. "
+                "Set headers via w.headers.set() before any write operations."
+            )
+
+        h = self.headers
+        # respond() always sends a complete fixed-size body, even when compression changes the bytes.
+        self._known_length = True
+
+        # Common response-helper path: no custom headers and no client encoding to negotiate.
+        # Keep it direct so simple text/json responses avoid mutating and iterating Headers.
+        if not h._data and self._accept_encoding is None:
+            content = b"".join(
+                (
+                    _get_status_line(status),
+                    self._get_date_header(),
+                    b"content-type: ",
+                    content_type,
+                    b"\r\ncontent-length: ",
+                    b"%d" % len(body),
+                    b"\r\n\r\n",
+                    body,
+                )
+            )
+        else:
+            # Header-aware path: preserve caller headers, and compress before Content-Length is set.
+            if h.rget(b"content-encoding") is None:
+                compressor = self._compression.select(
+                    self._accept_encoding,
+                    data=body,
+                    content_type=content_type,
+                )
+                if compressor is not None:
+                    body = compressor.frame(body)
+                    h.rset(b"content-encoding", compressor.encoding)
+                    _merge_vary(h, b"accept-encoding")
+
+            h.rset(b"content-type", content_type)
+            h.rset(b"content-length", b"%d" % len(body))
+
+            parts = [_get_status_line(status), self._get_date_header()]
+            append = parts.append
+
+            for name, value in h._data.items():
+                if isinstance(value, bytes):
+                    append(name)
+                    append(b": ")
+                    append(value)
+                    append(b"\r\n")
+                else:
+                    for item in value:
+                        append(name)
+                        append(b": ")
+                        append(item)
+                        append(b"\r\n")
+
+            append(b"\r\n")
+            append(body)
+            content = b"".join(parts)
+
+        self._transport_write(content)
+        # _status_code is the "response started" sentinel, so set it only after bytes are handed off.
+        self._status_code = status
+        self._on_completed()
+        self._completed = True
 
     # =========================================================================
     # Raw methods (no compression, Go-style)

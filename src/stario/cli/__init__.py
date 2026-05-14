@@ -3,7 +3,7 @@ Command-line scaffolding (``init``) and dev servers (``serve`` / ``watch``) buil
 
 Apps are referenced as ``module:callable`` so a checked-out tree runs without installing a console script first.
 
-Telemetry is configured with ``--tracer`` (``auto``, ``tty``, ``json``, ``sqlite``, or ``module:callable``).
+Telemetry is configured with ``--tracer`` (``auto``, ``tty``, ``json``, ``noop``, ``sqlite``, or ``module:callable``).
 """
 
 import argparse
@@ -243,7 +243,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SPEC",
         help=(
             "Telemetry sink: auto (TTY span tree if stdout is a TTY, else NDJSON), "
-            "or tty, json, sqlite, or custom <module>:<callable>"
+            "or tty, json, noop, sqlite, or custom <module>:<callable>"
         ),
     )
 
@@ -257,6 +257,7 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  stario serve main:bootstrap\n"
+            "  stario serve main:bootstrap --tracer noop\n"
             "  stario serve main:bootstrap --tracer json"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

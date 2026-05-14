@@ -28,7 +28,7 @@ from stario.cli.runtime import (
     watch_app,
 )
 from stario.http.writer import CompressionConfig
-from stario.telemetry import JsonTracer, SqliteTracer, TTYTracer
+from stario.telemetry import JsonTracer, NoOpTracer, SqliteTracer, TTYTracer
 
 
 def test_load_bootstrap_resolves_dotted_attribute(monkeypatch) -> None:
@@ -98,6 +98,10 @@ def test_resolve_tracer_factory_accepts_sqlite_alias() -> None:
 
 def test_resolve_tracer_factory_accepts_tty_alias() -> None:
     assert resolve_tracer_factory("tty") is TTYTracer
+
+
+def test_resolve_tracer_factory_accepts_noop_alias() -> None:
+    assert resolve_tracer_factory("noop") is NoOpTracer
 
 
 def test_resolve_cli_loop_uses_uvloop_when_available(monkeypatch) -> None:

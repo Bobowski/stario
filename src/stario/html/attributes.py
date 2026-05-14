@@ -2,41 +2,19 @@
 
 from collections.abc import Callable, Sequence
 from decimal import Decimal
+from functools import lru_cache
 from inspect import cleandoc
-from typing import cast
+from typing import Any, cast
 
 from stario.exceptions import StarioError
 
-from .constants import COMMON_SAFE_CSS_PROPS
 from .escape import escape_attribute_key, escape_attribute_value
 from .types import AttributeDict, SafeString
 
 
-def _render_style_key(key: object) -> str:
-    if type(key) is str:
-        key_str = cast(str, key)
-    elif type(key) is SafeString:
-        key_str = cast(SafeString, key).safe_str
-    else:
-        raise StarioError(
-            f"Invalid CSS property name type: {type(key).__name__}",
-            context={
-                "property": str(key),
-                "property_type": type(key).__name__,
-            },
-            help_text="CSS property names must be strings or SafeString objects.",
-            example=cleandoc(
-                """
-                from stario.html import Div
-
-                Div({"style": {"color": "red"}})
-                """
-            ),
-        )
-
-    if key_str in COMMON_SAFE_CSS_PROPS:
-        return key_str
-
+@lru_cache(maxsize=512)
+def _normalize_style_property_key(key_str: str) -> str:
+    """Validate a style property name and return the wire key (escaped via shared LRU)."""
     if key_str.startswith("@"):
         raise StarioError(
             f"Inline style attributes do not support at-rules like '{key_str}'",
@@ -70,7 +48,32 @@ def _render_style_key(key: object) -> str:
     return escape_attribute_value(key_str)
 
 
-def _render_style_value(key: str, value: object) -> str:
+def _render_style_key(key: Any) -> str:
+    if type(key) is str:
+        key_str = cast(str, key)
+    elif type(key) is SafeString:
+        key_str = cast(SafeString, key).safe_str
+    else:
+        raise StarioError(
+            f"Invalid CSS property name type: {type(key).__name__}",
+            context={
+                "property": str(key),
+                "property_type": type(key).__name__,
+            },
+            help_text="CSS property names must be strings or SafeString objects.",
+            example=cleandoc(
+                """
+                from stario.html import Div
+
+                Div({"style": {"color": "red"}})
+                """
+            ),
+        )
+
+    return _normalize_style_property_key(key_str)
+
+
+def _render_style_value(key: str, value: Any) -> str:
     value_type = type(value)
 
     if value_type is str:
@@ -100,11 +103,47 @@ def _render_style_value(key: str, value: object) -> str:
     )
 
 
-def _render_attribute_list(values: Sequence[object], key: str) -> str:
+def _join_attribute_token_list(
+    values: Sequence[Any], key: str, *, nested: bool = False
+) -> str:
+    """Join space-separated attribute tokens (e.g. ``class``, list-valued ``data-*``).
+
+    ``None`` and ``False`` omit a slot (conditional tokens). ``True`` is invalid:
+    token lists are not HTML boolean attributes; use a string or rely on
+    short-circuit expressions that yield ``False`` when off
+    (``active and \"active\"``).
+    """
     tokens: list[str] = []
     append = tokens.append
+    label = "nested attribute" if nested else "attribute"
 
     for value in values:
+        if value is None or value is False:
+            continue
+
+        if value is True:
+            raise StarioError(
+                f"Invalid list item for {label} '{key}': bool True is not a token",
+                context={
+                    "attribute": key,
+                    "item_type": "bool",
+                    "item_value": "True",
+                },
+                help_text=(
+                    "List-valued attributes accept token strings (and numbers). "
+                    "Omit a slot with None or False — e.g. "
+                    "`name if condition else False`. "
+                    "Do not pass bare True."
+                ),
+                example=cleandoc(
+                    """
+                    from stario.html import Div
+
+                    Div({"class": ["btn", "primary", is_active and "active"]})
+                    """
+                ),
+            )
+
         value_type = type(value)
 
         if value_type is str:
@@ -120,19 +159,21 @@ def _render_attribute_list(values: Sequence[object], key: str) -> str:
             continue
 
         raise StarioError(
-            f"Invalid list item type for nested attribute '{key}': {type(value).__name__}",
+            f"Invalid list item type for {label} '{key}': {type(value).__name__}",
             context={
                 "attribute": key,
                 "item_type": type(value).__name__,
                 "item_value": str(value)[:100],
             },
             help_text=(
-                "Nested attribute list items support: str, SafeString, int, float, or Decimal."
+                "List items may be str, SafeString, int, float, or Decimal; "
+                "None and False skip a slot."
             ),
             example=cleandoc(
                 """
-                from stario.html import Button
+                from stario.html import Div, Button
 
+                Div({"class": ["btn", "primary"]})
                 Button({"data": {"user-id": ["123", "456"]}})
                 """
             ),
@@ -141,7 +182,7 @@ def _render_attribute_list(values: Sequence[object], key: str) -> str:
     return " ".join(tokens)
 
 
-def _render_nested_key(key: object) -> str:
+def _render_nested_key(key: Any) -> str:
     if type(key) is str:
         return escape_attribute_key(cast(str, key))
 
@@ -209,7 +250,7 @@ def render_nested(
 
         if isinstance(value, Sequence):
             append(
-                f' {key_prefix}-{escaped_key}="{_render_attribute_list(cast(Sequence[object], value), f"{key_prefix}-{escaped_key}")}"'
+                f' {key_prefix}-{escaped_key}="{_join_attribute_token_list(cast(Sequence[Any], value), f"{key_prefix}-{escaped_key}", nested=True)}"'
             )
             continue
 
