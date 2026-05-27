@@ -21,12 +21,11 @@ from stario.cli.runtime import (
     _resolve_cli_loop,
     _run_cli_awaitable,
     _serve_command_argv,
-    default_tracer_factory,
     load_bootstrap,
-    normalize_bootstrap,
-    resolve_tracer_factory,
+    resolve_tracer,
     watch_app,
 )
+from stario.http.bootstrap import normalize_bootstrap
 from stario.http.writer import CompressionConfig
 from stario.telemetry import JsonTracer, NoOpTracer, SqliteTracer, TTYTracer
 
@@ -80,28 +79,28 @@ def test_load_bootstrap_imports_module_from_current_working_directory(
         sys.modules.pop("main", None)
 
 
-def test_resolve_tracer_factory_auto_prefers_tty_for_tty(monkeypatch) -> None:
+def test_resolve_tracer_auto_prefers_tty_for_tty(monkeypatch) -> None:
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    assert resolve_tracer_factory(None) is TTYTracer
-    assert default_tracer_factory() is TTYTracer
+    assert isinstance(resolve_tracer(None), TTYTracer)
+    assert isinstance(resolve_tracer("auto"), TTYTracer)
 
 
-def test_resolve_tracer_factory_auto_prefers_json_for_non_tty(monkeypatch) -> None:
+def test_resolve_tracer_auto_prefers_json_for_non_tty(monkeypatch) -> None:
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
-    assert resolve_tracer_factory(None) is JsonTracer
-    assert default_tracer_factory() is JsonTracer
+    assert isinstance(resolve_tracer(None), JsonTracer)
+    assert isinstance(resolve_tracer("auto"), JsonTracer)
 
 
-def test_resolve_tracer_factory_accepts_sqlite_alias() -> None:
-    assert resolve_tracer_factory("sqlite") is SqliteTracer
+def test_resolve_tracer_accepts_sqlite_alias() -> None:
+    assert isinstance(resolve_tracer("sqlite"), SqliteTracer)
 
 
-def test_resolve_tracer_factory_accepts_tty_alias() -> None:
-    assert resolve_tracer_factory("tty") is TTYTracer
+def test_resolve_tracer_accepts_tty_alias() -> None:
+    assert isinstance(resolve_tracer("tty"), TTYTracer)
 
 
-def test_resolve_tracer_factory_accepts_noop_alias() -> None:
-    assert resolve_tracer_factory("noop") is NoOpTracer
+def test_resolve_tracer_accepts_noop_alias() -> None:
+    assert isinstance(resolve_tracer("noop"), NoOpTracer)
 
 
 def test_resolve_cli_loop_uses_uvloop_when_available(monkeypatch) -> None:
@@ -158,16 +157,18 @@ def test_run_cli_awaitable_uses_runner_when_loop_factory_is_available(
     assert calls == [loop_factory, "run", "awaited"]
 
 
-def test_resolve_tracer_factory_custom_import(monkeypatch) -> None:
+def test_resolve_tracer_custom_import(monkeypatch) -> None:
     module = types.ModuleType("fake_tracer_module")
 
     def tracer_factory():
-        return object()
+        return JsonTracer(output=io.StringIO())
 
     setattr(module, "runtime", types.SimpleNamespace(factory=tracer_factory))
     monkeypatch.setitem(__import__("sys").modules, module.__name__, module)
 
-    assert resolve_tracer_factory("fake_tracer_module:runtime.factory") is tracer_factory
+    assert isinstance(
+        resolve_tracer("fake_tracer_module:runtime.factory"), JsonTracer
+    )
 
 
 def test_serve_command_passes_runtime_options(monkeypatch) -> None:

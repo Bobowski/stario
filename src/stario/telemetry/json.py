@@ -2,16 +2,41 @@
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
-from typing import Any, TextIO
+from typing import Any, Self, TextIO
 from uuid import UUID, uuid7
 
 from .core import Span
 from .tracebacks import format_exception_for_telemetry
 
 _logger = logging.getLogger("stario.telemetry.json")
+
+_DEFAULT_FLUSH_INTERVAL = 0.125
+_DEFAULT_MAX_PENDING_SPANS = 65536
+_DEFAULT_MAX_BATCH_SPANS = 512
+
+
+def _env_float(key: str, default: float) -> float:
+    if key not in os.environ:
+        return default
+    raw = os.environ[key].strip()
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a number, got {raw!r}") from exc
+
+
+def _env_int(key: str, default: int) -> int:
+    if key not in os.environ:
+        return default
+    raw = os.environ[key].strip()
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer, got {raw!r}") from exc
 
 
 class _JsonState:
@@ -165,9 +190,9 @@ class JsonTracer:
         output: TextIO | None = None,
         *,
         flush_each: bool = True,
-        flush_interval: float = 0.125,
-        max_pending_spans: int = 65536,
-        max_batch_spans: int = 512,
+        flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
+        max_pending_spans: int = _DEFAULT_MAX_PENDING_SPANS,
+        max_batch_spans: int = _DEFAULT_MAX_BATCH_SPANS,
     ) -> None:
         if flush_interval <= 0:
             raise ValueError("flush_interval must be greater than zero")
@@ -192,6 +217,21 @@ class JsonTracer:
         self._dropped_spans = 0
         self._serialize_errors = 0
         self._spans_lock = threading.Lock()
+
+    @classmethod
+    def from_env(cls) -> Self:
+        """Build from ``TRACES_JSON_*`` when set in the environment."""
+        return cls(
+            flush_interval=_env_float(
+                "TRACES_JSON_FLUSH_INTERVAL", _DEFAULT_FLUSH_INTERVAL
+            ),
+            max_pending_spans=_env_int(
+                "TRACES_JSON_MAX_PENDING_SPANS", _DEFAULT_MAX_PENDING_SPANS
+            ),
+            max_batch_spans=_env_int(
+                "TRACES_JSON_MAX_BATCH_SPANS", _DEFAULT_MAX_BATCH_SPANS
+            ),
+        )
 
     def __enter__(self) -> JsonTracer:
         self._start_writer()

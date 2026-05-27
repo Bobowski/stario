@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import chain
-from typing import Any
+from typing import Any, Self
 from uuid import UUID, uuid7
 
 from stario.console import enable_windows_console_vt
@@ -239,6 +239,10 @@ class TTYTracer:
         self._running = False
         self._dirty = False
         self._live: _LiveRegion | None = None
+
+    @classmethod
+    def from_env(cls) -> Self:
+        return cls()
 
     @property
     def _width(self) -> int:

@@ -6,6 +6,17 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 3.4.0 - 2026-05-27
+
+Parametrize bundled tracers from the environment—path and writer tuning without CLI flags.
+
+### Added
+
+- **`SqliteTracer.from_env()`** — ``TRACES_SQLITE`` plus optional ``TRACES_SQLITE_*`` writer settings when set in the environment.
+- **`JsonTracer.from_env()`** — ``TRACES_JSON_*`` for the NDJSON sink when set.
+- **`STARIO_TRACER`** — Select a built-in tracer without ``--tracer`` (the flag still wins when both are set).
+- **`from_env()`` on all bundled tracers** — Same configuration entry point for every built-in name; custom sinks use ``module:from_env``.
+
 ## 3.3.0 - 2026-05-14
 
 This release focuses on server-side performance: reducing per-request allocations,

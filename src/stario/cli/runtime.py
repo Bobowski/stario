@@ -6,6 +6,7 @@ Bootstrap normalization lives in ``stario.http.bootstrap``. In tests use
 
 import asyncio
 import importlib
+import os
 import shlex
 import socket
 import subprocess
@@ -27,7 +28,6 @@ from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.sqlite import SqliteTracer
 from stario.telemetry.tty import TTYTracer
 
-type TracerFactory = Callable[[], Tracer]
 type CliLoop = Literal["asyncio", "uvloop"]
 
 
@@ -109,28 +109,40 @@ def load_bootstrap(spec: str) -> AppBootstrap:
     return normalize_bootstrap(cast(BootstrapCandidate, bootstrap))
 
 
-def default_tracer_factory() -> TracerFactory:
-    """TTY ⇒ ``TTYTracer``, else ``JsonTracer`` (used when ``--tracer auto``)."""
-    return TTYTracer if sys.stdout.isatty() else JsonTracer
+def resolve_tracer(spec: str | None) -> Tracer:
+    """Resolve ``auto``/built-in names/``STARIO_TRACER``/``module:callable`` to a tracer instance."""
+    # CLI --tracer wins; when omitted or auto, STARIO_TRACER picks the sink (Cosmo deploys use this).
+    if spec not in (None, "", "auto"):
+        effective = spec
+    else:
+        effective = os.environ.get("STARIO_TRACER", "").strip() or "auto"
 
+    try:
+        if effective == "auto":
+            if sys.stdout.isatty():
+                return TTYTracer.from_env()
+            return JsonTracer.from_env()
+        if effective == "tty":
+            return TTYTracer.from_env()
+        if effective == "json":
+            return JsonTracer.from_env()
+        if effective == "noop":
+            return NoOpTracer.from_env()
+        if effective == "sqlite":
+            return SqliteTracer.from_env()
 
-def resolve_tracer_factory(spec: str | None) -> TracerFactory:
-    """Map ``auto``/``tty``/``json``/``noop``/``sqlite`` or ``module:factory`` to a zero-arg tracer constructor."""
-    if spec in (None, "", "auto"):
-        return default_tracer_factory()
-    if spec == "tty":
-        return TTYTracer
-    if spec == "json":
-        return JsonTracer
-    if spec == "noop":
-        return NoOpTracer
-    if spec == "sqlite":
-        return SqliteTracer
-
-    factory = _load_symbol(spec, label="telemetry output")
-    if not callable(factory):
-        raise CliError(f"Telemetry output '{spec}' must be callable.")
-    return cast(TracerFactory, factory)
+        loaded = _load_symbol(effective, label="telemetry output")
+        if not callable(loaded):
+            raise CliError(f"Telemetry output '{effective}' must be callable.")
+        tracer = cast(Callable[[], Tracer], loaded)()
+        for name in ("__enter__", "__exit__", "create", "start", "end"):
+            if not callable(getattr(tracer, name, None)):
+                raise CliError(
+                    f"Telemetry output '{effective}' must return a Tracer (missing {name!r})."
+                )
+        return tracer
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
 
 
 def _resolve_cli_loop(
@@ -375,7 +387,7 @@ def serve_once(
     _check_unix_socket_supported(unix_socket)
     loop_name, loop_factory = _resolve_cli_loop(loop)
     bootstrap = load_bootstrap(app_spec)
-    tracer = resolve_tracer_factory(tracer_spec)()
+    tracer = resolve_tracer(tracer_spec)
 
     async def runner() -> None:
         with tracer:

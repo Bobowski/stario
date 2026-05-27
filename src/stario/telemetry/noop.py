@@ -1,6 +1,6 @@
 """No-op telemetry backend for high-throughput or benchmark runs."""
 
-from typing import Any
+from typing import Any, Self
 from uuid import UUID
 
 from .core import Span
@@ -12,6 +12,10 @@ class NoOpTracer:
     """Tracer implementation that discards all span data and performs no I/O."""
 
     __slots__ = ()
+
+    @classmethod
+    def from_env(cls) -> Self:
+        return cls()
 
     def __enter__(self) -> "NoOpTracer":
         return self
