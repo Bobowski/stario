@@ -1,140 +1,150 @@
+"""TTY tracer tests.
+
+Formatting is verified through `TTYRenderer` on hand-built `RecordingSpan` records.
+Tracer lifecycle is verified through the public context-manager API with an injected `out`
+stream.
+"""
+
 import io
 import os
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid7
 
-import pytest
+from stario.telemetry.noop import NoOpTracer
+from stario.telemetry.spans import RecordedEvent, RecordedLink, RecordingSpan
+from stario.telemetry.tty import TTYRenderer, TTYTracer
 
-import stario.telemetry.tty as tty_module
-from stario.telemetry.tty import TTYTracer, _fmt_duration
+_NOOP = NoOpTracer()
 
-
-class FakeLive:
-    instances: list["FakeLive"] = []
-
-    def __init__(self, out: io.StringIO, lock) -> None:
-        self._out = out
-        self._lock = lock
-        self.renderable: str | None = None
-        self.stopped = False
-        self.updates: list[str] = []
-        self.instances.append(self)
-
-    def erase(self) -> None:
-        pass
-
-    def write(self, content: str) -> None:
-        self.renderable = content
-        self.updates.append(content)
-
-    def stop(self) -> None:
-        self.stopped = True
+# Fixed wall-clock anchor so rendered absolute times are stable: 2023-11-14T22:13:20Z.
+_T0 = 1_700_000_000 * 1_000_000_000
 
 
-def _patch_tty(monkeypatch) -> None:
-    monkeypatch.setattr(
-        tty_module.shutil,
-        "get_terminal_size",
-        lambda _: os.terminal_size((120, 24)),
+def make_span(
+    name: str = "request",
+    *,
+    parent: RecordingSpan | None = None,
+    start_ns: int = _T0,
+    end_ns: int | None = _T0 + 5_000_000,
+    error: str | None = None,
+    attributes: dict | None = None,
+    events: list[RecordedEvent] | None = None,
+    links: list[RecordedLink] | None = None,
+) -> RecordingSpan:
+    span_id = uuid7()
+    return RecordingSpan(
+        id=span_id,
+        tracer=_NOOP,
+        trace_id=span_id if parent is None else parent.trace_id,
+        parent_id=None if parent is None else parent.id,
+        name=name,
+        start_ns=start_ns,
+        end_ns=end_ns,
+        error=error,
+        attributes=attributes,
+        events=events,
+        links=links,
     )
 
 
-def test_tty_tracer_records_changes_until_render_tick(monkeypatch) -> None:
-    output = io.StringIO()
-    FakeLive.instances.clear()
-    monkeypatch.setattr(tty_module, "_LiveRegion", FakeLive)
-    _patch_tty(monkeypatch)
-
-    tracer = TTYTracer()
-    tracer._running = True
-    tracer._out = output
-
-    span = tracer.create("first.request")
-    span.start()
-
-    assert output.getvalue() == ""
-    assert FakeLive.instances == []
-
-    tracer._render()
-
-    assert len(FakeLive.instances) == 1
-    assert FakeLive.instances[0].updates
-    assert output.getvalue() == ""
+def render(
+    span: RecordingSpan,
+    *,
+    children: dict[UUID, list[RecordingSpan]] | None = None,
+    width: int = 120,
+) -> str:
+    return TTYRenderer(width, children or {}).root_block(span)
 
 
-def test_tty_tracer_prints_finished_roots_and_restarts_live(
-    monkeypatch,
-) -> None:
-    output = io.StringIO()
-    FakeLive.instances.clear()
-    monkeypatch.setattr(tty_module, "_LiveRegion", FakeLive)
-    _patch_tty(monkeypatch)
+class TestTTYRendererHeaders:
+    def test_finished_span_shows_duration_and_id_tail(self):
+        span = make_span("request", end_ns=_T0 + 5_000_000)
 
-    tracer = TTYTracer()
-    tracer._running = True
-    tracer._out = output
+        text = render(span)
 
-    first = tracer.create("first.request")
-    second = tracer.create("second.request")
+        assert "request" in text
+        assert "5.0 ms" in text
+        assert str(span.id)[-8:] in text
 
-    first.start()
-    second.start()
-    tracer._render()
+    def test_in_progress_span_shows_ellipsis_instead_of_duration(self):
+        span = make_span("request", end_ns=None)
 
-    assert len(FakeLive.instances) == 1
-    assert FakeLive.instances[0].updates
+        assert "…" in render(span)
 
-    first.end()
+    def test_failed_span_renders_error_in_trailer(self):
+        span = make_span("request", error="db unavailable")
 
-    assert output.getvalue() == ""
+        assert "[db unavailable]" in render(span)
 
-    tracer._render()
+    def test_narrow_width_truncates_without_wrapping(self):
+        target = uuid4()
+        span = make_span(
+            "request." + "x" * 80,
+            attributes={
+                "request.path": "/" + "deeply-nested/" * 12,
+                "response.status_code": 200,
+            },
+            events=[
+                RecordedEvent(
+                    time_ns=_T0 + 1_000_000,
+                    name="event." + "y" * 80,
+                    attributes={"payload": "z" * 80},
+                    body="body line " + "w" * 80,
+                )
+            ],
+            links=[RecordedLink("related." + "l" * 80, target, {"kind": "test"})],
+        )
 
-    rendered = output.getvalue()
-    assert "first.request" in rendered
-    assert "second.request" not in rendered
-    assert FakeLive.instances[0].stopped is False
-    assert len(FakeLive.instances) == 1
-    assert FakeLive.instances[0].updates
+        text = render(span, width=20)
 
-    second.end()
-    tracer._render()
-
-    rendered = output.getvalue()
-    assert "second.request" in rendered
-    assert isinstance(FakeLive.instances[0].renderable, str)
-    assert FakeLive.instances[0].renderable == " "
-
-
-def test_fmt_duration_handles_sub_millisecond_spans() -> None:
-    assert _fmt_duration(250_000) == "250 us"
-    assert _fmt_duration(1_500_000) == "1.5 ms"
+        assert "…" in text
 
 
-def test_tty_tracer_end_requires_explicit_start() -> None:
-    tracer = TTYTracer()
-    span = tracer.create("request")
+class TestTTYRendererNesting:
+    def test_child_spans_render_after_parent_with_relative_offset(self):
+        parent = make_span("parent.request", end_ns=_T0 + 10_000_000)
+        child = make_span(
+            "child.step",
+            parent=parent,
+            start_ns=_T0 + 2_000_000,
+            end_ns=_T0 + 3_000_000,
+        )
 
-    with pytest.raises(RuntimeError, match="never started"):
-        span.end()
+        text = render(parent, children={parent.id: [child]})
+
+        assert text.index("parent.request") < text.index("child.step")
+        child_line = next(ln for ln in text.splitlines() if "child.step" in ln)
+        assert "+2.0 ms" in child_line
 
 
-def test_tty_tracer_printed_panel_includes_links(monkeypatch) -> None:
-    output = io.StringIO()
-    FakeLive.instances.clear()
-    monkeypatch.setattr(tty_module, "_LiveRegion", FakeLive)
-    _patch_tty(monkeypatch)
+class TestTracerPublicLifecycle:
+    """Exercises `TTYTracer` only through its public surface (`out=`, `with`, spans)."""
 
-    tracer = TTYTracer()
-    tracer._running = True
-    tracer._out = output
+    def test_context_manager_flushes_open_spans_on_exit(self, monkeypatch):
+        _patch_terminal_width(monkeypatch)
+        output = io.StringIO()
 
-    target = uuid4()
-    root = tracer.create("with-link")
-    root.start()
-    tracer.add_link(root.id, target, {"kind": "test"})
-    root.end()
-    tracer._render()
+        with TTYTracer(out=output) as tracer:
+            root = tracer.create("request.in-flight", {"http.method": "GET"})
+            root.start()
+            child = tracer.create("db.query", parent=root)
+            child.start()
+            child.end()
+            # Root is intentionally left open: exit must flush it to scrollback.
 
-    text = output.getvalue()
-    assert str(target)[-8:] in text
-    assert "kind=test" in text or "kind" in text
+        text = output.getvalue()
+        assert "request.in-flight" in text
+        assert "db.query" in text
+        assert "http.method" in text
+
+
+def _patch_terminal_width(monkeypatch) -> None:
+    import stario.telemetry.tty as tty_module
+
+    def fake_terminal_size(_fallback: os.terminal_size) -> os.terminal_size:
+        return os.terminal_size((120, 24))
+
+    monkeypatch.setattr(
+        tty_module.shutil,
+        "get_terminal_size",
+        fake_terminal_size,
+    )

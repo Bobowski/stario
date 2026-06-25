@@ -1,98 +1,78 @@
 """
-Normalize app entrypoints for ``Server`` and tests: plain async functions, sync functions, async context managers,
-single-yield async generators, and ``None`` become one ``AsyncContextManager`` contract.
+`bootstrap(app, span)` contract for `Server` and tests.
+
+Bootstrap must be an async generator that yields exactly once: code before `yield`
+is startup, code after is shutdown. The framework advances it with `anext()` so
+server failures never enter the generator.
 """
 
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from typing import AsyncContextManager, TypeGuard, cast
+from typing import Literal
 
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span
 
 from .app import App
-from .server import AppBootstrap
 
-type BootstrapResult = (
-    AsyncContextManager[object] | AsyncIterator[None] | Awaitable[object] | None
-)
-type BootstrapCandidate = Callable[[App, Span], BootstrapResult]
-
-
-def _is_async_context_manager(
-    value: object,
-) -> TypeGuard[AsyncContextManager[object]]:
-    return hasattr(value, "__aenter__") and hasattr(value, "__aexit__")
+type Bootstrap = Callable[[App, Span], AsyncGenerator[None]]
+type ShutdownTrigger = Literal[
+    "expected_stop",
+    "runtime_failure",
+    "fallback_cleanup",
+]
 
 
 @asynccontextmanager
-async def _bootstrap_async_generator_scope(
-    generator: AsyncIterator[None],
-) -> AsyncIterator[None]:
-    try:
-        await anext(generator)
-    except StopAsyncIteration as exc:
+async def bootstrap_run(
+    bootstrap: Bootstrap,
+    app: App,
+    span: Span,
+) -> AsyncGenerator[None]:
+    """Bootstrap startup on enter, teardown on exit.
+
+    Uses `anext()` on the user generator — not `async with` on it — so server
+    failures in the scoped body never enter bootstrap teardown via `.athrow()`.
+    """
+    result = bootstrap(app, span)
+    if inspect.isasyncgen(result):
+        gen = result
+    elif inspect.iscoroutine(result):
+        result.close()
         raise StarioError(
-            "Bootstrap async generator did not yield",
-            help_text="Add a single `yield` for teardown support or return normally for setup-only bootstraps.",
+            "Bootstrap must yield exactly once",
+            help_text="Define `async def bootstrap(app, span): ...; yield` (one yield).",
+        )
+    else:
+        raise StarioError(
+            "Bootstrap must be an async generator",
+            context={"type": type(result).__name__},
+            help_text="Define `async def bootstrap(app, span): ...; yield` (one yield).",
+        )
+
+    try:
+        await anext(gen)
+    except StopAsyncIteration as exc:
+        await gen.aclose()
+        raise StarioError(
+            "Bootstrap must yield exactly once",
+            help_text="Add `yield` after startup wiring and before teardown code.",
         ) from exc
+    except Exception:
+        await gen.aclose()
+        raise
 
     try:
         yield
     finally:
         try:
-            await anext(generator)
+            await anext(gen)
         except StopAsyncIteration:
             pass
         else:
+            await gen.aclose()
             raise StarioError(
-                "Bootstrap async generator yielded more than once",
+                "Bootstrap must not yield more than once",
                 help_text="Bootstrap async generators must yield exactly once.",
             )
-
-
-def normalize_bootstrap(bootstrap: BootstrapCandidate) -> AppBootstrap:
-    """Wrap a user ``bootstrap(app, span)`` so it always acts as an async context manager.
-
-    Parameters:
-        bootstrap: Callable returning an async context manager, a single-yield async generator, an awaitable, or ``None``.
-
-    Returns:
-        ``AppBootstrap`` — use as ``async with wrapped(app, span):`` from ``Server`` or tests.
-
-    Raises:
-        StarioError: From the wrapper when the return type is unsupported or an async generator mis-``yield``s.
-
-    Notes:
-        Async generators must ``yield`` exactly once between setup and teardown.
-    """
-    @asynccontextmanager
-    async def wrapped(app: App, span: Span) -> AsyncIterator[None]:
-        result = bootstrap(app, span)
-        if _is_async_context_manager(result):
-            async with result:
-                yield
-            return
-
-        if inspect.isasyncgen(result):
-            async with _bootstrap_async_generator_scope(result):
-                yield
-            return
-
-        if inspect.isawaitable(result):
-            await cast(Awaitable[object], result)
-            yield
-            return
-
-        if result is None:
-            yield
-            return
-
-        raise StarioError(
-            "Unsupported bootstrap return type",
-            context={"type": type(result).__name__},
-            help_text="Return an async context manager, an async generator, an awaitable, or None.",
-        )
-
-    return wrapped

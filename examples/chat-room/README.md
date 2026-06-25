@@ -1,46 +1,78 @@
 # Chat room
 
-## How to run
+Multi-room realtime chat — the **larger-app** counterpart to the single-file **tiles** example, and the reference layout for **Stario + SQLite + Datastar** apps.
 
-From this directory (after dependencies are installed):
+Rooms live in SQLite — the lobby starts empty. Create or delete from the lobby — **New room** opens a dialog; each card has a **×** delete button.
+
+## Run
 
 ```bash
+git clone https://github.com/bobowski/stario.git
+cd stario/examples/chat-room
 uv sync
-uv run stario serve main:bootstrap
+uv run stario watch app.main:bootstrap
 ```
 
-`stario` is declared like any published app (``stario init`` runs ``uv add 'stario>=N,<N+1'`` for the CLI’s major, e.g. ``stario>=3,<4``; **no** ``tool.uv.sources`` path), so a copy or a CLI-fetched tree only needs an index that can resolve the **stario** distribution—not the monorepo layout.
+Open http://127.0.0.1:8000 — create a room, then chat in two tabs to see live updates.
 
-**In the stario repo** (this example under ``shared/stario/examples/``), prefer ``uv run --with-editable ../.. …`` so dependency resolution stays portable—no ``tool.uv.sources`` path in this file—while commands still use your checkout.
-
-During development, reload on file changes:
-
-```bash
-uv run stario watch main:bootstrap
-```
-
-Run the example test suite (from this directory so `main` resolves):
+## Tests
 
 ```bash
 uv run pytest
 ```
 
-If you use the **published** ``stario`` package from an index, that is enough once the release includes HTTP ``stario.testing.TestClient``.
+Tests use `TestClient(app.main.bootstrap)` — same bootstrap the CLI loads. One test file per feature (`test_lobby.py`, `test_room.py`).
 
-When this example lives **inside** the stario repo, the index build may lag behind the tree you have on disk. Then point uv at the local framework without changing ``pyproject.toml`` (same mechanism ``stario init`` avoids path mounts for fetched copies):
+## Layout
 
-```bash
-uv run --with-editable ../.. pytest
+```text
+app/
+  main.py           bootstrap (composition root) — start here
+  config.py         env-first Config, read once in bootstrap
+  assets.py         AssetManifest + fingerprinted URLs
+  db.py             thin SQLite core (connection + transactions)
+  common/           page shell, demo identity — cross-feature, no owner
+  features/
+    lobby/          GET / ; POST/DELETE reuse paths from room/urls.py
+    room/           owns the room domain: /rooms… URLs, models, data, chat + SSE
+  static/           CSS, vendored Datastar
+tests/
+pyproject.toml
 ```
 
-Tests use an **async** ``client`` fixture (see ``tests/conftest.py``) that does ``async with TestClient(main.bootstrap)``; pytest-asyncio tears it down after each test. Use ``await client.get(...)`` in tests. ``client.app`` is the wired app (e.g. for ``url_for``).
+Each feature follows the same shape — every file optional:
 
-## What this app is doing
+| File | Role |
+|------|------|
+| `urls.py` | `UrlPath` constants (`room/urls.py` defines `ROOMS` and `ROOM / "send"` etc.) |
+| `models.py` | domain dataclasses (`room/models.py` owns `Room`, `Message`, `User`) |
+| `data.py` | `SCHEMA` DDL + query functions taking the shared `Database` |
+| `subjects.py` | relay subject helpers — no typo-prone f-strings at call sites |
+| `signals.py` | Datastar signal dataclass + `read_*_signals` for this page |
+| `views.py` | HTML trees (`common.shell.page` wraps body content) |
+| `handlers.py` | handler factories + `register_*` at the bottom |
 
-- **HTTP:** `main.bootstrap` wires an `App` instance: one static file mount, a home page route, and **mounted routers** for each feature (`app.chat`, `app.about`). Mounting merges route tables so named routes and `url_for` stay global.
+`app/main.py` reads `Config.from_env()`, builds shared deps once (`db`, `relay`), applies each feature's `SCHEMA`, registers static assets, then calls each `register_*`.
 
-- **Chat feature:** `app.chat` holds handlers, HTML views, SQLite access, domain models, and `router.build_router(db, relay)`. Handlers that need storage or pub/sub are **factories** (`subscribe(db, relay)`) so dependencies are passed from bootstrap, not read from globals.
+**Who owns the data:** the room feature owns the whole room domain (tables, models, queries). The lobby is UI over that domain — it imports `room.data` and `room.urls` rather than duplicating them. Domain imports flow one way (lobby consumes room's `data`/`models`, never the reverse); `urls.py` modules are leaves, so any feature may import another's URLs for links and redirects (room redirects to `LOBBY`). `app/db.py` never grows when you add a feature.
 
-- **Realtime:** Browsers open an SSE stream; the server pushes HTML fragments (Datastar) when state changes. **Relay** fans out events on dotted subjects (`chat.message`, `chat.presence`, …); every subscriber matching `chat.*` refreshes its client.
+## Request flow (CQRS-shaped)
 
-- **About feature:** `app.about` is a minimal second package: its `router` registers `GET /about` and is merged with `app.mount("/", …)` alongside chat, sharing the same `/static` mount. More areas add their own paths the same way without duplicating static setup.
+| Route | Job |
+|-------|-----|
+| `GET /` | Lobby — list rooms and online counts |
+| `GET /subscribe` | Long-lived SSE — patch lobby on presence and room list changes |
+| `POST /rooms` | Create a room (dialog signals) |
+| `DELETE /rooms/{id}` | Delete a room and its messages/presence |
+| `GET /rooms/{id}` | First paint for a room (mint demo user) |
+| `GET /rooms/{id}/subscribe` | Long-lived SSE — patch HTML on relay events |
+| `POST /rooms/{id}/send` | Store message — 204, update via SSE |
+| `POST /rooms/{id}/typing` | Typing flag — 204, update via SSE |
+
+Relay subjects are per room (`room.{id}.presence`, `room.{id}.message`, …), built by `room/subjects.py` and subscribed with `room.{id}.*`. The lobby opens `GET /subscribe` and listens on `room.*` and `lobby.*` so online counts and the room list update when users join or leave, or when rooms are created or deleted. When a room is deleted mid-stream, the room subscribe handler calls `SSE(w).navigate(LOBBY.href())` so live tabs return to the lobby without a full page reload.
+
+## Configuration
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CHAT_DB_PATH` | `:memory:` | SQLite file path; in-memory keeps dev zero-setup |

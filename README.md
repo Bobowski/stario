@@ -29,15 +29,29 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 Python 3.14 or newer is required. The package tracks current Python and the standard library (including APIs the framework builds on) rather than supporting older runtimes.
 
-## Quick start
-
-### From a template
-
-`uvx` runs the Stario CLI without a global install. Everything after this is interactive (project name, template, and optional dev server).
+**uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
 
 ```bash
-uvx stario init
+uv add "stario[uvloop]"
+# or: pip install "stario[uvloop]"
 ```
+
+Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows.
+
+## Quick start
+
+### From an example
+
+Clone the repo (or copy an example directory) and run:
+
+```bash
+git clone https://github.com/bobowski/stario.git
+cd stario/examples/tiles
+uv sync
+uv run stario watch main:bootstrap
+```
+
+See [`examples/`](examples/) for **tiles** (recommended), **hello-world**, and **chat-room** (multi-file layout).
 
 ### Manual setup
 
@@ -51,28 +65,32 @@ Put this in `main.py`:
 
 ```python
 import stario.responses as responses
-from stario import App, Context, Span, Writer
+from stario import App, Context, Span, UrlPath, Writer
 
 
 async def home(c: Context, w: Writer) -> None:
     responses.text(w, "Hello from Stario")
 
 
-async def bootstrap(app: App, span: Span) -> None:
+HOME = UrlPath("/")
+
+async def bootstrap(app: App, span: Span):
     span.attr("app.name", "example")
-    app.get("/", home, name="home")
+    app.get(HOME, home)
+    yield
 ```
 
 ```bash
 uv run stario watch main:bootstrap
 ```
 
-Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs once: register routes there and attach attributes to `span` (telemetry for the lifecycle). Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. See [Getting started](https://stario.dev/docs) for project layout and CLI options. For containers, TLS, and production-oriented setup, see [Deployment: Containers, TLS, and safe releases](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
+Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment: Containers, TLS, and safe releases](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
 
 ## What you get
 
-- Explicit wiring: `bootstrap(app, span)`, named routes, no hidden registration.
-- Sharp primitives: `Context` for the request, `Writer` for the response, HTML via `stario.html`, telemetry via `span`.
+- Explicit wiring: async-generator `bootstrap(app, span)` with a single `yield`, `UrlPath` constants, no hidden registration.
+- Sharp primitives: `Context` for the request, `Writer` for the response, HTML/SVG trees via `stario.markup`, telemetry via `span`.
+- Static assets: `AssetManifest` for fingerprinted URLs, `StaticAssets(manifest).register(app)` in bootstrap.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.
 - Observable runs: spans for startup and requests are part of how you structure apps, not an afterthought.
 
@@ -83,3 +101,22 @@ No bundled ORM, admin UI, or plugin discovery system. Databases, auth, and broke
 ## Releases
 
 Version history and upgrade notes live in [`CHANGELOG.md`](CHANGELOG.md).
+
+## Contributing
+
+From `stario/`:
+
+```bash
+uv sync
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright
+uv run pytest
+```
+
+Before committing:
+
+```bash
+uv run ruff check . --fix
+uv run ruff format .
+```

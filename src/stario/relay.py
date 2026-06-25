@@ -1,110 +1,230 @@
-"""
-Process-local pub/sub: dotted subjects, ``*`` segment wildcards.
+"""Tiny process-local pub/sub for dotted subjects and prefix wildcards.
 
-``publish`` is synchronous and thread-safe. Subscriptions are bound to the asyncio loop that created them.
-This is not a message broker—no cross-process delivery, durability, or global ordering guarantees.
+- `publish` is synchronous and thread-safe — safe from worker threads, asyncio
+  tasks, or sync code on the loop thread
+- subscriptions bind to the asyncio loop that registered them; consume only there
+- not a broker: no cross-process delivery, durability, replay, or global ordering
+- use NATS, Redis, or another broker when you need multiprocess fanout or
+  backpressure policy
+
+**Subjects** (publish): exact, non-empty dotted strings — no wildcards.
+
+**Patterns** (subscribe): exact subject, trailing `prefix.*`, or `*`.
+
+**Threading**: `Relay.lock` protects the subscriber registry. Each subscription
+has an `_inbox_lock` guarding its pending queue and waiter future so a worker
+thread can `publish` while a handler awaits the next message on the owning loop.
+Cross-loop delivery always uses `loop.call_soon_threadsafe`.
+
+`RelaySubscription` is an opaque handle — enter with `async with`, then
+consume with `receive()` or `async for`.
 """
 
-from asyncio import AbstractEventLoop, Queue, get_running_loop
+from asyncio import AbstractEventLoop, Future, get_running_loop
+from collections import deque
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from threading import Lock
 from types import TracebackType
 from typing import Any, Self
 
+from stario.exceptions import StarioError, StarioRuntime
+
 # Message: (subject, data)
 type Msg[T = Any] = tuple[str, T]
 
-# (queue, loop) — put on ``loop`` via ``call_soon_threadsafe`` when not on that loop's thread
-type _Sub[T] = tuple[Queue[Msg[T]], AbstractEventLoop]
 
-
-def _no_running_event_loop(exc: RuntimeError) -> bool:
-    """No running asyncio loop in this thread."""
-    return "no running event loop" in str(exc).lower()
-
-
-def _closed_loop_enqueue_error(exc: RuntimeError) -> bool:
-    """Enqueue failed: target loop is closed."""
-    msg = str(exc).lower()
-    if "event loop is closed" in msg:
+def _pattern_covers(broad: str, narrow: str) -> bool:
+    # True if every subject matched by `narrow` is also matched by `broad`.
+    # Used to collapse overlapping subscribe patterns into a minimal set.
+    if broad == "*":
         return True
-    if "cannot schedule" in msg and "closed" in msg:
-        return True
-    return False
+    if broad.endswith(".*"):
+        # Compare against the "prefix." boundary (keep the trailing dot) so
+        # "ab.*" does not spuriously cover "abc.x".
+        return narrow.startswith(broad[:-1])
+    return broad == narrow
+
+
+def _valid_subject(value: str) -> bool:
+    # Exact dotted subject: non-empty, no wildcards, no leading/trailing dots,
+    # no empty segments.
+    if not value or "*" in value:
+        return False
+    if value[0] == "." or value[-1] == ".":
+        return False
+    return ".." not in value
 
 
 @lru_cache(maxsize=1024)
-def _matching_patterns(subject: str) -> frozenset[str]:
-    """Lookup keys for ``subject`` as a published topic: ``{subject, *}`` plus each ``prefix.*`` (unordered)."""
-    parts = subject.split(".")
-    out: set[str] = {subject, "*"}
-    for i in range(len(parts) - 1, 0, -1):
-        out.add(".".join(parts[:i]) + ".*")
-    return frozenset(out)
+def _matching_patterns(subject: str) -> tuple[str, ...]:
+    """Lookup keys for an exact subject: exact, each trailing `prefix.*`, then `*`."""
+    # Walk dots from the right so "a.b.c" -> "a.b.c", "a.b.*", "a.*", "*": the only
+    # registry keys that can match this subject. Cached because the same subjects
+    # are typically published over and over (e.g. one room's event stream).
+    out = [subject]
+    end = len(subject)
+    while True:
+        dot = subject.rfind(".", 0, end)
+        if dot < 0:
+            break
+        out.append(subject[:dot] + ".*")
+        end = dot
+    out.append("*")
+    return tuple(out)
 
 
-@lru_cache(maxsize=1024)
-def _deduplicate_patterns(patterns: tuple[str, ...]) -> frozenset[str]:
-    """Minimal pattern set: drop entries subsumed by another via ``_matching_patterns`` (visit ``(len, lex)``)."""
-    uniq = tuple(dict.fromkeys(patterns))
-    if len(uniq) <= 1:
-        return frozenset(uniq)
-
-    kept: set[str] = set()
-    for q in sorted(uniq, key=lambda p: (len(p), p)):
-        chain = _matching_patterns(q)
-        if any(p in kept for p in chain):
+def _deduplicate_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate and merge overlapping patterns."""
+    kept: list[str] = []
+    for pattern in dict.fromkeys(patterns):
+        if not pattern:
+            raise StarioError("subscription patterns must be non-empty")
+        # Accept only "*", a trailing "prefix.*", or an exact dotted subject.
+        valid = (
+            pattern == "*"
+            or (
+                pattern.endswith(".*")
+                and pattern.count("*") == 1
+                and _valid_subject(pattern[:-2])
+            )
+            or _valid_subject(pattern)
+        )
+        if not valid:
+            raise StarioError(
+                "patterns must be exact dot-separated subjects, '*', or "
+                "trailing 'prefix.*'",
+            )
+        # Drop this pattern if a kept one already covers it; otherwise drop any
+        # kept patterns it subsumes. The result is a minimal, non-overlapping set,
+        # so no single subject can match two of a subscription's patterns — that is
+        # what makes delivery at-most-once without de-duplicating at publish time.
+        if any(_pattern_covers(existing, pattern) for existing in kept):
             continue
-        kept.add(q)
-    return frozenset(kept)
+        kept = [existing for existing in kept if not _pattern_covers(pattern, existing)]
+        kept.append(pattern)
+    return tuple(kept)
 
 
-class _RelaySubscription[T = Any]:
-    """Internal: ``subscribe`` handle (async context manager + async iterable)."""
+class RelaySubscription[T = Any]:
+    """Opaque `Relay.subscribe` handle — enter before receiving messages."""
 
-    __slots__ = ("_relay", "patterns", "_queue", "_entry")
+    __slots__ = (
+        "_inbox_lock",
+        "_items",
+        "_relay",
+        "_waiter",
+        "active",
+        "generation",
+        "loop",
+        "patterns",
+    )
 
-    def __init__(self, relay: Relay[T], patterns: frozenset[str]) -> None:
+    def __init__(
+        self,
+        relay: Relay[T],
+        patterns: tuple[str, ...],
+    ) -> None:
         self._relay = relay
         self.patterns = patterns
-        self._queue = Queue()
-        self._entry: _Sub[T] | None = None
-
-    @property
-    def pattern(self) -> str:
-        """Arbitrary representative when multiple patterns exist (``min`` string)."""
-        return min(self.patterns)
+        # Guards the inbox below so a worker-thread publish can hand a message to a
+        # handler awaiting on the owning loop.
+        self._inbox_lock = Lock()
+        self.active = False
+        # Bumped on register/unregister so in-flight deliveries after teardown are ignored.
+        self.generation = 0
+        # Messages delivered while no receive() is waiting. Unbounded by design.
+        self._items: deque[Msg[T]] = deque()
+        # The loop that registered us; every delivery must land there.
+        self.loop: AbstractEventLoop | None = None
+        # The future a blocked receive() is awaiting, if any (at most one).
+        self._waiter: Future[Msg[T]] | None = None
 
     def _register(self) -> None:
-        if self._entry is not None:
-            raise RuntimeError("subscription is already active")
         loop = get_running_loop()
-        entry: _Sub[T] = (self._queue, loop)
-        self._entry = entry
-        with self._relay._lock:
+        with self._inbox_lock:
+            if self.active:
+                raise StarioRuntime("subscription is already active")
+            self.generation += 1
+            # Reused handle: start clean so a prior enter's messages never surface.
+            self._items.clear()
+            self.loop = loop
+            self._waiter = None
+        # Join the registry while still inactive; publish skips until active is set.
+        with self._relay.lock:
             for pat in self.patterns:
-                if pat not in self._relay._subs:
-                    self._relay._subs[pat] = []
-                self._relay._subs[pat].append(entry)
+                self._relay.subs.setdefault(pat, []).append(self)
+        with self._inbox_lock:
+            self.active = True
 
-    def _unregister(self) -> None:
-        entry = self._entry
-        if entry is None:
-            return
-        with self._relay._lock:
-            for pattern in self.patterns:
-                if pattern in self._relay._subs:
-                    try:
-                        self._relay._subs[pattern].remove(entry)
-                    except ValueError:
-                        # Defensive: removal already happened on another path.
-                        pass
-                    if not self._relay._subs[pattern]:
-                        del self._relay._subs[pattern]
-        self._entry = None
+    def invalidate_inbox(self) -> None:
+        """Mark inactive, bump generation, and cancel any blocked receive."""
+        with self._inbox_lock:
+            self.active = False
+            self.generation += 1
+            waiter = self._waiter
+            self._waiter = None
+            loop = self.loop
+        # Cancelling a Future schedules its callbacks via loop.call_soon, which
+        # raises RuntimeError on a closed loop. A closed loop means the awaiting
+        # coroutine is already gone (this happens when publish() reaps a dead
+        # subscriber), so there is nothing to wake — skip the cancel.
+        if (
+            waiter is not None
+            and not waiter.done()
+            and loop is not None
+            and not loop.is_closed()
+        ):
+            waiter.cancel()
+
+    async def receive(self) -> Msg[T]:
+        """Wait for the next message on an active subscription."""
+        loop = get_running_loop()
+        with self._inbox_lock:
+            if not self.active:
+                raise StarioRuntime("subscription is not active")
+            if self.loop is not loop:
+                raise StarioRuntime(
+                    "subscription must be consumed on its owning loop",
+                )
+            # Drain buffered messages first; only block when the inbox is empty.
+            if self._items:
+                return self._items.popleft()
+            # Single-consumer handle: a second concurrent receive() is a usage bug.
+            if self._waiter is not None:
+                raise StarioRuntime("subscription already has a pending receive")
+            waiter = loop.create_future()
+            self._waiter = waiter
+        try:
+            return await waiter
+        finally:
+            # Clear our slot unless deliver already consumed it (or a newer receive
+            # replaced it after a cancellation woke us).
+            with self._inbox_lock:
+                if self._waiter is waiter:
+                    self._waiter = None
+
+    def deliver(self, msg: Msg[T], generation: int) -> None:
+        # Always runs on the subscription's own loop — inline for same-loop
+        # publishers, or via call_soon_threadsafe for cross-loop ones — so it never
+        # races a receive() or cancel happening on that loop.
+        with self._inbox_lock:
+            # Stale delivery for a torn-down / re-registered subscription: drop it.
+            if not self.active or self.generation != generation:
+                return
+            waiter = self._waiter
+            if waiter is not None:
+                self._waiter = None
+                # Hand straight to the blocked receive(); if it was already cancelled
+                # (done) fall through and buffer the message instead.
+                if not waiter.done():
+                    waiter.set_result(msg)
+                    return
+            self._items.append(msg)
 
     async def __aenter__(self) -> Self:
+        # Register on enter; unregister on exit — otherwise handles stay in
+        # relay.subs and never get garbage-collected.
         self._register()
         return self
 
@@ -114,81 +234,161 @@ class _RelaySubscription[T = Any]:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool:
-        self._unregister()
+        # Idempotent: we may already have been reaped (e.g. publish dropped a dead
+        # sub) before the `async with` block exits.
+        if self.active:
+            self._relay.drop_subscription(self)
         return False
 
     async def __aiter__(self) -> AsyncIterator[Msg[T]]:
-        if self._entry is None:
-            # ``async for relay.subscribe(...)`` without ``async with``: one enter/exit around the whole loop.
-            async with self:
-                while True:
-                    yield await self._queue.get()
-        else:
-            # ``async with`` already registered; do not nest ``__aenter__``.
-            while True:
-                yield await self._queue.get()
+        # A fresh async generator per `async for`; each step just awaits receive().
+        if not self.active:
+            raise StarioRuntime("subscription must be used with async with")
+        while True:
+            yield await self.receive()
 
 
 class Relay[T = Any]:
-    """
-    In-process publish/subscribe registry.
+    """In-process publish/subscribe registry.
 
-    **Subjects** are dot-separated strings. A subscription key like ``a.b.*`` or ``a.*`` matches published subjects
-    for which that key appears on the match ladder (exact topic, then shorter ``prefix.*``, then ``*``)—so broader
-    prefixes receive deeper subjects. A lone ``*`` receives all messages.
+    Use `async with relay.subscribe(...) as sub:`, then consume with
+    `sub.receive()` or `async for msg in sub`. Nothing is queued before enter.
 
-    **Threading:** ``publish`` may be called from any thread; it only holds the lock while copying subscriber
-    lists, then enqueues per subscriber loop (``put_nowait`` or ``call_soon_threadsafe``). No subscriber body runs
-    under the lock.
-
-    **Async:** Each subscription is tied to the event loop that registered it (``async with`` / first ``async for``).
+    Dead subscribers (closed event loop) are removed silently; `publish` does not
+    report delivery failures.
     """
 
-    __slots__ = ("_lock", "_subs")
+    __slots__ = ("lock", "subs")
 
     def __init__(self) -> None:
-        self._lock = Lock()
-        self._subs: dict[str, list[_Sub[T]]] = {}
+        self.lock = Lock()
+        # pattern -> subscriptions registered for it. Lists preserve delivery order
+        # and iterate fast for the small fanouts this registry is built for.
+        self.subs: dict[str, list[RelaySubscription[T]]] = {}
+
+    def drop_subscription(self, subscription: RelaySubscription[T]) -> None:
+        # Wake/cancel any blocked receive first, then remove from the registry.
+        subscription.invalidate_inbox()
+        with self.lock:
+            for pattern in subscription.patterns:
+                subs = self.subs.get(pattern)
+                if subs is None:
+                    continue
+                remaining = [s for s in subs if s is not subscription]
+                # Nothing removed for this pattern — leave the existing list in place.
+                if len(remaining) == len(subs):
+                    continue
+                if remaining:
+                    self.subs[pattern] = remaining
+                else:
+                    # Drop empty buckets so the registry doesn't accumulate dead keys.
+                    del self.subs[pattern]
 
     def publish(self, subject: str, data: T) -> None:
-        """
-        Deliver ``(subject, data)`` to every subscriber whose pattern matches ``subject``.
+        """Deliver `(subject, data)` to every subscriber whose pattern matches.
 
-        Thread-safe: resolves matching pattern keys under a lock, then enqueues without holding the lock.
-        Does not await subscribers; failures to enqueue (e.g. closed loop) are swallowed where safe.
+        Thread-safe from any OS thread. Delivery runs after the subscriber
+        snapshot is taken; neither `Relay.lock` nor `_inbox_lock` is held while
+        `Future.set_result` runs. Does not await subscribers.
         """
+        if not subject:
+            raise StarioError("publish subject must be non-empty")
+        if "*" in subject:
+            raise StarioError(
+                "publish subject must be exact; wildcards are only for subscribe()",
+            )
+        if not _valid_subject(subject):
+            raise StarioError("publish subject segments must be non-empty")
+
         msg: Msg[T] = (subject, data)
 
-        with self._lock:
-            to_notify: list[_Sub[T]] = []
-            for pattern in _matching_patterns(subject):
-                if subs := self._subs.get(pattern):
-                    to_notify.extend(subs)
-
+        # Detect the caller's loop once (None when publishing from a plain thread).
+        # Subscribers on this same loop can be delivered inline; subscribers on other
+        # loops must be scheduled onto their loop with call_soon_threadsafe.
         try:
-            running = get_running_loop()
-        except RuntimeError as exc:
-            if not _no_running_event_loop(exc):
-                raise
-            running = None
+            caller_loop = get_running_loop()
+        except RuntimeError:
+            caller_loop = None
 
-        for queue, loop in to_notify:
+        # Snapshot matching subscribers under the lock, then deliver outside it so
+        # set_result / call_soon_threadsafe never run while lock is held.
+        immediate: list[tuple[RelaySubscription[T], int]] = []
+        deferred: list[tuple[RelaySubscription[T], int, AbstractEventLoop]] = []
+        dead: list[RelaySubscription[T]] = []
+
+        with self.lock:
+            for pattern in _matching_patterns(subject):
+                subs = self.subs.get(pattern)
+                if not subs:
+                    continue
+                # Patterns are de-duplicated at subscribe time, so each subscription
+                # matches at most one of these keys — no per-subject de-dup needed.
+                for subscription in subs:
+                    # Inbox fields (active/loop/generation) are guarded by
+                    # _inbox_lock, not lock. Reading them here is a lock-free
+                    # snapshot; deliver re-validates under _inbox_lock, so a stale
+                    # read only skips, or harmlessly schedules, one delivery.
+                    if not subscription.active:
+                        continue
+                    loop = subscription.loop
+                    if loop is None:
+                        continue
+                    generation = subscription.generation
+                    if loop is caller_loop:
+                        immediate.append((subscription, generation))
+                    elif loop.is_closed():
+                        dead.append(subscription)
+                    else:
+                        deferred.append((subscription, generation, loop))
+
+        # Same-loop subscribers: deliver inline (we are already on their loop).
+        for subscription, generation in immediate:
+            subscription.deliver(msg, generation)
+
+        # Subscribers whose loop has closed are unreachable — reap them.
+        for subscription in dead:
+            self.drop_subscription(subscription)
+
+        # Cross-loop subscribers: hop onto each owning loop to deliver safely.
+        for subscription, generation, loop in deferred:
+            # Re-check the snapshot: the sub may have torn down since we sampled it.
+            if not subscription.active or subscription.generation != generation:
+                continue
+            if loop.is_closed():
+                self.drop_subscription(subscription)
+                continue
             try:
-                if running is loop:
-                    queue.put_nowait(msg)
-                else:
-                    loop.call_soon_threadsafe(queue.put_nowait, msg)
-            except RuntimeError as exc:
-                if not _closed_loop_enqueue_error(exc):
+                loop.call_soon_threadsafe(
+                    subscription.deliver,
+                    msg,
+                    generation,
+                )
+            except RuntimeError:
+                # Lost a race with loop shutdown; only swallow the closed-loop case.
+                if not loop.is_closed():
                     raise
+                self.drop_subscription(subscription)
 
-    def subscribe(self, *patterns: str) -> _RelaySubscription[T]:
-        """
-        Subscribe to one or more patterns. Overlapping patterns are reduced to a minimal equivalent set.
+    def subscribe(
+        self,
+        *patterns: str,
+    ) -> RelaySubscription[T]:
+        """Subscribe to one or more patterns.
 
-        Use ``async with relay.subscribe(...) as sub:`` and ``async for msg in sub:``, or ``async for`` directly
-        on ``subscribe(...)`` (registers for the lifetime of the loop). Requires at least one pattern.
+        Overlapping patterns are merged — each matching publish delivers at most once.
+
+        The returned handle buffers nothing until entered with `async with`; do not
+        use `async for` on the bare return value. Its inbox is unbounded: a consumer
+        that falls behind a fast publisher grows memory without limit. Use a broker
+        (NATS, Redis) when you need backpressure.
         """
         if not patterns:
-            raise TypeError("subscribe() requires at least one pattern")
-        return _RelaySubscription(self, _deduplicate_patterns(tuple(patterns)))
+            raise StarioError(
+                "subscribe() requires at least one pattern",
+                example='relay.subscribe("room.*")',
+            )
+
+        return RelaySubscription(
+            self,
+            _deduplicate_patterns(tuple(patterns)),
+        )

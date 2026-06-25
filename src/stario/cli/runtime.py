@@ -1,563 +1,172 @@
-"""CLI helpers: import ``module:bootstrap``, resolve tracers, serve/watch.
+"""CLI helpers: import `module:bootstrap`, resolve tracers, serve/watch.
 
-Bootstrap normalization lives in ``stario.http.bootstrap``. In tests use
-``async with stario.testing.TestClient(bootstrap)`` (pytest-asyncio).
+Bootstrap must be an async generator with a single `yield`. In tests use
+`async with stario.testing.TestClient(bootstrap)` (pytest-asyncio).
+
+Server runtime policy is read from `STARIO_*` environment variables
+(see `stario.cli.env`).
 """
 
-import asyncio
-import importlib
-import os
+import inspect
+import math
 import shlex
 import socket
-import subprocess
 import sys
-from collections.abc import Callable, Coroutine, Sequence
-from dataclasses import dataclass
-from fnmatch import fnmatch
+from collections.abc import Sequence
+from fnmatch import translate as glob_to_regex
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import cast
 
+from stario.cli.env import (
+    server_config_from_env,
+    tracer_from_env,
+    unix_socket_from_env,
+)
 from stario.cli.errors import CliError
-from stario.cli.term import style as _cli_style
-from stario.http.bootstrap import BootstrapCandidate, normalize_bootstrap
-from stario.http.server import AppBootstrap, Server
-from stario.http.writer import CompressionConfig
-from stario.telemetry.core import Tracer
-from stario.telemetry.json import JsonTracer
-from stario.telemetry.noop import NoOpTracer
-from stario.telemetry.sqlite import SqliteTracer
-from stario.telemetry.tty import TTYTracer
+from stario.cli.imports import load_symbol
+from stario.cli.term import echo, style
+from stario.exceptions import StarioError
+from stario.http.bootstrap import Bootstrap
+from stario.http.server import Server
 
-type CliLoop = Literal["asyncio", "uvloop"]
-
-
-def _watch_cli_line(msg: str) -> None:
-    """Watch-mode status line. Kept as a module-level function so tests can monkeypatch it."""
-    print(msg, flush=True)
-
-
-WATCH_GLOB_CHARS = frozenset("*?[")
-DEFAULT_WATCH_IGNORE_SPECS = (
-    "*.sqlite3",
-    "*.sqlite3-*",
-    "*.sqlite",
-    "*.sqlite-*",
-    "*.db",
-    "*.db-*",
+WATCH_GLOB_CHARS = "*?["
+WATCH_PATH_SEPARATORS = "/\\"
+WATCH_IGNORE_ENTITY_SUFFIXES = (
+    r"\.sqlite3(?:-.+)?$",
+    r"\.sqlite(?:-.+)?$",
+    r"\.db(?:-.+)?$",
 )
 
 
-@dataclass(frozen=True, slots=True)
-class _WatchPathSpec:
-    path: Path
-    recursive: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _WatchPlan:
-    roots: tuple[str, ...]
-    include_paths: tuple[_WatchPathSpec, ...]
-    include_globs: tuple[str, ...]
-    ignore_paths: tuple[_WatchPathSpec, ...]
-    ignore_globs: tuple[str, ...]
-
-
-def _ensure_cwd_on_syspath() -> None:
-    cwd = Path.cwd().resolve()
-    for entry in sys.path:
-        try:
-            candidate = cwd if entry == "" else Path(entry).resolve()
-        except OSError:
-            continue
-        if candidate == cwd:
-            return
-
-    # Console-script entry points can omit the app directory from sys.path.
-    sys.path.insert(0, str(cwd))
-
-
-def _load_symbol(spec: str, *, label: str) -> object:
-    module_name, separator, attr_path = spec.partition(":")
-    if not separator or not module_name or not attr_path:
-        raise CliError(f"Invalid {label} '{spec}'. Use 'module:callable'.")
-
-    _ensure_cwd_on_syspath()
-
-    try:
-        current: object = importlib.import_module(module_name)
-    except Exception as exc:
-        raise CliError(
-            f"Could not import module '{module_name}' for {label} '{spec}': {exc}"
-        ) from exc
-
-    for part in attr_path.split("."):
-        try:
-            current = getattr(current, part)
-        except AttributeError as exc:
-            raise CliError(
-                f"Module '{module_name}' does not define '{attr_path}' for {label} '{spec}'."
-            ) from exc
-
-    return current
-
-
-def load_bootstrap(spec: str) -> AppBootstrap:
-    """Import ``module:callable`` and wrap it with ``normalize_bootstrap`` for ``Server``."""
-    bootstrap = _load_symbol(spec, label="app")
+def load_bootstrap(spec: str) -> Bootstrap:
+    """Import `module:callable` for `Server`."""
+    bootstrap = load_symbol(spec, label="app")
     if not callable(bootstrap):
         raise CliError(f"App '{spec}' must be callable.")
-    return normalize_bootstrap(cast(BootstrapCandidate, bootstrap))
-
-
-def resolve_tracer(spec: str | None) -> Tracer:
-    """Resolve ``auto``/built-in names/``STARIO_TRACER``/``module:callable`` to a tracer instance."""
-    # CLI --tracer wins; when omitted or auto, STARIO_TRACER picks the sink (Cosmo deploys use this).
-    if spec not in (None, "", "auto"):
-        effective = spec
-    else:
-        effective = os.environ.get("STARIO_TRACER", "").strip() or "auto"
-
-    try:
-        if effective == "auto":
-            if sys.stdout.isatty():
-                return TTYTracer.from_env()
-            return JsonTracer.from_env()
-        if effective == "tty":
-            return TTYTracer.from_env()
-        if effective == "json":
-            return JsonTracer.from_env()
-        if effective == "noop":
-            return NoOpTracer.from_env()
-        if effective == "sqlite":
-            return SqliteTracer.from_env()
-
-        loaded = _load_symbol(effective, label="telemetry output")
-        if not callable(loaded):
-            raise CliError(f"Telemetry output '{effective}' must be callable.")
-        tracer = cast(Callable[[], Tracer], loaded)()
-        for name in ("__enter__", "__exit__", "create", "start", "end"):
-            if not callable(getattr(tracer, name, None)):
-                raise CliError(
-                    f"Telemetry output '{effective}' must return a Tracer (missing {name!r})."
-                )
-        return tracer
-    except ValueError as exc:
-        raise CliError(str(exc)) from exc
-
-
-def _resolve_cli_loop(
-    loop: CliLoop,
-) -> tuple[CliLoop, Callable[[], asyncio.AbstractEventLoop] | None]:
-    if loop == "asyncio":
-        return loop, None
-
-    if sys.platform == "win32":
+    if not inspect.isasyncgenfunction(bootstrap):
         raise CliError(
-            "uvloop is not supported on Windows. Use --loop asyncio."
+            f"App '{spec}' must be an async generator function "
+            "(async def bootstrap(app, span): ...; yield)."
         )
-
-    try:
-        uvloop = importlib.import_module("uvloop")
-    except ImportError as exc:
-        raise CliError(
-            "uvloop is not installed. Install it or use --loop asyncio."
-        ) from exc
-
-    loop_factory = getattr(uvloop, "new_event_loop", None)
-    if loop_factory is None:
-        raise CliError(
-            "uvloop is installed but does not expose new_event_loop(). Use --loop asyncio."
-        )
-    return loop, cast(Callable[[], asyncio.AbstractEventLoop], loop_factory)
-
-
-def _run_cli_awaitable(
-    awaitable: Coroutine[Any, Any, object],
-    *,
-    loop_factory: Callable[[], asyncio.AbstractEventLoop] | None,
-) -> None:
-    if loop_factory is None:
-        asyncio.run(awaitable)
-        return
-
-    with asyncio.Runner(loop_factory=loop_factory) as runner:
-        runner.run(awaitable)
-
-
-def _is_watch_glob(spec: str) -> bool:
-    return any(char in WATCH_GLOB_CHARS for char in spec)
-
-
-def _normalize_watch_spec(spec: str, *, option_name: str) -> str:
-    normalized = spec.strip()
-    if not normalized:
-        raise CliError(f"{option_name} entries cannot be empty.")
-    return normalized
-
-
-def _coerce_watch_path_spec(spec: str, *, option_name: str) -> _WatchPathSpec:
-    normalized = _normalize_watch_spec(spec, option_name=option_name)
-    directory_hint = normalized.endswith(("/", "\\"))
-    stripped = normalized.rstrip("/\\")
-    if not stripped:
-        stripped = normalized
-    candidate = Path(stripped)
-    return _WatchPathSpec(
-        path=candidate.resolve(),
-        recursive=directory_hint or candidate.is_dir(),
-    )
-
-
-def _path_match_candidates(path: str, *, cwd: Path) -> set[str]:
-    resolved_path = Path(path).resolve()
-    candidates = {
-        Path(path).name,
-        path.replace("\\", "/"),
-        resolved_path.as_posix(),
-    }
-    try:
-        relative = resolved_path.relative_to(cwd)
-    except ValueError:
-        return candidates
-
-    relative_text = relative.as_posix()
-    candidates.add(relative_text)
-    if relative_text != ".":
-        candidates.add(f"./{relative_text}")
-    return candidates
-
-
-def _matches_path_spec(path: Path, spec: _WatchPathSpec) -> bool:
-    if spec.recursive:
-        return path == spec.path or path.is_relative_to(spec.path)
-    return path == spec.path
-
-
-def _nearest_existing_dir(path: Path) -> Path:
-    candidate = path if path.is_dir() else path.parent
-    while True:
-        if candidate.exists():
-            return candidate if candidate.is_dir() else candidate.parent
-        parent = candidate.parent
-        if parent == candidate:
-            return Path.cwd().resolve()
-        candidate = parent
-
-
-def _watch_root_for_path_spec(spec: _WatchPathSpec) -> Path:
-    return _nearest_existing_dir(spec.path if spec.recursive else spec.path.parent)
-
-
-def _watch_root_for_glob(spec: str) -> Path:
-    normalized = spec.replace("\\", "/")
-    is_absolute = normalized.startswith("/")
-    prefix_parts: list[str] = []
-    for part in normalized.split("/"):
-        if not part or part == ".":
-            continue
-        if _is_watch_glob(part):
-            break
-        prefix_parts.append(part)
-
-    root = Path("/" if is_absolute else ".")
-    if prefix_parts:
-        root = root.joinpath(*prefix_parts)
-    return _nearest_existing_dir(root.resolve())
-
-
-def _display_watch_root(path: Path, *, cwd: Path) -> str:
-    try:
-        relative = path.relative_to(cwd)
-    except ValueError:
-        return str(path)
-    return "." if not relative.parts else relative.as_posix()
-
-
-def _build_watch_plan(
-    *,
-    watch_specs: Sequence[str],
-    ignore_specs: Sequence[str],
-) -> _WatchPlan:
-    cwd = Path.cwd().resolve()
-    raw_watch_specs = tuple(
-        _normalize_watch_spec(spec, option_name="--watch")
-        for spec in (watch_specs or (".",))
-    )
-    raw_ignore_specs = tuple(
-        _normalize_watch_spec(spec, option_name="--watch-ignore")
-        for spec in (*DEFAULT_WATCH_IGNORE_SPECS, *ignore_specs)
-    )
-
-    include_paths = tuple(
-        _coerce_watch_path_spec(spec, option_name="--watch")
-        for spec in raw_watch_specs
-        if not _is_watch_glob(spec)
-    )
-    include_globs = tuple(spec for spec in raw_watch_specs if _is_watch_glob(spec))
-    ignore_paths = tuple(
-        _coerce_watch_path_spec(spec, option_name="--watch-ignore")
-        for spec in raw_ignore_specs
-        if not _is_watch_glob(spec)
-    )
-    ignore_globs = tuple(spec for spec in raw_ignore_specs if _is_watch_glob(spec))
-
-    roots: list[str] = []
-    for path_spec in include_paths:
-        roots.append(_display_watch_root(_watch_root_for_path_spec(path_spec), cwd=cwd))
-    for glob_spec in include_globs:
-        roots.append(_display_watch_root(_watch_root_for_glob(glob_spec), cwd=cwd))
-
-    return _WatchPlan(
-        roots=tuple(dict.fromkeys(roots)) or (".",),
-        include_paths=include_paths,
-        include_globs=include_globs,
-        ignore_paths=ignore_paths,
-        ignore_globs=ignore_globs,
-    )
-
-
-def _build_watch_filter(plan: _WatchPlan) -> Callable[[Any, str], bool]:
-    from watchfiles.filters import DefaultFilter
-
-    cwd = Path.cwd().resolve()
-    default_filter = DefaultFilter()
-
-    def _filter(change: Any, path: str) -> bool:
-        if not default_filter(change, path):
-            return False
-
-        resolved_path = Path(path).resolve()
-        candidates = _path_match_candidates(path, cwd=cwd)
-
-        if plan.include_paths or plan.include_globs:
-            included_by_path = any(
-                _matches_path_spec(resolved_path, spec) for spec in plan.include_paths
-            )
-            included_by_glob = any(
-                fnmatch(candidate, pattern)
-                for candidate in candidates
-                for pattern in plan.include_globs
-            )
-            if not (included_by_path or included_by_glob):
-                return False
-
-        if any(_matches_path_spec(resolved_path, spec) for spec in plan.ignore_paths):
-            return False
-
-        return not any(
-            fnmatch(candidate, pattern)
-            for candidate in candidates
-            for pattern in plan.ignore_globs
-        )
-
-    return _filter
+    return cast(Bootstrap, bootstrap)
 
 
 def _check_unix_socket_supported(unix_socket: str | None) -> None:
-    """``AF_UNIX`` is Unix-only on most Python builds; Windows may lack it entirely."""
+    """`AF_UNIX` is Unix-only on most Python builds; Windows may lack it entirely."""
     if unix_socket is None:
         return
     if not hasattr(socket, "AF_UNIX"):
         raise CliError(
             "Unix domain sockets are not available on this platform. "
-            "Use --host and --port instead."
+            "Unset STARIO_UNIX_SOCKET or use STARIO_HOST and STARIO_PORT."
         )
 
 
-def _join_command_line_for_watchfiles(argv: list[str]) -> str:
-    """Command string for watchfiles; must match ``watchfiles.run.split_cmd`` (POSIX vs Windows)."""
-    if sys.platform == "win32":
-        return subprocess.list2cmdline(argv)
-    return shlex.join(argv)
+def serve_once(app_spec: str) -> None:
+    """CLI entry: load bootstrap, pick tracer, construct `Server`, block until shutdown."""
+    config = server_config_from_env()
+    _check_unix_socket_supported(config.unix_socket)
 
-
-def serve_once(
-    app_spec: str,
-    *,
-    loop: CliLoop,
-    tracer_spec: str | None,
-    host: str,
-    port: int,
-    unix_socket: str | None,
-    compression: CompressionConfig,
-    max_request_header_bytes: int,
-    max_request_body_bytes: int,
-) -> None:
-    """CLI entry: load bootstrap, pick tracer, construct ``Server``, block until shutdown signal."""
-    _check_unix_socket_supported(unix_socket)
-    loop_name, loop_factory = _resolve_cli_loop(loop)
     bootstrap = load_bootstrap(app_spec)
-    tracer = resolve_tracer(tracer_spec)
-
-    async def runner() -> None:
+    tracer = tracer_from_env()
+    try:
         with tracer:
-            server = Server(
-                bootstrap,
-                tracer,
-                host=host,
-                port=port,
-                unix_socket=unix_socket,
-                compression=compression,
-                event_loop_name=loop_name,
-                max_request_header_bytes=max_request_header_bytes,
-                max_request_body_bytes=max_request_body_bytes,
-            )
-            await server.run()
-
-    _run_cli_awaitable(runner(), loop_factory=loop_factory)
-
-
-def _serve_command_argv(
-    app_spec: str,
-    *,
-    loop: CliLoop,
-    tracer_spec: str | None,
-    host: str,
-    port: int,
-    unix_socket: str | None,
-    compression: CompressionConfig,
-    max_request_header_bytes: int,
-    max_request_body_bytes: int,
-) -> list[str]:
-    argv = [
-        sys.executable,
-        "-m",
-        "stario.cli",
-        "serve",
-        app_spec,
-        "--loop",
-        loop,
-        "--host",
-        host,
-        "--port",
-        str(port),
-    ]
-    if unix_socket is not None:
-        argv.extend(["--unix-socket", unix_socket])
-    argv.extend(
-        [
-            "--max-request-header-bytes",
-            str(max_request_header_bytes),
-            "--max-request-body-bytes",
-            str(max_request_body_bytes),
-        ]
-    )
-    if tracer_spec not in (None, "", "auto"):
-        argv.extend(["--tracer", tracer_spec])
-    argv.extend(
-        [
-            "--compress-min-size",
-            str(compression.min_size),
-            "--compress-zstd-level",
-            str(compression.zstd_level),
-        ]
-    )
-    if compression.zstd_window_log is not None:
-        argv.extend(["--compress-zstd-window-log", str(compression.zstd_window_log)])
-    argv.extend(
-        [
-            "--compress-brotli-level",
-            str(compression.brotli_level),
-        ]
-    )
-    if compression.brotli_window_log is not None:
-        argv.extend(
-            ["--compress-brotli-window-log", str(compression.brotli_window_log)]
-        )
-    argv.extend(
-        [
-            "--compress-gzip-level",
-            str(compression.gzip_level),
-        ]
-    )
-    if compression.gzip_window_bits is not None:
-        argv.extend(
-            ["--compress-gzip-window-bits", str(compression.gzip_window_bits)]
-        )
-    return argv
-
-
-def _build_serve_command(
-    app_spec: str,
-    *,
-    loop: CliLoop,
-    tracer_spec: str | None,
-    host: str,
-    port: int,
-    unix_socket: str | None,
-    compression: CompressionConfig,
-    max_request_header_bytes: int,
-    max_request_body_bytes: int,
-) -> str:
-    return _join_command_line_for_watchfiles(
-        _serve_command_argv(
-            app_spec,
-            loop=loop,
-            tracer_spec=tracer_spec,
-            host=host,
-            port=port,
-            unix_socket=unix_socket,
-            compression=compression,
-            max_request_header_bytes=max_request_header_bytes,
-            max_request_body_bytes=max_request_body_bytes,
-        )
-    )
+            Server(bootstrap, tracer, config=config).run()
+    except StarioError as exc:
+        raise CliError(str(exc)) from exc
 
 
 def watch_app(
     app_spec: str,
     *,
-    loop: CliLoop,
-    tracer_spec: str | None,
-    host: str,
-    port: int,
-    unix_socket: str | None,
-    compression: CompressionConfig,
-    max_request_header_bytes: int,
-    max_request_body_bytes: int,
     watch_specs: Sequence[str],
     watch_ignore_specs: Sequence[str] = (),
 ) -> None:
-    """Restart the dev server when matched paths change (requires ``watchfiles``)."""
-    _check_unix_socket_supported(unix_socket)
-    try:
-        from watchfiles import run_process as watch_run_process
-    except ImportError as exc:
-        raise CliError(
-            "watchfiles is not installed. Use 'stario serve' or install the dependency."
-        ) from exc
+    """Restart the dev server when watched paths change.
 
-    watch_plan = _build_watch_plan(
-        watch_specs=watch_specs,
-        ignore_specs=watch_ignore_specs,
+    Uses watchfiles `run_process` with a `stario serve` subprocess per reload so
+    reload children do not re-import watchfiles through multiprocessing spawn.
+    Each reload is a full re-import with a fresh read of `STARIO_*` env vars.
+    watchfiles debounces changes by about 1.6s by default. If the child exits
+    with an error, the parent keeps watching but does not restart until the next
+    file change.
+
+    `--watch` is path-only: a watched file reloads when that file changes; a
+    watched directory reloads for any child path under it because watchfiles
+    watches recursively by default.
+
+    `--watch-ignore` accepts paths and simple filename globs. An ignored file is
+    skipped; an ignored directory skips everything below that directory. A glob
+    such as `*.db` matches a file or directory name anywhere under the watched
+    paths. Path globs such as `data/*.db` are deliberately not supported.
+    """
+    from watchfiles import run_process
+    from watchfiles.filters import DefaultFilter
+
+    _check_unix_socket_supported(unix_socket_from_env())
+
+    stripped = tuple(spec.strip() for spec in watch_specs)
+    paths = tuple(dict.fromkeys(stripped)) or (".",)
+    ignore_paths: list[str] = []
+    ignore_globs: list[str] = []
+
+    for spec in paths:
+        if not spec:
+            raise CliError("--watch entries cannot be empty.")
+        if any(char in spec for char in WATCH_GLOB_CHARS):
+            raise CliError(
+                "--watch expects paths, not glob patterns; "
+                "watch directories recursively instead."
+            )
+        if not Path(spec).exists():
+            raise CliError(f"--watch path does not exist: {spec!r}")
+
+    for spec in (spec.strip() for spec in watch_ignore_specs):
+        if not spec:
+            raise CliError("--watch-ignore entries cannot be empty.")
+        if any(char in spec for char in WATCH_GLOB_CHARS):
+            if any(separator in spec for separator in WATCH_PATH_SEPARATORS):
+                raise CliError(
+                    "--watch-ignore supports simple filename globs only; "
+                    "use a directory path for path ignores."
+                )
+            ignore_globs.append(spec)
+        else:
+            if not Path(spec).exists():
+                raise CliError(f"--watch-ignore path does not exist: {spec!r}")
+            ignore_paths.append(spec)
+
+    watch_filter = DefaultFilter(
+        ignore_entity_patterns=(
+            *DefaultFilter.ignore_entity_patterns,
+            *WATCH_IGNORE_ENTITY_SUFFIXES,
+            *(glob_to_regex(pattern) for pattern in ignore_globs),
+        ),
+        ignore_paths=tuple(Path(spec).resolve() for spec in ignore_paths),
     )
-    _watch_cli_line(
-        _cli_style(
-            f"Watching {', '.join(watch_plan.roots)} for changes...",
+    echo(
+        style(
+            f"Watching {', '.join(paths)} for changes...",
             fg="cyan",
         )
     )
 
-    def _announce_reload(_changes: object) -> None:
-        _watch_cli_line(_cli_style("Changes detected, reloading...", fg="yellow"))
+    def on_reload(_changes: object) -> None:
+        echo(style("Changes detected, reloading...", fg="yellow"))
 
-    command = _build_serve_command(
-        app_spec,
-        loop=loop,
-        tracer_spec=tracer_spec,
-        host=host,
-        port=port,
-        unix_socket=unix_socket,
-        compression=compression,
-        max_request_header_bytes=max_request_header_bytes,
-        max_request_body_bytes=max_request_body_bytes,
+    config = server_config_from_env()
+    # Match watchfiles' wait budget to the server's drain window (+ force-close cap).
+    sigint_timeout = max(1, math.ceil(config.graceful_shutdown_timeout + 1.0))
+    serve_command = " ".join(
+        shlex.quote(part)
+        for part in (sys.executable, "-m", "stario.cli", "serve", app_spec)
     )
-    watch_filter = _build_watch_filter(watch_plan)
 
-    watch_run_process(
-        *watch_plan.roots,
-        target=command,
+    run_process(
+        *paths,
+        target=serve_command,
         target_type="command",
-        callback=_announce_reload,
+        callback=on_reload,
         watch_filter=watch_filter,
+        sigint_timeout=sigint_timeout,
     )

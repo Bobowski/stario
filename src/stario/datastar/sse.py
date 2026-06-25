@@ -1,300 +1,207 @@
-"""Datastar SSE events on a ``Writer`` (first write sets ``text/event-stream`` headers).
+"""Datastar Server-Sent Events bound to one response writer.
 
-Typical flow: long-lived handler + ``async with w.alive()`` + ``patch_*`` calls.
-Docstring ``# SSE:`` lines sketch the bytes written (``event:`` / ``data:``), not HTML pages.
-
-``redirect`` is a **client-side** navigation: it streams a small script patch so the browser sets
-``window.location`` after the SSE event—unlike ``responses.redirect()``, it is not an HTTP 3xx response.
+Create one `SSE` per response: `sse = SSE(w)`. The stream opens when you call
+`sse.open()` or when the first event is written.
 """
 
 import json
 from collections.abc import Mapping
-from functools import lru_cache
 from typing import Any, Literal
-from urllib.parse import quote
 
 from stario.exceptions import StarioError, StarioRuntime
-from stario.html import render as render_html
+from stario.http.redirect import normalized_location
 from stario.http.writer import Writer
+from stario.markup.render import render
+from stario.responses import JsonValue
 
-type JsonScalar = str | int | float | bool | None
-type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+from .format import require_mapping, validate_signal_name
+
 type JsonObject = Mapping[str, JsonValue]
+type PatchMode = Literal[
+    "outer", "inner", "replace", "prepend", "append", "before", "after"
+]
+type Namespace = Literal["svg", "mathml"]
+
+_PATCH_MODE_NAMES = (
+    "outer",
+    "inner",
+    "replace",
+    "prepend",
+    "append",
+    "before",
+    "after",
+)
+_PATCH_MODES = frozenset(_PATCH_MODE_NAMES)
+_PATCH_MODE_HELP = "Use one of: " + ", ".join(_PATCH_MODE_NAMES) + "."
+_NAMESPACES = ("svg", "mathml")
+_EVENT_PATCH_ELEMENTS = b"event: datastar-patch-elements"
+_EVENT_PATCH_SIGNALS = b"event: datastar-patch-signals"
 
 
-@lru_cache(maxsize=16)
-def _data_mode(mode: str) -> bytes:
-    return f"data: mode {mode}".encode("ascii")
-
-
-@lru_cache(maxsize=128)
-def _data_selector(selector: str) -> bytes:
-    return f"data: selector {selector}".encode("utf-8")
-
-
-@lru_cache(maxsize=4)
-def _data_namespace(namespace: str) -> bytes:
-    return f"data: namespace {namespace}".encode("ascii")
-
-
-def _render_html_bytes(content: Any) -> bytes:
-    if isinstance(content, bytes):
-        return content
-    if isinstance(content, str):
-        return content.encode("utf-8")
-    return render_html(content).encode("utf-8")
-
-
-def _encode_json_object(payload: JsonObject | bytes) -> bytes:
-    if isinstance(payload, bytes):
-        if not payload.lstrip().startswith(b"{"):
-            raise StarioError(
-                "Signal payload must be a JSON object",
-                context={"payload": payload[:100]},
-                help_text="Pass a dict or pre-serialized JSON object bytes.",
-            )
-        return payload
-
-    return json.dumps(dict(payload), separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
-    )
-
-
-def _normalize_redirect_target(url: str) -> str:
-    if "\r" in url or "\n" in url:
+def _sse_field_value(name: str, value: str) -> bytes:
+    """Encode one logical SSE field value; payload newlines are handled elsewhere."""
+    if "\r" in value or "\n" in value:
         raise StarioError(
-            "Redirect target must not contain control characters",
-            context={"url": url},
-            help_text="Remove CR/LF characters from redirect and navigation targets.",
-        )
-
-    if url.startswith("/") and (url.startswith("//") or "\\" in url):
-        raise StarioError(
-            "Relative redirect target must be a safe app-relative path",
-            context={"url": url},
+            "Datastar SSE field values must not contain line breaks",
+            context={"field": name, "value": value[:100]},
             help_text=(
-                "Use a path starting with '/' and avoid protocol-relative or "
-                "backslash-containing URLs."
+                "Only event payloads may be multiline. Keep selector and option "
+                "values on one line."
             ),
         )
+    return value.encode()
 
-    return quote(str(url), safe=":/%#?=@[]!$&'()*+,;")
 
+class SSE:
+    """Datastar SSE response bound to one `Writer`.
 
-def _safe_sse_navigation_url(url: str) -> str:
-    """Reject dangerous URL schemes for client-side navigation (``javascript:``, ``data:``, …)."""
-    normalized = _normalize_redirect_target(url)
-    stripped = normalized.lstrip()
-    lower = stripped.lower()
-    for bad in ("javascript:", "data:", "vbscript:"):
-        if lower.startswith(bad):
+    `open()` sends headers immediately. If you skip it, the first event opens the
+    stream. Event bytes still go through `Writer.write()`, so normal streaming
+    compression policy applies. Top-level `patch_signals()` keys are snake_case;
+    use nested JSON objects for nested state rather than dotted signal paths.
+    """
+
+    __slots__ = ("w",)
+
+    def __init__(self, w: Writer) -> None:
+        self.w = w
+
+    def open(self) -> None:
+        """Send `text/event-stream` headers now, before the first event."""
+        self._prepare_headers()
+        if not self.w.started:
+            self.w.write_headers(200)
+
+    def patch_elements(
+        self,
+        content: Any,
+        *,
+        mode: PatchMode | None = None,
+        selector: str | None = None,
+        namespace: Namespace | None = None,
+        view_transition: bool = False,
+        view_transition_selector: str | None = None,
+    ) -> None:
+        """Patch DOM elements with bytes, text, or Stario markup."""
+        if mode is not None and mode not in _PATCH_MODES:
             raise StarioError(
-                "SSE redirect URL uses a forbidden scheme",
-                context={"url": url},
-                help_text="Use an app-relative path or https: URL for sse.redirect().",
+                "Unknown Datastar patch mode",
+                context={"mode": str(mode)},
+                help_text=_PATCH_MODE_HELP,
             )
-    return normalized
+        if namespace is not None and namespace not in _NAMESPACES:
+            raise StarioError(
+                "Unknown Datastar patch namespace",
+                context={"namespace": str(namespace)},
+                help_text="Use 'svg', 'mathml', or omit namespace.",
+            )
 
+        lines = [_EVENT_PATCH_ELEMENTS]
+        if mode is not None:
+            lines.append(f"data: mode {mode}".encode("ascii"))
+        if selector:
+            lines.append(b"data: selector " + _sse_field_value("selector", selector))
+        if namespace:
+            lines.append(f"data: namespace {namespace}".encode("ascii"))
+        if view_transition:
+            lines.append(b"data: useViewTransition true")
+        if view_transition_selector is not None:
+            lines.append(
+                b"data: viewTransitionSelector "
+                + _sse_field_value("viewTransitionSelector", view_transition_selector)
+            )
 
-def _ensure_sse_headers(w: Writer) -> None:
-    if w.completed:
-        raise StarioRuntime(
-            "Cannot send SSE events after the response is completed",
-            help_text=(
-                "Start the Datastar stream before calling response helpers like "
-                "`responses.html()`, `responses.redirect()`, `responses.empty()`, or `w.end()`."
-            ),
-            example=(
-                "from stario import datastar as ds\n\n"
-                "ds.sse.patch_elements(w, view)\n"
-                "ds.sse.patch_signals(w, {'count': 1})"
-            ),
+        if isinstance(content, bytes):
+            html_bytes = content
+        elif isinstance(content, str):
+            html_bytes = content.encode("utf-8")
+        else:
+            html_bytes = render(content).encode("utf-8")
+
+        # SSE represents multiline payloads as repeated `data:` lines.
+        for line in html_bytes.split(b"\n"):
+            lines.append(b"data: elements " + line)
+
+        self._prepare_headers()
+        self.w.write(b"\n".join(lines) + b"\n\n")
+
+    def patch_signals(
+        self,
+        payload: JsonObject,
+        *,
+        only_if_missing: bool = False,
+    ) -> None:
+        """Patch Datastar signals from a JSON-shaped mapping."""
+        data = dict(require_mapping("patch_signals", payload))
+        for key in data:
+            validate_signal_name(key)
+        json_bytes = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
         )
+        lines = [_EVENT_PATCH_SIGNALS]
+        if only_if_missing:
+            lines.append(b"data: onlyIfMissing true")
+        for line in json_bytes.split(b"\n"):
+            lines.append(b"data: signals " + line)
+        self._prepare_headers()
+        self.w.write(b"\n".join(lines) + b"\n\n")
 
-    if w.started:
-        ct = w.headers.get("content-type")
-        if ct is None or "text/event-stream" not in ct.lower():
+    def navigate(self, url: str) -> None:
+        """Navigate the browser from an SSE response; not an HTTP redirect."""
+        safe_url = json.dumps(normalized_location(url))
+        self.execute_script(f"setTimeout(() => window.location = {safe_url});")
+
+    def execute_script(self, code: str, *, auto_remove: bool = True) -> None:
+        """Run trusted developer-authored JavaScript by appending a script element.
+
+        The code is streamed verbatim; do not interpolate untrusted input.
+        """
+        code_bytes = code.encode("utf-8")
+        if auto_remove:
+            script = b'<script data-effect="el.remove();">' + code_bytes + b"</script>"
+        else:
+            script = b"<script>" + code_bytes + b"</script>"
+        self.patch_elements(script, mode="append", selector="body")
+
+    def remove(self, selector: str) -> None:
+        """Remove nodes matching `selector`."""
+        lines = [
+            _EVENT_PATCH_ELEMENTS,
+            b"data: mode remove",
+            b"data: selector " + _sse_field_value("selector", selector),
+        ]
+        self._prepare_headers()
+        self.w.write(b"\n".join(lines) + b"\n\n")
+
+    def _prepare_headers(self) -> None:
+        w = self.w
+        if w.completed:
             raise StarioRuntime(
-                "Cannot send Datastar SSE events: response already started without "
-                "Content-Type: text/event-stream",
+                "Cannot send SSE events after the response is completed",
                 help_text=(
-                    "Call Datastar SSE helpers first for this response, or send SSE before "
-                    "any other body or non-SSE Content-Type."
+                    "Create and use `SSE(w)` before response helpers like "
+                    "`responses.html()`, `responses.redirect()`, `responses.empty()`, or `w.end()`."
+                ),
+                example=(
+                    "from stario.datastar import SSE\n\n"
+                    "sse = SSE(w)\n"
+                    "sse.patch_elements(view)\n"
+                    "sse.patch_signals({'count': 1})"
                 ),
             )
-        return
 
-    w.headers.rset(b"content-type", b"text/event-stream")
-    w.headers.rset(b"cache-control", b"no-cache")
-    w.headers.rset(b"connection", b"keep-alive")
+        if w.started:
+            content_type = w.headers.unsafe_get(b"content-type")
+            if content_type is None or b"text/event-stream" not in content_type.lower():
+                raise StarioRuntime(
+                    "Cannot send Datastar SSE events: response already started without "
+                    "Content-Type: text/event-stream",
+                    help_text=(
+                        "Create `SSE(w)` and send SSE before any other body or "
+                        "non-SSE Content-Type."
+                    ),
+                )
+            return
 
-
-def _patch_elements_event(
-    html: bytes,
-    *,
-    mode: str = "outer",
-    selector: str | None = None,
-    namespace: str | None = None,
-    use_view_transition: bool = False,
-) -> bytes:
-    lines = [b"event: datastar-patch-elements"]
-    append = lines.append
-
-    if mode != "outer":
-        append(_data_mode(mode))
-
-    if selector:
-        append(_data_selector(selector))
-
-    if namespace:
-        append(_data_namespace(namespace))
-
-    if use_view_transition:
-        append(b"data: useViewTransition true")
-
-    # Write multiline HTML as repeated SSE data lines
-    for line in html.split(b"\n"):
-        append(b"data: elements " + line)
-
-    return b"\n".join(lines) + b"\n\n"
-
-
-def _patch_signals_event(
-    json_bytes: bytes,
-    *,
-    only_if_missing: bool = False,
-) -> bytes:
-    lines = [b"event: datastar-patch-signals"]
-    append = lines.append
-
-    if only_if_missing:
-        append(b"data: onlyIfMissing true")
-
-    for line in json_bytes.split(b"\n"):
-        append(b"data: signals " + line)
-
-    return b"\n".join(lines) + b"\n\n"
-
-
-def _script_event(
-    code: str,
-    *,
-    auto_remove: bool = True,
-) -> bytes:
-    code_bytes = code.encode("utf-8")
-    if auto_remove:
-        html = b'<script data-effect="el.remove();">' + code_bytes + b"</script>"
-    else:
-        html = b"<script>" + code_bytes + b"</script>"
-    return _patch_elements_event(html, mode="append", selector="body")
-
-
-def _redirect_event(url: str) -> bytes:
-    safe_url = json.dumps(url)
-    return _script_event(f"setTimeout(() => window.location = {safe_url});")
-
-
-def _remove_event(selector: str) -> bytes:
-    lines = [
-        b"event: datastar-patch-elements",
-        b"data: mode remove",
-        _data_selector(selector),
-    ]
-    return b"\n".join(lines) + b"\n\n"
-
-
-def patch_elements(
-    w: Writer,
-    content: Any,
-    *,
-    mode: Literal["outer", "inner", "prepend", "append", "before", "after"] = "outer",
-    selector: str | None = None,
-    namespace: Literal["svg", "mathml"] | None = None,
-    use_view_transition: bool = False,
-) -> None:
-    """Stream an element patch (replace, append, …). ``content`` may be bytes, str, or HTML nodes.
-
-    ```python
-    async def live(c, w):
-        async with w.alive():
-            ds.sse.patch_elements(w, h.Div(h.P("Hello")))
-            # SSE: event: datastar-patch-elements … data: elements <div><p>Hello</p></div>
-            await asyncio.sleep(1)
-            ds.sse.patch_elements(w, h.Div(h.P("Updated")), selector="#slot", mode="inner")
-            # SSE: … data: mode inner … data: selector #slot … data: elements <div><p>Updated</p></div>
-    ```
-    """
-    _ensure_sse_headers(w)
-    w.write(
-        _patch_elements_event(
-            _render_html_bytes(content),
-            mode=mode,
-            selector=selector,
-            namespace=namespace,
-            use_view_transition=use_view_transition,
-        )
-    )
-
-
-def patch_signals(
-    w: Writer,
-    payload: JsonObject | bytes,
-    *,
-    only_if_missing: bool = False,
-) -> None:
-    """Push signal updates to the client (merge into the page store).
-
-    ```python
-    ds.sse.patch_signals(w, {"count": 2, "status": "ok"})
-    # SSE: event: datastar-patch-signals … data: signals {"count":2,"status":"ok"}
-    ```
-    """
-    _ensure_sse_headers(w)
-    w.write(
-        _patch_signals_event(
-            _encode_json_object(payload),
-            only_if_missing=only_if_missing,
-        )
-    )
-
-
-def redirect(w: Writer, url: str) -> None:
-    """Client-side navigation (not an HTTP 3xx): streams a script that sets ``window.location``.
-
-    The browser navigates after it applies the SSE patch—unlike ``responses.redirect()``,
-    there is no ``Location`` response header.
-
-    ```python
-    ds.sse.redirect(w, "/done")
-    # SSE: … data: elements <script data-effect="el.remove();">setTimeout(() => window.location = "/done");</script>
-    ```
-    """
-    _ensure_sse_headers(w)
-    w.write(_redirect_event(_safe_sse_navigation_url(url)))
-
-
-def execute(w: Writer, code: str, *, auto_remove: bool = True) -> None:
-    """Run JS on the client by patching a script element (removed by default).
-
-    Convenience over ``patch_elements``: serializes ``code`` into ``<script>`` HTML and
-    streams an **append-to-body** patch (same wire path as other element patches).
-
-    ```python
-    ds.sse.execute(w, "console.info('tick')")
-    # SSE: … data: elements <script data-effect="el.remove();">console.info('tick')</script>
-    ```
-    """
-    _ensure_sse_headers(w)
-    w.write(_script_event(code, auto_remove=auto_remove))
-
-
-def remove(w: Writer, selector: str) -> None:
-    """Remove nodes matching ``selector`` via a patch.
-
-    ```python
-    ds.sse.remove(w, "#toast")
-    # SSE: event: datastar-patch-elements … data: mode remove … data: selector #toast
-    ```
-    """
-    _ensure_sse_headers(w)
-    w.write(_remove_event(selector))
+        w.headers.unsafe_set(b"content-type", b"text/event-stream")
+        w.headers.unsafe_set(b"cache-control", b"no-cache")

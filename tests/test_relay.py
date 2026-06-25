@@ -1,342 +1,183 @@
 """Tests for stario.relay - In-process pub/sub."""
 
 import asyncio
+import queue
+import threading
 
 import pytest
 
-from stario.relay import Relay, _deduplicate_patterns, _matching_patterns
+from stario.exceptions import StarioError, StarioRuntime
+from stario.relay import Relay
 
 
-def _pattern_cleared(relay: Relay, pattern: str) -> bool:
-    """True when no subscribers remain at this pattern string."""
-    return pattern not in relay._subs
+async def _collect_one(
+    relay: Relay, pattern: str, subject: str, data: object = None
+) -> None:
+    """Start a single-shot subscriber; publish once; wait until it receives or times out."""
+    received: list[tuple[str, object]] = []
+    done = asyncio.Event()
 
+    async def subscriber() -> None:
+        async with relay.subscribe(pattern) as sub:
+            s, d = await sub.receive()
+            received.append((s, d))
+            done.set()
 
-def _naive_pattern_enumeration(subject: str) -> tuple[str, ...]:
-    """Reference list of pattern strings (tests only; not used by ``Relay.publish``)."""
-    parts = subject.split(".")
-    patterns = [subject]
-    for i in range(len(parts) - 1, 0, -1):
-        patterns.append(".".join(parts[:i]) + ".*")
-    patterns.append("*")
-    return tuple(patterns)
-
-
-class TestMatchingPatterns:
-    """Naive pattern enumeration stays aligned with relay semantics (documentation / regression)."""
-
-    def test_simple_subject(self):
-        patterns = _naive_pattern_enumeration("room.123")
-        assert "room.123" in patterns
-        assert "room.*" in patterns
-        assert "*" in patterns
-
-    def test_deep_subject(self):
-        patterns = _naive_pattern_enumeration("room.123.moves.1")
-        assert "room.123.moves.1" in patterns
-        assert "room.123.moves.*" in patterns
-        assert "room.123.*" in patterns
-        assert "room.*" in patterns
-        assert "*" in patterns
-
-    def test_single_segment(self):
-        patterns = _naive_pattern_enumeration("simple")
-        assert "simple" in patterns
-        assert "*" in patterns
-
-    def test_order_most_specific_first(self):
-        patterns = _naive_pattern_enumeration("a.b.c")
-        # Exact match should be first
-        assert patterns[0] == "a.b.c"
-        # Wildcard should be last
-        assert patterns[-1] == "*"
-
-    def test_matching_patterns_same_as_naive_as_set(self):
-        """``_matching_patterns`` is the same key set as the naive tuple (order not defined)."""
-        subject = "room.123.moves"
-        assert _matching_patterns(subject) == frozenset(_naive_pattern_enumeration(subject))
-
-    def test_matching_patterns_literal_star_segment_no_duplicate_row(self):
-        """Last segment ``*``: loop must not repeat the full subject before ``frozenset``."""
-        assert _matching_patterns("room.123.*") == frozenset({"room.123.*", "room.*", "*"})
-
-
-class TestDeduplicatePatterns:
-    def test_star_subsumes_all(self):
-        assert _deduplicate_patterns(("users.*", "*")) == frozenset({"*"})
-
-    def test_users_wildcard_subsumes_exact_user_id(self):
-        assert _deduplicate_patterns(("users.*", "users.user1234")) == frozenset({"users.*"})
-
-    def test_independent_exact_patterns_kept(self):
-        assert _deduplicate_patterns(("users.a", "users.b")) == frozenset({"users.a", "users.b"})
-
-    def test_order_independent_same_result(self):
-        a = _deduplicate_patterns(("users.a", "users.b", "users.*"))
-        b = _deduplicate_patterns(("users.*", "users.b", "users.a"))
-        assert a == b == frozenset({"users.*"})
-
-    def test_wildcard_prefix_chain_keeps_broadest(self):
-        assert _deduplicate_patterns(("room.123.moves.*", "room.*", "room.123.*")) == frozenset({"room.*"})
-
-    def test_idempotent(self):
-        once = _deduplicate_patterns(("a.*", "a.b", "a.b.c"))
-        assert _deduplicate_patterns(tuple(once)) == once
-
-    def test_invariant_redundant_patterns_skipped(self):
-        """Every dropped pattern has some kept key in its ``_matching_patterns`` chain."""
-        raw = ("users.*", "users.x", "room.123.*", "room.*", "*")
-        out = set(_deduplicate_patterns(raw))
-        assert out == {"*"}
-        for q in raw:
-            if q in out:
-                continue
-            chain = set(_matching_patterns(q))
-            assert chain & out
+    task = asyncio.create_task(subscriber())
+    await asyncio.sleep(0.01)
+    relay.publish(subject, data)
+    await asyncio.wait_for(done.wait(), timeout=1.0)
+    await task
+    assert received == [(subject, data)]
 
 
 class TestRelayBasic:
-    """Test basic Relay functionality."""
-
-    def test_subscribe_requires_at_least_one_pattern(self):
+    def test_subscribe_requires_at_least_one_pattern(self) -> None:
         relay = Relay()
-        with pytest.raises(TypeError, match="at least one pattern"):
+        with pytest.raises(StarioError, match="at least one pattern"):
             relay.subscribe()  # type: ignore[call-arg]
 
-    def test_create_relay(self):
+    def test_subscribe_rejects_invalid_patterns(self) -> None:
         relay = Relay()
-        assert relay is not None
+        with pytest.raises(StarioError, match="non-empty"):
+            relay.subscribe("")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe("room.*.message")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe("room.*.*")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe("room*")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe(".room")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe("room.")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe("room..message")
+        with pytest.raises(StarioError, match="trailing"):
+            relay.subscribe(".*")
 
-    async def test_publish_no_subscribers(self):
+    def test_publish_requires_exact_subject(self) -> None:
         relay = Relay()
-        # Should not raise even with no subscribers
-        relay.publish("test.subject", {"data": 1})
+        with pytest.raises(StarioError, match="non-empty"):
+            relay.publish("", None)
+        with pytest.raises(StarioError, match="exact"):
+            relay.publish("*", None)
+        with pytest.raises(StarioError, match="exact"):
+            relay.publish("room.*", None)
+        with pytest.raises(StarioError, match="exact"):
+            relay.publish("room.*.message", None)
+        with pytest.raises(StarioError, match="segments"):
+            relay.publish(".room", None)
+        with pytest.raises(StarioError, match="segments"):
+            relay.publish("room.", None)
+        with pytest.raises(StarioError, match="segments"):
+            relay.publish("room..message", None)
 
-    async def test_subscribe_receive(self):
+    async def test_subscribe_receive(self) -> None:
         relay = Relay()
-        received = []
+        received: list[tuple[str, dict[str, int]]] = []
 
-        async def subscriber():
-            async for subject, data in relay.subscribe("test.*"):
-                received.append((subject, data))
+        async def subscriber() -> None:
+            async with relay.subscribe("test.*") as sub:
+                async for subject, data in sub:
+                    received.append((subject, data))
+                    if len(received) >= 2:
+                        break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("test.one", {"msg": 1})
+        relay.publish("test.two", {"msg": 2})
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert received == [("test.one", {"msg": 1}), ("test.two", {"msg": 2})]
+
+    async def test_unbounded_subscription_keeps_pending_messages(self) -> None:
+        relay = Relay[int]()
+        received: list[int] = []
+
+        async with relay.subscribe("tick") as sub:
+            relay.publish("tick", 1)
+            relay.publish("tick", 2)
+
+            async for _subject, data in sub:
+                received.append(data)
                 if len(received) >= 2:
                     break
 
-        # Start subscriber task
-        task = asyncio.create_task(subscriber())
-
-        # Give subscriber time to start
-        await asyncio.sleep(0.01)
-
-        # Publish messages
-        relay.publish("test.one", {"msg": 1})
-        relay.publish("test.two", {"msg": 2})
-
-        # Wait for subscriber to receive
-        await asyncio.wait_for(task, timeout=1.0)
-
-        assert len(received) == 2
-        assert received[0] == ("test.one", {"msg": 1})
-        assert received[1] == ("test.two", {"msg": 2})
+        assert received == [1, 2]
 
 
 class TestRelayPatterns:
-    """Test pattern matching."""
-
-    async def test_exact_match(self):
+    async def test_exact_match(self) -> None:
         relay = Relay()
-        received = []
+        received: list[str] = []
 
-        async def subscriber():
-            async for subject, data in relay.subscribe("exact.match"):
+        async def subscriber() -> None:
+            async with relay.subscribe("exact.match") as sub:
+                subject, _data = await sub.receive()
                 received.append(subject)
-                break
 
         task = asyncio.create_task(subscriber())
         await asyncio.sleep(0.01)
-
         relay.publish("exact.match", None)
-        relay.publish("exact.other", None)  # Should not match
-
+        relay.publish("exact.other", None)
         await asyncio.wait_for(task, timeout=1.0)
 
         assert received == ["exact.match"]
 
-    async def test_catchall_pattern(self):
+    async def test_catchall_pattern(self) -> None:
         relay = Relay()
-        received = []
+        received: list[str] = []
 
-        async def subscriber():
-            async for subject, data in relay.subscribe("room.123.*"):
-                received.append(subject)
-                if len(received) >= 3:
-                    break
+        async def subscriber() -> None:
+            async with relay.subscribe("room.123.*") as sub:
+                async for subject, _data in sub:
+                    received.append(subject)
+                    if len(received) >= 3:
+                        break
 
         task = asyncio.create_task(subscriber())
         await asyncio.sleep(0.01)
-
         relay.publish("room.123.moves", None)
         relay.publish("room.123.chat", None)
         relay.publish("room.123.leave", None)
-        relay.publish("room.456.moves", None)  # Different room, should not match
-
+        relay.publish("room.456.moves", None)
         await asyncio.wait_for(task, timeout=1.0)
 
-        assert len(received) == 3
-        assert "room.123.moves" in received
-        assert "room.123.chat" in received
-        assert "room.123.leave" in received
+        assert received == ["room.123.moves", "room.123.chat", "room.123.leave"]
 
-    async def test_global_wildcard(self):
+    async def test_global_wildcard(self) -> None:
         relay = Relay()
-        received = []
+        received: list[str] = []
 
-        async def subscriber():
-            async for subject, data in relay.subscribe("*"):
-                received.append(subject)
-                if len(received) >= 2:
-                    break
+        async def subscriber() -> None:
+            async with relay.subscribe("*") as sub:
+                async for subject, _data in sub:
+                    received.append(subject)
+                    if len(received) >= 2:
+                        break
 
         task = asyncio.create_task(subscriber())
         await asyncio.sleep(0.01)
-
         relay.publish("anything.here", None)
         relay.publish("something.else", None)
-
         await asyncio.wait_for(task, timeout=1.0)
 
-        assert len(received) == 2
-
-
-class TestRelayCleanup:
-    """Test subscription cleanup."""
-
-    async def test_unsubscribe_on_exit(self):
-        relay = Relay()
-        cleanup_done = asyncio.Event()
-
-        async def subscriber():
-            try:
-                async for _ in relay.subscribe("cleanup.test"):
-                    break
-            finally:
-                # Give generator time to cleanup
-                await asyncio.sleep(0)
-                cleanup_done.set()
-
-        # Start subscriber and publish a message so it can exit
-        task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
-        relay.publish("cleanup.test", None)
-        await asyncio.wait_for(cleanup_done.wait(), timeout=1.0)
-        await task
-
-        # After subscriber exits, pattern should be removed
-        assert _pattern_cleared(relay, "cleanup.test")
-
-
-class TestRelayMultipleSubscribers:
-    """Test multiple subscribers."""
-
-    async def test_multiple_subscribers_same_pattern(self):
-        relay = Relay()
-        received1 = []
-        received2 = []
-
-        async def sub1():
-            async for subject, data in relay.subscribe("shared.*"):
-                received1.append(subject)
-                break
-
-        async def sub2():
-            async for subject, data in relay.subscribe("shared.*"):
-                received2.append(subject)
-                break
-
-        task1 = asyncio.create_task(sub1())
-        task2 = asyncio.create_task(sub2())
-        await asyncio.sleep(0.01)
-
-        relay.publish("shared.message", None)
-
-        await asyncio.wait_for(asyncio.gather(task1, task2), timeout=1.0)
-
-        # Both should receive the message
-        assert received1 == ["shared.message"]
-        assert received2 == ["shared.message"]
-
-
-class TestRelayRaceConditions:
-    """Test race condition handling in Relay."""
-
-    async def test_cleanup_after_subscriber_exits(self):
-        """Test that pattern is cleaned up after subscriber exits."""
-        relay = Relay()
-        cleanup_complete = asyncio.Event()
-
-        # Create a subscriber that exits after first message
-        async def subscriber():
-            try:
-                async for subject, data in relay.subscribe("race.test"):
-                    break
-            finally:
-                # Need to yield to allow generator cleanup
-                await asyncio.sleep(0)
-                cleanup_complete.set()
-
-        task = asyncio.create_task(subscriber())
-        await asyncio.sleep(0.01)
-
-        # Publish to unblock
-        relay.publish("race.test", None)
-        await asyncio.wait_for(task, timeout=1.0)
-        await asyncio.wait_for(cleanup_complete.wait(), timeout=1.0)
-
-        # Pattern should be cleaned up
-        assert _pattern_cleared(relay, "race.test")
-
-    async def test_concurrent_unsubscribe(self):
-        """Test that concurrent unsubscribes don't cause issues."""
-        relay = Relay()
-        unsubscribed = [0]
-        cleanup_events = [asyncio.Event() for _ in range(5)]
-
-        async def quick_subscriber(idx: int):
-            try:
-                async for _ in relay.subscribe("concurrent.*"):
-                    break
-            finally:
-                await asyncio.sleep(0)
-                unsubscribed[0] += 1
-                cleanup_events[idx].set()
-
-        # Start multiple subscribers
-        tasks = [asyncio.create_task(quick_subscriber(i)) for i in range(5)]
-        await asyncio.sleep(0.01)
-
-        # Publish to unblock all
-        relay.publish("concurrent.msg", None)
-
-        # All should complete without error
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
-        await asyncio.wait_for(
-            asyncio.gather(*[e.wait() for e in cleanup_events]), timeout=1.0
-        )
-
-        assert unsubscribed[0] == 5
-        assert _pattern_cleared(relay, "concurrent.*")
+        assert received == ["anything.here", "something.else"]
 
 
 class TestRelaySubscribeMultiplePatterns:
-    async def test_one_delivery_when_patterns_overlap(self):
+    async def test_one_delivery_when_patterns_overlap(self) -> None:
         relay = Relay()
         received: list[tuple[str, int]] = []
 
-        async def subscriber():
-            async for subject, data in relay.subscribe("*", "users.*"):
-                received.append((subject, data))
-                if len(received) >= 2:
-                    break
+        async def subscriber() -> None:
+            async with relay.subscribe("*", "users.*") as sub:
+                async for subject, data in sub:
+                    received.append((subject, data))
+                    if len(received) >= 2:
+                        break
 
         task = asyncio.create_task(subscriber())
         await asyncio.sleep(0.01)
@@ -345,32 +186,196 @@ class TestRelaySubscribeMultiplePatterns:
         await asyncio.wait_for(task, timeout=1.0)
         assert received == [("users.a.b", 1), ("other.x", 2)]
 
-    async def test_unsubscribe_removes_all_patterns(self):
+    async def test_redundant_exact_pattern_deduped(self) -> None:
+        relay = Relay()
+        received: list[tuple[str, int]] = []
+
+        async def subscriber() -> None:
+            async with relay.subscribe("users.*", "users.alice") as sub:
+                subject, data = await sub.receive()
+                received.append((subject, data))
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("users.alice", 1)
+        await asyncio.wait_for(task, timeout=1.0)
+        assert received == [("users.alice", 1)]
+
+    async def test_nested_wildcard_chain_delivers_once(self) -> None:
+        relay = Relay[int]()
+        received: list[tuple[str, int]] = []
+
+        async def subscriber() -> None:
+            async with relay.subscribe(
+                "users.alice.message",
+                "users.alice.*",
+                "users.*",
+            ) as sub:
+                async for msg in sub:
+                    received.append(msg)
+                    if len(received) >= 2:
+                        break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("users.alice.message", 1)
+        relay.publish("users.bob.message", 2)
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert received == [("users.alice.message", 1), ("users.bob.message", 2)]
+
+    async def test_exact_topic_and_child_wildcard_are_independent(self) -> None:
+        relay = Relay[int]()
+        received: list[tuple[str, int]] = []
+
+        async def subscriber() -> None:
+            async with relay.subscribe("users.alice", "users.alice.*") as sub:
+                async for msg in sub:
+                    received.append(msg)
+                    if len(received) >= 2:
+                        break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("users.alice", 1)
+        relay.publish("users.alice.message", 2)
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert received == [("users.alice", 1), ("users.alice.message", 2)]
+
+    async def test_independent_exact_patterns_both_receive(self) -> None:
+        relay = Relay()
+        received: list[tuple[str, int]] = []
+
+        async def subscriber() -> None:
+            async with relay.subscribe("users.a", "users.b") as sub:
+                async for subject, data in sub:
+                    received.append((subject, data))
+                    if len(received) >= 2:
+                        break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+        relay.publish("users.a", 1)
+        relay.publish("users.b", 2)
+        await asyncio.wait_for(task, timeout=1.0)
+        assert received == [("users.a", 1), ("users.b", 2)]
+
+    async def test_unsubscribe_removes_all_patterns(self) -> None:
         relay = Relay()
 
-        async def subscriber():
+        async def subscriber() -> None:
             async with relay.subscribe("chat.*", "room.*") as sub:
                 relay.publish("chat.msg", None)
                 async for _ in sub:
                     break
 
-        task = asyncio.create_task(subscriber())
+        await asyncio.wait_for(asyncio.create_task(subscriber()), timeout=1.0)
+        await _collect_one(relay, "chat.*", "chat.after", "ok")
+        await _collect_one(relay, "room.*", "room.after", "ok")
+
+
+class TestRelayCleanup:
+    async def test_bare_async_for_requires_async_with(self) -> None:
+        relay = Relay()
+
+        with pytest.raises(StarioRuntime, match="async with"):
+            async for _ in relay.subscribe("cleanup.test"):
+                pass
+
+        await _collect_one(relay, "cleanup.test", "cleanup.test", "ok")
+
+    async def test_unsubscribe_after_finite_async_with(self) -> None:
+        relay = Relay()
+
+        async def first() -> None:
+            async with relay.subscribe("cleanup.test") as sub:
+                async for _ in sub:
+                    break
+
+        task = asyncio.create_task(first())
+        await asyncio.sleep(0.01)
+        relay.publish("cleanup.test", None)
         await asyncio.wait_for(task, timeout=1.0)
-        assert _pattern_cleared(relay, "chat.*")
-        assert _pattern_cleared(relay, "room.*")
+
+        await _collect_one(relay, "cleanup.test", "cleanup.test", "only-one")
+
+    async def test_reused_subscription_does_not_keep_old_pending_messages(self) -> None:
+        relay = Relay[str]()
+        sub = relay.subscribe("cleanup.test")
+
+        async with sub:
+            relay.publish("cleanup.test", "stale")
+
+        async with sub as live:
+            relay.publish("cleanup.test", "fresh")
+            _subject, data = await live.receive()
+            assert data == "fresh"
+
+
+class TestRelayMultipleSubscribers:
+    async def test_multiple_subscribers_same_pattern(self) -> None:
+        relay = Relay()
+        received1: list[str] = []
+        received2: list[str] = []
+
+        async def sub1() -> None:
+            async with relay.subscribe("shared.*") as sub:
+                subject, _data = await sub.receive()
+                received1.append(subject)
+
+        async def sub2() -> None:
+            async with relay.subscribe("shared.*") as sub:
+                subject, _data = await sub.receive()
+                received2.append(subject)
+
+        task1 = asyncio.create_task(sub1())
+        task2 = asyncio.create_task(sub2())
+        await asyncio.sleep(0.01)
+        relay.publish("shared.message", None)
+        await asyncio.wait_for(asyncio.gather(task1, task2), timeout=1.0)
+
+        assert received1 == ["shared.message"]
+        assert received2 == ["shared.message"]
+
+
+class TestRelayRaceConditions:
+    async def test_concurrent_unsubscribe(self) -> None:
+        relay = Relay()
+        unsubscribed = 0
+        cleanup_events = [asyncio.Event() for _ in range(5)]
+
+        async def quick_subscriber(idx: int) -> None:
+            nonlocal unsubscribed
+            try:
+                async with relay.subscribe("concurrent.*") as sub:
+                    await sub.receive()
+            finally:
+                await asyncio.sleep(0)
+                unsubscribed += 1
+                cleanup_events[idx].set()
+
+        tasks = [asyncio.create_task(quick_subscriber(i)) for i in range(5)]
+        await asyncio.sleep(0.01)
+        relay.publish("concurrent.msg", None)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
+        await asyncio.wait_for(
+            asyncio.gather(*[e.wait() for e in cleanup_events]), timeout=1.0
+        )
+
+        assert unsubscribed == 5
+        await _collect_one(relay, "concurrent.*", "concurrent.after", "ok")
 
 
 class TestRelaySubscriptionOrdering:
-    """Subscribe is active before the first ``queue.get()`` — safe to publish after ``async with``."""
-
-    async def test_events_after_enter_not_missed(self):
+    async def test_events_after_enter_not_missed(self) -> None:
         relay = Relay[str]()
         received: list[str] = []
 
-        async def subscriber():
+        async def subscriber() -> None:
             async with relay.subscribe("room.*") as sub:
                 relay.publish("room.a", "during-setup")
-                async for subject, data in sub:
+                async for _subject, data in sub:
                     received.append(data)
                     if len(received) >= 2:
                         break
@@ -381,3 +386,185 @@ class TestRelaySubscriptionOrdering:
         await asyncio.wait_for(task, timeout=1.0)
 
         assert received == ["during-setup", "after-loop-start"]
+
+
+class TestRelayThreadSafety:
+    async def test_publish_from_worker_thread_reaches_subscriber(self) -> None:
+        relay = Relay[dict[str, int]]()
+        received: list[tuple[str, dict[str, int]]] = []
+
+        async def subscriber() -> None:
+            async with relay.subscribe("room.*") as sub:
+                async for subject, data in sub:
+                    received.append((subject, data))
+                    break
+
+        task = asyncio.create_task(subscriber())
+        await asyncio.sleep(0.01)
+
+        thread = threading.Thread(
+            target=lambda: relay.publish("room.1", {"x": 1}),
+        )
+        thread.start()
+        thread.join(timeout=1.0)
+
+        await asyncio.wait_for(task, timeout=1.0)
+        assert received == [("room.1", {"x": 1})]
+
+    async def test_publish_fans_out_to_subscribers_on_multiple_loops(self) -> None:
+        relay = Relay[str]()
+        ready = threading.Event()
+        results = queue.Queue()
+
+        def run_background_subscriber() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            async def consume() -> None:
+                async with relay.subscribe("room.*") as sub:
+                    ready.set()
+                    results.put(await sub.receive())
+
+            try:
+                loop.run_until_complete(consume())
+            except BaseException as exc:
+                results.put(exc)
+            finally:
+                loop.close()
+
+        async def consume_one(sub) -> tuple[str, str]:
+            async for msg in sub:
+                return msg
+            raise AssertionError("subscription ended without a message")
+
+        main_result: tuple[str, str] | None = None
+        background_result = None
+
+        async with relay.subscribe("room.*") as main_sub:
+            thread = threading.Thread(target=run_background_subscriber)
+            thread.start()
+            assert ready.wait(timeout=1.0)
+
+            main_task = asyncio.create_task(consume_one(main_sub))
+            relay.publish("room.1", "x")
+
+            main_result = await asyncio.wait_for(main_task, timeout=1.0)
+            background_result = results.get(timeout=1.0)
+            thread.join(timeout=1.0)
+
+        assert main_result == ("room.1", "x")
+        assert background_result == ("room.1", "x")
+
+    async def test_active_subscription_must_be_consumed_on_owning_loop(self) -> None:
+        relay = Relay[int]()
+        results = queue.Queue()
+
+        result = None
+
+        async with relay.subscribe("room.*") as sub:
+            relay.publish("room.1", 1)
+
+            def consume_from_other_loop() -> None:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                async def consume() -> None:
+                    async for _ in sub:
+                        pass
+
+                try:
+                    loop.run_until_complete(consume())
+                except BaseException as exc:
+                    results.put(exc)
+                finally:
+                    loop.close()
+
+            thread = threading.Thread(target=consume_from_other_loop)
+            thread.start()
+            result = results.get(timeout=1.0)
+            thread.join(timeout=1.0)
+
+        assert isinstance(result, StarioRuntime)
+        assert "owning loop" in str(result)
+
+
+class TestRelayFailureModes:
+    async def test_double_register_raises(self) -> None:
+        relay = Relay()
+        sub = relay.subscribe("a.b")
+        async with sub:
+            with pytest.raises(StarioRuntime, match="already active"):
+                async with sub:
+                    pass
+
+        await _collect_one(relay, "a.b", "a.b", "reuse-ok")
+
+    async def test_publish_after_subscriber_loop_closed_is_swallowed(self) -> None:
+        relay = Relay()
+
+        def run_and_abandon() -> None:
+            other_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(other_loop)
+
+            async def register_only() -> None:
+                async with relay.subscribe("zombie.topic"):
+                    await asyncio.Event().wait()
+
+            task = other_loop.create_task(register_only())
+            other_loop.run_until_complete(asyncio.sleep(0.05))
+            task.cancel()
+            other_loop.close()
+
+        thread = threading.Thread(target=run_and_abandon)
+        thread.start()
+        thread.join(timeout=1.0)
+
+        relay.publish("zombie.topic", "lost")
+        await _collect_one(relay, "zombie.topic", "zombie.topic", "fresh")
+
+    async def test_cancelled_subscriber_unregisters(self) -> None:
+        relay = Relay()
+        started = asyncio.Event()
+
+        async def consume() -> None:
+            async with relay.subscribe("jobs.*") as sub:
+                started.set()
+                async for _ in sub:
+                    pass
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        await _collect_one(relay, "jobs.*", "jobs.after", "ok")
+
+    async def test_receive_requires_active_subscription(self) -> None:
+        relay = Relay()
+        sub = relay.subscribe("feed.*")
+
+        with pytest.raises(StarioRuntime, match="not active"):
+            await sub.receive()
+
+        await _collect_one(relay, "feed.*", "feed.after", "ok")
+
+    async def test_cancelled_infinite_async_with_unregisters(self) -> None:
+        relay = Relay()
+        started = asyncio.Event()
+
+        async def consume() -> None:
+            async with relay.subscribe("live.*") as sub:
+                started.set()
+                async for _ in sub:
+                    pass
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        await _collect_one(relay, "live.*", "live.after", "ok")

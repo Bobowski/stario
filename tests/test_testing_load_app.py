@@ -1,6 +1,4 @@
-"""``aload_app`` plus ``TestClient`` wire production bootstrap into tests."""
-
-from contextlib import asynccontextmanager
+"""`aload_app` plus `TestClient` wire production bootstrap into tests."""
 
 import pytest
 
@@ -11,39 +9,34 @@ from stario.telemetry.core import Span
 from stario.testing import TestClient, aload_app
 
 
-async def _minimal_bootstrap(app: App, span) -> None:
+async def _minimal_bootstrap(app: App, span):
     async def ping(c, w):
         responses.text(w, "pong")
 
     app.get("/ping", ping)
+    yield
 
 
 @pytest.mark.asyncio
 async def test_aload_app_registers_routes() -> None:
-    async with aload_app(_minimal_bootstrap) as app:
-        async with TestClient(app) as client:
-            assert (await client.get("/ping")).text == "pong"
-
-
-@pytest.mark.asyncio
-async def test_test_client_accepts_bootstrap_directly() -> None:
-    async with TestClient(_minimal_bootstrap) as client:
+    async with aload_app(_minimal_bootstrap) as app, TestClient(app) as client:
         assert (await client.get("/ping")).text == "pong"
-        assert isinstance(client.app, App)
 
 
 @pytest.mark.asyncio
-async def test_test_client_bootstrap_requires_context() -> None:
-    client = TestClient(_minimal_bootstrap)
+@pytest.mark.parametrize("kind", ["bootstrap", "app"])
+async def test_test_client_requires_context(kind: str) -> None:
+    client = (
+        TestClient(_minimal_bootstrap) if kind == "bootstrap" else TestClient(App())
+    )
     with pytest.raises(RuntimeError, match="async with TestClient"):
         await client.get("/ping")
 
 
 @pytest.mark.asyncio
-async def test_aload_app_runs_teardown_for_async_context_bootstrap() -> None:
+async def test_aload_app_runs_teardown_for_bootstrap_generator() -> None:
     events: list[str] = []
 
-    @asynccontextmanager
     async def bootstrap(app: App, span):
         events.append("in")
         yield
@@ -55,26 +48,9 @@ async def test_aload_app_runs_teardown_for_async_context_bootstrap() -> None:
 
 
 @pytest.mark.asyncio
-async def test_aload_app_signals_app_shutdown_before_bootstrap_teardown() -> None:
-    shutdown_seen = False
-
-    @asynccontextmanager
-    async def bootstrap(app: App, span):
-        nonlocal shutdown_seen
-        yield
-        shutdown_seen = app.shutting_down
-
-    async with aload_app(bootstrap):
-        pass
-
-    assert shutdown_seen
-
-
-@pytest.mark.asyncio
 async def test_test_client_inside_aload_app_does_not_own_app_shutdown() -> None:
     shutdown_seen = False
 
-    @asynccontextmanager
     async def bootstrap(app: App, span):
         nonlocal shutdown_seen
 
@@ -86,7 +62,7 @@ async def test_test_client_inside_aload_app_does_not_own_app_shutdown() -> None:
         shutdown_seen = app.shutting_down
 
     async with aload_app(bootstrap) as app:
-        async with TestClient(app) as client:
+        async with TestClient(app, owns_shutdown=False) as client:
             assert (await client.get("/ping")).text == "pong"
         assert not app.shutting_down
 
@@ -95,27 +71,24 @@ async def test_test_client_inside_aload_app_does_not_own_app_shutdown() -> None:
 
 @pytest.mark.asyncio
 async def test_aload_app_emits_server_startup_and_shutdown_like_cli() -> None:
-    """Match ``Server`` startup/shutdown: startup span ends after the yielded body; shutdown is separate."""
-
-    startup_phase: list[str] = []
-    shutdown_phase: list[str] = []
+    """Match `Server` startup/shutdown: startup span ends after the yielded body; shutdown is separate."""
 
     async def bootstrap(app: App, span: Span):
         span.attr("phase.boot", "setup")
-        startup_phase.append(span.id.hex)
         yield
         span.attr("phase.boot", "teardown")
-        shutdown_phase.append(span.id.hex)
-
-    app = App()
 
     async def ping(c, w):
         responses.text(w, "pong")
 
-    app.get("/ping", ping)
-
     tracer = stio_testing.TestTracer()
-    async with aload_app(bootstrap, app_factory=lambda: app, tracer=tracer):
+
+    def provide_app() -> App:
+        app = App()
+        app.get("/ping", ping)
+        return app
+
+    async with aload_app(bootstrap, app_factory=provide_app, tracer=tracer):
         pass
 
     startup = tracer.find_span("server.startup")
@@ -125,23 +98,65 @@ async def test_aload_app_emits_server_startup_and_shutdown_like_cli() -> None:
     assert startup.attributes["phase.boot"] == "setup"
     assert shutdown.attributes["phase.boot"] == "teardown"
     assert shutdown.attributes["server.shutdown.trigger"] == "expected_stop"
-    assert startup_phase == [startup.id.hex]
-    assert shutdown_phase == [shutdown.id.hex]
-    assert any(
-        ln.span_id == startup.id for ln in shutdown.links
-    )
 
 
 @pytest.mark.asyncio
-async def test_aload_app_custom_factory() -> None:
-    created: list[App] = []
+async def test_aload_app_startup_failure_marks_startup_span_failed() -> None:
+    tracer = stio_testing.TestTracer()
 
-    def factory() -> App:
-        app = App()
-        created.append(app)
-        return app
+    async def bootstrap(app: App, span):
+        raise RuntimeError("boot failed")
+        yield
 
-    async with aload_app(_minimal_bootstrap, app_factory=factory) as app:
-        async with TestClient(app) as client:
-            assert (await client.get("/ping")).status_code == 200
-    assert created == [app]
+    with pytest.raises(RuntimeError, match="boot failed"):
+        async with aload_app(bootstrap, tracer=tracer):
+            pass
+
+    startup = tracer.find_span("server.startup")
+    assert startup is not None
+    assert startup.error == "boot failed"
+    assert any(ev.name == "exception" for ev in startup.events)
+    # Startup never completed, so no shutdown span exists.
+    assert tracer.find_span("server.shutdown") is None
+
+
+@pytest.mark.asyncio
+async def test_aload_app_teardown_failure_marks_shutdown_span_failed() -> None:
+    tracer = stio_testing.TestTracer()
+
+    async def bootstrap(app: App, span):
+        yield
+        raise RuntimeError("teardown failed")
+
+    with pytest.raises(RuntimeError, match="teardown failed"):
+        async with aload_app(bootstrap, tracer=tracer):
+            pass
+
+    shutdown = tracer.find_span("server.shutdown")
+    assert shutdown is not None
+    assert shutdown.attributes.get("server.shutdown.trigger") == "expected_stop"
+    assert shutdown.error == "teardown failed"
+
+
+@pytest.mark.asyncio
+async def test_aload_app_signals_drain_on_exit() -> None:
+    async with aload_app(_minimal_bootstrap) as app:
+        assert not app.shutting_down
+    assert app.shutting_down
+
+
+@pytest.mark.asyncio
+async def test_aload_app_body_failure_emits_runtime_failure_shutdown() -> None:
+    tracer = stio_testing.TestTracer()
+
+    async def bootstrap(app: App, span):
+        yield
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        async with aload_app(bootstrap, tracer=tracer):
+            raise RuntimeError("body failed")
+
+    shutdown = tracer.find_span("server.shutdown")
+    assert shutdown is not None
+    assert shutdown.attributes.get("server.shutdown.trigger") == "runtime_failure"
+    assert shutdown.error is not None

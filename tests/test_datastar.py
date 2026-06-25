@@ -1,440 +1,493 @@
 """Tests for stario.datastar module - SSE events, attributes, and signals."""
 
-import asyncio
 import json
+from typing import Any, cast
 
 import pytest
 
-from stario import datastar as ds
-from stario.datastar import DATASTAR_CDN_URL, js, s, sse
-from stario.html import Div, P, Span, render
-from stario.http.writer import Writer
+from stario.datastar import (
+    DATASTAR_CDN_URL,
+    SSE,
+    ModuleScript,
+    at,
+    data,
+)
+from stario.datastar.attributes import DatastarAttributes
+from stario.datastar.format import (
+    debounce_to_string,
+    js_object,
+    throttle_to_string,
+    time_to_string,
+)
+from stario.exceptions import StarioError, StarioRuntime
+from stario.markup import html as h
+from stario.markup import render
+from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
+from stario.markup.types import Attrs
+from stario.testing.transport import decode_chunked as _decode_chunked
+from tests.helpers import (
+    make_writer_raw as _make_writer,
+)
+from tests.helpers import (
+    split_response as _split_response,
+)
+
+Div = h.Div
 
 
-def _make_writer() -> tuple[Writer, bytearray, asyncio.AbstractEventLoop]:
-    loop = asyncio.new_event_loop()
-    sink = bytearray()
-    writer = Writer(
-        transport_write=sink.extend,
-        get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-        on_completed=lambda: None,
-        disconnect=loop.create_future(),
-        shutdown=loop.create_future(),
-    )
-    return writer, sink, loop
-
-
-def _split_response(raw: bytes) -> tuple[bytes, bytes]:
-    head, _, body = raw.partition(b"\r\n\r\n")
-    return head, body
-
-
-def _decode_chunked(body: bytes) -> bytes:
-    remaining = body
-    decoded = bytearray()
-    while remaining:
-        size_line, _, rest = remaining.partition(b"\r\n")
-        if not rest:
-            break
-        size = int(size_line.split(b";", 1)[0], 16)
-        if size == 0:
-            break
-        decoded.extend(rest[:size])
-        remaining = rest[size + 2 :]
-    return bytes(decoded)
+def _wire_attrs(mapping: dict[str, str | bool]) -> Attrs:
+    parts: list[str] = []
+    for key, value in mapping.items():
+        if value is True:
+            parts.append(f" {key}")
+        elif isinstance(value, str) and "signals" in key and '"' in value:
+            parts.append(f" {key}='{escape_sq_attribute_value(value)}'")
+        elif isinstance(value, str) and '"' in value:
+            parts.append(f' {key}="{escape_attribute_value(value)}"')
+        else:
+            parts.append(f' {key}="{value}"')
+    return Attrs("".join(parts))
 
 
 class TestSseSignals:
     """Test writer-bound signal patching helpers."""
 
-    def test_basic_signals(self):
-        w, sink, loop = _make_writer()
+    def test_patch_signals_rejects_non_snake_key(self):
+        w, _sink, loop = _make_writer()
         try:
-            sse.patch_signals(w, {"count": 42, "name": "test"})
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"event: datastar-patch-signals" in result
-            assert b"data: signals" in result
-            assert b'"count"' in result
-            assert b"42" in result
-            assert b'"name"' in result
-            assert b'"test"' in result
-            assert result.endswith(b"\n\n")
+            with pytest.raises(StarioError, match="snake_case"):
+                SSE(w).patch_signals({"myCount": 42})
         finally:
             loop.close()
 
-    def test_signals_only_if_missing(self):
-        w, sink, loop = _make_writer()
+    def test_patch_signals_rejects_completed_writer(self):
+        w, _sink, loop = _make_writer()
         try:
-            sse.patch_signals(w, b'{"new":"value"}', only_if_missing=True)
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"data: onlyIfMissing true" in result
+            w.end()
+            with pytest.raises(StarioRuntime, match="after the response is completed"):
+                SSE(w).patch_signals({"count": 1})
         finally:
             loop.close()
 
 
-class TestSsePatch:
-    """Test writer-bound HTML patch helpers."""
+class TestSseNavigate:
+    """Test client-side navigation over SSE."""
 
-    def test_basic_patch(self):
+    def test_navigate_with_special_chars(self):
+        """URL is embedded as a JSON string literal; single quotes survive as-is."""
         w, sink, loop = _make_writer()
         try:
-            sse.patch_elements(w, Div("Hello"))
+            SSE(w).navigate("/page?name=O'Brien")
             _, body = _split_response(bytes(sink))
             result = _decode_chunked(body)
 
-            assert b"event: datastar-patch-elements" in result
-            assert b"data: elements <div>Hello</div>" in result
+            assert b'window.location = "/page?name=O\'Brien"' in result
         finally:
             loop.close()
 
-    def test_patch_with_mode(self):
+    def test_navigate_with_unicode(self):
+        """Non-ASCII path segments are percent-encoded before embedding."""
         w, sink, loop = _make_writer()
         try:
-            sse.patch_elements(w, Span("Updated"), mode="inner")
+            SSE(w).navigate("/users/日本語")
             _, body = _split_response(bytes(sink))
             result = _decode_chunked(body)
 
-            assert b"data: mode inner" in result
-            assert b"<span>Updated</span>" in result
+            assert b'window.location = "/users/%E6%97%A5%E6%9C%AC%E8%AA%9E"' in result
         finally:
             loop.close()
 
-    def test_patch_with_selector(self):
+    def test_navigate_percent_encodes_script_breakout(self):
+        """`</script>` in a redirect target cannot break out of the script patch."""
         w, sink, loop = _make_writer()
         try:
-            sse.patch_elements(w, P("New content"), selector="#target")
+            SSE(w).navigate("/page?q=</script><script>alert(1)</script>")
             _, body = _split_response(bytes(sink))
             result = _decode_chunked(body)
 
-            assert b"data: selector #target" in result
+            # The angle brackets must be percent-encoded inside the JS string;
+            # the only raw </script> on the wire is the patch's own closing tag.
+            assert b"%3C/script%3E" in result
+            assert result.count(b"</script>") == 1
+            assert b"<script>alert(1)</script>" not in result
         finally:
             loop.close()
 
-    def test_patch_with_namespace(self):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "JaVaScRiPt:alert(1)",
+        ],
+    )
+    def test_navigate_rejects_forbidden_schemes(self, url: str):
         w, sink, loop = _make_writer()
         try:
-            sse.patch_elements(
-                w,
-                b"<circle cx='10' cy='10' r='5'></circle>",
-                selector="#icon",
-                namespace="svg",
+            with pytest.raises(StarioError, match="app-relative path or absolute"):
+                SSE(w).navigate(url)
+            assert bytes(sink) == b""
+        finally:
+            loop.close()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "/safe\r\nx: injected",
+            r"/\evil",
+        ],
+    )
+    def test_navigate_rejects_crlf_and_unsafe_paths(self, url: str):
+        w, sink, loop = _make_writer()
+        try:
+            with pytest.raises(StarioError):
+                SSE(w).navigate(url)
+            assert bytes(sink) == b""
+        finally:
+            loop.close()
+
+
+class TestSseWireFormat:
+    """Pin the exact SSE wire contract: data-line splitting, modes, encodings."""
+
+    def test_constructor_does_not_start_response(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w)
+
+            assert not w.started
+            assert bytes(sink) == b""
+        finally:
+            loop.close()
+
+    def test_open_sends_headers_before_first_event(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).open()
+            head, body = _split_response(bytes(sink))
+
+            assert b"content-type: text/event-stream" in head
+            assert b"cache-control: no-cache" in head
+            assert body == b""
+        finally:
+            loop.close()
+
+    def test_first_event_opens_stream_lazily(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_signals({"ok": True})
+            head, body = _split_response(bytes(sink))
+
+            assert b"content-type: text/event-stream" in head
+            assert b"cache-control: no-cache" in head
+            assert b'data: signals {"ok":true}' in _decode_chunked(body)
+        finally:
+            loop.close()
+
+    def test_patch_elements_rejects_unknown_mode(self):
+        w, _sink, loop = _make_writer()
+        try:
+            with pytest.raises(StarioError, match="patch mode"):
+                SSE(w).patch_elements(h.Div("x"), mode=cast(Any, "sideways"))
+        finally:
+            loop.close()
+
+    def test_patch_elements_rejects_unknown_namespace(self):
+        w, _sink, loop = _make_writer()
+        try:
+            with pytest.raises(StarioError, match="patch namespace"):
+                SSE(w).patch_elements(h.Div("x"), namespace=cast(Any, "html"))
+        finally:
+            loop.close()
+
+    @pytest.mark.parametrize(
+        "mode", ["inner", "replace", "prepend", "append", "before", "after"]
+    )
+    def test_non_outer_modes_emit_mode_line(self, mode):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements(h.Div("x"), mode=mode, selector="#t")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert f"data: mode {mode}".encode() in result
+        finally:
+            loop.close()
+
+    def test_omitted_mode_omits_mode_line(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements(h.Div("x"))
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert b"data: mode" not in result
+        finally:
+            loop.close()
+
+    def test_mathml_namespace(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements(b"<mi>x</mi>", namespace="mathml")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert b"data: namespace mathml" in result
+        finally:
+            loop.close()
+
+    def test_multiline_html_splits_into_repeated_data_lines(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements("<div>\n  <p>a</p>\n</div>")
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert (
+                b"data: elements <div>\n"
+                b"data: elements   <p>a</p>\n"
+                b"data: elements </div>\n\n"
+            ) in result
+        finally:
+            loop.close()
+
+    def test_patch_signals_rejects_raw_json_text(self):
+        w, sink, loop = _make_writer()
+        try:
+            with pytest.raises(TypeError, match="mapping"):
+                SSE(w).patch_signals('{"raw":true}')  # type: ignore[arg-type]
+            assert bytes(sink) == b""
+        finally:
+            loop.close()
+
+    def test_unicode_signals_are_utf8_on_the_wire(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_signals({"msg": "日本語"})
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert 'data: signals {"msg":"日本語"}'.encode() in result
+        finally:
+            loop.close()
+
+    def test_patch_signals_rejects_raw_json_bytes(self):
+        w, sink, loop = _make_writer()
+        try:
+            with pytest.raises(TypeError, match="mapping"):
+                SSE(w).patch_signals(b'{"raw":true}')  # type: ignore[arg-type]
+            assert bytes(sink) == b""
+        finally:
+            loop.close()
+
+
+class TestSseScriptTrustContract:
+    """`execute_script()` streams developer-authored JS verbatim.
+
+    The code is intentionally NOT escaped: it is a trusted-content API.
+    Untrusted input must never be interpolated into `execute_script()` —
+    a `</script>` sequence would break out of the script element.
+    """
+
+    def test_execute_streams_code_verbatim_including_script_close(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).execute_script('console.log("</script>")', auto_remove=False)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
+
+            assert b'data: elements <script>console.log("</script>")</script>' in result
+        finally:
+            loop.close()
+
+    def test_multiline_code_splits_into_data_lines(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).execute_script(
+                "let a = 1;\nconsole.log(a);",
+                auto_remove=False,
             )
             _, body = _split_response(bytes(sink))
             result = _decode_chunked(body)
 
-            assert b"data: selector #icon" in result
-            assert b"data: namespace svg" in result
-        finally:
-            loop.close()
-
-    def test_patch_append_mode(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.patch_elements(w, Div("item"), mode="append", selector="#list")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"data: mode append" in result
-            assert b"data: selector #list" in result
-        finally:
-            loop.close()
-
-    def test_patch_with_view_transition(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.patch_elements(w, Div("content"), use_view_transition=True)
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"data: useViewTransition true" in result
-        finally:
-            loop.close()
-
-    def test_patch_html_accepts_str_options(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.patch_elements(w, b"<div>Hello</div>", mode="inner", selector="#target")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"data: mode inner" in result
-            assert b"data: selector #target" in result
-            assert b"data: elements <div>Hello</div>" in result
+            assert (
+                b"data: elements <script>let a = 1;\n"
+                b"data: elements console.log(a);</script>"
+            ) in result
         finally:
             loop.close()
 
 
-class TestSseScript:
-    """Test script execution SSE helper."""
+class TestDatastarThroughRender:
+    """Datastar attribute payloads must survive HTML attribute escaping."""
 
-    def test_basic_script(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.execute(w, "console.log('hello');")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+    def test_signals_json_round_trips_through_attribute_escaping(self):
+        import html as html_mod
 
-            assert b"event: datastar-patch-elements" in result
-            assert b"console.log" in result
-        finally:
-            loop.close()
+        payload = {"q": 'He said "hi" & left', "n": 1}
+        out = render(h.Div(data.signals(payload)))
 
-    def test_script_with_auto_remove(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.execute(w, "alert('hi');", auto_remove=True)
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"data-effect" in result
-        finally:
-            loop.close()
-
-    def test_script_without_auto_remove(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.execute(w, "persist();", auto_remove=False)
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"data-effect" not in result
-        finally:
-            loop.close()
-
-
-class TestSseRedirect:
-    """Test redirect SSE helper."""
-
-    def test_basic_redirect(self):
-        w, sink, loop = _make_writer()
-        try:
-            sse.redirect(w, "/new-page")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"event: datastar-patch-elements" in result
-            assert b"/new-page" in result
-            assert b"window.location" in result
-        finally:
-            loop.close()
-
-    def test_redirect_with_special_chars(self):
-        """Test URL with quotes and special characters is properly escaped."""
-        w, sink, loop = _make_writer()
-        try:
-            sse.redirect(w, "/page?name=O'Brien")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"event: datastar-patch-elements" in result
-            assert b"O'Brien" in result or b"O\\'Brien" in result
-            assert b"window.location" in result
-        finally:
-            loop.close()
-
-    def test_redirect_with_query_params(self):
-        """Test URL with query parameters."""
-        w, sink, loop = _make_writer()
-        try:
-            sse.redirect(w, "/search?q=hello&page=1")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"/search?q=hello&page=1" in result
-        finally:
-            loop.close()
-
-    def test_redirect_with_unicode(self):
-        """Test URL with unicode characters."""
-        w, sink, loop = _make_writer()
-        try:
-            sse.redirect(w, "/users/日本語")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"event: datastar-patch-elements" in result
-            assert b"/users/" in result
-            assert b"window.location" in result
-        finally:
-            loop.close()
+        prefix = "<div data-signals='"
+        assert out.startswith(prefix)
+        value = out.split(prefix, 1)[1].split("'", 1)[0]
+        assert "'" not in value  # attribute delimiter cannot be terminated early
+        assert json.loads(html_mod.unescape(value)) == payload
 
 
 class TestSseRemove:
     """Test remove helper."""
 
-    def test_basic_remove(self):
+    def test_remove_rejects_line_breaks_in_selector(self):
         w, sink, loop = _make_writer()
         try:
-            sse.remove(w, "#old-item")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
-
-            assert b"event: datastar-patch-elements" in result
-            assert b"data: mode remove" in result
-            assert b"data: selector #old-item" in result
+            with pytest.raises(StarioError, match="line breaks"):
+                SSE(w).remove("#old\ndata: mode append")
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
 
-class TestDatastarAttributes:
-    """Test module-level Datastar attribute helpers."""
+class TestDatastarAttributeValidation:
+    """Validation rules not covered by the wire-format matrix."""
 
-    def test_bind(self):
-        attrs = ds.bind("username")
-        assert attrs == {"data-bind": "username"}
+    def test_bind_rejects_non_snake_signal_name(self):
+        with pytest.raises(StarioError, match="snake_case"):
+            data.bind("mySignal")
 
-    def test_bind_prop_event(self):
-        assert ds.bind("isChecked", prop="checked", event="change") == {
-            "data-bind:is-checked__prop.checked__event.change": "isChecked"
-        }
+    def test_bind_rejects_non_snake_signal_path_segment(self):
+        with pytest.raises(StarioError, match="snake_case"):
+            data.bind("crane.selectedCrane")
 
-    def test_bind_explicit_case(self):
-        assert ds.bind("mySignal", case="kebab") == {
-            "data-bind:my-signal__case.kebab": "mySignal"
-        }
+    @pytest.mark.parametrize(
+        "time",
+        [None, True, -1, -0.1, float("inf"), "0.5s", "150", "fast", "1.2ms"],
+    )
+    def test_time_to_string_rejects_ambiguous_values(self, time):
+        with pytest.raises(StarioError, match="Invalid Datastar time value"):
+            time_to_string(time)
 
-    def test_on_intersect_threshold_and_example_modifiers(self):
-        attrs = ds.on_intersect("$x = true", threshold=0.25, once=True, full=True)
-        key = next(iter(attrs))
-        assert key == "data-on-intersect__threshold.25__once__full"
-        assert attrs[key] == "$x = true"
+    def test_timing_modifier_helpers_reject_unknown_modifiers(self):
+        with pytest.raises(StarioError, match="Invalid debounce modifier"):
+            debounce_to_string(("150ms", "trailing"))  # type: ignore[arg-type]
 
-    def test_on_intersect_threshold_string(self):
-        attrs = ds.on_intersect("tick()", threshold="0.5")
-        assert list(attrs.keys())[0] == "data-on-intersect__threshold.0.5"
+        with pytest.raises(StarioError, match="Invalid throttle modifier"):
+            throttle_to_string(("150ms", "leading"))  # type: ignore[arg-type]
 
-    def test_pro_match_media(self):
-        attrs = ds.match_media("isDark", "'prefers-color-scheme: dark'")
-        assert attrs == {"data-match-media:is-dark": "'prefers-color-scheme: dark'"}
 
-    def test_pro_persist_key_session(self):
-        assert ds.persist(storage_key="mykey", session=True) == {
-            "data-persist:mykey__session": True
-        }
+class TestDatastarAttributeMatrix:
+    """Table-driven contract for every attribute helper's wire format."""
 
-    def test_show(self):
-        attrs = ds.show("isVisible")
-        assert attrs == {"data-show": "isVisible"}
+    @pytest.mark.parametrize(
+        ("actual", "expected"),
+        [
+            (data.ignore_morph(), {"data-ignore-morph": True}),
+            (
+                data.computed("full_name", "$a + $b"),
+                {"data-computed:full-name__case.snake": "$a + $b"},
+            ),
+            (data.signals({"count": 0}), {"data-signals": '{"count":0}'}),
+            (data.bind("email"), {"data-bind": "email"}),
+            (data.show("$visible"), {"data-show": "$visible"}),
+            (
+                data.on("submit", "go()", prevent=True, stop=True),
+                {"data-on:submit__prevent__stop": "go()"},
+            ),
+            (
+                data.on("click", "go()", prevent=True),
+                {"data-on:click__prevent": "go()"},
+            ),
+            (
+                data.on("keydown", "go()", debounce=("150ms", "leading")),
+                {"data-on:keydown__debounce.150ms.leading": "go()"},
+            ),
+            (
+                data.on_intersect("seen()", threshold="half"),
+                {"data-on-intersect__half": "seen()"},
+            ),
+            (
+                data.persist(include=["draft", "settings"]),
+                {"data-persist": "{'include':'draft|settings'}"},
+            ),
+            (
+                DatastarAttributes("data-star-").text("$title"),
+                {"data-star-text": "$title"},
+            ),
+            (
+                data.scroll_into_view(behavior="smooth", vertical="center", focus=True),
+                {"data-scroll-into-view__smooth__vcenter__focus": True},
+            ),
+        ],
+        ids=lambda value: next(iter(value)) if isinstance(value, dict) else "case",
+    )
+    def test_attribute_helper_wire_format(self, actual, expected):
+        assert actual == _wire_attrs(expected)
 
-    def test_text(self):
-        attrs = ds.text("message")
-        assert attrs == {"data-text": "message"}
+    def test_on_rejects_passive_with_prevent(self):
+        with pytest.raises(StarioError, match="passive and prevent"):
+            data.on("touchstart", "go()", passive=True, prevent=True)
 
-    def test_ref(self):
-        attrs = ds.ref("myElement")
-        assert attrs == {"data-ref": "myElement"}
+    @pytest.mark.parametrize("threshold", [-0.1, 1.5, 25, 100.0])
+    def test_on_intersect_rejects_out_of_range_numeric_threshold(self, threshold):
+        # `threshold.1.5` would misparse client-side (`.` separates modifier args).
+        with pytest.raises(StarioError, match="Invalid intersection threshold"):
+            data.on_intersect("load()", threshold=threshold)
 
-    def test_effect(self):
-        attrs = ds.effect("console.log($count)")
-        assert attrs == {"data-effect": "console.log($count)"}
 
-    def test_classes_mapping(self):
-        attrs = ds.classes({"active": "$isActive", "hidden": "!$visible"})
-        assert "data-class" in attrs
-        # Should be JSON-like
-        assert "active" in attrs["data-class"]
+class TestSignalsConversion:
+    def test_signals_rejects_plain_object(self):
+        """No implicit `__dict__` serialization; `vars(obj)` is the explicit spelling."""
 
-    def test_on_click(self):
-        attrs = ds.on("click", "@get('/api/data')")
-        assert "data-on:click" in attrs
+        class State:
+            def __init__(self):
+                self.count = 1
 
-    def test_on_with_modifiers(self):
-        attrs = ds.on("submit", "@post('/form')", prevent=True)
-        key = list(attrs.keys())[0]
-        assert "prevent" in key
+        with pytest.raises(TypeError, match="mapping"):
+            data.signals(State())  # type: ignore[arg-type]
 
-    def test_signal_single_key(self):
-        attrs = ds.signal("count", "0")
-        # "count" is all-lowercase → classified as kebab-case, modifier added
-        assert attrs == {"data-signals:count__case.kebab": "0"}
+    def test_signals_from_vars_of_plain_object(self):
+        class State:
+            def __init__(self):
+                self.count = 1
 
-    def test_signal_camel_key(self):
-        attrs = ds.signal("myCount", "0")
-        # camelCase keys get no case modifier (Datastar default)
-        assert attrs == {"data-signals:my-count": "0"}
+        assert data.signals(vars(State())) == _wire_attrs(
+            {"data-signals": '{"count":1}'}
+        )
 
-    def test_signal_with_string_literal(self):
-        attrs = ds.signal("name", s("hello"))
-        # "name" is all-lowercase → kebab modifier
-        assert attrs == {"data-signals:name__case.kebab": "'hello'"}
+    def test_signals_rejects_pydantic_like_model(self):
+        class Model:
+            def model_dump(self):
+                return {"name": "ada"}
 
-    def test_signal_ifmissing(self):
-        attrs = ds.signal("count", "0", ifmissing=True)
-        key = list(attrs.keys())[0]
-        assert "ifmissing" in key
-        assert attrs[key] == "0"
+        with pytest.raises(TypeError, match="mapping"):
+            data.signals(Model())  # type: ignore[arg-type]
 
-    def test_signals_rejects_str_payload(self):
-        with pytest.raises(TypeError, match=r"signal\(name"):
-            ds.signals("count")  # type: ignore[arg-type]
-
-    def test_signals(self):
-        attrs = ds.signals({"count": 0, "name": "test"})
-        assert "data-signals" in attrs
-        value = attrs["data-signals"]
-        parsed = json.loads(value)
-        assert parsed["count"] == 0
-        assert parsed["name"] == "test"
-
-    def test_signals_ifmissing(self):
-        attrs = ds.signals({"new": 1}, ifmissing=True)
-        assert "data-signals__ifmissing" in attrs
-
-    def test_signals_from_dataclass(self):
-        from dataclasses import dataclass
-
-        @dataclass
-        class FormState:
-            count: int = 0
-            name: str = ""
-
-        attrs = ds.signals(FormState())
-        assert "data-signals" in attrs
-        value = attrs["data-signals"]
-        parsed = json.loads(value)
-        assert parsed["count"] == 0
-        assert parsed["name"] == ""
-
-    def test_indicator(self):
-        attrs = ds.indicator("isLoading")
-        assert attrs == {"data-indicator": "isLoading"}
-
-    def test_ignore(self):
-        attrs = ds.ignore()
-        assert attrs == {"data-ignore": True}
-
-    def test_ignore_self_only(self):
-        attrs = ds.ignore(self_only=True)
-        assert attrs == {"data-ignore__self": True}
+    def test_signals_rejects_unconvertible_value(self):
+        with pytest.raises(TypeError, match="mapping"):
+            data.signals(42)  # type: ignore[arg-type]
 
 
 class TestDatastarActions:
-    """Test module-level Datastar action helpers."""
-
-    def test_get_simple(self):
-        action = ds.get("/api/data")
-        assert action == "@get('/api/data')"
+    """Test Datastar action helpers."""
 
     def test_get_with_query(self):
-        action = ds.get("/search", {"q": "test"})
-        assert "@get" in action
-        assert "/search" in action
+        action = at.get("/search", {"q": "test"})
+        assert action == "@get('/search?q=test')"
 
-    def test_post_simple(self):
-        action = ds.post("/api/submit")
-        assert action == "@post('/api/submit')"
+    def test_get_merges_existing_query(self):
+        action = at.get("/search?sort=recent", {"q": "test"})
+        assert action == "@get('/search?sort=recent&q=test')"
+
+    def test_get_query_uses_doseq(self):
+        action = at.get("/search", {"tag": ["a", "b"]})
+        assert action == "@get('/search?tag=a&tag=b')"
 
     def test_post_with_options(self):
         payload = {"extra": 123}
 
-        action = ds.post(
+        action = at.post(
             "/api/submit",
             include="form.*",
-            selector="#result",
             retry="error",
             payload=payload,
         )
@@ -442,93 +495,73 @@ class TestDatastarActions:
         assert "@post" in action
         assert "/api/submit" in action
 
-        expected_payload_str = f"payload: {js(payload)}"
+        expected_payload_str = f"payload: {js_object(payload)}"
         assert expected_payload_str in action
 
         assert "retry: 'error'" in action
 
-    def test_put(self):
-        action = ds.put("/api/item/123")
-        assert action == "@put('/api/item/123')"
+    def test_selector_requires_form_content_type(self):
+        action = at.post("/checkout", content_type="form", selector="#checkout-form")
+        assert "contentType: 'form'" in action
+        assert "selector: '#checkout-form'" in action
 
-    def test_patch(self):
-        action = ds.patch("/api/item/123")
-        assert "@patch" in action
+        with pytest.raises(StarioError, match="content_type='form'"):
+            at.post("/checkout", selector="#checkout-form")
+
+    def test_retry_max_wait_uses_v1_option_name(self):
+        """Datastar 1.0.x expects `retryMaxWait`, not `retryMaxWaitMs`."""
+        action = at.get("/api", retry_max_wait_ms=5_000)
+        assert "retryMaxWait: 5000" in action
+        assert "retryMaxWaitMs" not in action
+
+    def test_open_when_hidden_tristate(self):
+        # Omitted options defer to the client default and are elided.
+        assert at.post("/api") == "@post('/api')"
+        # Explicit True/False are emitted (the client default is method-dependent).
+        assert "openWhenHidden: true" in at.get("/api", open_when_hidden=True)
+        assert "openWhenHidden: false" in at.post("/api", open_when_hidden=False)
+
+    def test_none_fetch_options_are_omitted(self):
+        action = at.get(
+            "/api",
+            content_type=None,
+            open_when_hidden=None,
+            payload=None,
+            retry=None,
+            retry_interval_ms=None,
+            retry_scaler=None,
+            retry_max_wait_ms=None,
+            retry_max_count=None,
+            request_cancellation=None,
+        )
+
+        assert action == "@get('/api')"
 
     def test_delete(self):
-        action = ds.delete("/api/item/123")
+        action = at.delete("/api/item/123")
         assert action == "@delete('/api/item/123')"
 
-    def test_peek(self):
-        action = ds.peek("$count")
-        assert "@peek" in action
-        assert "$count" in action
-
-    def test_set_all(self):
-        action = ds.set_all("false")
-        assert "@setAll" in action
-
-    def test_toggle_all(self):
-        action = ds.toggle_all()
-        assert "@toggleAll" in action
-
-
-class TestDatastarIntegration:
-    """Test using Datastar attributes in HTML elements."""
-
-    def test_button_with_click_handler(self):
-        from stario.html import Button
-
-        btn = Button(
-            ds.on("click", ds.get("/api/increment")),
-            "Click me",
+    def test_intl_basic(self):
+        action = at.intl("number", "$price", {"style": "currency", "currency": "USD"})
+        assert (
+            action == "@intl('number', $price, {'style':'currency','currency':'USD'})"
         )
-        html = render(btn)
 
-        assert "data-on:click" in html
-        assert "@get" in html
-        assert "/api/increment" in html
-
-    def test_input_with_bind(self):
-        from stario.html import Input
-
-        inp = Input(
-            {"type": "text"},
-            ds.bind("username"),
-        )
-        html = render(inp)
-
-        assert 'data-bind="username"' in html
-
-    def test_div_with_signals(self):
-        d = Div(
-            ds.signals({"count": 0}),
-            {"id": "app"},
-            Span(ds.text("$count")),
-        )
-        html = render(d)
-
-        assert "data-signals" in html
-        assert "data-text" in html
+    def test_set_all_with_filters(self):
+        action = at.set_all("null", include=["draft"], exclude="tmp.*")
+        assert action == "@setAll(null, {'include':'draft','exclude':'tmp.*'})"
 
 
 class TestDatastarScriptTag:
     """Test the shared Datastar CDN script helper."""
 
     def test_ModuleScript_uses_cdn(self):
-        html = render(ds.ModuleScript())
+        html = render(ModuleScript())
 
         assert 'type="module"' in html
         assert f'src="{DATASTAR_CDN_URL}"' in html
 
     def test_ModuleScript_accepts_custom_src(self):
-        html = render(ds.ModuleScript("/static/vendor/datastar.js"))
+        html = render(ModuleScript("/static/vendor/datastar.js"))
 
         assert 'src="/static/vendor/datastar.js"' in html
-
-    def test_module_still_exports_low_level_helpers(self):
-        assert callable(s)
-        assert callable(js)
-        assert hasattr(sse, "patch_signals")
-        assert callable(ds.read_signals)
-        assert DATASTAR_CDN_URL.endswith("/datastar.js")

@@ -1,0 +1,8 @@
+[project]
+name = "tiles"
+version = "0.0.0"
+description = "Stario collaborative painting board — recommended starting example (main:bootstrap)"
+requires-python = ">=3.14"
+dependencies = [
+
+]

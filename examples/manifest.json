@@ -1,9 +1,0 @@
-{
-  "examples": [
-    {
-      "name": "chat-room",
-      "description": "Real-time chat room",
-      "long_description": "Multi-user chat with typing indicators, message history,\n    and live presence. Medium layout: app/chat feature package (router, handlers,\n    views, SQLite) plus shared app/static. SSE + Relay demo."
-    }
-  ]
-}

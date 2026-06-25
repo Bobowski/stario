@@ -1,101 +1,107 @@
-"""TTY span tree output (stdlib + ANSI); interactive dev UX, not a production log format.
+"""TTY span tree for interactive development (stdlib + ANSI).
 
-Layout: ``_LiveRegion`` keeps an in-place footer (cursor-up + clear); ``_render_locked`` erases
-it, prints finished roots to scrollback, then redraws open roots so the cursor always sits right
-after the live block (required for the next erase).
+Not a production log format. Finished roots scroll into history; open roots
+repaint in a live footer (`_LiveRegion` uses cursor-up + clear). Nothing else
+should write to the same output stream while the tracer is active.
+
+`TTYRenderer` is the pure span→string layer and the unit-test seam: no locks,
+threads, or I/O.
 """
 
-import os
 import shutil
 import sys
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import chain
-from typing import Any, Self
+from types import TracebackType
+from typing import Any, TextIO, cast
+from unicodedata import combining, east_asian_width
 from uuid import UUID, uuid7
 
-from stario.console import enable_windows_console_vt
+from stario._terminal import RESET as _RESET
+from stario._terminal import SGR, color_enabled, enable_vt_for_stream
 
-from .core import Span
-from .tracebacks import format_exception_for_telemetry
+from .core import Attributes, Span, TelemetryStats
+from .spans import RecordedEvent, RecordedLink, RecordingSpan
 
 _REFRESH_INTERVAL_S = 0.125
 _TIME_COL = 14
-# Single-cell live placeholder so ``splitlines()`` still counts as one row.
+# Single-cell live placeholder so `splitlines()` still counts as one row.
 _IDLE_LIVE = " "
-
-_RESET = "\033[0m"
-# --- ANSI (respects NO_COLOR in ``_styled`` only; live cursor escapes are unconditional) ---
-
-_STYLES: dict[str, str] = {
-    "dim": "\033[2m",
-    "white": "\033[37m",
-    "red": "\033[31m",
-    "green": "\033[32m",
-    "yellow": "\033[33m",
-    "cyan": "\033[36m",
-}
+_ELLIPSIS = "…"
 
 
 def _styled(text: str, style: str) -> str:
-    if os.environ.get("NO_COLOR", "").strip():
+    if not color_enabled():
         return text
-    p = _STYLES.get(style)
-    if not p:
+    prefix = SGR.get(style)
+    if not prefix:
         return text
-    return f"{p}{text}{_RESET}"
+    return f"{prefix}{text}{_RESET}"
 
 
-@dataclass(slots=True)
-class _SpanState:
-    id: UUID
-    name: str
-    parent_id: UUID | None
-    start_ns: int
-    end_ns: int | None = None
-    error: str | None = None
-    attrs: dict[str, Any] = field(default_factory=dict)
-    events: list["_SpanEvent"] = field(default_factory=list)
-    links: list["_SpanLink"] = field(default_factory=list)
-
-    @property
-    def started(self) -> bool:
-        return self.start_ns != 0
-
-    @property
-    def duration_ns(self) -> int | None:
-        if self.end_ns is None:
-            return None
-        return self.end_ns - self.start_ns
-
-    @property
-    def in_progress(self) -> bool:
-        return self.end_ns is None
-
-    @property
-    def finished(self) -> bool:
-        return self.end_ns is not None
-
-    @property
-    def failed(self) -> bool:
-        return self.error is not None
+def _ansi_sequence_end(text: str, index: int) -> int | None:
+    if text[index : index + 2] != "\033[":
+        return None
+    for end in range(index + 2, len(text)):
+        if "@" <= text[end] <= "~":
+            return end + 1
+    return None
 
 
-@dataclass(slots=True)
-class _SpanEvent:
-    time_ns: int
-    name: str
-    attributes: dict[str, Any] = field(default_factory=dict)
-    body: Any | None = None
+def _cell_width(ch: str) -> int:
+    if combining(ch):
+        return 0
+    return 2 if east_asian_width(ch) in {"F", "W"} else 1
 
 
-@dataclass(slots=True, frozen=True)
-class _SpanLink:
-    span_id: UUID
-    attributes: dict[str, Any] = field(default_factory=dict)
+def _visible_width(text: str) -> int:
+    width = 0
+    i = 0
+    while i < len(text):
+        if (end := _ansi_sequence_end(text, i)) is not None:
+            i = end
+            continue
+        width += _cell_width(text[i])
+        i += 1
+    return width
+
+
+def _clip_visible(text: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    if _visible_width(text) <= max_width:
+        return text
+
+    ellipsis_width = _cell_width(_ELLIPSIS)
+    if max_width <= ellipsis_width:
+        return _ELLIPSIS[:max_width]
+
+    budget = max_width - ellipsis_width
+    width = 0
+    i = 0
+    pieces: list[str] = []
+    saw_ansi = False
+    while i < len(text):
+        if (end := _ansi_sequence_end(text, i)) is not None:
+            pieces.append(text[i:end])
+            saw_ansi = True
+            i = end
+            continue
+        ch = text[i]
+        ch_width = _cell_width(ch)
+        if width + ch_width > budget:
+            break
+        pieces.append(ch)
+        width += ch_width
+        i += 1
+
+    pieces.append(_ELLIPSIS)
+    if saw_ansi:
+        pieces.append(_RESET)
+    return "".join(pieces)
 
 
 def _fmt_duration(ns: int) -> str:
@@ -124,17 +130,17 @@ def _uuid_tail(uid: UUID) -> str:
     return s[-8:] if len(s) >= 8 else s
 
 
-def _span_status_style(span: _SpanState) -> str:
+def _span_status_style(span: RecordingSpan) -> str:
     if span.in_progress:
         return "cyan"
     if span.failed:
         return "red"
     for key in ("response.status_code", "status_code"):
-        if key not in span.attrs:
+        if not span.attributes or key not in span.attributes:
             continue
         try:
-            code = int(span.attrs[key])
-        except (ValueError, TypeError):
+            code = int(span.attributes[key])
+        except ValueError, TypeError:
             continue
         if 200 <= code < 300:
             return "green"
@@ -144,7 +150,7 @@ def _span_status_style(span: _SpanState) -> str:
     return "green"
 
 
-def _build_status_trailer(span: _SpanState, max_len: int) -> str:
+def _build_status_trailer(span: RecordingSpan, max_len: int) -> str:
     if span.in_progress:
         dur = "…"
     elif span.duration_ns is not None:
@@ -177,7 +183,7 @@ def _build_status_trailer(span: _SpanState, max_len: int) -> str:
 class _LiveRegion:
     """Bottom-of-terminal live block: erase previous lines, then caller prints history, then write."""
 
-    __slots__ = ("_out", "_lock", "_lines")
+    __slots__ = ("_lines", "_lock", "_out")
 
     def __init__(self, out: Any, lock: threading.Lock) -> None:
         self._out = out
@@ -196,12 +202,11 @@ class _LiveRegion:
 
     def write(self, content: str) -> None:
         with self._lock:
-            self._out.write(content)
-            if not content.endswith("\n"):
-                self._out.write("\n")
+            written = content if content.endswith("\n") else content + "\n"
+            self._out.write(written)
             self._out.flush()
-            # ``" ".splitlines()`` is [] — still one screen row for the idle placeholder.
-            self._lines = max(1, len(content.splitlines())) if content else 1
+            # `" ".splitlines()` is [] — still one screen row for the idle placeholder.
+            self._lines = max(1, len(written.splitlines())) if written else 1
 
     def _clear_written_lines(self) -> None:
         for _ in range(self._lines):
@@ -212,296 +217,53 @@ class _LiveRegion:
             self._erase_unlocked()
 
 
-class TTYTracer:
-    """Live span tree on a TTY (dev UX); background thread repaints while ``with tracer`` is active."""
+class TTYRenderer:
+    """Pure string rendering for span trees; no I/O, locks, or threads.
 
-    __slots__ = (
-        "_spans",
-        "_roots",
-        "_children",
-        "_lock",
-        "_write_lock",
-        "_thread",
-        "_running",
-        "_dirty",
-        "_live",
-        "_out",
-    )
+    Pass terminal width and a `parent_id → children` map so nested spans and
+    events sort by time. Tests build `RecordingSpan` records and drive this
+    class directly.
+    """
 
-    def __init__(self) -> None:
-        self._out = sys.stdout
-        self._write_lock = threading.Lock()
-        self._spans: dict[UUID, _SpanState] = {}
-        self._roots: dict[UUID, _SpanState] = {}
-        self._children: dict[UUID, list[_SpanState]] = {}
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._running = False
-        self._dirty = False
-        self._live: _LiveRegion | None = None
+    __slots__ = ("_children", "_width")
 
-    @classmethod
-    def from_env(cls) -> Self:
-        return cls()
+    def __init__(self, width: int, children: dict[UUID, list[RecordingSpan]]) -> None:
+        self._width = max(1, width)
+        self._children = children
 
-    @property
-    def _width(self) -> int:
-        try:
-            return max(40, shutil.get_terminal_size((80, 24)).columns)
-        except OSError:
-            return 80
+    def _fit_line(self, line: str) -> str:
+        return _clip_visible(line, self._width)
 
-    def __enter__(self) -> TTYTracer:
-        self._start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self._stop()
-
-    def create(
-        self,
-        name: str,
-        attributes: dict[str, Any] | None = None,
-        /,
-        *,
-        parent_id: UUID | None = None,
-    ) -> Span:
-        if not self._running:
-            self._start()
-        span = Span(id=uuid7(), tracer=self)
-        state = _SpanState(
-            id=span.id,
-            name=name,
-            parent_id=parent_id,
-            start_ns=0,
-            attrs=attributes.copy() if attributes else {},
+    def root_block(self, span: RecordingSpan) -> str:
+        return (
+            self.root_separator_line(span)
+            + "\n"
+            + self.span_tree(span, parent_start_ns=None, indent_level=0)
         )
-        with self._lock:
-            self._spans[span.id] = state
-            if parent_id is None:
-                self._roots[span.id] = state
-            else:
-                self._children.setdefault(parent_id, [])
-                if state not in self._children[parent_id]:
-                    self._children[parent_id].append(state)
-        return span
 
-    def start(self, span_id: UUID) -> None:
-        with self._lock:
-            if state := self._spans.get(span_id):
-                if state.start_ns == 0:
-                    state.start_ns = time.time_ns()
-                    self._dirty = True
-
-    def set_attribute(
-        self,
-        span_id: UUID,
-        name: str,
-        value: Any,
-    ) -> None:
-        with self._lock:
-            if state := self._spans.get(span_id):
-                state.attrs[name] = value
-                self._dirty = True
-
-    def set_attributes(
-        self,
-        span_id: UUID,
-        attributes: dict[str, Any],
-    ) -> None:
-        if not attributes:
-            return
-        with self._lock:
-            if state := self._spans.get(span_id):
-                state.attrs.update(attributes)
-                self._dirty = True
-
-    def add_event(
-        self,
-        span_id: UUID,
-        name: str,
-        attributes: dict[str, Any] | None = None,
-        /,
-        *,
-        body: Any | None = None,
-    ) -> None:
-        event = _SpanEvent(
-            time_ns=time.time_ns(),
-            name=name,
-            attributes=attributes.copy() if attributes else {},
-            body=body,
-        )
-        with self._lock:
-            if state := self._spans.get(span_id):
-                state.events.append(event)
-                self._dirty = True
-
-    def add_link(
-        self,
-        span_id: UUID,
-        target_span_id: UUID,
-        attributes: dict[str, Any] | None = None,
-        /,
-    ) -> None:
-        link = _SpanLink(
-            span_id=target_span_id, attributes=attributes.copy() if attributes else {}
-        )
-        with self._lock:
-            if state := self._spans.get(span_id):
-                state.links.append(link)
-                self._dirty = True
-
-    def fail(self, span_id: UUID, message: str) -> None:
-        with self._lock:
-            if state := self._spans.get(span_id):
-                state.error = message
-                self._dirty = True
-
-    def set_name(self, span_id: UUID, name: str) -> None:
-        with self._lock:
-            if state := self._spans.get(span_id):
-                state.name = name
-                self._dirty = True
-
-    def end(self, span_id: UUID) -> None:
-        with self._lock:
-            if state := self._spans.get(span_id):
-                if state.start_ns == 0:
-                    raise RuntimeError(
-                        "Cannot end a span that was never started. "
-                        "Call span.start() or use the span as a context manager."
-                    )
-                if state.end_ns is None:
-                    state.end_ns = time.time_ns()
-                    self._dirty = True
-
-    def _start(self) -> None:
-        enable_windows_console_vt()
-        with self._lock:
-            if self._running:
-                return
-            self._running = True
-            self._dirty = True
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
-
-    def _stop(self) -> None:
-        with self._lock:
-            self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-        self.flush()
-
-    def flush(self) -> None:
-        with self._lock:
-            self._stop_live_locked()
-            remaining = [span for span in self._roots.values() if span.started]
-            self._print_roots_locked(remaining)
-            self._roots.clear()
-            self._children.clear()
-            self._spans.clear()
-            self._dirty = False
-
-    def _loop(self) -> None:
-        # Timer-driven so in-flight spans repaint even without new attribute mutations.
-        while True:
-            started_at = time.perf_counter()
-            with self._lock:
-                if not self._running:
-                    return
-                if self._dirty:
-                    self._render_locked()
-
-            if (remaining := _REFRESH_INTERVAL_S - (time.perf_counter() - started_at)) > 0:
-                time.sleep(remaining)
-
-    def _render(self) -> None:
-        with self._lock:
-            self._render_locked()
-
-    def _render_locked(self) -> None:
-        closed_roots = [
-            span for span in self._roots.values() if span.started and span.finished
-        ]
-        open_roots = [
-            span for span in self._roots.values() if span.started and span.in_progress
-        ]
-
-        # Cursor must sit immediately after the previous live block when we erase.
-        # So: erase live → print finished roots into scrollback → redraw live at the bottom.
-        if self._live is not None:
-            self._live.erase()
-
-        if closed_roots:
-            closed_blocks = [
-                (span, self._span_tree_str(span, parent_start_ns=None, indent_level=0))
-                for span in closed_roots
-            ]
-            self._print_roots_locked(closed_roots, blocks=closed_blocks)
-
-        if open_roots or closed_roots or self._live is not None:
-            text = self._live_renderable_str(open_roots)
-            if self._live is None:
-                self._live = _LiveRegion(self._out, self._write_lock)
-            self._live.write(text)
-
-        self._dirty = False
-
-    def _live_renderable_str(self, open_roots: list[_SpanState]) -> str:
+    def live_text(self, open_roots: list[RecordingSpan]) -> str:
         if not open_roots:
             return _IDLE_LIVE
         parts: list[str] = []
         for span in open_roots:
-            parts.append(self._root_separator_line_str(span))
-            parts.append(self._span_tree_str(span, parent_start_ns=None, indent_level=0))
+            parts.append(self.root_block(span))
         return "\n".join(parts)
 
-    def _stop_live_locked(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
-
-    def _println(self, s: str = "") -> None:
-        with self._write_lock:
-            self._out.write(s + "\n")
-            self._out.flush()
-
-    def _print_roots_locked(
-        self,
-        spans: list[_SpanState],
-        *,
-        blocks: list[tuple[_SpanState, str]] | None = None,
-    ) -> None:
-        block_map = {span.id: block for span, block in blocks or []}
-        for span in spans:
-            self._println(self._root_separator_line_str(span))
-            self._println(
-                block_map.get(span.id)
-                or self._span_tree_str(span, parent_start_ns=None, indent_level=0)
-            )
-            self._cleanup(span.id)
-
-    def _cleanup(self, span_id: UUID) -> None:
-        self._roots.pop(span_id, None)
-        self._spans.pop(span_id, None)
-        for child in self._children.pop(span_id, []):
-            self._cleanup(child.id)
-
-    def _root_separator_line_str(self, span: _SpanState) -> str:
-        w = max(16, self._width)
+    def root_separator_line(self, span: RecordingSpan) -> str:
         style = _span_status_style(span)
-        return _styled("─" * w, style)
+        return _styled("─" * self._width, style)
 
-    def _span_header_line_str(
+    def span_header_line(
         self,
-        span: _SpanState,
+        span: RecordingSpan,
         *,
         parent_start_ns: int | None,
         indent_level: int,
     ) -> str:
         indent = "  " * indent_level
-        tw = max(40, self._width)
+        tw = self._width
+        if span.start_ns is None:
+            raise RuntimeError("TTYRenderer can only render started spans")
         if parent_start_ns is None:
             time_s = (
                 datetime.fromtimestamp(span.start_ns / 1e9)
@@ -514,39 +276,25 @@ class TTYTracer:
 
         prefix_len = len(indent) + _TIME_COL + 1
         style = _span_status_style(span)
+        available = tw - prefix_len
 
-        max_trailer = tw - prefix_len - 5
-        trailer = _build_status_trailer(span, max(8, max_trailer))
-        name_w = max(4, tw - prefix_len - len(trailer) - 1)
-        name = span.name
-        if len(name) > name_w:
-            name = name[: max(0, name_w - 1)] + "…"
+        trailer = ""
+        if available >= 16:
+            trailer_budget = max(8, available // 2)
+            trailer = _build_status_trailer(span, trailer_budget)
 
-        gap = tw - prefix_len - len(name) - len(trailer)
-        attempts = 0
-        while gap < 0 and attempts < 6:
-            attempts += 1
-            max_trailer = max(8, max_trailer - 8)
-            trailer = _build_status_trailer(span, max_trailer)
-            name_w = max(4, tw - prefix_len - len(trailer) - 1)
-            name = span.name
-            if len(name) > name_w:
-                name = name[: max(0, name_w - 1)] + "…"
-            gap = tw - prefix_len - len(name) - len(trailer)
-        if gap < 0:
-            name = "…"
-            gap = max(0, tw - prefix_len - len(name) - len(trailer))
+        name_w = max(0, available - len(trailer) - (1 if trailer else 0))
+        name = _clip_visible(span.name, name_w)
+        gap = max(0, available - _visible_width(name) - len(trailer))
 
-        return (
+        return self._fit_line(
             _styled(indent + time_s + " ", "dim")
             + _styled(name, "white")
             + _styled(" " * gap, "dim")
             + _styled(trailer, style)
         )
 
-    def _render_attribute_lines_str(
-        self, attrs: Mapping[str, Any], base_level: int
-    ) -> list[str]:
+    def attribute_lines(self, attrs: Mapping[str, Any], base_level: int) -> list[str]:
         if not attrs:
             return []
         keys = sorted(attrs.keys())
@@ -564,89 +312,93 @@ class TTYTracer:
                 + " "
                 + _styled(str(attrs[key]), "white")
             )
-            lines.append(line)
+            lines.append(self._fit_line(line))
         return lines
 
-    def _render_link_lines_str(self, links: list[_SpanLink], base_level: int) -> list[str]:
+    def link_lines(self, links: list[RecordedLink], base_level: int) -> list[str]:
         base = "  " * base_level
         lines: list[str] = []
         for link in links:
             tail = _uuid_tail(link.span_id)
-            parts = base + _styled("link ", "dim") + _styled(tail, "white")
+            parts = base + _styled("link ", "dim") + _styled(link.name, "white")
+            parts += _styled(f" {tail}", "dim")
             if link.attributes:
                 parts += "  "
                 for i, (k, v) in enumerate(link.attributes.items()):
                     if i:
                         parts += " "
                     parts += _styled(f"{k}=", "dim") + _styled(str(v), "white")
-            lines.append(parts)
+            lines.append(self._fit_line(parts))
         return lines
 
-    def _span_tree_str(
+    def span_tree(
         self,
-        span: _SpanState,
+        span: RecordingSpan,
         *,
         parent_start_ns: int | None,
         indent_level: int,
     ) -> str:
         parts: list[str] = [
-            self._span_header_line_str(
+            self.span_header_line(
                 span, parent_start_ns=parent_start_ns, indent_level=indent_level
             )
         ]
-        attrs = span.attrs
+        attrs = span.attributes
         if attrs:
-            parts.extend(self._render_attribute_lines_str(attrs, indent_level + 1))
+            parts.extend(self.attribute_lines(attrs, indent_level + 1))
         if span.links:
-            parts.extend(self._render_link_lines_str(span.links, indent_level + 1))
-        nested = self._nested_items_str(span, indent_level)
+            parts.extend(self.link_lines(span.links, indent_level + 1))
+        nested = self.nested_items(span, indent_level)
         if nested:
             parts.append(nested)
         return "\n".join(parts)
 
-    def _nested_items_str(self, span: _SpanState, indent_level: int) -> str | None:
-        items = sorted(
+    def nested_items(self, span: RecordingSpan, indent_level: int) -> str | None:
+        items: list[tuple[int, RecordedEvent | RecordingSpan]] = sorted(
             chain(
-                ((e.time_ns, e) for e in span.events),
+                ((e.time_ns, e) for e in span.events or []),
                 (
                     (c.start_ns, c)
                     for c in self._children.get(span.id, [])
-                    if c.started
+                    if c.start_ns is not None
                 ),
             ),
             key=lambda x: x[0],
         )
         if not items:
             return None
+        parent_start = span.start_ns
+        if parent_start is None:
+            return None
         child_level = indent_level + 1
         blocks: list[str] = []
         for _, item in items:
-            if isinstance(item, _SpanEvent):
+            if isinstance(item, RecordedEvent):
                 blocks.append(
-                    self._event_block_str(item, span.start_ns, indent_level=child_level)
+                    self.event_block(item, parent_start, indent_level=child_level)
                 )
             else:
                 blocks.append(
-                    self._span_tree_str(
-                        item, parent_start_ns=span.start_ns, indent_level=child_level
+                    self.span_tree(
+                        item, parent_start_ns=parent_start, indent_level=child_level
                     )
                 )
         return "\n".join(blocks)
 
-    def _event_block_str(
+    def event_block(
         self,
-        event: _SpanEvent,
+        event: RecordedEvent,
         parent_start: int,
         indent_level: int,
     ) -> str:
         body = event.body
-        is_exception = isinstance(body, BaseException)
+        is_exception = event.name == "exception"
         indent_str = "  " * indent_level
         cont = "  " * (indent_level + 1)
 
         rel = f"+{_fmt_duration(event.time_ns - parent_start)}"
-        cw = max(40, self._width)
-        name_w = max(4, cw - indent_level * 2 - _TIME_COL - 1 - 2)
+        cw = self._width
+        name_w = max(1, cw - indent_level * 2 - _TIME_COL - 1 - 2)
         ev_name = event.name
         if len(ev_name) > name_w:
             ev_name = ev_name[: max(0, name_w - 1)] + "…"
@@ -664,17 +416,239 @@ class TTYTracer:
                 if i > 0:
                     line += " "
                 line += _styled(f"{k}: ", "dim") + _styled(str(v), "white")
+        line = self._fit_line(line)
         if body is None:
             return line
 
         parts: list[str] = [line]
         if is_exception:
-            if isinstance(body, BaseException):
-                text = format_exception_for_telemetry(body).rstrip("\n")
-                for ln in text.splitlines():
-                    parts.append(cont + _styled(ln, "dim"))
+            for ln in body.rstrip("\n").splitlines():
+                parts.append(self._fit_line(cont + _styled(ln, "dim")))
         else:
-            body_str = str(body) if not isinstance(body, str) else body
-            for ln in body_str.splitlines():
-                parts.append(cont + _styled(ln, "dim"))
+            for ln in body.splitlines():
+                parts.append(self._fit_line(cont + _styled(ln, "dim")))
         return "\n".join(parts)
+
+
+class TTYTracer:
+    """Live span tree on a TTY while `with tracer` is active.
+
+    A background thread repaints open roots on a timer so in-flight attributes
+    and events appear without hooking every mutation. `stats()` is always zero
+    (dev-only sink).
+    """
+
+    __slots__ = (
+        "_children",
+        "_closed_blocks",
+        "_live",
+        "_lock",
+        "_open_span_ids",
+        "_out",
+        "_rendered_width",
+        "_roots",
+        "_running",
+        "_thread",
+        "_write_lock",
+    )
+
+    def __init__(self, *, out: TextIO | None = None) -> None:
+        self._out = out if out is not None else sys.stdout
+        self._write_lock = threading.Lock()
+        self._roots: dict[UUID, RecordingSpan] = {}
+        self._children: dict[UUID, list[RecordingSpan]] = {}
+        self._open_span_ids: set[UUID] = set()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._closed_blocks: list[str] = []
+        self._live: _LiveRegion | None = None
+        self._rendered_width: int | None = None
+
+    def _terminal_width(self) -> int:
+        try:
+            return max(1, shutil.get_terminal_size((80, 24)).columns - 1)
+        except OSError:
+            return 79
+
+    def __enter__(self) -> TTYTracer:
+        self._start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self._stop()
+
+    def create(
+        self,
+        name: str,
+        attributes: Attributes | None = None,
+        /,
+        *,
+        parent: Span | None = None,
+    ) -> RecordingSpan:
+        if not self._running:
+            raise RuntimeError("TTYTracer must be entered before creating spans.")
+        span_id = uuid7()
+        if parent is None:
+            trace_id = span_id
+            parent_id = None
+        else:
+            trace_id = parent.trace_id
+            parent_id = parent.id
+        span = RecordingSpan(
+            span_id,
+            self,
+            trace_id,
+            parent_id,
+            name,
+            attributes=dict(attributes) if attributes else None,
+        )
+        with self._lock:
+            if span.parent_id is None:
+                self._roots[span.id] = span
+                self._open_span_ids.add(span.id)
+            else:
+                if span.parent_id not in self._open_span_ids:
+                    raise RuntimeError(
+                        "Cannot create a child span for a span that is not open."
+                    )
+                self._children.setdefault(span.parent_id, []).append(span)
+                self._open_span_ids.add(span.id)
+        return span
+
+    def on_end(self, span: Span) -> None:
+        span = cast(RecordingSpan, span)
+        with self._lock:
+            self._open_span_ids.discard(span.id)
+            if span.parent_id is None:
+                width = self._terminal_width()
+                self._closed_blocks.append(
+                    TTYRenderer(width, self._children).root_block(span)
+                )
+                self._cleanup(span.id)
+
+    def stats(self) -> TelemetryStats:
+        return TelemetryStats()
+
+    def _start(self) -> None:
+        if self._out is sys.stdout or getattr(self._out, "isatty", lambda: False)():
+            enable_vt_for_stream(self._out)
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+    def _stop(self) -> None:
+        with self._lock:
+            self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self.flush()
+
+    def flush(self) -> None:
+        with self._lock:
+            width = self._terminal_width()
+            self._rendered_width = width
+            remaining = [span for span in self._roots.values() if span.started]
+            renderer = TTYRenderer(width, self._children)
+            # Roots that finished after the last repaint tick are still queued; drain them
+            # too or they would be silently dropped on shutdown.
+            blocks = self._closed_blocks + [
+                renderer.root_block(span) for span in remaining
+            ]
+            self._closed_blocks = []
+            self._roots.clear()
+            self._children.clear()
+            self._open_span_ids.clear()
+        self._stop_live()
+        self._print_blocks(blocks)
+
+    def _should_render_locked(self) -> bool:
+        if self._closed_blocks:
+            return True
+        current_width = self._terminal_width()
+        if self._rendered_width is not None and current_width != self._rendered_width:
+            return True
+        if self._live is not None:
+            return True
+        return any(span.started and span.in_progress for span in self._roots.values())
+
+    def _loop(self) -> None:
+        # Timer repaints open roots so live attributes/events appear without mutation hooks.
+        # Timer-driven so in-flight spans repaint even without new attribute mutations.
+        while True:
+            started_at = time.perf_counter()
+            with self._lock:
+                if not self._running:
+                    return
+                should_render = self._should_render_locked()
+            if should_render:
+                self._render()
+
+            if (
+                remaining := _REFRESH_INTERVAL_S - (time.perf_counter() - started_at)
+            ) > 0:
+                time.sleep(remaining)
+
+    def _render(self) -> None:
+        with self._lock:
+            closed_blocks, live_text = self._render_plan_locked()
+        self._write_render_plan(closed_blocks, live_text)
+
+    def _render_plan_locked(self) -> tuple[list[str], str | None]:
+        open_roots = [
+            span for span in self._roots.values() if span.started and span.in_progress
+        ]
+        width = self._terminal_width()
+        self._rendered_width = width
+        renderer = TTYRenderer(width, self._children)
+
+        closed_blocks = self._closed_blocks
+        self._closed_blocks = []
+        live_text = (
+            renderer.live_text(open_roots)
+            if open_roots or closed_blocks or self._live is not None
+            else None
+        )
+        return closed_blocks, live_text
+
+    def _write_render_plan(
+        self, closed_blocks: list[str], live_text: str | None
+    ) -> None:
+        # Cursor must sit immediately after the previous live block when we erase.
+        # So: erase live → print finished roots into scrollback → redraw live at the bottom.
+        if self._live is not None:
+            self._live.erase()
+        self._print_blocks(closed_blocks)
+        if live_text is None:
+            return
+        if self._live is None:
+            self._live = _LiveRegion(self._out, self._write_lock)
+        self._live.write(live_text)
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def _print_blocks(self, blocks: list[str]) -> None:
+        if not blocks:
+            return
+        with self._write_lock:
+            self._out.write("\n".join(blocks))
+            self._out.write("\n")
+            self._out.flush()
+
+    def _cleanup(self, span_id: UUID) -> None:
+        self._open_span_ids.discard(span_id)
+        self._roots.pop(span_id, None)
+        for child in self._children.pop(span_id, []):
+            self._cleanup(child.id)

@@ -42,6 +42,226 @@ body {
     background-size: 24px 24px;
 }
 
+/* Lobby */
+.lobby-container {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 3rem;
+}
+
+.lobby-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+}
+
+.lobby-title {
+    font-size: 1.75rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 50%, #fcd34d 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.lobby-new-btn {
+    border: 1px solid var(--accent-light);
+    background: var(--accent-soft);
+    color: var(--fg);
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 0.45rem 0.85rem;
+    border-radius: 999px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.lobby-new-btn:hover {
+    background: #fde68a;
+    box-shadow: 0 2px 8px var(--accent-glow);
+}
+
+.lobby-lead {
+    color: var(--muted);
+    margin-bottom: 1.5rem;
+    line-height: 1.5;
+}
+
+.room-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.room-card {
+    display: flex;
+    align-items: stretch;
+    gap: 0.5rem;
+    padding: 0.5rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.room-card:hover {
+    border-color: var(--accent-light);
+    background: var(--surface-hover);
+    box-shadow: 0 4px 16px rgba(245, 158, 11, 0.12);
+}
+
+.room-card-link {
+    flex: 1;
+    display: block;
+    padding: 0.5rem 0.6rem;
+    text-decoration: none;
+    color: inherit;
+    min-width: 0;
+}
+
+.room-delete-btn {
+    align-self: center;
+    width: 2rem;
+    height: 2rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 1.25rem;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.room-delete-btn:hover {
+    color: #b91c1c;
+    border-color: #fecaca;
+    background: #fef2f2;
+}
+
+.lobby-empty {
+    color: var(--muted);
+    padding: 1rem;
+    text-align: center;
+}
+
+.room-dialog {
+    margin: auto;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) + 2px);
+    padding: 0;
+    max-width: 24rem;
+    width: calc(100% - 2rem);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+}
+
+.room-dialog::backdrop {
+    background: rgba(28, 25, 23, 0.35);
+}
+
+.room-dialog-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    padding: 1.25rem;
+}
+
+.room-dialog-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+}
+
+.room-dialog-label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--muted);
+}
+
+.room-dialog-input,
+.room-dialog-textarea {
+    font: inherit;
+    font-size: 0.9rem;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.6rem 0.75rem;
+    outline: none;
+    resize: vertical;
+}
+
+.room-dialog-input:focus,
+.room-dialog-textarea:focus {
+    border-color: var(--accent-light);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.room-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.25rem;
+}
+
+.room-dialog-cancel,
+.room-dialog-create {
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 0.5rem 0.9rem;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+
+.room-dialog-cancel {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+}
+
+.room-dialog-create {
+    border: none;
+    background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%);
+    color: white;
+}
+
+.room-dialog-create:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.room-card-title {
+    display: block;
+    font-weight: 700;
+    font-size: 1.05rem;
+    margin-bottom: 0.25rem;
+}
+
+.room-card-desc {
+    display: block;
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 0.5rem;
+}
+
+.room-card-meta {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+}
+
 /* Chat Container */
 .chat-container {
     display: flex;
@@ -66,6 +286,15 @@ body {
     }
 }
 
+/* SSE patch target — must mirror .chat-container flex layout */
+#room-live {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+}
+
 /* Header */
 .chat-header {
     background: var(--surface);
@@ -73,17 +302,43 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 0.75rem;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
 }
 
+.back-link {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-decoration: none;
+    flex-shrink: 0;
+}
+
+.back-link:hover {
+    color: var(--accent);
+}
+
+.chat-title-wrap {
+    flex: 1;
+    min-width: 0;
+}
+
 .chat-title {
-    font-size: 1.1rem;
+    font-size: 1.05rem;
     font-weight: 700;
     background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 50%, #fcd34d 100%);
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
+}
+
+.chat-subtitle {
+    font-size: 0.75rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* Online Users */

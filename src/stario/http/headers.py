@@ -1,400 +1,55 @@
+"""Small HTTP header container used by the parser, writer, and application API.
+
+Internally, header names and values are stored as `bytes`, matching HTTP's
+Latin-1-compatible wire form. Names are always lowercased for case-insensitive
+lookup; values keep their original bytes.
+
+Use `set` / `add` / `get` for normal application code. They accept only `str`
+names and values, validate against header injection, and encode to wire bytes.
+The `unsafe_*` methods are for parser/writer paths that already have lowercased,
+safe bytes and want to skip repeated validation.
+
+`_encode_header_name` and `encode_header_value` are wire helpers used by
+`Headers` and tests; prefer the public `Headers` methods in application code.
 """
-Case-folded header map using bytes (Latin-1) to match on-the-wire form and avoid repeated encoding in hot paths.
 
-``set``/``add`` validate names and values; ``rset``/``radd`` assume callers already produced safe lowercased names for paths
-that have duplicated that work (e.g. cookie serialization). Validation targets CRLF/injection issues, not application semantics.
-"""
+from functools import lru_cache
+from typing import cast
 
-import re
-from collections.abc import Mapping
-from typing import Self, overload
+_MISSING = object()
 
 # =============================================================================
-# COMMON HEADERS - Defined as canonical strings
+# VALIDATION
+# Names follow RFC 9110 `token`: visible ASCII tchars only.
+# Values reject control characters that can split or smuggle headers. HTAB is
+# allowed, and obs-text bytes (0x80-0xFF) are preserved as HTTP permits.
 # =============================================================================
 
-REQUEST_HEADERS: tuple[str, ...] = (
-    "Accept",
-    "Accept-Charset",
-    "Accept-Encoding",
-    "Accept-Language",
-    "Authorization",
-    "Cache-Control",
-    "Connection",
-    "Content-Length",
-    "Content-Type",
-    "Cookie",
-    "DNT",
-    "Expect",
-    "Forwarded",
-    "From",
-    "Host",
-    "If-Match",
-    "If-Modified-Since",
-    "If-None-Match",
-    "If-Range",
-    "If-Unmodified-Since",
-    "Max-Forwards",
-    "Origin",
-    "Pragma",
-    "Proxy-Authorization",
-    "Range",
-    "Referer",
-    "Sec-CH-UA",
-    "Sec-CH-UA-Mobile",
-    "Sec-CH-UA-Platform",
-    "Sec-Fetch-Dest",
-    "Sec-Fetch-Mode",
-    "Sec-Fetch-Site",
-    "Sec-Fetch-User",
-    "TE",
-    "Upgrade",
-    "Upgrade-Insecure-Requests",
-    "User-Agent",
-    "Via",
-    "X-Correlation-ID",
-    "X-Forwarded-For",
-    "X-Forwarded-Host",
-    "X-Forwarded-Proto",
-    "X-Real-IP",
-    "X-Request-ID",
-    "X-Requested-With",
+_VALID_NAME_BYTES = (
+    b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
-
-RESPONSE_HEADERS: tuple[str, ...] = (
-    "Accept-Ranges",
-    "Access-Control-Allow-Credentials",
-    "Access-Control-Allow-Headers",
-    "Access-Control-Allow-Methods",
-    "Access-Control-Allow-Origin",
-    "Access-Control-Expose-Headers",
-    "Access-Control-Max-Age",
-    "Age",
-    "Allow",
-    "Alt-Svc",
-    "Cache-Control",
-    "Clear-Site-Data",
-    "Connection",
-    "Content-Disposition",
-    "Content-Encoding",
-    "Content-Language",
-    "Content-Length",
-    "Content-Location",
-    "Content-Range",
-    "Content-Security-Policy",
-    "Content-Security-Policy-Report-Only",
-    "Content-Type",
-    "Cross-Origin-Embedder-Policy",
-    "Cross-Origin-Opener-Policy",
-    "Cross-Origin-Resource-Policy",
-    "Date",
-    "ETag",
-    "Expires",
-    "Last-Modified",
-    "Link",
-    "Location",
-    "NEL",
-    "Permissions-Policy",
-    "Pragma",
-    "Proxy-Authenticate",
-    "Referrer-Policy",
-    "Retry-After",
-    "Server",
-    "Server-Timing",
-    "Set-Cookie",
-    "Strict-Transport-Security",
-    "Timing-Allow-Origin",
-    "Trailer",
-    "Transfer-Encoding",
-    "Upgrade",
-    "Vary",
-    "Via",
-    "WWW-Authenticate",
-    "X-Content-Type-Options",
-    "X-DNS-Prefetch-Control",
-    "X-Frame-Options",
-    "X-Powered-By",
-    "X-XSS-Protection",
-)
-
-ALL_HEADERS: tuple[str, ...] = tuple(set(REQUEST_HEADERS + RESPONSE_HEADERS))
-
-# =============================================================================
-# COMMON VALUES - Defined as strings
-# =============================================================================
-
-CONTENT_TYPES: tuple[str, ...] = (
-    # Application
-    "application/gzip",
-    "application/javascript",
-    "application/javascript; charset=utf-8",
-    "application/json",
-    "application/json; charset=utf-8",
-    "application/ld+json",
-    "application/manifest+json",
-    "application/octet-stream",
-    "application/pdf",
-    "application/vnd.api+json",
-    "application/x-www-form-urlencoded",
-    "application/xml",
-    "application/xml; charset=utf-8",
-    "application/zip",
-    # Audio
-    "audio/mpeg",
-    "audio/ogg",
-    "audio/wav",
-    "audio/webm",
-    # Font
-    "font/otf",
-    "font/ttf",
-    "font/woff",
-    "font/woff2",
-    # Image
-    "image/avif",
-    "image/gif",
-    "image/jpeg",
-    "image/png",
-    "image/svg+xml",
-    "image/webp",
-    "image/x-icon",
-    # Multipart
-    "multipart/form-data",
-    # Text
-    "text/css",
-    "text/css; charset=utf-8",
-    "text/csv",
-    "text/event-stream",
-    "text/html",
-    "text/html; charset=utf-8",
-    "text/javascript",
-    "text/javascript; charset=utf-8",
-    "text/markdown",
-    "text/plain",
-    "text/plain; charset=utf-8",
-    "text/xml",
-    # Video
-    "video/mp4",
-    "video/ogg",
-    "video/webm",
-)
-
-ENCODINGS: tuple[str, ...] = (
-    "br",
-    "deflate",
-    "gzip",
-    "identity",
-    "zstd",
-    "gzip, br",
-    "gzip, deflate",
-    "gzip, deflate, br",
-    "gzip, deflate, br, zstd",
-    "zstd, br, gzip, deflate",
-)
-
-CACHE_CONTROL_VALUES: tuple[str, ...] = (
-    "max-age=0",
-    "max-age=3600",
-    "max-age=31536000",
-    "max-age=31536000, immutable",
-    "no-cache",
-    "no-cache, no-store",
-    "no-cache, no-store, must-revalidate",
-    "no-store",
-    "private",
-    "private, max-age=0",
-    "private, no-cache",
-    "public",
-    "public, max-age=31536000",
-    "public, max-age=31536000, immutable",
-)
-
-CONNECTION_VALUES: tuple[str, ...] = (
-    "close",
-    "keep-alive",
-    "upgrade",
-)
-
-TRANSFER_ENCODING_VALUES: tuple[str, ...] = (
-    "chunked",
-    "compress",
-    "deflate",
-    "gzip",
-    "identity",
-)
-
-VARY_VALUES: tuple[str, ...] = (
-    "*",
-    "Accept",
-    "Accept-Encoding",
-    "Accept-Encoding, Accept-Language",
-    "Accept-Language",
-    "Cookie",
-    "Origin",
-    "User-Agent",
-)
-
-ACCESS_CONTROL_VALUES: tuple[str, ...] = (
-    "*",
-    "false",
-    "true",
-)
-
-X_CONTENT_TYPE_OPTIONS_VALUES: tuple[str, ...] = ("nosniff",)
-
-X_FRAME_OPTIONS_VALUES: tuple[str, ...] = (
-    "DENY",
-    "SAMEORIGIN",
-)
-
-# Referrer-Policy values
-REFERRER_POLICY_VALUES: tuple[str, ...] = (
-    "no-referrer",
-    "no-referrer-when-downgrade",
-    "origin",
-    "origin-when-cross-origin",
-    "same-origin",
-    "strict-origin",
-    "strict-origin-when-cross-origin",
-    "unsafe-url",
-)
-
-# Cross-Origin policy values
-CROSS_ORIGIN_VALUES: tuple[str, ...] = (
-    "anonymous",
-    "use-credentials",
-    "same-origin",
-    "same-site",
-    "cross-origin",
-    "require-corp",
-    "credentialless",
-    "unsafe-none",
-)
-
-# Accept-Ranges values
-ACCEPT_RANGES_VALUES: tuple[str, ...] = (
-    "bytes",
-    "none",
-)
-
-# Common HTTP methods (for Access-Control-Allow-Methods)
-HTTP_METHODS: tuple[str, ...] = (
-    "GET",
-    "POST",
-    "PUT",
-    "DELETE",
-    "PATCH",
-    "HEAD",
-    "OPTIONS",
-    "CONNECT",
-    "TRACE",
-    "GET, POST",
-    "GET, POST, PUT, DELETE",
-    "GET, POST, PUT, DELETE, PATCH",
-    "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-)
-
-# Content-Disposition values
-CONTENT_DISPOSITION_VALUES: tuple[str, ...] = (
-    "inline",
-    "attachment",
-)
-
-ALL_VALUES: tuple[str, ...] = (
-    CONTENT_TYPES
-    + ENCODINGS
-    + CACHE_CONTROL_VALUES
-    + CONNECTION_VALUES
-    + TRANSFER_ENCODING_VALUES
-    + VARY_VALUES
-    + ACCESS_CONTROL_VALUES
-    + X_CONTENT_TYPE_OPTIONS_VALUES
-    + X_FRAME_OPTIONS_VALUES
-    + REFERRER_POLICY_VALUES
-    + CROSS_ORIGIN_VALUES
-    + ACCEPT_RANGES_VALUES
-    + HTTP_METHODS
-    + CONTENT_DISPOSITION_VALUES
+_VALID_VALUE_BYTES = bytes(
+    b for b in range(256) if b == 0x09 or (b >= 0x20 and b != 0x7F)
 )
 
 
-# =============================================================================
-# VALIDATION — rejects CTLs/newlines to prevent HTTP response splitting.
-# Header names: RFC 9110 "token" — regex matches *invalid* bytes.
-# Header values: reject CTLs except HT (0x09), allow obs-text (0x80-0xFF).
-# =============================================================================
-
-HEADER_RE = re.compile(rb'[\x00-\x1f\x7f()<>@,;:\\"/\[\]\?={} \t]')
-HEADER_VALUE_RE = re.compile(b"[\x00-\x08\x0a-\x1f\x7f]")
-
-
-def _validate_header(name: str | bytes) -> bytes:
-    """Validate and normalize header name to lowercased bytes."""
-    if isinstance(name, str):
-        name = name.encode("latin-1")
-
-    lowered = name.lower()
-
-    if HEADER_RE.search(lowered):
+@lru_cache(maxsize=1024)
+def _encode_header_name(name: str) -> bytes:
+    """Validate and return a lowercased wire-name for public header APIs."""
+    name_bytes = name.encode("latin-1")
+    if not name_bytes:
+        raise ValueError("Invalid header name: empty")
+    if name_bytes.translate(None, _VALID_NAME_BYTES):
         raise ValueError(f"Invalid header name: {name}")
+    return name_bytes.lower()
 
-    return lowered
 
-
-def _validate_value(value: str | bytes) -> bytes:
-    """Validate header value bytes."""
-    if isinstance(value, str):
-        value = value.encode("latin-1")
-
-    if HEADER_VALUE_RE.search(value):
+def encode_header_value(value: str) -> bytes:
+    """Validate and return wire bytes for a header value."""
+    value_bytes = value.encode("latin-1")
+    if value_bytes.translate(None, _VALID_VALUE_BYTES):
         raise ValueError(f"Invalid header value: {value}")
-
-    return value
-
-
-# =============================================================================
-# LOOKUPS — separate to avoid collisions (e.g. "Accept" is both a header and a Vary value)
-# =============================================================================
-
-
-class _HeaderLookup(dict):
-    """Self-populating header name lookup. Bounded to _MAX_SIZE entries."""
-
-    __slots__ = ()
-    _MAX_SIZE = 1024  # ~400 pre-populated + room for ~600 custom
-
-    def __missing__(self, key: str | bytes) -> bytes:
-        result = _validate_header(key)
-        if len(self) < self._MAX_SIZE:
-            self[key] = result
-        return result
-
-
-HEADER_LOOKUP: _HeaderLookup = _HeaderLookup()
-_h = _hb = _lo = _lob = ""
-for _h in ALL_HEADERS:
-    _hb = _h.encode("latin-1")
-    _lo = _h.lower()
-    _lob = _lo.encode("latin-1")
-    HEADER_LOOKUP[_h] = _lob
-    HEADER_LOOKUP[_hb] = _lob
-    HEADER_LOOKUP[_lo] = _lob
-    HEADER_LOOKUP[_lob] = _lob
-
-VALUE_LOOKUP: dict[str | bytes, bytes] = {}
-_v = _vb = ""
-for _v in ALL_VALUES:
-    _vb = _v.encode("latin-1")
-    VALUE_LOOKUP[_v] = _vb
-    VALUE_LOOKUP[_vb] = _vb
-
-del _h, _hb, _lo, _lob, _v, _vb
-
-
-def encode_value(value: str | bytes) -> bytes:
-    """Encode header value to bytes. Custom values validated per call (not cached)."""
-    if encoded := VALUE_LOOKUP.get(value):
-        return encoded
-    return _validate_value(value)
+    return value_bytes
 
 
 # =============================================================================
@@ -403,169 +58,171 @@ def encode_value(value: str | bytes) -> bytes:
 
 
 class Headers:
-    """HTTP header map: validated ``str``/``bytes`` API plus ``r*`` helpers for already-normalized wire bytes."""
+    """Case-insensitive HTTP headers with a bytes-backed internal store.
+
+    `_data` maps lowercased header-name bytes to either one value (`bytes`) or
+    multiple values (`list[bytes]`). The single-value shape keeps common headers
+    cheap; the list shape preserves duplicates such as `Set-Cookie`.
+
+    `_data` is a stable internal layout for protocol/writer hot paths.
+    """
 
     __slots__ = ("_data",)
 
     def __init__(
         self, raw_header_data: dict[bytes, bytes | list[bytes]] | None = None
     ) -> None:
-        """Build an empty map or wrap pre-parsed wire-form headers.
+        """Build an empty map or wrap already-normalized wire-form headers.
 
-        Parameters:
-            raw_header_data: Optional internal dict (lowercased ASCII ``bytes`` keys; values are ``bytes`` or lists for duplicates).
-
-        Notes:
-            The fast path from the HTTP parser uses this constructor; application code should prefer ``set`` / ``add``.
+        `raw_header_data` is an internal fast path for the parser and tests. It
+        is trusted as-is: names must already be lowercased bytes, and values must
+        already be safe bytes. Non-lowercase keys are not normalized; lookups
+        will miss. The dict is stored by reference; mutations alias the caller's
+        mapping. Application code should use `set` / `add`.
         """
-        self._data = raw_header_data or {}
-
-    def add(self, name: str | bytes, value: str | bytes) -> Self:
-        """Append a value, allowing duplicates (e.g. multiple ``Set-Cookie``).
-
-        Parameters:
-            name: Header name (canonical names are validated against known tokens when using ``str``).
-            value: Header value; encoded for wire form.
-
-        Returns:
-            ``self`` for chaining.
-        """
-        key = HEADER_LOOKUP[name]
-        val = encode_value(value)
-        if (existing := self._data.setdefault(key, val)) is not val:
-            if isinstance(existing, list):
-                existing.append(val)
-            else:
-                self._data[key] = [existing, val]
-        return self
-
-    def set(self, name: str | bytes, value: str | bytes) -> Self:
-        """Replace any existing values for this header name.
-
-        Parameters:
-            name: Header name.
-            value: New value.
-
-        Returns:
-            ``self`` for chaining.
-        """
-        self._data[HEADER_LOOKUP[name]] = encode_value(value)
-        return self
+        self._data = raw_header_data if raw_header_data is not None else {}
 
     # -------------------------------------------------------------------------
-    # Raw methods - no encoding/validation
+    # Write
     # -------------------------------------------------------------------------
 
-    def radd(self, name: bytes, value: bytes) -> Self:
-        """Like ``add`` but assumes ``name`` is already lowercased header-name bytes (no validation)."""
-        if (existing := self._data.setdefault(name, value)) is not value:
-            if isinstance(existing, list):
-                existing.append(value)
-            else:
-                self._data[name] = [existing, value]
-        return self
+    def add(self, name: str, value: str) -> None:
+        """Append a validated value, keeping prior values for the same name."""
+        self.unsafe_add(_encode_header_name(name), encode_header_value(value))
 
-    def rset(self, name: bytes, value: bytes) -> Self:
-        """Like ``set`` for pre-lowercased name bytes (response helpers use this in hot paths)."""
+    def unsafe_add(self, name: bytes, value: bytes) -> None:
+        """Append wire bytes; `name` must already be lowercased."""
+        data = self._data
+        if name not in data:
+            data[name] = value
+            return
+        existing = data[name]
+        if isinstance(existing, list):
+            existing.append(value)
+        else:
+            data[name] = [existing, value]
+
+    def set(self, name: str, value: str) -> None:
+        """Replace all values for `name` with one validated value."""
+        self.unsafe_set(_encode_header_name(name), encode_header_value(value))
+
+    def unsafe_set(self, name: bytes, value: bytes) -> None:
+        """Set wire bytes for `name`; no validation."""
         self._data[name] = value
-        return self
 
-    def update(
-        self,
-        other: (
-            Mapping[str, str]
-            | Mapping[bytes, bytes]
-            | Mapping[str | bytes, str | bytes]
-            | None
-        ),
-    ) -> Self:
-        if other is None:
-            return self
-        # Directly add items to _data (faster than calling set repeatedly)
-        for name, value in other.items():
-            self._data[HEADER_LOOKUP[name]] = encode_value(value)
-        return self
+    def setdefault(self, name: str, value: str) -> str:
+        """Return the first value, or set and return `value` when absent."""
+        key = _encode_header_name(name)
+        existing = self.unsafe_get(key, _MISSING)
+        if existing is not _MISSING:
+            return cast(bytes, existing).decode("latin-1")
+        val = encode_header_value(value)
+        self.unsafe_set(key, val)
+        return val.decode("latin-1")
 
-    def setdefault(self, name: str | bytes, value: str | bytes) -> str:
-        """Set header if not present, return value as string."""
-        key = HEADER_LOOKUP[name]
-        existing = self._data.get(key)
-        if existing is None:
-            val = encode_value(value)
-            self._data[key] = val
-            return val.decode("latin-1")
-        raw = existing if isinstance(existing, bytes) else existing[0]
-        return raw.decode("latin-1")
+    # -------------------------------------------------------------------------
+    # Read
+    # -------------------------------------------------------------------------
 
-    @overload
-    def get(self, name: str | bytes) -> str | None: ...
-
-    @overload
-    def get[T](self, name: str | bytes, default: T) -> str | T: ...
-
-    def get[T](self, name: str | bytes, default: T | None = None) -> str | T | None:
-        """First header value as ``str`` (Latin-1 decoded), or ``default``."""
-        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
-        value = self._data.get(key)
-        if value is None:
+    def get[T](self, name: str, default: T = None) -> str | T:
+        """Return the first value as `str`, or `default` when missing."""
+        wire = self.unsafe_get(_encode_header_name(name), _MISSING)
+        if wire is _MISSING:
             return default
-        raw = value if isinstance(value, bytes) else value[0]
-        return raw.decode("latin-1")
+        return cast(bytes, wire).decode("latin-1")
 
-    def getlist(self, name: str | bytes) -> list[str]:
-        """Every value for a possibly multi-valued header, as strings."""
-        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
-        value = self._data.get(key)
-        if value is None:
-            return []
-        if isinstance(value, bytes):
-            return [value.decode("latin-1")]
-        return [v.decode("latin-1") for v in value]
-
-    # -------------------------------------------------------------------------
-    # Raw read methods - return bytes
-    # -------------------------------------------------------------------------
-
-    def rget[T: bytes | None = None](self, name: bytes, default: T = None) -> T | bytes:
-        """First value as wire ``bytes`` (``name`` must be lowercased header bytes)."""
+    def unsafe_get[T](self, name: bytes, default: T = None) -> T | bytes:
+        """Return the first wire value as `bytes`."""
         value = self._data.get(name)
         if value is None:
             return default
-        return value if isinstance(value, bytes) else value[0]
+        # `type is bytes` fast path; lists only come from `unsafe_add`.
+        if type(value) is bytes:
+            return value
+        return cast(list[bytes], value)[0]
 
-    def rgetlist(self, name: bytes) -> list[bytes]:
-        """All values as wire ``bytes`` (for duplicated headers such as ``Set-Cookie``)."""
+    def getlist(self, name: str) -> list[str]:
+        """Return every value for `name` as strings."""
+        return [
+            v.decode("latin-1") for v in self.unsafe_getlist(_encode_header_name(name))
+        ]
+
+    def unsafe_getlist(self, name: bytes) -> list[bytes]:
+        """Return every wire value for `name` as bytes (copy prevents aliasing)."""
         value = self._data.get(name)
         if value is None:
             return []
-        return [value] if isinstance(value, bytes) else list(value)
+        if type(value) is bytes:
+            return [value]
+        return list(cast(list[bytes], value))
 
-    def remove(self, name: str | bytes) -> Self:
-        """Remove a header."""
-        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
-        self._data.pop(key, None)
-        return self
+    # -------------------------------------------------------------------------
+    # Remove
+    # -------------------------------------------------------------------------
 
-    def items(self) -> list[tuple[bytes, bytes]]:
-        """Return all header name-value pairs (flattened)."""
+    def remove(self, name: str) -> None:
+        """Remove all values for `name`."""
+        self.unsafe_remove(_encode_header_name(name))
+
+    def unsafe_remove(self, name: bytes) -> None:
+        """Remove all wire values for `name`."""
+        self._data.pop(name, None)
+
+    # -------------------------------------------------------------------------
+    # Iterate
+    # -------------------------------------------------------------------------
+
+    def items(self) -> list[tuple[str, str]]:
+        """Return flattened `(name, value)` pairs as lowercased strings."""
+        return [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in self.unsafe_items()
+        ]
+
+    def unsafe_items(self) -> list[tuple[bytes, bytes]]:
+        """Return flattened `(name, value)` pairs as wire bytes."""
         result: list[tuple[bytes, bytes]] = []
         for name, value in self._data.items():
-            if isinstance(value, bytes):
-                result.append((name, value))
-            else:
+            if isinstance(value, list):
                 for v in value:
                     result.append((name, v))
+            else:
+                result.append((name, value))
         return result
 
-    def clear(self) -> None:
-        """Remove all headers."""
-        self._data.clear()
+    def unsafe_iter_wire_pairs(self) -> list[tuple[bytes, bytes | list[bytes]]]:
+        """Return `(name, value)` wire pairs without flattening multi-value headers."""
+        return list(self._data.items())
 
-    def __contains__(self, name: str | bytes) -> bool:
-        key = HEADER_LOOKUP[name] if isinstance(name, str) else name.lower()
+    def unsafe_append_wire_lines(self, parts: list[bytes]) -> None:
+        """Append header lines to `parts` for protocol/writer hot paths."""
+        for name, value in self._data.items():
+            if type(value) is bytes:
+                parts.append(name)
+                parts.append(b": ")
+                parts.append(value)
+                parts.append(b"\r\n")
+                continue
+            for header_value in cast(list[bytes], value):
+                parts.append(name)
+                parts.append(b": ")
+                parts.append(header_value)
+                parts.append(b"\r\n")
+
+    # -------------------------------------------------------------------------
+    # Protocol
+    # -------------------------------------------------------------------------
+
+    def __contains__(self, name: str) -> bool:
+        """Whether `name` is present (case-insensitive)."""
+        try:
+            key = _encode_header_name(name)
+        except ValueError:
+            return False
         return key in self._data
 
     def __len__(self) -> int:
+        """Number of distinct header names (not total field lines)."""
         return len(self._data)
 
     def __repr__(self) -> str:

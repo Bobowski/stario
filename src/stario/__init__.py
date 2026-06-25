@@ -1,28 +1,55 @@
 """
-HTTP apps as explicit routes + plain HTML trees; wire protocol and rendering stay visible (no magic request globals).
+HTTP apps as explicit routes + plain HTML trees; wire protocol and rendering stay visible.
 
-The package root re-exports the types most handlers touch; use submodules (``stario.responses``, ``stario.datastar``, …) for helpers.
+**Package layout**
 
-Prefer ``from stario import …`` by name—for markup, ``from stario import html as h`` and ``from stario import svg`` are the usual entry points (both are the same modules as ``stario.html`` and ``stario.html.svg``). Import tag helpers explicitly (for example ``from stario.html import Div, P``) or use the submodule ``from stario.html import tags as tags`` when you want the full catalog without a long import list. **Datastar** helpers use ``from stario import datastar as ds`` (the ``stario.datastar`` package). **Intentional HTTP outcomes** use ``HttpException`` for bodies (4xx/5xx) and ``RedirectException`` for redirects (3xx), both from ``stario.exceptions`` and re-exported here.
+- `stario` (this module) — daily handler primitives re-exported below.
+- `stario.routing` — compile-time URL language (`UrlPath`, `normalize_path`, …).
+- `stario.http` — request/response wire, dispatch (`Router`), and server embedding.
+- `stario.staticassets` — fingerprinted static files (`AssetManifest`, `StaticAssets`).
+- `stario.responses` / `stario.cookies` — thin helpers on `Writer`.
+
+Import feature areas from their modules: `import stario.responses as responses`,
+`from stario.datastar import at, data`, and symbols from `stario.markup`
+(for example `from stario.markup import baked` and `from stario.markup import html as h`).
+
+Prefer `from stario import …` for:
+
+- **Per-handler:** `App`, `Context`, `Writer`, `UrlPath`
+- **Control flow:** `HttpException`, `RedirectException`
+- **Bootstrap / assets:** `AssetManifest`, `StaticAssets`, `Span`
+- **Middleware / realtime:** `Handler`, `Middleware`, `Relay`
+
+Register routes on `App` (`app.get(HOME, …)`), scope middleware with `app.use(pattern, mw)`.
+Import `Router` from `stario.http` when you need a separate route table. For HTTP types
+(`Request`, `ParsedQuery`, `Headers`, `RouteMatch`), use `stario.http`.
 """
 
 from importlib.metadata import version as _package_version
 
 __version__ = _package_version("stario")
 
-from stario import cookies as cookies
-from stario import html as html
-from stario import responses as responses
-from stario.exceptions import HttpException as HttpException
-from stario.exceptions import RedirectException as RedirectException
-from stario.html import svg as svg
-from stario.http.app import App as App
-from stario.http.context import Context as Context
-from stario.http.context import Handler as Handler
-from stario.http.context import Middleware as Middleware
-from stario.http.request import Request as Request
-from stario.http.router import Router as Router
-from stario.http.staticassets import StaticAssets as StaticAssets
-from stario.http.writer import Writer as Writer
-from stario.relay import Relay as Relay
-from stario.telemetry import Span as Span
+from stario.exceptions import HttpException, RedirectException
+from stario.http.app import App
+from stario.http.context import Context, Handler, Middleware
+from stario.http.writer import Writer
+from stario.relay import Relay
+from stario.routing import UrlPath
+from stario.staticassets import AssetManifest, StaticAssets
+from stario.telemetry import Span
+
+__all__ = [
+    "App",
+    "AssetManifest",
+    "Context",
+    "Handler",
+    "HttpException",
+    "Middleware",
+    "RedirectException",
+    "Relay",
+    "Span",
+    "StaticAssets",
+    "UrlPath",
+    "Writer",
+    "__version__",
+]

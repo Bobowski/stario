@@ -1,22 +1,45 @@
 [project]
 name = "stario"
-version = "3.4.0"
-description = "Stario - Bringing back the joy of web development"
+version = "4.0.0"
+description = "Craft realtime hypermedia apps that are a joy to write and ship."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
 ]
 requires-python = ">=3.14"
+keywords = ["asyncio", "http", "hypermedia", "html", "sse", "framework"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
+]
 dependencies = [
-    "aiofiles>=24.1.0",
-    "brotli>=1.1.0",
-    "httptools>=0.7.1",
-    "xxhash>=3.5.0",
-    "watchfiles>=1.1.0",
+    "aiofiles>=24.1.0,<26",
+    "brotli>=1.1.0,<2",
+    "httptools>=0.7.1,<0.9",
+    "xxhash>=3.5.0,<4",
+    "watchfiles>=1.1.0,<2",
 ]
 
+[project.urls]
+Homepage = "https://stario.dev"
+Documentation = "https://stario.dev/docs"
+Repository = "https://github.com/bobowski/stario"
+Changelog = "https://github.com/bobowski/stario/blob/main/CHANGELOG.md"
+Issues = "https://github.com/bobowski/stario/issues"
+
+[project.optional-dependencies]
+uvloop = ["uvloop>=0.21.0,<1"]
+
 [project.scripts]
-stario = "stario.cli:main"
+stario = "stario.cli.main:main"
 
 [build-system]
 requires = ["uv_build>=0.8.6,<0.9.0"]
@@ -30,7 +53,57 @@ dev = [
     "ruff>=0.12.8",
 ]
 
+[tool.uv]
+default-groups = ["dev"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+reportPrivateUsage = false
+reportMissingTypeStubs = false
+strict = ["src"]
+include = [
+    "src",
+    "tests",
+    "examples",
+]
+exclude = ["benchmarks", "**/.venv", "**/__pycache__"]
+
+[[tool.pyright.executionEnvironments]]
+root = "examples/chat-room"
+extraPaths = ["examples/chat-room"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = ["src", "tests", "examples"]
+exclude = [
+    "benchmarks",
+    ".venv",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "UP", "B", "SIM", "RUF", "PT"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+# Close-button glyph in markup examples and tests.
+allowed-confusables = ["×"]
+
+[tool.ruff.lint.isort]
+# First-party roots aligned with pyright `include`. Multi-file examples use an
+# `app` package (see examples/chat-room); add other top-level example package
+# names here when a new layout needs it.
+known-first-party = ["stario", "tests", "app"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = false
+docstring-code-line-length = "dynamic"

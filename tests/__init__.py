@@ -1,2 +1,1 @@
 """Stario Test Suite."""
-

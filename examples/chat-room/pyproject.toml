@@ -1,10 +1,10 @@
 [project]
 name = "chat-room"
 version = "0.0.0"
-description = "Stario chat-room example application"
+description = "Stario multi-room chat — larger-app example (app.main:bootstrap)"
 requires-python = ">=3.14"
 dependencies = [
-    "stario>=3,<4",
+
 ]
 
 [dependency-groups]

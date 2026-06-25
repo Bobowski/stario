@@ -1,4 +1,4 @@
-"""Streaming, client teardown, and telemetry (``TestClient`` drains work on exit)."""
+"""Streaming, client teardown, and telemetry (`TestClient` drains work on exit)."""
 
 import asyncio
 
@@ -10,12 +10,14 @@ from stario.testing import TestClient
 
 
 @pytest.mark.asyncio
-async def test_empty_response_then_background_child_span_finished_on_client_exit() -> None:
+async def test_empty_response_then_background_child_span_finished_on_client_exit() -> (
+    None
+):
     """Handler returns **204** immediately; background work uses a **child** span.
 
     The request span is snapshotted when the handler returns. Later attribute updates on the root
-    span are ignored by ``TestTracer``—record post-response work on a child span. Leaving
-    ``async with TestClient(...)`` awaits ``app.create_task`` and open spans (same as app shutdown).
+    span are ignored by `TestTracer`—record post-response work on a child span. Leaving
+    `async with TestClient(...)` awaits `app.create_task` and open spans (same as app shutdown).
     """
 
     app = App()
@@ -56,7 +58,7 @@ async def test_empty_response_then_background_child_span_finished_on_client_exit
 
 @pytest.mark.asyncio
 async def test_stream_exit_signals_disconnect_and_finishes_handler() -> None:
-    """Leaving ``async with client.stream`` disconnects and waits for the handler (no manual API)."""
+    """Leaving `async with client.stream` disconnects and waits for the handler (no manual API)."""
 
     app = App()
 
@@ -65,7 +67,7 @@ async def test_stream_exit_signals_disconnect_and_finishes_handler() -> None:
         w.write_headers(200)
         sent = 0
         while sent < 50:
-            if w.disconnected:
+            if c.disconnected:
                 c.span.attr("stream.events_sent", sent)
                 c.span.event("stream.client_disconnected", {"at_least_one": True})
                 return

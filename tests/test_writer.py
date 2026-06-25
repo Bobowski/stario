@@ -2,20 +2,26 @@
 
 import asyncio
 import json
-import zlib
-from compression import zstd
 
-import brotli
 import pytest
 
 import stario.cookies as cookies
 import stario.responses as responses
 from stario import App
-from stario import datastar as ds
+from stario.datastar import SSE
 from stario.exceptions import StarioError, StarioRuntime
-from stario.html import H1
-from stario.http.writer import CompressionConfig, Writer
+from stario.http.writer import Writer
+from stario.markup import html as h
 from stario.testing import TestClient
+from tests.helpers import (
+    _MemoryTransport,
+)
+from tests.helpers import (
+    make_context as _make_context,
+)
+from tests.helpers import (
+    make_writer_raw as _make_writer,
+)
 
 
 def _make_app() -> App:
@@ -25,7 +31,7 @@ def _make_app() -> App:
         responses.text(w, "Hello, World!")
 
     async def html_route(c, w):
-        responses.html(w, H1("Hello"))
+        responses.html(w, h.H1("Hello"))
 
     async def json_route(c, w):
         responses.json(w, {"message": "hello"})
@@ -41,16 +47,7 @@ def _make_app() -> App:
         responses.redirect(w, "/redirect-cookie/final", 302)
 
     async def redirect_cookie_final(c, w):
-        responses.text(w, cookies.get_cookie(c.req, "session") or "missing")
-
-    async def query_route(c, w):
-        responses.json(
-            w,
-            {
-                "page": c.req.query.get("page"),
-                "tags": c.req.query.getlist("tag"),
-            }
-        )
+        responses.text(w, c.req.cookies.get("session") or "missing")
 
     async def json_echo(c, w):
         responses.json(w, json.loads(await c.req.body()))
@@ -61,7 +58,7 @@ def _make_app() -> App:
             {
                 "body": (await c.req.body()).decode(),
                 "content_type": c.req.headers.get("content-type"),
-            }
+            },
         )
 
     async def upload_echo(c, w):
@@ -76,17 +73,14 @@ def _make_app() -> App:
         responses.json(
             w,
             {
-                "session": cookies.get_cookie(c.req, "session"),
-                "theme": cookies.get_cookie(c.req, "theme"),
-            }
+                "session": c.req.cookies.get("session"),
+                "theme": c.req.cookies.get("theme"),
+            },
         )
 
     async def telemetry_route(c, w):
         c.span.event("handler.hit", {"path": c.req.path})
         responses.json(w, {"ok": True})
-
-    async def compressed_route(c, w):
-        responses.text(w, "x" * 2048)
 
     async def error_route(c, w):
         responses.text(w, "teapot", 418)
@@ -98,49 +92,14 @@ def _make_app() -> App:
     app.get("/final", final_route)
     app.get("/redirect-cookie", redirect_cookie_route)
     app.get("/redirect-cookie/final", redirect_cookie_final)
-    app.get("/query", query_route)
     app.post("/json-echo", json_echo)
     app.post("/form-echo", form_echo)
     app.post("/upload", upload_echo)
     app.get("/login", login)
     app.get("/me", me)
     app.get("/telemetry", telemetry_route)
-    app.get("/compressed", compressed_route)
     app.get("/error", error_route)
     return app
-
-
-def _make_writer() -> tuple[Writer, bytearray, asyncio.AbstractEventLoop]:
-    loop = asyncio.new_event_loop()
-    sink = bytearray()
-    writer = Writer(
-        transport_write=sink.extend,
-        get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-        on_completed=lambda: None,
-        disconnect=loop.create_future(),
-        shutdown=loop.create_future(),
-    )
-    return writer, sink, loop
-
-
-def _split_response(raw: bytes) -> tuple[bytes, bytes]:
-    head, _, body = raw.partition(b"\r\n\r\n")
-    return head, body
-
-
-def _decode_chunked(body: bytes) -> bytes:
-    remaining = body
-    decoded = bytearray()
-    while remaining:
-        size_line, _, rest = remaining.partition(b"\r\n")
-        if not rest:
-            break
-        size = int(size_line.split(b";", 1)[0], 16)
-        if size == 0:
-            break
-        decoded.extend(rest[:size])
-        remaining = rest[size + 2 :]
-    return bytes(decoded)
 
 
 @pytest.mark.asyncio
@@ -186,17 +145,15 @@ class TestClientBasics:
 
     async def test_redirects_merge_response_cookies_into_request_cookie_overrides(self):
         async with TestClient(_make_app()) as client:
-            response = await client.get("/redirect-cookie", cookies={"session": "stale"})
+            response = await client.get(
+                "/redirect-cookie", cookies={"session": "stale"}
+            )
 
         assert response.status_code == 200
         assert response.text == "fresh"
 
     async def test_client_sends_query_json_form_and_file_payloads(self):
         async with TestClient(_make_app()) as client:
-            query_response = await client.get(
-                "/query",
-                params={"page": 2, "tag": ["a", "b"]},
-            )
             json_response = await client.post("/json-echo", json={"name": "Ada"})
             form_response = await client.post(
                 "/form-echo", data={"active": True, "count": 2}
@@ -207,7 +164,6 @@ class TestClientBasics:
                 files={"file": ("avatar.txt", "hello", "text/plain")},
             )
 
-        assert query_response.json() == {"page": "2", "tags": ["a", "b"]}
         assert json_response.json() == {"name": "Ada"}
         assert form_response.json() == {
             "body": "active=true&count=2",
@@ -264,32 +220,13 @@ class TestClientBasics:
             assert state["n"] == 0
         assert state["n"] == 1
 
-    async def test_drain_tasks_flushes_before_client_exit(self):
-        app = App()
-        state = {"n": 0}
-
-        async def handler(c, w):
-            async def bg():
-                await asyncio.sleep(0.02)
-                state["n"] = 1
-
-            c.app.create_task(bg())
-            responses.text(w, "ok")
-
-        app.get("/", handler)
-        async with TestClient(app) as client:
-            await client.get("/")
-            assert state["n"] == 0
-            await client.drain_tasks()
-            assert state["n"] == 1
-
     async def test_client_exit_signals_app_shutdown_before_draining_tasks(self):
         app = App()
         stopped = asyncio.Event()
 
         async def handler(c, w):
             async def bg():
-                await c.app.wait_shutdown()
+                await c.app.shutdown
                 stopped.set()
 
             c.app.create_task(bg())
@@ -302,43 +239,37 @@ class TestClientBasics:
 
         assert stopped.is_set()
 
-    async def test_client_decompresses_compressed_responses(self):
-        compression = CompressionConfig(
-            min_size=1,
-            zstd_level=-1,
-            brotli_level=-1,
-            gzip_level=6,
-        )
-        async with TestClient(_make_app(), compression=compression) as client:
-            response = await client.get(
-                "/compressed",
-                headers={"Accept-Encoding": "gzip"},
-            )
+    async def test_redirect_loop_raises_after_max_redirects(self):
+        app = App()
 
-        assert response.headers.get("content-encoding") == "gzip"
-        assert response.text == "x" * 2048
+        async def loop_route(c, w):
+            responses.redirect(w, "/loop", 302)
 
-    async def test_client_prefers_brotli_when_multiple_codecs_are_available(self):
-        compression = CompressionConfig(min_size=1)
-        async with TestClient(_make_app(), compression=compression) as client:
-            response = await client.get(
-                "/compressed",
-                headers={"Accept-Encoding": "gzip, zstd, br"},
-            )
+        app.get("/loop", loop_route)
+        async with TestClient(app, max_redirects=3) as client:
+            with pytest.raises(RuntimeError, match="Too many redirects"):
+                await client.get("/loop")
 
-        assert response.headers.get("content-encoding") == "br"
-        assert response.text == "x" * 2048
+    @pytest.mark.parametrize(
+        ("client_timeout", "request_timeout"),
+        [
+            (0.05, None),
+            (None, 0.05),
+        ],
+    )
+    async def test_request_timeout_default_applies(
+        self, client_timeout, request_timeout
+    ):
+        app = App()
 
-    async def test_client_respects_accept_encoding_qvalues(self):
-        compression = CompressionConfig(min_size=1)
-        async with TestClient(_make_app(), compression=compression) as client:
-            response = await client.get(
-                "/compressed",
-                headers={"Accept-Encoding": "gzip;q=0.9, br;q=0.2"},
-            )
+        async def slow(c, w):
+            await asyncio.sleep(10)
+            responses.text(w, "late")
 
-        assert response.headers.get("content-encoding") == "gzip"
-        assert response.text == "x" * 2048
+        app.get("/slow", slow)
+        async with TestClient(app, request_timeout=client_timeout) as client:
+            with pytest.raises(TimeoutError):
+                await client.get("/slow", timeout=request_timeout)
 
     async def test_response_raise_for_status(self):
         async with TestClient(_make_app()) as client:
@@ -357,30 +288,13 @@ class TestClientBasics:
             w.end()
 
         app.get("/s", handler)
-        async with TestClient(app) as client:
-            async with client.stream(
-                "GET", "/s", headers={"Accept-Encoding": "identity"}
-            ) as r:
-                assert r.status_code == 200
-                parts = [c async for c in r.iter_bytes()]
+        async with (
+            TestClient(app) as client,
+            client.stream("GET", "/s", headers={"Accept-Encoding": "identity"}) as r,
+        ):
+            assert r.status_code == 200
+            parts = [c async for c in r.iter_bytes()]
         assert b"".join(parts) == b"hello"
-
-    async def test_stream_body_reads_full_entity(self):
-        app = App()
-
-        async def handler(c, w):
-            w.write_headers(200)
-            w.write(b"hel")
-            w.write(b"lo")
-            w.end()
-
-        app.get("/s", handler)
-        async with TestClient(app) as client:
-            async with client.stream(
-                "GET", "/s", headers={"Accept-Encoding": "identity"}
-            ) as r:
-                assert r.status_code == 200
-                assert await r.body() == b"hello"
 
     async def test_stream_iter_events(self):
         app = App()
@@ -392,56 +306,65 @@ class TestClientBasics:
             w.end()
 
         app.get("/e", handler)
-        async with TestClient(app) as client:
-            async with client.stream(
-                "GET", "/e", headers={"Accept-Encoding": "identity"}
-            ) as r:
-                evs = [e async for e in r.iter_events()]
+        async with (
+            TestClient(app) as client,
+            client.stream("GET", "/e", headers={"Accept-Encoding": "identity"}) as r,
+        ):
+            evs = [e async for e in r.iter_events()]
         assert evs == [{"event": "ping", "data": "hello"}]
 
 
 class TestTestClient:
-    async def test_client_supports_async_tests(self):
-        async with TestClient(_make_app()) as client:
-            response = await client.post("/json-echo", json={"count": 42})
+    async def test_client_exit_signals_context_disconnect(self):
+        app = App()
+        done = asyncio.Event()
 
-        assert response.status_code == 200
-        assert response.json() == {"count": 42}
+        async def handler(c, w):
+            async def watch():
+                while not c.disconnected:
+                    await asyncio.sleep(0)
+                done.set()
+
+            c.app.create_task(watch())
+            responses.text(w, "ok")
+
+        app.get("/", handler)
+        async with TestClient(app) as client:
+            r = await client.get("/")
+            assert r.status_code == 200
+            assert not done.is_set()
+        assert done.is_set()
 
 
 class TestWriterRaw:
-    async def test_closing_combines_disconnect_and_shutdown(self):
-        loop = asyncio.get_running_loop()
+    async def test_writes_stop_after_transport_closes(self):
+        sink = bytearray()
+        transport = _MemoryTransport(sink.extend)
         writer = Writer(
-            transport_write=bytearray().extend,
+            transport=transport,
             get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
             on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
         )
 
-        assert not writer.closing
+        writer.respond(b"ok", b"text/plain")
+        assert b"ok" in sink
 
-        writer._disconnect.set_result(None)
+        sink.clear()
+        transport.close()
+        writer.respond(b"nope", b"text/plain")
 
-        assert writer.disconnected
-        assert writer.closing
+        assert b"nope" not in sink
 
-    async def test_alive_exits_when_connection_closes(self):
+    async def test_context_alive_exits_when_connection_closes(self):
         loop = asyncio.get_running_loop()
-        writer = Writer(
-            transport_write=bytearray().extend,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
-        )
+        disconnect = loop.create_future()
+        context = _make_context(loop=loop, disconnect=disconnect)
         started = asyncio.Event()
         stopped = asyncio.Event()
         never = asyncio.Event()
 
         async def worker() -> None:
-            async with writer.alive():
+            async with context.alive():
                 started.set()
                 await never.wait()
             stopped.set()
@@ -449,24 +372,29 @@ class TestWriterRaw:
         task = asyncio.create_task(worker())
         await started.wait()
 
-        writer._disconnect.set_result(None)
+        disconnect.set_result(None)
         await asyncio.wait_for(stopped.wait(), timeout=0.1)
         await task
 
-    async def test_alive_does_not_swallow_unrelated_cancellation(self):
+    async def test_context_closing_combines_disconnect_and_shutdown(self):
         loop = asyncio.get_running_loop()
-        writer = Writer(
-            transport_write=bytearray().extend,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
-        )
+        context = _make_context(loop=loop)
+
+        assert not context.closing
+
+        context.app.shutdown.set_result(None)
+
+        assert context.shutting_down
+        assert context.closing
+
+    async def test_context_alive_does_not_swallow_unrelated_cancellation(self):
+        loop = asyncio.get_running_loop()
+        context = _make_context(loop=loop)
         started = asyncio.Event()
         never = asyncio.Event()
 
         async def worker() -> None:
-            async with writer.alive():
+            async with context.alive():
                 started.set()
                 await never.wait()
 
@@ -478,32 +406,34 @@ class TestWriterRaw:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    def test_patch_writes_namespace_sse_line(self):
-        w, sink, loop = _make_writer()
-        try:
-            ds.sse.patch_elements(
-                w,
-                b"<circle cx='10' cy='10' r='5'></circle>",
-                namespace="svg",
-            )
+    async def test_context_alive_without_source_raises(self):
+        loop = asyncio.get_running_loop()
+        context = _make_context(loop=loop)
 
-            head, body = _split_response(bytes(sink))
-            decoded = _decode_chunked(body)
+        with pytest.raises(RuntimeError, match=r"async with c\.alive"):
+            async for _ in context.alive():
+                pass
 
-            assert b"content-type: text/event-stream" in head
-            assert b"data: namespace svg" in decoded
-            assert b"data: elements <circle cx='10' cy='10' r='5'></circle>" in decoded
-        finally:
-            loop.close()
+    async def test_context_alive_iterates_source_until_disconnect(self):
+        loop = asyncio.get_running_loop()
+        disconnect = loop.create_future()
+        context = _make_context(loop=loop, disconnect=disconnect)
 
-    def test_end_empty_bytes_sends_200(self):
-        w, sink, loop = _make_writer()
-        try:
-            w.end(b"")
-            assert bytes(sink).startswith(b"HTTP/1.1 200 OK\r\n")
-            assert b"content-length: 0\r\n" in bytes(sink)
-        finally:
-            loop.close()
+        async def source():
+            yield "a"
+            yield "b"
+            await asyncio.Event().wait()
+
+        collected: list[str] = []
+
+        async def worker() -> None:
+            async for item in context.alive(source()):
+                collected.append(item)
+                if len(collected) == 2:
+                    disconnect.set_result(None)
+
+        await asyncio.wait_for(worker(), timeout=0.2)
+        assert collected == ["a", "b"]
 
     def test_end_without_data_sends_204(self):
         w, sink, loop = _make_writer()
@@ -514,249 +444,81 @@ class TestWriterRaw:
         finally:
             loop.close()
 
-    def test_redirect_keeps_safe_relative_target(self):
-        w, sink, loop = _make_writer()
+    def test_write_after_204_raises(self):
+        w, _sink, loop = _make_writer()
         try:
-            responses.redirect(
-                w,
-                "/dashboard with spaces?tab=team settings#profile section",
-                303,
-            )
-            head, body = _split_response(bytes(sink))
-
-            assert b"HTTP/1.1 303 See Other\r\n" in head
-            assert (
-                b"location: /dashboard%20with%20spaces?tab=team%20settings#profile%20section\r\n"
-                in head
-            )
-            assert body == b""
-        finally:
-            loop.close()
-
-    @pytest.mark.parametrize(
-        "target",
-        [
-            "//evil.example/login",
-            r"/\\evil",
-            "/safe\r\nx-header: injected",
-        ],
-    )
-    def test_redirect_rejects_unsafe_relative_targets(self, target):
-        w, sink, loop = _make_writer()
-        try:
-            with pytest.raises(StarioError, match="safe app-relative path|control characters"):
-                responses.redirect(w, target, 302)
+            w.write_headers(204)
+            with pytest.raises(StarioRuntime, match="Cannot write a body"):
+                w.write(b"data")
         finally:
             loop.close()
 
     def test_sse_rejects_non_event_stream_after_headers_started(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             w.headers.set("content-type", "text/html")
             w.write_headers(200)
             with pytest.raises(StarioRuntime, match="text/event-stream"):
-                ds.sse.patch_signals(w, {"x": 1})
+                SSE(w).patch_signals({"x": 1})
         finally:
             loop.close()
 
-    def test_sse_redirect_uses_safe_relative_target(self):
+    def test_write_headers_twice_raises_stario_runtime(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.write_headers(200)
+            with pytest.raises(StarioRuntime, match="already started"):
+                w.write_headers(200)
+        finally:
+            loop.close()
+
+    def test_content_length_mismatch_raises_at_end(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.headers.unsafe_set(b"content-length", b"5")
+            w.write_headers(200)
+            w.write(b"abc")
+            with pytest.raises(StarioRuntime, match="body length mismatch"):
+                w.end()
+        finally:
+            loop.close()
+
+    def test_invalid_content_length_raises_stario_error(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.headers.unsafe_set(b"content-length", b"not-a-number")
+            with pytest.raises(StarioError, match="Invalid Content-Length"):
+                w.write_headers(200)
+        finally:
+            loop.close()
+
+    def test_respond_after_started_raises(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.write_headers(200)
+            with pytest.raises(StarioRuntime, match="already started"):
+                w.respond(b"late", b"text/plain")
+        finally:
+            loop.close()
+
+    def test_write_after_end_raises(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.respond(b"ok", b"text/plain")
+            with pytest.raises(StarioRuntime, match="completed"):
+                w.write(b"extra")
+        finally:
+            loop.close()
+
+    def test_respond_when_disconnected_completes_without_body(self):
         w, sink, loop = _make_writer()
+        completed: list[str] = []
         try:
-            ds.sse.redirect(w, "/home page?tab=recent items#hero banner")
-            head, body = _split_response(bytes(sink))
-            decoded = _decode_chunked(body)
-
-            assert b"content-type: text/event-stream" in head
-            assert (
-                b'window.location = "/home%20page?tab=recent%20items#hero%20banner"'
-                in decoded
-            )
-        finally:
-            loop.close()
-
-    def test_redirect_allows_relative_targets_with_absolute_urls_in_query(self):
-        w, sink, loop = _make_writer()
-        try:
-            responses.redirect(
-                w,
-                "/login?next=https://example.com/docs page#section",
-                302,
-            )
-            head, _ = _split_response(bytes(sink))
-
-            assert b"HTTP/1.1 302 Found\r\n" in head
-            assert (
-                b"location: /login?next=https://example.com/docs%20page#section\r\n"
-                in head
-            )
-        finally:
-            loop.close()
-
-    def test_redirect_allows_absolute_targets(self):
-        w, sink, loop = _make_writer()
-        try:
-            responses.redirect(w, "https://example.com/login?next=%2Fw", 302)
-            head, _ = _split_response(bytes(sink))
-
-            assert b"HTTP/1.1 302 Found\r\n" in head
-            assert b"location: https://example.com/login?next=%2Fw\r\n" in head
-        finally:
-            loop.close()
-
-    @pytest.mark.parametrize(
-        ("accept_encoding", "decompress"),
-        [
-            ("br", brotli.decompress),
-            ("gzip", lambda body: zlib.decompress(body, wbits=31)),
-            ("zstd", zstd.decompress),
-        ],
-    )
-    def test_streaming_compression_finishes_frames(
-        self,
-        accept_encoding: str,
-        decompress,
-    ):
-        compression = CompressionConfig(min_size=1)
-        loop = asyncio.new_event_loop()
-        sink = bytearray()
-        writer = Writer(
-            transport_write=sink.extend,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
-            compression=compression,
-            accept_encoding=accept_encoding,
-        )
-
-        try:
-            payload = b"event: patch\ndata: <div>hello</div>\n\n"
-            writer.write(payload)
-            writer.write(payload)
-            writer.end()
-
-            head, body = _split_response(bytes(sink))
-            assert b"transfer-encoding: chunked" in head
-            compressed = _decode_chunked(body)
-            assert decompress(compressed) == payload * 2
-        finally:
-            loop.close()
-
-    def test_respond_skips_compression_for_image_content_types(self):
-        compression = CompressionConfig(min_size=1)
-        loop = asyncio.new_event_loop()
-        sink = bytearray()
-        writer = Writer(
-            transport_write=sink.extend,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
-            compression=compression,
-            accept_encoding="gzip",
-        )
-
-        try:
-            payload = b"\x89PNG\r\n\x1a\n" + b"x" * 2048
-            writer.respond(payload, b"image/png", 200)
-
-            head, body = _split_response(bytes(sink))
-            assert b"content-encoding:" not in head
-            assert body == payload
-        finally:
-            loop.close()
-
-    def test_chunked_writes_skip_compression_for_image_content_types(self):
-        compression = CompressionConfig(min_size=1)
-        loop = asyncio.new_event_loop()
-        sink = bytearray()
-        writer = Writer(
-            transport_write=sink.extend,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
-            compression=compression,
-            accept_encoding="gzip",
-        )
-
-        try:
-            payload = b"\x89PNG\r\n\x1a\n" + b"x" * 256
-            writer.headers.rset(b"content-type", b"image/png")
-            writer.write(payload)
-            writer.end()
-
-            head, body = _split_response(bytes(sink))
-            assert b"content-encoding:" not in head
-            assert _decode_chunked(body) == payload
-        finally:
-            loop.close()
-
-    def test_select_skips_encodings_with_zero_qvalue(self):
-        compression = CompressionConfig(min_size=1)
-
-        compressor = compression.select("br;q=0, gzip;q=0.5")
-
-        assert compressor is not None
-        assert compressor.encoding == b"gzip"
-
-    def test_select_does_not_match_substrings(self):
-        compression = CompressionConfig(min_size=1)
-
-        assert compression.select("abracadabra") is None
-
-    def test_select_uses_wildcard_accept_encoding(self):
-        compression = CompressionConfig(min_size=1)
-
-        compressor = compression.select(
-            "*;q=0.5",
-            data=b"x" * 2048,
-            content_type=b"text/plain; charset=utf-8",
-        )
-
-        assert compressor is not None
-        assert compressor.encoding == b"br"
-
-    def test_select_returns_none_immediately_when_all_codecs_disabled(self):
-        compression = CompressionConfig(
-            zstd_level=-1,
-            brotli_level=-1,
-            gzip_level=-1,
-        )
-        assert (
-            compression.select(
-                "gzip, deflate, br, zstd",
-                data=b"ok",
-                content_type=b"text/plain",
-            )
-            is None
-        )
-
-    def test_respond_does_not_duplicate_vary_accept_encoding_case_insensitive(self):
-        compression = CompressionConfig(
-            min_size=1,
-            zstd_level=-1,
-            brotli_level=-1,
-            gzip_level=6,
-        )
-        loop = asyncio.new_event_loop()
-        sink = bytearray()
-        writer = Writer(
-            transport_write=sink.extend,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            disconnect=loop.create_future(),
-            shutdown=loop.create_future(),
-            compression=compression,
-            accept_encoding=b"gzip",
-        )
-
-        try:
-            writer.headers.rset(b"vary", b"Accept-Encoding")
-            writer.respond(b"x" * 2048, b"text/plain; charset=utf-8", 200)
-            head, _ = _split_response(bytes(sink))
-
-            assert head.count(b"vary:") == 1
-            assert b"vary: Accept-Encoding\r\n" in head
+            w._on_completed = lambda: completed.append("done")
+            w._transport.close()
+            w.respond(b"ok", b"text/plain")
+            assert bytes(sink) == b""
+            assert w.completed
+            assert completed == ["done"]
         finally:
             loop.close()

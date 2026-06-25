@@ -1,13 +1,30 @@
 """
-Tracer implementations export different sinks; handlers only see ``Span`` attached to ``Context``.
+Telemetry sinks and span types for Stario apps.
 
-Swap ``TTYTracer`` vs ``JsonTracer`` (or SQLite) at process startup without changing handler or protocol code.
+Handlers see `Span` on `Context`. Import tracer backends from their modules
+when wiring a process:
+
+```python
+from stario.telemetry.json import JsonTracer
+from stario.telemetry.tty import TTYTracer
+from stario.telemetry.noop import NoOpTracer
+from stario.telemetry.sqlite import SqliteTracer
+```
+
+CLI reads `STARIO_TRACER` via `stario.cli.env.tracer_from_env()`.
 """
 
-from .core import Span, Tracer
-from .json import JsonTracer
-from .noop import NoOpTracer
-from .sqlite import SqliteTracer
-from .tty import TTYTracer
+from .core import EventBody, Span, TelemetryStats, Tracer
+from .spans import NoOpSpan, ProxySpan, RecordedEvent, RecordedLink, RecordingSpan
 
-__all__ = ["Span", "Tracer", "JsonTracer", "NoOpTracer", "SqliteTracer", "TTYTracer"]
+__all__ = [
+    "EventBody",
+    "NoOpSpan",
+    "ProxySpan",
+    "RecordedEvent",
+    "RecordedLink",
+    "RecordingSpan",
+    "Span",
+    "TelemetryStats",
+    "Tracer",
+]

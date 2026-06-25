@@ -1,23 +1,37 @@
-"""HTML attribute helpers for Datastar (``data-*`` strings, signals JSON, event bindings).
+"""Datastar HTML attribute helpers.
 
-Each helper returns a small ``dict`` of attributes. Pass those dicts as the first arguments
-to a Stario tag (before children): ``h.Input(ds.bind("q"), {"type": "search"})``—the tag
-merges consecutive mappings. See the Datastar attributes reference for wire-format details;
-docstrings here focus on copy-paste examples (``h`` means ``stario.html`` or its tag imports).
-In those blocks, ``#`` lines are the HTML from ``stario.html.render(...)`` (attribute escaping as in the wire format).
+Use the exported `data` instance:
 
-Helpers whose docstrings state **Datastar Pro only** map to attributes that require a
-`commercial Datastar Pro license <https://data-star.dev/pro#license>`_ and the Pro client
-plugins; the open-source bundle ignores them unless Pro is enabled.
+```python
+from stario.datastar import at, data
+
+h.Button(data.on("click", at.post("/cart")), "Add")
+```
+
+Each method returns a pre-rendered `Attrs` fragment (opening-tag attribute bytes).
+The default instance emits normal `data-*` attributes. Create another instance when serving a
+custom Datastar bundle with an aliased prefix:
+
+```python
+from stario.datastar import DatastarAttributes
+
+star = DatastarAttributes("data-star-")
+h.Div(star.text("$title"))
+```
+
+Reference: https://data-star.dev/reference/attributes
 """
 
 import json
-from dataclasses import asdict, is_dataclass
-from inspect import cleandoc
-from typing import Any, Literal
+from collections.abc import Mapping
+from typing import Literal
 
 from stario.exceptions import StarioError
+from stario.markup.escape import escape_attribute_value as escape_attr
+from stario.markup.escape import escape_sq_attribute_value
+from stario.markup.types import Attrs
 
+from ._jsevents import JSEvent
 from .format import (
     Case,
     Debounce,
@@ -26,935 +40,760 @@ from .format import (
     Throttle,
     TimeValue,
     debounce_to_string,
-    js,
-    parse_filter_value,
-    s,
+    filter_js,
+    js_object,
+    require_mapping,
+    signal_key,
+    signal_path_key,
     throttle_to_string,
     time_to_string,
     to_kebab_key,
+    validate_signal_path,
 )
 
 
-def _to_dict(obj: Any) -> dict[str, Any]:
+class DatastarAttributes:
+    """Namespace for Datastar `data-*` attributes.
+
+    Each helper returns an `Attrs` fragment (pre-rendered opening-tag bytes).
+    JavaScript expressions and `js_object()` / `filter_js()` output are
+    trusted Datastar content. Helpers escape them for HTML attribute boundaries,
+    but do not parse or sanitize the JavaScript itself. `signals()` wraps JSON
+    in single-quoted attributes and escapes only `'`, `&`, and `<`/`>` —
+    so JSON double quotes stay literal on the wire.
+
+    `prefix` defaults to `"data-"`. Pass an explicit Datastar alias prefix, such
+    as `"data-star-"`, when loading a custom aliased Datastar bundle.
     """
-    Convert various types to dict for JSON serialization.
 
-    Supports:
-    - dict: returned as-is
-    - dataclass instance: converted via asdict()
-    - Pydantic model instance: converted via model_dump()
-    - Any object with __dict__: uses __dict__
-    """
-    if isinstance(obj, dict):
-        return obj
+    __slots__ = ("prefix",)
 
-    # Dataclass instance (not the class itself)
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return asdict(obj)
+    def __init__(self, prefix: str = "data-") -> None:
+        if not prefix:
+            raise ValueError("Datastar attribute prefix cannot be empty.")
+        self.prefix = prefix if prefix.endswith("-") else prefix + "-"
 
-    # Pydantic model instance (v2) - check callable to ensure it's a method
-    if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-        return obj.model_dump()  # type: ignore[no-any-return]
+    def attr(self, key: str, expression: str) -> Attrs:
+        """Set one HTML attribute from a reactive expression.
 
-    # Pydantic model instance (v1 fallback)
-    if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-        return obj.dict()  # type: ignore[no-any-return]
+        ```python
+        data.attr("title", "$item.label")
+        # Attrs(' data-attr:title="$item.label"')
+        ```
+        """
+        return Attrs(f' {self.prefix}attr:{key}="{escape_attr(expression)}"')
 
-    # Generic object with __dict__
-    if hasattr(obj, "__dict__"):
-        return obj.__dict__
+    def attrs(self, mapping: dict[str, str]) -> Attrs:
+        """Set several HTML attributes from a mapping of expressions.
 
-    raise StarioError(
-        f"Cannot convert {type(obj).__name__} to signals dict",
-        context={"type": type(obj).__name__, "value": repr(obj)[:100]},
-        help_text="Pass a dict, dataclass instance, or Pydantic model.",
-        example=cleandoc(
-            """
-            ds.signals({"count": 0})  # dict
-            ds.signals(MyDataclass())  # dataclass instance
-            ds.signal("count", "0")  # one key on the element
-            """
-        ),
-    )
+        ```python
+        data.attrs({"open": "sidebarOpen"})
+        # Attrs(' data-attr="{'open':sidebarOpen}"')
+        ```
+        """
+        return Attrs(f' {self.prefix}attr="{escape_attr(js_object(mapping))}"')
 
-# DOM event names accepted by ``on()`` (typed hints only; strings also work at runtime).
-JSEvent = Literal[
-    "abort",
-    "afterprint",
-    "animationend",
-    "animationiteration",
-    "animationstart",
-    "beforeprint",
-    "beforeunload",
-    "blur",
-    "canplay",
-    "canplaythrough",
-    "change",
-    "click",
-    "contextmenu",
-    "copy",
-    "cut",
-    "dblclick",
-    "drag",
-    "dragend",
-    "dragenter",
-    "dragleave",
-    "dragover",
-    "dragstart",
-    "drop",
-    "durationchange",
-    "ended",
-    "error",
-    "focus",
-    "focusin",
-    "focusout",
-    "fullscreenchange",
-    "fullscreenerror",
-    "hashchange",
-    "input",
-    "invalid",
-    "keydown",
-    "keypress",
-    "keyup",
-    "load",
-    "loadeddata",
-    "loadedmetadata",
-    "loadstart",
-    "message",
-    "mousedown",
-    "mouseenter",
-    "mouseleave",
-    "mousemove",
-    "mouseover",
-    "mouseout",
-    "mouseup",
-    "mousewheel",
-    "offline",
-    "online",
-    "open",
-    "pagehide",
-    "pageshow",
-    "paste",
-    "pause",
-    "play",
-    "playing",
-    "popstate",
-    "progress",
-    "ratechange",
-    "resize",
-    "reset",
-    "scroll",
-    "search",
-    "seeked",
-    "seeking",
-    "select",
-    "show",
-    "stalled",
-    "storage",
-    "submit",
-    "suspend",
-    "timeupdate",
-    "toggle",
-    "touchcancel",
-    "touchend",
-    "touchmove",
-    "touchstart",
-    "transitionend",
-    "unload",
-    "volumechange",
-    "waiting",
-    "wheel",
-]
+    def bind(
+        self,
+        signal_name: str,
+        *,
+        prop: str | None = None,
+        event: str | None = None,
+    ) -> Attrs:
+        """Two-way bind an element value to a signal.
 
+        ```python
+        data.bind("email")
+        # Attrs(' data-bind="email"')
 
-def attr(key: str, expression: str) -> dict[str, str]:
-    """Set one HTML attribute from a reactive expression.
+        data.bind("is_checked", prop="checked", event="change")
+        # Attrs(' data-bind:is-checked__case.snake__prop.checked__event.change="is_checked"')
+        ```
+        """
+        validate_signal_path(signal_name)
+        if prop is None and event is None:
+            return Attrs(f' {self.prefix}bind="{escape_attr(signal_name)}"')
 
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-attr>
-
-    ```python
-    h.Div(ds.attr("title", "$item.label"), {"class": "tooltip"})
-    # <div data-attr:title="$item.label" class="tooltip"></div>
-    ```
-    """
-    return {"data-attr:" + key: expression}
-
-
-def attrs(mapping: dict[str, str]) -> dict[str, str]:
-    """Set several HTML attributes at once from reactive expressions.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-attr>
-
-    ```python
-    h.Aside(ds.attrs({"open": "sidebarOpen"}), {"class": "drawer"})
-    # <aside data-attr="{&#x27;open&#x27;:sidebarOpen}" class="drawer"></aside>
-    ```
-    """
-    return {"data-attr": js(mapping)}
-
-
-def bind(
-    signal_name: str,
-    *,
-    case: Case | None = None,
-    prop: str | None = None,
-    event: str | None = None,
-) -> dict[str, str]:
-    """``data-bind`` — two-way bind a signal to an input or similar.
-
-    Uses :func:`~stario.datastar.format.to_kebab_key` for the attribute key. Value form is
-    ``data-bind="signal"``; key forms use ``data-bind:key...="signal"`` (same identifier as the value).
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-bind>
-
-    ```python
-    h.Input(ds.bind("email"), {"type": "email", "class": "input input-bordered"})
-    # <input data-bind="email" type="email" class="input input-bordered"/>
-
-    h.Input(ds.bind("isChecked", prop="checked", event="change"))
-    # <input data-bind:is-checked__prop.checked__event.change="isChecked" />
-
-    h.Input(ds.bind("mySignal", case="kebab"))
-    # <input data-bind:my-signal__case.kebab="mySignal" />
-    ```
-    """
-    if prop is None and event is None and (case is None or case == "camel"):
-        return {"data-bind": signal_name}
-
-    kebab_key, from_case = to_kebab_key(signal_name)
-
-    mods: list[str] = []
-    if case is not None:
-        if case != "camel":
-            mods.append("case." + case)
-    elif (prop is not None or event is not None) and from_case != "camel":
-        mods.append("case." + from_case)
-    if prop is not None:
-        mods.append("prop." + prop)
-    if event is not None:
-        mods.append("event." + event)
-
-    key = (
-        f"data-bind:{kebab_key}"
-        if not mods
-        else f"data-bind:{kebab_key}__{'__'.join(mods)}"
-    )
-    return {key: signal_name}
-
-
-def class_(name: str, expression: str) -> dict[str, str]:
-    """Toggle one CSS class from a reactive expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-class>
-
-    ```python
-    h.Div(ds.class_("hidden", "!$expanded"))
-    # <div data-class:hidden="!$expanded"></div>
-    ```
-    """
-    return {"data-class:" + name: expression}
-
-
-def classes(mapping: dict[str, str]) -> dict[str, str]:
-    """Toggle several CSS classes at once from reactive expressions.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-class>
-
-    ```python
-    h.Ul(ds.classes({"loading": "$pending", "text-error": "$error != null"}))
-    # <ul data-class="{&#x27;loading&#x27;:$pending,&#x27;text-error&#x27;:$error != null}"></ul>
-    ```
-    """
-    return {"data-class": js(mapping)}
-
-
-def computed(key: str, expression: str) -> dict[str, str]:
-    """Create one computed signal from a reactive expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-computed>
-
-    ```python
-    h.Span(ds.computed("fullName", "$first + ' ' + $last"))
-    # <span data-computed:full-name="$first + &#x27; &#x27; + $last"></span>
-    ```
-    """
-    kebab_key, from_case = to_kebab_key(key)
-    if from_case == "camel":
-        return {"data-computed:" + kebab_key: expression}
-    return {f"data-computed:{kebab_key}__case.{from_case}": expression}
-
-
-def computeds(mapping: dict[str, str]) -> dict[str, str]:
-    """Create several computed signals at once from a mapping of expressions.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-computed>
-
-    ```python
-    h.Div(ds.computeds({"fullName": "$first + ' ' + $last", "initials": "$first[0]"}))
-    # <div data-computed:full-name="$first + &#x27; &#x27; + $last" data-computed:initials__case.kebab="$first[0]"></div>
-    ```
-    """
-    kebab_cases = [(to_kebab_key(k), value) for k, value in mapping.items()]
-    return {
-        (
-            f"data-computed:{kebab_key}"
-            if from_case == "camel"
-            else f"data-computed:{kebab_key}__case.{from_case}"
-        ): value
-        for (kebab_key, from_case), value in kebab_cases
-    }
-
-
-def effect(expression: str) -> dict[str, str]:
-    """Run a client-side side effect when the element is initialized or updated.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-effect>
-
-    ```python
-    h.Div(ds.effect("el.querySelector('input')?.focus()"))
-    # <div data-effect="el.querySelector(&#x27;input&#x27;)?.focus()"></div>
-    ```
-    """
-    return {"data-effect": expression}
-
-
-def ignore(self_only: bool = False) -> dict[str, bool]:
-    """Tell Datastar to ignore this element or its whole subtree during processing.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-ignore>
-
-    ```python
-    h.Div(ds.ignore(), h.P("Third-party widget root"))
-    # <div data-ignore><p>Third-party widget root</p></div>
-    ```
-    """
-    return {"data-ignore__self": True} if self_only else {"data-ignore": True}
-
-
-def ignore_morph() -> dict[str, bool]:
-    """Prevent Datastar morphing from changing this element and its descendants.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-ignore-morph>
-
-    ```python
-    h.Textarea(ds.ignore_morph(), {"name": "notes"})
-    # <textarea data-ignore-morph name="notes"></textarea>
-    ```
-    """
-    return {"data-ignore-morph": True}
-
-
-def indicator(signal_name: str) -> dict[str, str]:
-    """Track in-flight fetch state in a signal for loading indicators and disabled UI.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-indicator>
-
-    ```python
-    h.Span(ds.indicator("saving"), "Saving…")
-    # <span data-indicator="saving">Saving…</span>
-    ```
-    """
-    return {"data-indicator": signal_name}
-
-
-def init(
-    expression: str,
-    *,
-    delay: TimeValue | None = None,
-    viewtransition: bool = False,
-) -> dict[str, str]:
-    """Run a client expression when the element is initialized in the DOM.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-init>
-
-    ```python
-    h.Div(ds.init("$focusFirstInput(el)"), {"id": "form-shell"})
-    # <div data-init="$focusFirstInput(el)" id="form-shell"></div>
-    h.Div(ds.init("loadMore()", delay="200ms"), {"id": "infinite-sentinel"})
-    # <div data-init__delay.200ms="loadMore()" id="infinite-sentinel"></div>
-    ```
-    """
-    if delay is None:
-        return (
-            {"data-init__viewtransition": expression}
-            if viewtransition
-            else {"data-init": expression}
+        key_suffix = signal_path_key(signal_name)
+        if prop is None:
+            return Attrs(
+                f' {self.prefix}bind:{key_suffix}__event.{event}="'
+                f'{escape_attr(signal_name)}"'
+            )
+        if event is None:
+            return Attrs(
+                f' {self.prefix}bind:{key_suffix}__prop.{prop}="'
+                f'{escape_attr(signal_name)}"'
+            )
+        return Attrs(
+            f' {self.prefix}bind:{key_suffix}__prop.{prop}__event.{event}="'
+            f'{escape_attr(signal_name)}"'
         )
 
-    mods = "delay." + time_to_string(delay)
-    if viewtransition:
-        mods += "__viewtransition"
-    return {"data-init__" + mods: expression}
+    def class_(self, name: str, expression: str) -> Attrs:
+        """Toggle one CSS class from a reactive expression.
 
+        ```python
+        data.class_("hidden", "!$expanded")
+        # Attrs(' data-class:hidden="!$expanded"')
+        ```
+        """
+        return Attrs(f' {self.prefix}class:{name}="{escape_attr(expression)}"')
 
-def json_signals(
-    *,
-    include: FilterValue | None = None,
-    exclude: FilterValue | None = None,
-    terse: bool = False,
-) -> dict[str, str | bool]:
-    """Control how signals are serialized for inspection with optional include/exclude filters.
+    def classes(self, mapping: dict[str, str]) -> Attrs:
+        """Toggle several CSS classes from a mapping of expressions.
 
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-json-signals>
+        ```python
+        data.classes({"loading": "$pending"})
+        # Attrs(' data-class="{'loading':$pending}"')
+        ```
+        """
+        return Attrs(f' {self.prefix}class="{escape_attr(js_object(mapping))}"')
 
-    ```python
-    h.Form(ds.json_signals(include=["email", "password"]), {"action": "/login", "method": "post"})
-    # <form data-json-signals="{&#x27;include&#x27;:&#x27;email|password&#x27;}" action="/login" method="post"></form>
-    ```
-    """
-    if include is not None or exclude is not None:
-        filters: dict[str, str] = {}
-        if include is not None:
-            filters["include"] = s(parse_filter_value(include))
-        if exclude is not None:
-            filters["exclude"] = s(parse_filter_value(exclude))
-        value: str | bool = js(filters)
-    else:
-        value = True
+    def computed(self, key: str, expression: str) -> Attrs:
+        """Create one computed signal from a reactive expression.
 
-    return {"data-json-signals__terse": value} if terse else {"data-json-signals": value}
+        ```python
+        data.computed("full_name", "$first + $last")
+        # Attrs(' data-computed:full-name__case.snake="$first + $last"')
+        ```
+        """
+        return Attrs(
+            f' {self.prefix}computed:{signal_key(key)}="{escape_attr(expression)}"'
+        )
 
+    def computeds(self, mapping: dict[str, str]) -> Attrs:
+        """Create several computed signals from expressions.
 
-def on_intersect(
-    expression: str,
-    *,
-    threshold: float | str | None = None,
-    once: bool = False,
-    full: bool = False,
-    delay: TimeValue | None = None,
-    debounce: Debounce | None = None,
-    throttle: Throttle | None = None,
-) -> dict[str, str]:
-    """``data-on-intersect`` — Intersection Observer → expression.
+        ```python
+        data.computeds({"full_name": "$a", "initials": "$b"})
+        # Attrs(' data-computed:full-name__case.snake="$a" data-computed:initials__case.snake="$b"')
+        ```
+        """
+        prefix = self.prefix + "computed:"
+        return Attrs(
+            "".join(
+                f' {prefix}{signal_key(key)}="{escape_attr(value)}"'
+                for key, value in mapping.items()
+            )
+        )
 
-    Matches the ``data-on-intersect`` modifiers: ``__threshold``, ``__delay``, ``__debounce``,
-    ``__throttle``, plus ``once`` and ``full`` as in the reference example (modifier order:
-    threshold, then ``once`` / ``full``, then timing modifiers).
+    def effect(self, expression: str) -> Attrs:
+        """Run a side effect when the element initializes or updates.
 
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-on-intersect>
+        ```python
+        data.effect("el.focus()")
+        # Attrs(' data-effect="el.focus()"')
+        ```
+        """
+        return Attrs(f' {self.prefix}effect="{escape_attr(expression)}"')
 
-    ```python
-    h.Div(ds.on_intersect("@get('/feed?cursor=' + $cursor)", once=True), {"id": "sentinel"})
-    # <div data-on-intersect__once="@get(&#x27;/feed?cursor=&#x27; + $cursor)" id="sentinel"></div>
+    def ignore(self, self_only: bool = False) -> Attrs:
+        """Skip Datastar processing for this element or subtree.
 
-    h.Div(ds.on_intersect("$loaded = true", threshold=0.25, once=True, full=True))
-    # <div data-on-intersect__threshold.25__once__full="$loaded = true"></div>
-    ```
-    """
-    modifiers: list[str] = []
-    append = modifiers.append
-    if threshold is not None:
-        if isinstance(threshold, str):
-            append("threshold." + threshold)
-        elif 0.0 <= threshold <= 1.0:
-            append(f"threshold.{int(round(threshold * 100))}")
+        ```python
+        data.ignore()
+        # Attrs(' data-ignore')
+
+        data.ignore(self_only=True)
+        # Attrs(' data-ignore__self')
+        ```
+        """
+        if self_only:
+            return Attrs(f" {self.prefix}ignore__self")
+        return Attrs(f" {self.prefix}ignore")
+
+    def ignore_morph(self) -> Attrs:
+        """Prevent backend patches from morphing this subtree.
+
+        ```python
+        data.ignore_morph()
+        # Attrs(' data-ignore-morph')
+        ```
+        """
+        return Attrs(f" {self.prefix}ignore-morph")
+
+    def indicator(self, signal_name: str) -> Attrs:
+        """Track in-flight fetch state in a signal.
+
+        ```python
+        data.indicator("saving")
+        # Attrs(' data-indicator="saving"')
+        ```
+        """
+        validate_signal_path(signal_name)
+        return Attrs(f' {self.prefix}indicator="{escape_attr(signal_name)}"')
+
+    def init(
+        self,
+        expression: str,
+        *,
+        delay: TimeValue | None = None,
+        view_transition: bool = False,
+    ) -> Attrs:
+        """Run an expression on element initialization.
+
+        ```python
+        data.init("setup()")
+        # Attrs(' data-init="setup()"')
+
+        data.init("setup()", delay="200ms", view_transition=True)
+        # Attrs(' data-init__delay.200ms__viewtransition="setup()"')
+        ```
+        """
+        if delay is None:
+            if view_transition:
+                return Attrs(
+                    f' {self.prefix}init__viewtransition="{escape_attr(expression)}"'
+                )
+            return Attrs(f' {self.prefix}init="{escape_attr(expression)}"')
+
+        modifiers = "delay." + time_to_string(delay)
+        if view_transition:
+            modifiers += "__viewtransition"
+        return Attrs(f' {self.prefix}init__{modifiers}="{escape_attr(expression)}"')
+
+    def json_signals(
+        self,
+        *,
+        include: FilterValue | None = None,
+        exclude: FilterValue | None = None,
+        terse: bool = False,
+    ) -> Attrs:
+        """Render signals as JSON text.
+
+        ```python
+        data.json_signals()
+        # Attrs(' data-json-signals')
+
+        data.json_signals(include=["email", "password"], terse=True)
+        # Attrs(' data-json-signals__terse="{'include':'email|password'}"')
+        ```
+        """
+        filters = filter_js(include, exclude)
+        value: str | bool = filters if filters is not None else True
+        if terse:
+            key = self.prefix + "json-signals__terse"
         else:
-            append(f"threshold.{threshold}")
-    if once:
-        append("once")
-    if full:
-        append("full")
-    if delay is not None:
-        append("delay." + time_to_string(delay))
-    if debounce is not None:
-        append(debounce_to_string(debounce))
-    if throttle is not None:
-        append(throttle_to_string(throttle))
+            key = self.prefix + "json-signals"
+        if value is True:
+            return Attrs(f" {key}")
+        return Attrs(f' {key}="{escape_attr(value)}"')
 
-    return (
-        {"data-on-intersect__" + "__".join(modifiers): expression}
-        if modifiers
-        else {"data-on-intersect": expression}
-    )
+    def on(
+        self,
+        event: JSEvent | str,
+        expression: str,
+        *,
+        once: bool = False,
+        passive: bool = False,
+        capture: bool = False,
+        delay: TimeValue | None = None,
+        debounce: Debounce | None = None,
+        throttle: Throttle | None = None,
+        view_transition: bool = False,
+        target: Literal["window", "document", "outside"] | None = None,
+        prevent: bool = False,
+        stop: bool = False,
+        case: Case = "kebab",
+    ) -> Attrs:
+        """Listen for an event.
 
+        ```python
+        data.on("click", "@get('/cart/count')")
+        # Attrs(' data-on:click="@get('/cart/count')"')
 
-def on_interval(
-    expression: str,
-    *,
-    duration: TimeValue | tuple[TimeValue, Literal["leading"]] = "1s",
-    viewtransition: bool = False,
-) -> dict[str, str]:
-    """Run a client expression on an interval, optionally with a custom duration.
+        data.on("click", "$open = false", target="outside")
+        # Attrs(' data-on:click__outside="$open = false"')
+        ```
+        """
+        if passive and prevent:
+            raise StarioError(
+                "passive and prevent contradict each other",
+                context={"event": event},
+                help_text=(
+                    "`passive` promises the listener never calls preventDefault; "
+                    "`prevent` calls it. Pass only one."
+                ),
+            )
 
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-on-interval>
+        if (
+            not once
+            and not passive
+            and not capture
+            and delay is None
+            and debounce is None
+            and throttle is None
+            and not view_transition
+            and target is None
+            and not prevent
+            and not stop
+            and case == "kebab"
+            and event.islower()
+            and "_" not in event
+        ):
+            return Attrs(f' {self.prefix}on:{event}="{escape_attr(expression)}"')
 
-    ```python
-    h.Div(ds.on_interval("$pollInbox()", duration="5s"))
-    # <div data-on-interval__duration.5s="$pollInbox()"></div>
-    ```
-    """
-    if duration == "1s":
-        return (
-            {"data-on-interval__viewtransition": expression}
-            if viewtransition
-            else {"data-on-interval": expression}
+        modifiers: list[str] = []
+        if once:
+            modifiers.append("once")
+        if passive:
+            modifiers.append("passive")
+        if capture:
+            modifiers.append("capture")
+        if target is not None:
+            modifiers.append(target)
+        if prevent:
+            modifiers.append("prevent")
+        if stop:
+            modifiers.append("stop")
+        if delay is not None:
+            modifiers.append("delay." + time_to_string(delay))
+        if debounce is not None:
+            modifiers.append(debounce_to_string(debounce))
+        if throttle is not None:
+            modifiers.append(throttle_to_string(throttle))
+        if view_transition:
+            modifiers.append("viewtransition")
+
+        kebab_event = to_kebab_key(event)
+        if case != "kebab":
+            modifiers.append("case." + case)
+
+        if modifiers:
+            return Attrs(
+                f' {self.prefix}on:{kebab_event}__{"__".join(modifiers)}="'
+                f'{escape_attr(expression)}"'
+            )
+        return Attrs(f' {self.prefix}on:{kebab_event}="{escape_attr(expression)}"')
+
+    def on_intersect(
+        self,
+        expression: str,
+        *,
+        threshold: float | Literal["half", "full"] | str | None = None,
+        once: bool = False,
+        exit: bool = False,
+        delay: TimeValue | None = None,
+        debounce: Debounce | None = None,
+        throttle: Throttle | None = None,
+    ) -> Attrs:
+        """React to viewport intersection.
+
+        ```python
+        data.on_intersect("load()", threshold=0.25, once=True)
+        # Attrs(' data-on-intersect__threshold.25__once="load()"')
+        ```
+        """
+        modifiers: list[str] = []
+        if threshold is not None:
+            if isinstance(threshold, str):
+                modifiers.append(
+                    threshold
+                    if threshold in ("half", "full")
+                    else "threshold." + threshold
+                )
+            elif 0.0 <= threshold <= 1.0:
+                modifiers.append(f"threshold.{round(threshold * 100)}")
+            else:
+                raise StarioError(
+                    f"Invalid intersection threshold: {threshold}",
+                    context={
+                        "threshold_value": str(threshold),
+                        "threshold_type": type(threshold).__name__,
+                    },
+                    help_text=(
+                        "Numeric thresholds are the visible fraction of the element and "
+                        "must be between 0.0 and 1.0, or the strings 'half' / 'full'."
+                    ),
+                )
+        if once:
+            modifiers.append("once")
+        if exit:
+            modifiers.append("exit")
+        if delay is not None:
+            modifiers.append("delay." + time_to_string(delay))
+        if debounce is not None:
+            modifiers.append(debounce_to_string(debounce))
+        if throttle is not None:
+            modifiers.append(throttle_to_string(throttle))
+
+        if modifiers:
+            return Attrs(
+                f' {self.prefix}on-intersect__{"__".join(modifiers)}="'
+                f'{escape_attr(expression)}"'
+            )
+        return Attrs(f' {self.prefix}on-intersect="{escape_attr(expression)}"')
+
+    def on_interval(
+        self,
+        expression: str,
+        *,
+        duration: TimeValue = "1s",
+        leading: bool = False,
+        view_transition: bool = False,
+    ) -> Attrs:
+        """Run an expression on an interval.
+
+        ```python
+        data.on_interval("tick()")
+        # Attrs(' data-on-interval="tick()"')
+
+        data.on_interval("tick()", duration="2s", leading=True)
+        # Attrs(' data-on-interval__duration.2s.leading="tick()"')
+        ```
+        """
+        if duration == "1s" and not leading:
+            if view_transition:
+                return Attrs(
+                    f' {self.prefix}on-interval__viewtransition="'
+                    f'{escape_attr(expression)}"'
+                )
+            return Attrs(f' {self.prefix}on-interval="{escape_attr(expression)}"')
+
+        modifiers = "duration." + time_to_string(duration)
+        if leading:
+            modifiers += ".leading"
+        if view_transition:
+            modifiers += "__viewtransition"
+        return Attrs(
+            f' {self.prefix}on-interval__{modifiers}="{escape_attr(expression)}"'
         )
 
-    if isinstance(duration, (int, float, str)):
-        mods = "duration." + time_to_string(duration)
-    elif isinstance(duration, tuple):
-        mods = f"duration.{time_to_string(duration[0])}.{duration[1]}"
-    else:
-        raise StarioError(
-            f"Invalid duration configuration for on_interval: {duration}",
-            context={
-                "duration_value": str(duration),
-                "duration_type": type(duration).__name__,
-            },
-            help_text="Duration must be a time value (int/float/str) or a tuple with time and 'leading' modifier.",
+    def on_signal_patch(
+        self,
+        expression: str,
+        *,
+        delay: TimeValue | None = None,
+        debounce: Debounce | None = None,
+        throttle: Throttle | None = None,
+        include: FilterValue | None = None,
+        exclude: FilterValue | None = None,
+    ) -> Attrs:
+        """React to signal patches.
+
+        ```python
+        data.on_signal_patch("save()", debounce="500ms", include=["draft"])
+        # Attrs(' data-on-signal-patch__debounce.500ms="save()" data-on-signal-patch-filter="{'include':'draft'}"')
+        ```
+        """
+        modifiers: list[str] = []
+        if delay is not None:
+            modifiers.append("delay." + time_to_string(delay))
+        if debounce is not None:
+            modifiers.append(debounce_to_string(debounce))
+        if throttle is not None:
+            modifiers.append(throttle_to_string(throttle))
+
+        if modifiers:
+            key = f"{self.prefix}on-signal-patch__{'__'.join(modifiers)}"
+        else:
+            key = self.prefix + "on-signal-patch"
+
+        filters = filter_js(include, exclude)
+        if filters is not None:
+            return Attrs(
+                f' {key}="{escape_attr(expression)}"'
+                f' {self.prefix}on-signal-patch-filter="'
+                f'{escape_attr(filters)}"'
+            )
+        return Attrs(f' {key}="{escape_attr(expression)}"')
+
+    def preserve_attr(self, attrs: str | list[str]) -> Attrs:
+        """Preserve selected attributes during DOM morphing.
+
+        ```python
+        data.preserve_attr(["data-testid", "id"])
+        # Attrs(' data-preserve-attr="data-testid id"')
+        ```
+        """
+        value = attrs if isinstance(attrs, str) else " ".join(attrs)
+        return Attrs(f' {self.prefix}preserve-attr="{escape_attr(value)}"')
+
+    def ref(self, signal_name: str) -> Attrs:
+        """Store the current element in a signal.
+
+        ```python
+        data.ref("search_input")
+        # Attrs(' data-ref="search_input"')
+        ```
+        """
+        validate_signal_path(signal_name)
+        return Attrs(f' {self.prefix}ref="{escape_attr(signal_name)}"')
+
+    def show(self, expression: str) -> Attrs:
+        """Show or hide an element from a boolean expression.
+
+        ```python
+        data.show("$error != null")
+        # Attrs(' data-show="$error != null"')
+        ```
+        """
+        return Attrs(f' {self.prefix}show="{escape_attr(expression)}"')
+
+    def signal(
+        self,
+        name: str,
+        expression: str,
+        *,
+        if_missing: bool = False,
+    ) -> Attrs:
+        """Patch one signal from a Datastar expression.
+
+        ```python
+        data.signal("my_count", "0", if_missing=True)
+        # Attrs(' data-signals:my-count__case.snake__ifmissing="0"')
+        ```
+        """
+        if if_missing:
+            return Attrs(
+                f' {self.prefix}signals:{signal_key(name)}__ifmissing="'
+                f'{escape_attr(expression)}"'
+            )
+        return Attrs(
+            f' {self.prefix}signals:{signal_key(name)}="{escape_attr(expression)}"'
         )
 
-    if viewtransition:
-        mods += "__viewtransition"
-    return {"data-on-interval__" + mods: expression}
+    def signals(
+        self,
+        payload: Mapping[str, SignalValue],
+        *,
+        if_missing: bool = False,
+    ) -> Attrs:
+        """Patch several signals.
 
-
-def on_signal_patch(
-    expression: str,
-    *,
-    delay: TimeValue | None = None,
-    debounce: Debounce | None = None,
-    throttle: Throttle | None = None,
-    include: FilterValue | None = None,
-    exclude: FilterValue | None = None,
-) -> dict[str, str]:
-    """React to signal patch events, optionally filtered to specific signals.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-on-signal-patch>
-
-    ```python
-    h.Div(ds.on_signal_patch("@post('/autosave')", debounce="500ms", include=["draft"]))
-    # <div data-on-signal-patch__debounce.500ms="@post(&#x27;/autosave&#x27;)" data-on-signal-patch-filter="{&#x27;include&#x27;:&#x27;draft&#x27;}"></div>
-    ```
-    """
-    modifiers: list[str] = []
-    append = modifiers.append
-    if delay is not None:
-        append("delay." + time_to_string(delay))
-    if debounce is not None:
-        append(debounce_to_string(debounce))
-    if throttle is not None:
-        append(throttle_to_string(throttle))
-
-    key = (
-        "data-on-signal-patch__" + "__".join(modifiers)
-        if modifiers
-        else "data-on-signal-patch"
-    )
-
-    if include is not None or exclude is not None:
-        filter_dict: dict[str, str] = {}
-        if include is not None:
-            filter_dict["include"] = s(parse_filter_value(include))
-        if exclude is not None:
-            filter_dict["exclude"] = s(parse_filter_value(exclude))
-        return {
-            key: expression,
-            "data-on-signal-patch-filter": js(filter_dict),
-        }
-
-    return {key: expression}
-
-
-def on(
-    event: JSEvent | str,
-    expression: str,
-    *,
-    once: bool = False,
-    passive: bool = False,
-    capture: bool = False,
-    delay: TimeValue | None = None,
-    debounce: Debounce | None = None,
-    throttle: Throttle | None = None,
-    viewtransition: bool = False,
-    window: bool = False,
-    outside: bool = False,
-    prevent: bool = False,
-    stop: bool = False,
-) -> dict[str, str]:
-    """Listen for DOM or window events and run a Datastar expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-on>
-
-    ```python
-    h.Button(ds.on("click", ds.get("/cart/count")), {"type": "button", "class": "btn"})
-    # <button data-on:click="@get(&#x27;/cart/count&#x27;)" type="button" class="btn"></button>
-    h.Input(ds.on("keydown", "$query = el.value", debounce=("150ms", "leading")))
-    # <input data-on:keydown__debounce.150ms.leading="$query = el.value"/>
-    ```
-    """
-    if (
-        not once
-        and not passive
-        and not capture
-        and delay is None
-        and debounce is None
-        and throttle is None
-        and not viewtransition
-        and not window
-        and not outside
-        and not prevent
-        and not stop
-        and event.islower()
-        and "_" not in event
-    ):
-        return {"data-on:" + event: expression}
-
-    modifiers: list[str] = []
-    append = modifiers.append
-    if once:
-        append("once")
-    if passive:
-        append("passive")
-    if capture:
-        append("capture")
-    if window:
-        append("window")
-    if outside:
-        append("outside")
-    if prevent:
-        append("prevent")
-    if stop:
-        append("stop")
-    if delay is not None:
-        append("delay." + time_to_string(delay))
-    if debounce is not None:
-        append(debounce_to_string(debounce))
-    if throttle is not None:
-        append(throttle_to_string(throttle))
-    if viewtransition:
-        append("viewtransition")
-
-    kebab_event, from_case = to_kebab_key(event)
-    if from_case != "kebab":
-        append("case." + from_case)
-
-    return (
-        {f"data-on:{kebab_event}__{'__'.join(modifiers)}": expression}
-        if modifiers
-        else {f"data-on:{kebab_event}": expression}
-    )
-
-
-def preserve_attr(attrs: str | list[str]) -> dict[str, str]:
-    """Preserve selected attribute values when Datastar morphs the DOM.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-preserve-attr>
-
-    ```python
-    h.Div(ds.preserve_attr(["data-testid", "id"]), {"class": "card"})
-    # <div data-preserve-attr="data-testid id" class="card"></div>
-    ```
-    """
-    value = attrs if isinstance(attrs, str) else " ".join(attrs)
-    return {"data-preserve-attr": value}
-
-
-def ref(signal_name: str) -> dict[str, str]:
-    """Store the current element in a signal so expressions can reference it later.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-ref>
-
-    ```python
-    h.Input(ds.ref("searchInput"), ds.bind("q"), {"type": "search"})
-    # <input data-ref="searchInput" data-bind="q" type="search"/>
-    ```
-    """
-    return {"data-ref": signal_name}
-
-
-def show(expression: str) -> dict[str, str]:
-    """Show or hide an element based on a boolean expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-show>
-
-    ```python
-    h.Div({"class": "alert alert-error", "role": "alert"}, ds.show("$error != null"))
-    # <div class="alert alert-error" role="alert" data-show="$error != null"></div>
-    ```
-    """
-    return {"data-show": expression}
-
-
-def signal(name: str, expression: str, *, ifmissing: bool = False) -> dict[str, str]:
-    """Patch one signal on this element from a Datastar expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-signals>
-
-    ```python
-    h.Div({"class": "theme-root"}, ds.signal("theme", "'dark'"))
-    # <div class="theme-root" data-signals:theme__case.kebab="&#x27;dark&#x27;"></div>
-    ```
-    """
-    kebab_key, from_case = to_kebab_key(name)
-    mods = ""
-    if from_case != "camel":
-        mods += "__case." + from_case
-    if ifmissing:
-        mods += "__ifmissing"
-    return {f"data-signals:{kebab_key}{mods}": expression}
-
-
-def signals(
-    data: dict[str, SignalValue] | Any,
-    *,
-    ifmissing: bool = False,
-) -> dict[str, str]:
-    """Patch several signals at once from a dict, dataclass, or similar object.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-signals>
-
-    ```python
-    h.Body(ds.signals({"count": 0, "open": False}), h.Main(...))
-    # <body data-signals="{&quot;count&quot;:0,&quot;open&quot;:false}"><main>…</main></body>
-    ```
-    """
-    if isinstance(data, str):
-        raise TypeError(
-            "signals() expects a dict or model object; use signal(name, expression) for one key."
+        ```python
+        data.signals({"count": 0, "open": False})
+        # Attrs(" data-signals='{\"count\":0,\"open\":false}'")
+        ```
+        """
+        value = escape_sq_attribute_value(
+            json.dumps(
+                dict(require_mapping("signals", payload)),
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
         )
-    signals_dict = _to_dict(data)
-    attr_key = "data-signals__ifmissing" if ifmissing else "data-signals"
-    return {
-        attr_key: json.dumps(signals_dict, separators=(",", ":"), ensure_ascii=False)
-    }
+        if if_missing:
+            return Attrs(f" {self.prefix}signals__ifmissing='{value}'")
+        return Attrs(f" {self.prefix}signals='{value}'")
+
+    def style(self, prop: str, expression: str) -> Attrs:
+        """Set one inline style property from a reactive expression.
+
+        ```python
+        data.style("width", "$pct + '%'")
+        # Attrs(' data-style:width="$pct + '%'"')
+        ```
+        """
+        return Attrs(f' {self.prefix}style:{prop}="{escape_attr(expression)}"')
+
+    def styles(self, mapping: dict[str, str]) -> Attrs:
+        """Set several inline style properties from expressions.
+
+        ```python
+        data.styles({"opacity": "$visible ? '1' : '0'"})
+        # Attrs(' data-style="{'opacity':$visible ? '1' : '0'}"')
+        ```
+        """
+        return Attrs(f' {self.prefix}style="{escape_attr(js_object(mapping))}"')
+
+    def text(self, expression: str) -> Attrs:
+        """Bind text content to a Datastar expression.
+
+        ```python
+        data.text("$greeting")
+        # Attrs(' data-text="$greeting"')
+        ```
+        """
+        return Attrs(f' {self.prefix}text="{escape_attr(expression)}"')
+
+    def animate(self, expression: str) -> Attrs:
+        """Animate element attributes over time. **Datastar Pro only.**
+
+        ```python
+        data.animate("$x")
+        # Attrs(' data-animate="$x"')
+        ```
+        """
+        return Attrs(f' {self.prefix}animate="{escape_attr(expression)}"')
+
+    def custom_validity(self, expression: str) -> Attrs:
+        """Set a custom validity message. **Datastar Pro only.**
+
+        ```python
+        data.custom_validity("$msg")
+        # Attrs(' data-custom-validity="$msg"')
+        ```
+        """
+        return Attrs(f' {self.prefix}custom-validity="{escape_attr(expression)}"')
+
+    def match_media(self, signal_name: str, expression: str) -> Attrs:
+        """Sync a signal with `matchMedia`. **Datastar Pro only.**
+
+        ```python
+        data.match_media("is_dark", "'prefers-color-scheme: dark'")
+        # Attrs(' data-match-media:is-dark__case.snake="'prefers-color-scheme: dark'"')
+        ```
+        """
+        return Attrs(
+            f' {self.prefix}match-media:{signal_key(signal_name)}="'
+            f'{escape_attr(expression)}"'
+        )
+
+    def on_raf(
+        self,
+        expression: str,
+        *,
+        throttle: Throttle | None = None,
+    ) -> Attrs:
+        """Run an expression on every animation frame. **Datastar Pro only.**
+
+        ```python
+        data.on_raf("draw()", throttle="100ms")
+        # Attrs(' data-on-raf__throttle.100ms="draw()"')
+        ```
+        """
+        if throttle is not None:
+            return Attrs(
+                f' {self.prefix}on-raf__{throttle_to_string(throttle)}="'
+                f'{escape_attr(expression)}"'
+            )
+        return Attrs(f' {self.prefix}on-raf="{escape_attr(expression)}"')
+
+    def on_resize(
+        self,
+        expression: str,
+        *,
+        debounce: Debounce | None = None,
+        throttle: Throttle | None = None,
+    ) -> Attrs:
+        """React to element resize. **Datastar Pro only.**
+
+        ```python
+        data.on_resize("layout()", debounce="50ms", throttle="100ms")
+        # Attrs(' data-on-resize__debounce.50ms__throttle.100ms="layout()"')
+        ```
+        """
+        modifiers: list[str] = []
+        if debounce is not None:
+            modifiers.append(debounce_to_string(debounce))
+        if throttle is not None:
+            modifiers.append(throttle_to_string(throttle))
+
+        if modifiers:
+            return Attrs(
+                f' {self.prefix}on-resize__{"__".join(modifiers)}="'
+                f'{escape_attr(expression)}"'
+            )
+        return Attrs(f' {self.prefix}on-resize="{escape_attr(expression)}"')
+
+    def persist(
+        self,
+        *,
+        include: FilterValue | None = None,
+        exclude: FilterValue | None = None,
+        storage_key: str | None = None,
+        session: bool = False,
+    ) -> Attrs:
+        """Persist signals. **Datastar Pro only.**
+
+        ```python
+        data.persist(include="draft", storage_key="prefs", session=True)
+        # Attrs(' data-persist:prefs__session="{'include':'draft'}"')
+        ```
+        """
+        filters = filter_js(include, exclude)
+        value: str | bool = filters if filters is not None else True
+        if storage_key is None:
+            key = self.prefix + "persist"
+        elif session:
+            key = f"{self.prefix}persist:{storage_key}__session"
+        else:
+            key = f"{self.prefix}persist:{storage_key}"
+        if value is True:
+            return Attrs(f" {key}")
+        return Attrs(f' {key}="{escape_attr(value)}"')
+
+    def query_string(
+        self,
+        *,
+        include: FilterValue | None = None,
+        exclude: FilterValue | None = None,
+        filter_empty: bool = False,
+        history: bool = False,
+    ) -> Attrs:
+        """Sync signals with the URL. **Datastar Pro only.**
+
+        ```python
+        data.query_string(include="page", history=True)
+        # Attrs(' data-query-string__history="{'include':'page'}"')
+        ```
+        """
+        modifiers: list[str] = []
+        if filter_empty:
+            modifiers.append("filter")
+        if history:
+            modifiers.append("history")
+
+        if modifiers:
+            key = f"{self.prefix}query-string__{'__'.join(modifiers)}"
+        else:
+            key = self.prefix + "query-string"
+        filters = filter_js(include, exclude)
+        value: str | bool = filters if filters is not None else True
+        if value is True:
+            return Attrs(f" {key}")
+        return Attrs(f' {key}="{escape_attr(value)}"')
+
+    def replace_url(self, expression: str) -> Attrs:
+        """Replace the current browser URL. **Datastar Pro only.**
+
+        ```python
+        data.replace_url("`/page/${$page}`")
+        # Attrs(' data-replace-url="`/page/${$page}`"')
+        ```
+        """
+        return Attrs(f' {self.prefix}replace-url="{escape_attr(expression)}"')
+
+    def scroll_into_view(
+        self,
+        *,
+        behavior: Literal["smooth", "instant", "auto"] | None = None,
+        horizontal: Literal["start", "center", "end", "nearest"] | None = None,
+        vertical: Literal["start", "center", "end", "nearest"] | None = None,
+        focus: bool = False,
+    ) -> Attrs:
+        """Scroll this element into view. **Datastar Pro only.**
+
+        ```python
+        data.scroll_into_view(behavior="smooth", vertical="center", focus=True)
+        # Attrs(' data-scroll-into-view__smooth__vcenter__focus')
+        ```
+        """
+        modifiers: list[str] = []
+        if behavior is not None:
+            modifiers.append(behavior)
+        if horizontal is not None:
+            modifiers.append("h" + horizontal)
+        if vertical is not None:
+            modifiers.append("v" + vertical)
+        if focus:
+            modifiers.append("focus")
+
+        if modifiers:
+            return Attrs(f" {self.prefix}scroll-into-view__{'__'.join(modifiers)}")
+        return Attrs(f" {self.prefix}scroll-into-view")
+
+    def view_transition(self, expression: str) -> Attrs:
+        """Set `view-transition-name`. **Datastar Pro only.**
+
+        ```python
+        data.view_transition("$id")
+        # Attrs(' data-view-transition="$id"')
+        ```
+        """
+        return Attrs(f' {self.prefix}view-transition="{escape_attr(expression)}"')
 
 
-def style(prop: str, expression: str) -> dict[str, str]:
-    """Set one inline style property from a reactive expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-style>
-
-    ```python
-    h.Div({"class": "bar-fill"}, ds.style("width", "$pct + '%'"))
-    # <div class="bar-fill" data-style:width="$pct + &#x27;%&#x27;"></div>
-    ```
-    """
-    return {"data-style:" + prop: expression}
-
-
-def styles(mapping: dict[str, str]) -> dict[str, str]:
-    """Set several inline style properties at once from reactive expressions.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-style>
-
-    ```python
-    h.Div(ds.styles({"opacity": "$visible ? '1' : '0'"}))
-    # <div data-style="{&#x27;opacity&#x27;:$visible ? &#x27;1&#x27; : &#x27;0&#x27;}"></div>
-    ```
-    """
-    return {"data-style": js(mapping)}
-
-
-def text(expression: str) -> dict[str, str]:
-    """Bind an element's text content to a Datastar expression.
-
-    Official Datastar docs: <https://data-star.dev/reference/attributes#data-text>
-
-    ```python
-    h.P(ds.text("$greeting"))
-    # <p data-text="$greeting"></p>
-    h.Span({"class": "font-mono"}, ds.text("$user.name"))
-    # <span class="font-mono" data-text="$user.name"></span>
-    ```
-    """
-    return {"data-text": expression}
-
-
-# --- Datastar Pro attributes (https://data-star.dev/reference/attributes#pro-attributes) ---
-
-
-def animate(expression: str) -> dict[str, str]:
-    """**Datastar Pro only.** Animate element attributes over time from a reactive expression.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-animate>
-    """
-    return {"data-animate": expression}
-
-
-def custom_validity(expression: str) -> dict[str, str]:
-    """**Datastar Pro only.** Set a custom validity message from a reactive expression.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-custom-validity>
-    """
-    return {"data-custom-validity": expression}
-
-
-def match_media(
-    signal_name: str,
-    expression: str,
-    *,
-    case: Case | None = None,
-) -> dict[str, str]:
-    """**Datastar Pro only.** Sync a signal with a ``window.matchMedia`` query.
-
-    Modifiers match the reference: optional ``__case`` (``.camel`` / ``.kebab`` / …).
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-match-media>
-    """
-    kebab_key, from_case = to_kebab_key(signal_name)
-    key = "data-match-media:" + kebab_key
-    effective_case = case if case is not None else from_case
-    if effective_case != "camel":
-        key += "__case." + effective_case
-    return {key: expression}
-
-
-def on_raf(
-    expression: str,
-    *,
-    throttle: Throttle | None = None,
-) -> dict[str, str]:
-    """**Datastar Pro only.** Run a Datastar expression on every animation frame.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-on-raf>
-    """
-    modifiers = [] if throttle is None else [throttle_to_string(throttle)]
-    key = "data-on-raf" if not modifiers else f"data-on-raf__{'__'.join(modifiers)}"
-    return {key: expression}
-
-
-def on_resize(
-    expression: str,
-    *,
-    debounce: Debounce | None = None,
-    throttle: Throttle | None = None,
-) -> dict[str, str]:
-    """**Datastar Pro only.** React to element resize events with a Datastar expression.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-on-resize>
-    """
-    modifiers: list[str] = []
-    if debounce is not None:
-        modifiers.append(debounce_to_string(debounce))
-    if throttle is not None:
-        modifiers.append(throttle_to_string(throttle))
-    key = (
-        "data-on-resize"
-        if not modifiers
-        else f"data-on-resize__{'__'.join(modifiers)}"
-    )
-    return {key: expression}
-
-
-def persist(
-    *,
-    filter_signals: dict[str, Any] | None = None,
-    storage_key: str | None = None,
-    session: bool = False,
-) -> dict[str, str | bool]:
-    """**Datastar Pro only.** Persist signals in local or session storage.
-
-    ``filter_signals`` becomes the attribute value as a JS object (``include`` / ``exclude`` regexes).
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-persist>
-    """
-    value = True if filter_signals is None else js(filter_signals)
-    if storage_key is not None:
-        key = "data-persist:" + storage_key
-        if session:
-            key += "__session"
-        return {key: value}
-    return {"data-persist": value}
-
-
-def query_string(
-    *,
-    filter_signals: dict[str, Any] | None = None,
-    filter_empty: bool = False,
-    history: bool = False,
-) -> dict[str, str | bool]:
-    """**Datastar Pro only.** Sync matching signals with the page query string.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-query-string>
-    """
-    modifiers: list[str] = []
-    if filter_empty:
-        modifiers.append("filter")
-    if history:
-        modifiers.append("history")
-    key = (
-        "data-query-string"
-        if not modifiers
-        else f"data-query-string__{'__'.join(modifiers)}"
-    )
-    return {key: True if filter_signals is None else js(filter_signals)}
-
-
-def replace_url(expression: str) -> dict[str, str]:
-    """**Datastar Pro only.** Replace the current browser URL from a reactive expression.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-replace-url>
-    """
-    return {"data-replace-url": expression}
-
-
-def scroll_into_view(
-    *,
-    smooth: bool = False,
-    instant: bool = False,
-    auto: bool = False,
-    hstart: bool = False,
-    hcenter: bool = False,
-    hend: bool = False,
-    hnearest: bool = False,
-    vstart: bool = False,
-    vcenter: bool = False,
-    vend: bool = False,
-    vnearest: bool = False,
-    focus: bool = False,
-) -> dict[str, bool]:
-    """**Datastar Pro only.** Scroll the element into view with optional focus behavior.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-scroll-into-view>
-    """
-    modifiers: list[str] = []
-    append = modifiers.append
-    if smooth:
-        append("smooth")
-    if instant:
-        append("instant")
-    if auto:
-        append("auto")
-    if hstart:
-        append("hstart")
-    if hcenter:
-        append("hcenter")
-    if hend:
-        append("hend")
-    if hnearest:
-        append("hnearest")
-    if vstart:
-        append("vstart")
-    if vcenter:
-        append("vcenter")
-    if vend:
-        append("vend")
-    if vnearest:
-        append("vnearest")
-    if focus:
-        append("focus")
-    key = (
-        "data-scroll-into-view"
-        if not modifiers
-        else f"data-scroll-into-view__{'__'.join(modifiers)}"
-    )
-    return {key: True}
-
-
-def view_transition(expression: str) -> dict[str, str]:
-    """**Datastar Pro only.** Set an explicit ``view-transition-name`` from an expression.
-
-    Requires a Datastar Pro license and client bundle. Official Datastar docs:
-    <https://data-star.dev/reference/attributes#data-view-transition>
-    """
-    return {"data-view-transition": expression}
+data = DatastarAttributes()

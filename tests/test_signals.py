@@ -1,11 +1,11 @@
-"""Tests for Datastar signal parsing via ``stario.datastar.read_signals``."""
+"""Tests for Datastar signal parsing via `stario.datastar.read_signals`."""
 
-import json
 from urllib.parse import urlencode
 
 import pytest
 
-from stario import datastar as ds
+from stario.datastar import read_signals
+from stario.exceptions import StarioError
 from stario.http.headers import Headers
 from stario.http.request import BodyReader, Request
 
@@ -20,7 +20,8 @@ def _make_request(
 ) -> Request:
     hdrs = Headers()
     if headers:
-        hdrs.update(headers)
+        for name, value in headers.items():
+            hdrs.set(name, value)
 
     reader = BodyReader(
         pause=lambda: None,
@@ -43,51 +44,58 @@ class TestReadSignals:
     async def test_returns_dict_for_valid_post_body(self):
         req = _make_request(method="POST", body=b'{"name":"test","count":42}')
 
-        result = await ds.read_signals(req)
+        result = await read_signals(req)
 
         assert result == {"name": "test", "count": 42}
 
     async def test_reads_get_query_datastar_payload(self):
-        req = _make_request(method="GET", query={"datastar": '{"name":"test","count":42}'})
+        req = _make_request(
+            method="GET", query={"datastar": '{"name":"test","count":42}'}
+        )
 
-        result = await ds.read_signals(req)
+        result = await read_signals(req)
 
         assert result == {"name": "test", "count": 42}
 
-    async def test_reads_delete_query_datastar_payload(self):
-        req = _make_request(method="DELETE", query={"datastar": '{"id":7,"ok":true}'})
-
-        result = await ds.read_signals(req)
-
-        assert result == {"id": 7, "ok": True}
-
     async def test_delete_ignores_body_uses_query(self):
-        """DELETE signals ride the query; body is not used (Datastar PR #1146)."""
         req = _make_request(
             method="DELETE",
             query={"datastar": '{"from":"query"}'},
             body=b'{"from":"body"}',
         )
 
-        result = await ds.read_signals(req)
+        result = await read_signals(req)
 
         assert result == {"from": "query"}
 
     async def test_missing_payload_defaults_to_empty_dict(self):
         req = _make_request(method="GET")
 
-        result = await ds.read_signals(req)
+        result = await read_signals(req)
 
         assert result == {}
 
-    async def test_invalid_json_raises_json_decode_error(self):
+    async def test_invalid_json_raises_stario_error(self):
         req = _make_request(method="POST", body=b"{invalid")
 
-        with pytest.raises(json.JSONDecodeError):
-            await ds.read_signals(req)
+        with pytest.raises(StarioError, match="valid JSON"):
+            await read_signals(req)
 
-    async def test_non_object_json_raises_type_error(self):
-        req = _make_request(method="POST", body=b"[1,2,3]")
+    @pytest.mark.parametrize("payload", [b"[1,2,3]", b"null", b'"text"', b"42"])
+    async def test_non_object_json_raises_stario_error(self, payload: bytes):
+        req = _make_request(method="POST", body=payload)
 
-        with pytest.raises(TypeError, match="Signals must decode to a JSON object"):
-            await ds.read_signals(req)
+        with pytest.raises(StarioError, match="Signals must decode to a JSON object"):
+            await read_signals(req)
+
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+    async def test_write_methods_use_body_not_query(self, method: str):
+        req = _make_request(
+            method=method,
+            query={"datastar": '{"from":"query"}'},
+            body=b'{"from":"body"}',
+        )
+
+        result = await read_signals(req)
+
+        assert result == {"from": "body"}
