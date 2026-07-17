@@ -42,6 +42,7 @@ from stario import (
     Writer,
 )
 from stario.datastar import SSE, at, data, read_signals
+from stario.debug import debug_inspector
 from stario.markup import HtmlElement, baked, classes, styles
 from stario.markup import html as h
 
@@ -259,6 +260,8 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
             ),
             info_view(user_id, game),
             board_view(game),
+            # Demo leaves this on. Gate before shipping, e.g. os.environ.get("STARIO_DEBUG").
+            debug_inspector(),
         ),
     )
 
