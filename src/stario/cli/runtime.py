@@ -11,6 +11,7 @@ import inspect
 import math
 import shlex
 import socket
+import subprocess
 import sys
 from collections.abc import Sequence
 from fnmatch import translate as glob_to_regex
@@ -36,6 +37,14 @@ WATCH_IGNORE_ENTITY_SUFFIXES = (
     r"\.sqlite(?:-.+)?$",
     r"\.db(?:-.+)?$",
 )
+
+
+def _watch_serve_command(app_spec: str) -> str:
+    """Command string for watchfiles, using the platform's quoting rules."""
+    parts = (sys.executable, "-m", "stario.cli", "serve", app_spec)
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(parts)
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def load_bootstrap(spec: str) -> Bootstrap:
@@ -157,10 +166,7 @@ def watch_app(
     config = server_config_from_env()
     # Match watchfiles' wait budget to the server's drain window (+ force-close cap).
     sigint_timeout = max(1, math.ceil(config.graceful_shutdown_timeout + 1.0))
-    serve_command = " ".join(
-        shlex.quote(part)
-        for part in (sys.executable, "-m", "stario.cli", "serve", app_spec)
-    )
+    serve_command = _watch_serve_command(app_spec)
 
     run_process(
         *paths,

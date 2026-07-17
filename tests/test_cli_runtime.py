@@ -1,6 +1,7 @@
 """Tests for watch CLI flags and validation."""
 
 import shlex
+import subprocess
 import sys
 from typing import cast
 
@@ -8,14 +9,7 @@ import pytest
 
 from stario.cli.errors import CliError
 from stario.cli.main import main
-from stario.cli.runtime import watch_app
-
-
-def _expected_watch_serve_command(app_spec: str) -> str:
-    return " ".join(
-        shlex.quote(part)
-        for part in (sys.executable, "-m", "stario.cli", "serve", app_spec)
-    )
+from stario.cli.runtime import _watch_serve_command, watch_app
 
 
 def test_watch_command_defaults_to_current_directory(monkeypatch) -> None:
@@ -112,7 +106,28 @@ def test_watch_app_passes_sigint_timeout_and_serve_command(
     command = kwargs["target"]
     assert kwargs["sigint_timeout"] == 14
     assert kwargs["target_type"] == "command"
-    assert command == _expected_watch_serve_command("demo:bootstrap")
+    assert command == _watch_serve_command("demo:bootstrap")
     parts = shlex.split(cast(str, command))
     assert parts[:4] == [sys.executable, "-m", "stario.cli", "serve"]
     assert parts[4] == "demo:bootstrap"
+
+
+def test_watch_serve_command_uses_list2cmdline_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    python = r"C:\Python\python.exe"
+    monkeypatch.setattr(sys, "executable", python)
+
+    command = _watch_serve_command("app.main:bootstrap")
+
+    assert command == subprocess.list2cmdline(
+        [python, "-m", "stario.cli", "serve", "app.main:bootstrap"]
+    )
+    assert command.startswith(python)
+    assert "'" not in command
+    assert shlex.split(command, posix=False) == [
+        python,
+        "-m",
+        "stario.cli",
+        "serve",
+        "app.main:bootstrap",
+    ]
