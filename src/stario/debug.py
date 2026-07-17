@@ -32,6 +32,7 @@ def debug_inspector(
                 "opacity": "0.95",
                 "border": "1px solid #ccc",
                 "background": "#fff",
+                "color": "#111",
                 "padding": "0.75rem",
                 "width": "320px",
                 "z-index": "9999",
@@ -79,6 +80,7 @@ def debug_inspector(
                 {
                     "background": "#f4f4f4",
                     "border": "1px solid #eee",
+                    "color": "#111",
                     "padding": "0.5rem",
                     "margin-top": "0.5rem",
                     "margin-bottom": "0",
