@@ -1,4 +1,4 @@
-"""Shared bounded queue, writer thread, and self-metrics for Json/SQLite sinks."""
+"""Shared bounded queue, writer thread, and self-metrics for buffered sinks."""
 
 import queue
 import sys
@@ -10,7 +10,7 @@ from uuid import uuid7
 from .core import Attributes, Span, TelemetryStats, Tracer
 from .spans import RecordingSpan
 
-# Subclassed by JsonTracer and SqliteTracer.
+# Subclassed by ConsoleTracer, JsonTracer, and SqliteTracer.
 __all__ = ["_BufferedTracer"]
 
 
@@ -18,7 +18,7 @@ class _BufferedTracer:
     """Background writer thread with a bounded pending queue and drop metrics.
 
     Subclasses implement `_write_batch()` and `_thread_name()`. Not part of the
-    public API — use `JsonTracer` or `SqliteTracer`.
+    public API — use `ConsoleTracer`, `JsonTracer`, or `SqliteTracer`.
     """
 
     __slots__ = (

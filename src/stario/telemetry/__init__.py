@@ -5,6 +5,7 @@ Handlers see `Span` on `Context`. Import tracer backends from their modules
 when wiring a process:
 
 ```python
+from stario.telemetry.console import ConsoleTracer
 from stario.telemetry.json import JsonTracer
 from stario.telemetry.tty import TTYTracer
 from stario.telemetry.noop import NoOpTracer

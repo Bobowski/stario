@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime
 from itertools import chain
 from types import TracebackType
 from typing import Any, TextIO, cast
@@ -21,9 +20,14 @@ from unicodedata import combining, east_asian_width
 from uuid import UUID, uuid7
 
 from stario._terminal import RESET as _RESET
-from stario._terminal import SGR, color_enabled, enable_vt_for_stream
+from stario._terminal import enable_vt_for_stream
 
 from .core import Attributes, Span, TelemetryStats
+from .presentation import format_duration as _fmt_duration
+from .presentation import format_timestamp as _fmt_timestamp
+from .presentation import short_id as _uuid_tail
+from .presentation import span_status_style as _span_status_style
+from .presentation import styled as _styled
 from .spans import RecordedEvent, RecordedLink, RecordingSpan
 
 _REFRESH_INTERVAL_S = 0.125
@@ -31,15 +35,6 @@ _TIME_COL = 14
 # Single-cell live placeholder so `splitlines()` still counts as one row.
 _IDLE_LIVE = " "
 _ELLIPSIS = "…"
-
-
-def _styled(text: str, style: str) -> str:
-    if not color_enabled():
-        return text
-    prefix = SGR.get(style)
-    if not prefix:
-        return text
-    return f"{prefix}{text}{_RESET}"
 
 
 def _ansi_sequence_end(text: str, index: int) -> int | None:
@@ -102,52 +97,6 @@ def _clip_visible(text: str, max_width: int) -> str:
     if saw_ansi:
         pieces.append(_RESET)
     return "".join(pieces)
-
-
-def _fmt_duration(ns: int) -> str:
-    if ns < 1_000_000:
-        us = ns / 1e3
-        if us < 10:
-            return f"{us:.1f} us"
-        return f"{us:.0f} us"
-
-    ms = ns / 1e6
-    if ms < 10:
-        return f"{ms:.1f} ms"
-    if ms < 1000:
-        return f"{ms:.0f} ms"
-    if ms < 60_000:
-        return f"{ms / 1000:.2f} s"
-    minutes, seconds = divmod(int(ms / 1000), 60)
-    if minutes < 60:
-        return f"{minutes}:{seconds:02d} min"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02d}:{seconds:02d}"
-
-
-def _uuid_tail(uid: UUID) -> str:
-    s = str(uid)
-    return s[-8:] if len(s) >= 8 else s
-
-
-def _span_status_style(span: RecordingSpan) -> str:
-    if span.in_progress:
-        return "cyan"
-    if span.failed:
-        return "red"
-    for key in ("response.status_code", "status_code"):
-        if not span.attributes or key not in span.attributes:
-            continue
-        try:
-            code = int(span.attributes[key])
-        except ValueError, TypeError:
-            continue
-        if 200 <= code < 300:
-            return "green"
-        if 300 <= code < 500:
-            return "yellow"
-        return "red"
-    return "green"
 
 
 def _build_status_trailer(span: RecordingSpan, max_len: int) -> str:
@@ -265,11 +214,7 @@ class TTYRenderer:
         if span.start_ns is None:
             raise RuntimeError("TTYRenderer can only render started spans")
         if parent_start_ns is None:
-            time_s = (
-                datetime.fromtimestamp(span.start_ns / 1e9)
-                .strftime("%H:%M:%S.%f")[:-3]
-                .ljust(_TIME_COL)[:_TIME_COL]
-            )
+            time_s = _fmt_timestamp(span.start_ns).ljust(_TIME_COL)[:_TIME_COL]
         else:
             offset_ns = span.start_ns - parent_start_ns
             time_s = f"+{_fmt_duration(offset_ns)}"[:_TIME_COL].ljust(_TIME_COL)

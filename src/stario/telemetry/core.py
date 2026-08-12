@@ -22,8 +22,8 @@ type Attributes = Mapping[str, Any]
 class TelemetryStats:
     """Snapshot of tracer self-observation counters.
 
-    Json and SQLite sinks increment these when spans are dropped, serialization
-    fails, or the writer raises. Dev (`TTYTracer`) and noop tracers always
+    Buffered sinks increment these when spans are dropped, serialization fails,
+    or the writer raises. Dev (`TTYTracer`) and noop tracers always
     return zeros.
     """
 
@@ -127,8 +127,8 @@ class Tracer(Protocol):
     ## Lifecycle
 
     Enter the tracer before `create()` so async writers and database handles
-    are running. Exit drains pending spans (Json/SQLite) or flushes the TTY
-    view.
+    are running. Exit drains pending spans from buffered sinks or flushes the
+    TTY view.
 
     Custom factories registered via `STARIO_TRACER=module:callable` must return
     an object implementing this protocol. `create()` should return spans

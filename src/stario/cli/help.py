@@ -14,8 +14,9 @@ Listen:
   STARIO_GRACEFUL_SHUTDOWN_TIMEOUT=5
 
 Telemetry (STARIO_TRACER plus json/sqlite backend tuning):
-  STARIO_TRACER=auto|tty|json|noop|sqlite|module:callable
+  STARIO_TRACER=auto|console|tty|json|noop|sqlite|module:callable
     auto — tty when stdout is a TTY, otherwise json
+    console — one TTY-style line per finished span (runner-safe)
   STARIO_TRACERS_JSON_FLUSH_INTERVAL=0.125
   STARIO_TRACERS_JSON_MAX_PENDING_SPANS=...
   STARIO_TRACERS_JSON_MAX_BATCH_SPANS=...

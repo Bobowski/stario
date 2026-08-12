@@ -5,6 +5,7 @@ import pytest
 
 from stario.cli.env import tracer_from_env
 from stario.cli.errors import CliError
+from stario.telemetry.console import ConsoleTracer
 from stario.telemetry.json import JsonTracer
 from stario.telemetry.tty import TTYTracer
 
@@ -16,6 +17,12 @@ def test_tracer_from_env_defaults_to_auto_tty_or_json(monkeypatch) -> None:
 
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
     assert isinstance(tracer_from_env(), JsonTracer)
+
+
+def test_tracer_from_env_selects_console_tracer(monkeypatch) -> None:
+    monkeypatch.setenv("STARIO_TRACER", "console")
+
+    assert isinstance(tracer_from_env(), ConsoleTracer)
 
 
 def test_tracer_from_env_invalid_sqlite_env_raises_cli_error(monkeypatch) -> None:

@@ -15,6 +15,7 @@ from stario.cli.imports import load_symbol
 from stario.exceptions import StarioError
 from stario.http.config import ServerConfig
 from stario.http.config import server_config_from_env as _server_config_from_env
+from stario.telemetry.console import ConsoleTracer
 from stario.telemetry.core import Tracer
 from stario.telemetry.json import json_tracer_from_env
 from stario.telemetry.noop import NoOpTracer
@@ -30,8 +31,8 @@ def unix_socket_from_env() -> str | None:
 def tracer_from_env() -> Tracer:
     """Read `STARIO_TRACER` and optional `STARIO_TRACERS_*` settings.
 
-    Built-in values: `auto` (TTY when stdout is a TTY, else JSON), `tty`,
-    `json`, `noop`, `sqlite`, or `module:callable` for a custom factory that
+    Built-in values: `auto` (TTY when stdout is a TTY, else JSON), `console`,
+    `tty`, `json`, `noop`, `sqlite`, or `module:callable` for a custom factory that
     returns a `Tracer`. Custom factories must implement `create()` and return
     spans whose finished records work with the bundled `on_end()` export path.
     """
@@ -42,6 +43,8 @@ def tracer_from_env() -> Tracer:
             if sys.stdout.isatty():
                 return TTYTracer()
             return json_tracer_from_env()
+        if builtin == "console":
+            return ConsoleTracer()
         if builtin == "tty":
             return TTYTracer()
         if builtin == "json":
