@@ -99,6 +99,17 @@ class TestFindHandler:
         handler, _ = router.find_handler("", "/rooms/7/send", "GET")
         assert handler is method_not_allowed_handler(frozenset({"POST"}))
 
+    def test_query_registers_rfc_query_method(self):
+        router = Router()
+        router.query("/feed", noop_handler)
+        router.add(Route.query("/search"), noop_handler)
+
+        _, feed = router.find_handler("", "/feed", "QUERY")
+        _, search = router.find_handler("", "/search", "QUERY")
+
+        assert feed.pattern == "/feed"
+        assert search.pattern == "/search"
+
     def test_add_rejects_non_route(self):
         router = Router()
 

@@ -9,10 +9,12 @@ from stario.routing import Route, UrlPath
 class TestRoute:
     def test_factories_set_method_and_path(self):
         home = Route.get("/")
+        search = Route.query("/feed")
         send = Route.post("/rooms/{room_id}/send")
 
         assert home.method == "GET"
         assert home.path.path_text == "/"
+        assert search.method == "QUERY"
         assert send.method == "POST"
         assert send.href(room_id="abc") == "/rooms/abc/send"
 

@@ -572,6 +572,8 @@ class TestDatastarActions:
             at.fetch("/save")  # type: ignore[arg-type]
         with pytest.raises(StarioError, match="no Datastar action"):
             at.fetch(Route.head("/page"))
+        with pytest.raises(StarioError, match="no Datastar action"):
+            at.fetch(Route.query("/feed"))
 
 
 class TestDatastarScriptTag:

@@ -160,3 +160,19 @@ async def test_aload_app_body_failure_emits_runtime_failure_shutdown() -> None:
     assert shutdown is not None
     assert shutdown.attributes.get("server.shutdown.trigger") == "runtime_failure"
     assert shutdown.error is not None
+
+
+@pytest.mark.asyncio
+async def test_test_client_query_sends_body() -> None:
+    async def bootstrap(app: App, span):
+        async def search(c, w):
+            responses.text(w, (await c.req.body()).decode())
+
+        app.query("/feed", search)
+        yield
+
+    async with TestClient(bootstrap) as client:
+        response = await client.query("/feed", content=b"q=foo")
+
+    assert response.status_code == 200
+    assert response.text == "q=foo"

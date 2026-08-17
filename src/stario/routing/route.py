@@ -41,6 +41,10 @@ class Route:
         return cls("GET", path)
 
     @classmethod
+    def query(cls, path: str | UrlPath) -> Route:
+        return cls("QUERY", path)
+
+    @classmethod
     def post(cls, path: str | UrlPath) -> Route:
         return cls("POST", path)
 

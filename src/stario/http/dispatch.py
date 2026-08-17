@@ -546,6 +546,15 @@ class Router:
     ) -> None:
         self.handle("GET", path, handler, middleware=middleware)
 
+    def query(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        self.handle("QUERY", path, handler, middleware=middleware)
+
     def post(
         self,
         path: UrlPath | str,

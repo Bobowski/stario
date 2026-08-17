@@ -358,6 +358,9 @@ class TestClient:
     async def get(self, url: str, **kwargs: Any) -> TestResponse:
         return await self.request("GET", url, **kwargs)
 
+    async def query(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("QUERY", url, **kwargs)
+
     async def head(self, url: str, **kwargs: Any) -> TestResponse:
         return await self.request("HEAD", url, **kwargs)
 
