@@ -130,10 +130,10 @@ class Tracer(Protocol):
     are running. Exit drains pending spans (Json/SQLite) or flushes the TTY
     view.
 
-    Custom factories registered via `STARIO_TRACER=module:callable` must return
-    an object implementing this protocol. `create()` should return spans
-    compatible with the bundled `RecordingSpan` record shape so `on_end()` can
-    read finished fields.
+    Custom factories registered via `STARIO_TRACER=module` (`make_tracer`) or
+    `STARIO_TRACER=module:callable` must return an object implementing this
+    protocol. `create()` should return spans compatible with the bundled
+    `RecordingSpan` record shape so `on_end()` can read finished fields.
     """
 
     def __enter__(self) -> Tracer: ...

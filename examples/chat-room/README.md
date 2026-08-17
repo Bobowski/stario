@@ -35,7 +35,7 @@ app/
   features/
     lobby/          GET / ; POST/DELETE reuse paths from room/urls.py
     room/           owns the room domain: /rooms… URLs, models, data, chat + SSE
-  static/           CSS, vendored Datastar
+static/             CSS, vendored Datastar — sibling of app/
 tests/
 pyproject.toml
 ```

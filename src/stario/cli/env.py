@@ -21,6 +21,8 @@ from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.sqlite import sqlite_tracer_from_env
 from stario.telemetry.tty import TTYTracer
 
+_CUSTOM_TRACER_FACTORY = "make_tracer"
+
 
 def unix_socket_from_env() -> str | None:
     """Read `STARIO_UNIX_SOCKET` without validating the full server config."""
@@ -31,9 +33,10 @@ def tracer_from_env() -> Tracer:
     """Read `STARIO_TRACER` and optional `STARIO_TRACERS_*` settings.
 
     Built-in values: `auto` (TTY when stdout is a TTY, else JSON), `tty`,
-    `json`, `noop`, `sqlite`, or `module:callable` for a custom factory that
-    returns a `Tracer`. Custom factories must implement `create()` and return
-    spans whose finished records work with the bundled `on_end()` export path.
+    `json`, `noop`, `sqlite`, a module that exports `make_tracer()`, or
+    `module:callable` for a custom factory that returns a `Tracer`. Custom
+    factories must implement `create()` and return spans whose finished
+    records work with the bundled `on_end()` export path.
     """
     effective = env_str("STARIO_TRACER", "auto")
     builtin = effective.lower()
@@ -51,21 +54,41 @@ def tracer_from_env() -> Tracer:
         if builtin == "sqlite":
             return sqlite_tracer_from_env()
 
-        loaded = load_symbol(effective, label="telemetry output")
-        if not callable(loaded):
-            raise CliError(f"Telemetry output '{effective}' must be callable.")
-        try:
-            tracer = cast(Callable[[], Tracer], loaded)()
-        except Exception as exc:
-            raise CliError(f"Telemetry output '{effective}' failed: {exc}") from exc
-        for name in ("__enter__", "__exit__", "create", "on_end", "stats"):
-            if not callable(getattr(tracer, name, None)):
-                raise CliError(
-                    f"Telemetry output '{effective}' must return a Tracer (missing {name!r})."
-                )
-        return tracer
+        return _custom_tracer_from_spec(effective)
     except (StarioError, ValueError) as exc:
         raise CliError(str(exc)) from exc
+
+
+def _custom_tracer_from_spec(spec: str) -> Tracer:
+    """Load a custom tracer from `module` (`make_tracer`) or `module:callable`."""
+    if ":" in spec:
+        factory_spec = spec
+    else:
+        factory_spec = f"{spec}:{_CUSTOM_TRACER_FACTORY}"
+
+    try:
+        loaded = load_symbol(factory_spec, label="telemetry output")
+    except CliError as exc:
+        if ":" not in spec and f"has no attribute '{_CUSTOM_TRACER_FACTORY}'" in str(exc):
+            raise CliError(
+                f"Telemetry output '{spec}' has no {_CUSTOM_TRACER_FACTORY}(). "
+                f"Add def {_CUSTOM_TRACER_FACTORY}() -> Tracer, "
+                "or set STARIO_TRACER=module:callable."
+            ) from exc
+        raise
+
+    if not callable(loaded):
+        raise CliError(f"Telemetry output '{spec}' must be callable.")
+    try:
+        tracer = cast(Callable[[], Tracer], loaded)()
+    except Exception as exc:
+        raise CliError(f"Telemetry output '{spec}' failed: {exc}") from exc
+    for name in ("__enter__", "__exit__", "create", "on_end", "stats"):
+        if not callable(getattr(tracer, name, None)):
+            raise CliError(
+                f"Telemetry output '{spec}' must return a Tracer (missing {name!r})."
+            )
+    return tracer
 
 
 def server_config_from_env() -> ServerConfig:
