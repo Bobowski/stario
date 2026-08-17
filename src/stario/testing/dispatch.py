@@ -150,7 +150,7 @@ def prepare_request(
 
 
 def merge_headers(target: Headers, incoming: HeaderMap | None) -> None:
-    """Merge fields into ``target``; later values replace earlier ones for the same name."""
+    """Merge fields into `target`; later values replace earlier ones for the same name."""
 
     if incoming is None:
         return
@@ -165,7 +165,7 @@ async def run_dispatch(
     deadline: float | None,
     on_finished: Callable[[BaseException | None], None] | None = None,
 ) -> None:
-    """Run one in-process request; always signals ``wired.disconnect`` when done."""
+    """Run one in-process request; always signals `wired.disconnect` when done."""
 
     exc: BaseException | None = None
     try:

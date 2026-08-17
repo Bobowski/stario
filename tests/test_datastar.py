@@ -24,6 +24,7 @@ from stario.markup import html as h
 from stario.markup import render
 from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
 from stario.markup.types import Attrs
+from stario.routing import Route
 from stario.testing.transport import decode_chunked as _decode_chunked
 from tests.helpers import (
     make_writer_raw as _make_writer,
@@ -550,6 +551,27 @@ class TestDatastarActions:
     def test_set_all_with_filters(self):
         action = at.set_all("null", include=["draft"], exclude="tmp.*")
         assert action == "@setAll(null, {'include':'draft','exclude':'tmp.*'})"
+
+    def test_fetch_uses_route_method_and_href(self):
+        subscribe = Route.get("/rooms/{room_id}/subscribe")
+        send = Route.post("/rooms/{room_id}/send")
+        remove = Route.delete("/rooms/{room_id}")
+
+        assert at.fetch(subscribe, {"room_id": "7"}, retry="always") == (
+            "@get('/rooms/7/subscribe', {retry: 'always'})"
+        )
+        assert at.fetch(send, {"room_id": "7"}) == "@post('/rooms/7/send')"
+        assert at.fetch(remove, {"room_id": "7"}) == "@delete('/rooms/7')"
+        assert (
+            at.fetch(send, {"room_id": "7"}, query={"src": "btn"}, fragment="latest")
+            == "@post('/rooms/7/send?src=btn#latest')"
+        )
+
+    def test_fetch_rejects_non_route_and_unknown_methods(self):
+        with pytest.raises(StarioError, match="takes a Route"):
+            at.fetch("/save")  # type: ignore[arg-type]
+        with pytest.raises(StarioError, match="no Datastar action"):
+            at.fetch(Route.head("/page"))
 
 
 class TestDatastarScriptTag:

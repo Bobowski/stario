@@ -6,7 +6,7 @@ from stario.exceptions import StarioError
 from stario.http import Router, default_not_found, method_not_allowed_handler
 from stario.http.context import EMPTY_ROUTE_MATCH, Context, Handler
 from stario.http.writer import Writer
-from stario.routing import UrlPath
+from stario.routing import Route, UrlPath
 from tests.helpers import DummyWriter, run_handler, run_with_app
 
 
@@ -85,6 +85,25 @@ class TestFindHandler:
 
         with pytest.raises(StarioError, match="Route already registered"):
             router.get("/hello", noop_handler)
+
+    def test_add_registers_route_method_and_path(self):
+        send = Route.post("/rooms/{room_id}/send")
+        router = Router()
+        router.add(send, noop_handler)
+
+        _, match = router.find_handler("", "/rooms/7/send", "POST")
+
+        assert match.pattern == "/rooms/{room_id}/send"
+        assert dict(match.params) == {"room_id": "7"}
+
+        handler, _ = router.find_handler("", "/rooms/7/send", "GET")
+        assert handler is method_not_allowed_handler(frozenset({"POST"}))
+
+    def test_add_rejects_non_route(self):
+        router = Router()
+
+        with pytest.raises(StarioError, match="takes a Route"):
+            router.add("/health", noop_handler)  # type: ignore[arg-type]
 
     def test_hostless_method_wins_over_host_405(self):
         router = Router()

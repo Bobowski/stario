@@ -2,7 +2,7 @@
 Route table: register patterns on a trie, match requests against it.
 
 Host routes are tried first when present; hostless routes are shared defaults (Go-style).
-Patterns come from `stario.routing.UrlPath`; build URLs there, not here.
+Patterns come from `stario.routing.UrlPath`. Register a `Route` with `add()`.
 
 **Match cache.** `find_handler` memoizes `(host, path, method)` → `(handler, route_match)`
 (LRU, 1024 entries). Registration clears the cache.
@@ -28,7 +28,7 @@ from stario.http.context import (
     RouteMatch,
 )
 from stario.http.writer import Writer
-from stario.routing import Segment, UrlPath
+from stario.routing import Route, Segment, UrlPath
 
 type MethodNotAllowedHandler = Callable[[frozenset[str]], Handler]
 type MatchStatus = Literal["found", "method_not_allowed", "not_found"]
@@ -452,7 +452,7 @@ class Router:
                 "Middleware must be registered before matching routes",
                 context={"pattern": pattern},
                 help_text=(
-                    "Call app.use(pattern, ...) before app.get/post/etc. "
+                    "Call app.use(pattern, ...) before app.add(...) or app.get/post on that prefix. "
                     "Middleware is baked into route handlers at registration time."
                 ),
             )
@@ -516,6 +516,26 @@ class Router:
         if method not in current.methods:
             current.methods = current.methods | frozenset({method})
         self._clear_match_cache()
+
+    def add(
+        self,
+        route: Route,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        """Register a `Route`. Path + method stay on `handle()`."""
+        if not isinstance(route, Route):
+            raise StarioError(
+                "add() takes a Route",
+                context={"got": type(route).__name__},
+                help_text=(
+                    "Declare the endpoint with Route.get/post/... and pass that object. "
+                    "Use app.handle(method, path, handler) or app.get(path, handler) "
+                    "for a path without a Route."
+                ),
+            )
+        self.handle(route.method, route.path, handler, middleware=middleware)
 
     def get(
         self,

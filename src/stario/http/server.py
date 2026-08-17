@@ -329,10 +329,10 @@ class Server:
         """Install SIGINT/SIGTERM handlers for graceful shutdown.
 
         Contract:
-          - 1st signal → complete ``shutdown_future`` and start drain
-          - 2nd signal → set ``_urgent_drain`` (skip remaining graceful wait)
-          - after shutdown started → ``SIG_IGN`` until exit so extra signals
-            during tracer flush do not become ``KeyboardInterrupt``
+          - 1st signal → complete `shutdown_future` and start drain
+          - 2nd signal → set `_urgent_drain` (skip remaining graceful wait)
+          - after shutdown started → `SIG_IGN` until exit so extra signals
+            during tracer flush do not become `KeyboardInterrupt`
         """
         loop = asyncio.get_running_loop()
 

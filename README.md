@@ -65,18 +65,18 @@ Put this in `main.py`:
 
 ```python
 import stario.responses as responses
-from stario import App, Context, Span, UrlPath, Writer
+from stario import App, Context, Route, Span, Writer
 
 
 async def home(c: Context, w: Writer) -> None:
     responses.text(w, "Hello from Stario")
 
 
-HOME = UrlPath("/")
+HOME = Route.get("/")
 
 async def bootstrap(app: App, span: Span):
     span.attr("app.name", "example")
-    app.get(HOME, home)
+    app.add(HOME, home)
     yield
 ```
 
@@ -88,7 +88,7 @@ Install with `pip install stario` if you are not using uv. During startup, `boot
 
 ## What you get
 
-- Explicit wiring: async-generator `bootstrap(app, span)` with a single `yield`, `UrlPath` constants, no hidden registration.
+- Explicit wiring: async-generator `bootstrap(app, span)` with a single `yield`, `Route` endpoints, no hidden registration.
 - Sharp primitives: `Context` for the request, `Writer` for the response, HTML/SVG trees via `stario.markup`, telemetry via `span`.
 - Static assets: `AssetManifest` for fingerprinted URLs, `StaticAssets(manifest).register(app)` in bootstrap.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.

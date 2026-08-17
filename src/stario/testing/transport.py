@@ -75,7 +75,7 @@ async def wait_sink(
     *,
     deadline: float | None = None,
 ) -> None:
-    """Wait for sink progress; ``deadline`` is an absolute ``loop.time()`` limit."""
+    """Wait for sink progress; `deadline` is an absolute `loop.time()` limit."""
 
     if deadline is None:
         await sink.wait(seen_gen)
@@ -104,7 +104,7 @@ def try_parse_http_head(buf: bytes | bytearray) -> tuple[int, Headers, int] | No
 
 
 def parse_chunk_size_line(buf: bytes | bytearray, pos: int) -> tuple[int, int] | None:
-    """Return ``(chunk_size, payload_start)`` or ``None`` when the size line is incomplete."""
+    """Return `(chunk_size, payload_start)` or `None` when the size line is incomplete."""
 
     nl = buf.find(b"\r\n", pos)
     if nl < 0:
@@ -114,7 +114,7 @@ def parse_chunk_size_line(buf: bytes | bytearray, pos: int) -> tuple[int, int] |
 
 
 def decode_chunked(body: bytes | bytearray, *, start: int = 0) -> bytes:
-    """Decode an HTTP/1.1 chunked transfer body from ``start`` to the end."""
+    """Decode an HTTP/1.1 chunked transfer body from `start` to the end."""
 
     pos = start
     decoded = bytearray()

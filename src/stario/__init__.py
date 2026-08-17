@@ -15,12 +15,13 @@ Import feature areas from their modules: `import stario.responses as responses`,
 
 Prefer `from stario import …` for:
 
-- **Per-handler:** `App`, `Context`, `Writer`, `UrlPath`
+- **Per-handler:** `App`, `Context`, `Writer`, `Route`, `UrlPath`
 - **Control flow:** `HttpException`, `RedirectException`
 - **Bootstrap / assets:** `AssetManifest`, `StaticAssets`, `Span`
 - **Middleware / realtime:** `Handler`, `Middleware`, `Relay`
 
-Register routes on `App` (`app.get(HOME, …)`), scope middleware with `app.use(pattern, mw)`.
+Register endpoints on `App` with `app.add(Route.get("/"), home)`. Scope middleware
+with `app.use(pattern, mw)` on a `UrlPath` prefix.
 Import `Router` from `stario.http` when you need a separate route table. For HTTP types
 (`Request`, `ParsedQuery`, `Headers`, `RouteMatch`), use `stario.http`.
 """
@@ -34,7 +35,7 @@ from stario.http.app import App
 from stario.http.context import Context, Handler, Middleware
 from stario.http.writer import Writer
 from stario.relay import Relay
-from stario.routing import UrlPath
+from stario.routing import Route, UrlPath
 from stario.staticassets import AssetManifest, StaticAssets
 from stario.telemetry import Span
 
@@ -47,6 +48,7 @@ __all__ = [
     "Middleware",
     "RedirectException",
     "Relay",
+    "Route",
     "Span",
     "StaticAssets",
     "UrlPath",

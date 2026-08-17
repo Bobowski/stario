@@ -1,7 +1,7 @@
 """Parsed route templates — one representation for registration and link building.
 
-``UrlPath`` is the public face of this package: parse once at import time, then
-pass the same object to ``app.get(...)`` and ``HOME.href(...)``.
+`UrlPath` is the public face of this package: parse once at import time, then
+pass the same object to `app.get(...)` and `HOME.href(...)`.
 
 Construction flow: normalize path → parse host/path segments → collect
 placeholders → cache static hrefs when there is nothing to substitute.
@@ -155,9 +155,9 @@ class UrlPath:
     pass the host separately: `UrlPath("/users", host="api.example.com")` or
     `UrlPath("/users", host="{tenant}.example.com")`.
 
-    Pass the object to route registration (`app.get(HOME, …)`). Call `href()` to build
-    a browser URL with path params, query params, or a fragment. Host-aware patterns
-    build network-path hrefs (`//host/path`).
+    Compose locations, then pin a method with `Route.get(HOME)` and register with
+    `app.add`. Call `href()` to build a browser URL with path params, query params,
+    or a fragment. Host-aware patterns build network-path hrefs (`//host/path`).
 
     Host labels are stored left-to-right as authored. The trie walks them right-to-left
     (DNS-style); use `host_trie()` for registration and `request_host()` for matching.
@@ -308,8 +308,8 @@ class UrlPath:
         """Build a browser URL from this route pattern.
 
         Path and host placeholders are passed as keyword arguments (or a positional
-        mapping). URL query parameters use the ``query=`` keyword only — not a path
-        segment named ``query``.
+        mapping). URL query parameters use the `query=` keyword only — not a path
+        segment named `query`.
         """
         if params is None:
             body = self.format(params_kwargs)

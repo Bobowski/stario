@@ -2,22 +2,25 @@
 
 Public exports (submodules are also fine for narrower imports):
 
-- ``UrlPath`` — route templates for registration and ``href()``
-- ``normalize_path`` — canonical path strings
-- ``append_query_fragment`` — query/fragment helper for asset hrefs and similar
-- ``Segment`` — parsed pattern segment (trie matching and advanced tooling)
+- `UrlPath` — location templates for composition, `href()`, and prefixes
+- `Route` — one HTTP method on one `UrlPath` (register with `app.add`)
+- `normalize_path` — canonical path strings
+- `append_query_fragment` — query/fragment helper for asset hrefs and similar
+- `Segment` — parsed pattern segment (trie matching and advanced tooling)
 
-Read bottom-up when exploring internals: ``locations`` → ``segment`` → ``urlpath``.
+Read bottom-up when exploring internals: `locations` → `segment` → `urlpath`.
 
 No HTTP wire imports — safe for routes modules, templates, and asset manifests.
-For request matching and handler dispatch, use ``stario.http.dispatch.Router``.
+For request matching and handler dispatch, use `stario.http.dispatch.Router`.
 """
 
 from stario.routing.locations import append_query_fragment, normalize_path
+from stario.routing.route import Route
 from stario.routing.segment import Segment
 from stario.routing.urlpath import UrlPath
 
 __all__ = [
+    "Route",
     "Segment",
     "UrlPath",
     "append_query_fragment",

@@ -1,13 +1,13 @@
 """Route pattern segments — the shared edge alphabet for format and trie walks.
 
-Each URL piece becomes a ``Segment`` with one of three kinds:
+Each URL piece becomes a `Segment` with one of three kinds:
 
-- ``exact``    — literal text (`users`)
-- ``wildcard`` — one segment, no slash (`{user_id}`)
-- ``catchall`` — rest of path or host (`{path...}`), only in terminal position
+- `exact`    — literal text (`users`)
+- `wildcard` — one segment, no slash (`{user_id}`)
+- `catchall` — rest of path or host (`{path...}`), only in terminal position
 
-``Segment`` objects are shared by ``UrlPath`` (link building) and the HTTP trie
-(matching). Use ``Segment.parse`` for pattern text; host/path parsers below apply
+`Segment` objects are shared by `UrlPath` (link building) and the HTTP trie
+(matching). Use `Segment.parse` for pattern text; host/path parsers below apply
 placement rules.
 """
 
@@ -24,8 +24,8 @@ type SegmentKind = Literal["exact", "wildcard", "catchall"]
 class Segment:
     """One parsed route pattern segment.
 
-    ``name`` is the trie key / ``href()`` kwarg. For ``exact`` segments it is the
-    literal value; ``pattern`` is the authored segment text.
+    `name` is the trie key / `href()` kwarg. For `exact` segments it is the
+    literal value; `pattern` is the authored segment text.
     """
 
     kind: SegmentKind
@@ -161,7 +161,7 @@ def parse_host_segments(host: str) -> tuple[Segment, ...]:
 
 
 def parse_path_segments(path: str) -> tuple[Segment, ...]:
-    """Parse a canonical path (from ``normalize_path``) into segments."""
+    """Parse a canonical path (from `normalize_path`) into segments."""
     path_body = path.strip("/")
     if not path_body:
         return ()

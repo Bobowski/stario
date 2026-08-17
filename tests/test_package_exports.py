@@ -30,6 +30,7 @@ def test_core_modules_import() -> None:
                 "App",
                 "AssetManifest",
                 "Context",
+                "Route",
                 "StaticAssets",
                 "UrlPath",
                 "Writer",
@@ -37,7 +38,7 @@ def test_core_modules_import() -> None:
         ),
         (
             "stario.routing",
-            ["UrlPath", "Segment", "normalize_path", "append_query_fragment"],
+            ["Route", "UrlPath", "Segment", "normalize_path", "append_query_fragment"],
         ),
         (
             "stario.http",

@@ -12,7 +12,7 @@ def normalize_path(path: str) -> str:
     """Canonical URL path: leading `/`, no trailing slash (`/` alone for root).
 
     Leading and trailing slashes are stripped before re-prefixing, so runs of
-    leading slashes collapse (``//host/`` → ``/host``). Internal ``//`` segments
+    leading slashes collapse (`//host/` → `/host`). Internal `//` segments
     are preserved.
     """
     return "/" + path.strip("/")

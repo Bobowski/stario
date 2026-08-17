@@ -3,13 +3,15 @@
 Use the exported `at` instance:
 
 ```python
+from stario import Route
 from stario.datastar import at, data
 
-h.Button(data.on("click", at.get("/items")), "Refresh")
+REFRESH = Route.get("/items")
+h.Button(data.on("click", at.fetch(REFRESH)), "Refresh")
 ```
 
 The methods return strings such as `@get('/items')` for use inside Datastar
-attributes like `data.on(...)`.
+attributes like `data.on(...)`. Prefer `at.fetch(route)` when the URL is a `Route`.
 """
 
 from collections.abc import Mapping
@@ -17,6 +19,7 @@ from typing import Any, Literal
 from urllib.parse import urlencode
 
 from stario.exceptions import StarioError
+from stario.routing import Route
 
 from .format import FilterValue, filter_js, js_object, string_literal
 
@@ -334,6 +337,71 @@ class DatastarActions:
             "delete",
             url,
             queries,
+            content_type=content_type,
+            include=include,
+            exclude=exclude,
+            selector=selector,
+            headers=headers,
+            open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
+            retry_interval_ms=retry_interval_ms,
+            retry_scaler=retry_scaler,
+            retry_max_wait_ms=retry_max_wait_ms,
+            retry_max_count=retry_max_count,
+            request_cancellation=request_cancellation,
+        )
+
+    def fetch(
+        self,
+        route: Route,
+        params: Mapping[str, object] | None = None,
+        /,
+        *,
+        query: Mapping[str, object] | None = None,
+        fragment: str | None = None,
+        content_type: ContentType | str | None = None,
+        include: FilterValue | None = None,
+        exclude: FilterValue | None = None,
+        selector: str | None = None,
+        headers: dict[str, str] | None = None,
+        open_when_hidden: bool | None = None,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str | None = None,
+        retry_interval_ms: int | None = None,
+        retry_scaler: float | None = None,
+        retry_max_wait_ms: int | None = None,
+        retry_max_count: int | None = None,
+        request_cancellation: RequestCancellation | str | None = None,
+    ) -> str:
+        """Build `@get` / `@post` / `@put` / `@patch` / `@delete` from a `Route`.
+
+        Path params, `query=`, and `fragment=` match `href()`. Datastar fetch
+        options stay keyword-only so they do not collide with path names.
+
+        ```python
+        data.init(at.fetch(SUBSCRIBE, {"room_id": room.id}, retry="always"))
+        h.Button(data.on("click", at.fetch(SEND, {"room_id": room.id})), "Send")
+        ```
+        """
+        if not isinstance(route, Route):
+            raise StarioError(
+                "at.fetch() takes a Route",
+                context={"got": type(route).__name__},
+                help_text=(
+                    "Declare the endpoint with Route.get/post/... and pass that object. "
+                    "Use at.get(url) or at.post(url) for a raw URL."
+                ),
+            )
+        if route.method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise StarioError(
+                "at.fetch() has no Datastar action for this method",
+                context={"method": route.method, "path": route.path.text},
+                help_text="at.fetch() emits @get, @post, @put, @patch, or @delete.",
+            )
+        return self._fetch(
+            route.method.lower(),
+            route.href(params, query=query, fragment=fragment),
             content_type=content_type,
             include=include,
             exclude=exclude,
