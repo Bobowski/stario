@@ -17,17 +17,44 @@ PYTHON="${PYTHON:-3.14}"
 KEEP_RAW="${KEEP_RAW:-0}"
 WRK="${WRK:-wrk}"
 BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
-TARGETS=(stario stario-cython fastapi blacksheep-uvicorn blacksheep-granian sanic)
+TARGETS=(
+  stario stario-cython
+  socketify robyn granian-rsgi sanic django-bolt
+  blacksheep-granian blacksheep-uvicorn fastapi
+)
+TARGET_LABELS=(
+  "stario|Stario (Python httptools)"
+  "stario-cython|Stario (Cython llhttp)"
+  "socketify|Socketify (uWebSockets/libuv)"
+  "robyn|Robyn (Rust/Actix)"
+  "granian-rsgi|Granian RSGI (Rust, no framework)"
+  "sanic|Sanic (uvloop)"
+  "django-bolt|Django-Bolt (Actix/Tokio)"
+  "blacksheep-granian|BlackSheep + Granian ASGI"
+  "blacksheep-uvicorn|BlackSheep + Uvicorn ASGI"
+  "fastapi|FastAPI + Uvicorn ASGI"
+)
+SUMMARY_GROUPS=(
+  "Stario (this checkout)|stario stario-cython"
+  "Native HTTP servers|socketify robyn granian-rsgi sanic django-bolt"
+  "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
+)
 ENDPOINTS=(plaintext json params validate)
 
 RUN_DIR=""
 SERVER_PID=""
 SERVER_PORT=""
 SERVER_CMD=()
+SELECTED_TARGETS=()
 
 usage() {
   cat <<'EOF'
-Usage: benchmarks/server/run.sh [stario|stario-cython|fastapi|blacksheep-uvicorn|blacksheep-granian|sanic ...]
+Usage: benchmarks/server/run.sh [target ...]
+
+Targets (default: all):
+  Stario:              stario, stario-cython
+  Native HTTP servers: socketify, robyn, granian-rsgi, sanic, django-bolt
+  ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 RUNS=7 WARMUP=2 HOST=127.0.0.1
              PORT=3000 PYTHON=3.14 REFRESH_ENVS=1 KEEP_RAW=1 WRK=wrk
@@ -35,8 +62,8 @@ Environment: DURATION=10s THREADS=2 CONNECTIONS=128 RUNS=7 WARMUP=2 HOST=127.0.0
 Each endpoint is measured RUNS times; the first WARMUP samples are discarded,
 then IQR outlier trimming is applied before reporting median RPS ± stdev.
 
-PORT is the base port. Targets use fixed offsets: stario=PORT, stario-cython=PORT+1,
-fastapi=PORT+2, blacksheep-uvicorn=PORT+3, blacksheep-granian=PORT+4, sanic=PORT+5.
+PORT is the base port. Targets use fixed offsets in TARGETS order (stario=PORT,
+stario-cython=PORT+1, socketify=PORT+2, ...).
 EOF
 }
 
@@ -150,6 +177,18 @@ build_stario_cython() {
   (cd "$ROOT" && PKG_CONFIG_PATH="$pkg_config_path" "$python" setup.py)
 }
 
+target_label() {
+  local target="$1" entry label
+  for entry in "${TARGET_LABELS[@]}"; do
+    label="${entry#*|}"
+    if [[ "${entry%%|*}" == "$target" ]]; then
+      echo "$label"
+      return 0
+    fi
+  done
+  echo "$target"
+}
+
 ensure_target() {
   case "$1" in
     stario) ensure_env stario "stario @ file://$ROOT" uvloop ujson ;;
@@ -157,10 +196,14 @@ ensure_target() {
       ensure_env stario-cython "stario @ file://$ROOT" uvloop ujson cython setuptools wheel
       build_stario_cython "$(python_for stario-cython)"
       ;;
+    socketify) ensure_env socketify socketify ujson ;;
+    robyn) ensure_env robyn robyn ujson ;;
+    granian-rsgi) ensure_env granian-rsgi granian uvloop ujson ;;
+    sanic) ensure_env sanic sanic uvloop ujson ;;
+    django-bolt) ensure_env django-bolt django django-bolt msgspec ujson ;;
     fastapi) ensure_env fastapi fastapi 'uvicorn[standard]' ujson ;;
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
-    sanic) ensure_env sanic sanic uvloop ujson ;;
   esac
 }
 
@@ -222,6 +265,39 @@ command_for() {
         --host "$HOST" --port "$SERVER_PORT"
       )
       ;;
+    socketify)
+      export BENCH_HOST="$HOST"
+      export BENCH_PORT="$SERVER_PORT"
+      SERVER_CMD=(
+        "$(python_for socketify)" "$BENCHMARK_DIR/apps/socketify_app.py"
+      )
+      ;;
+    robyn)
+      export BENCH_HOST="$HOST"
+      export BENCH_PORT="$SERVER_PORT"
+      SERVER_CMD=(
+        "$(python_for robyn)" "$BENCHMARK_DIR/apps/robyn_app.py"
+        --log-level=WARN --disable-openapi --processes 1 --workers 1
+      )
+      ;;
+    granian-rsgi)
+      SERVER_CMD=(
+        "$(python_for granian-rsgi)" -m granian apps.granian_rsgi_app:app
+        --interface rsgi
+        --host "$HOST" --port "$SERVER_PORT"
+        --workers 1
+        --runtime-threads 1
+        --loop uvloop
+        --no-access-log
+        --log-level warning
+      )
+      ;;
+    django-bolt)
+      SERVER_CMD=(
+        "$(python_for django-bolt)" "$BENCHMARK_DIR/apps/django_bolt/manage.py"
+        runbolt --host "$HOST" --port "$SERVER_PORT" --processes 1
+      )
+      ;;
   esac
 }
 
@@ -241,7 +317,7 @@ fail_with_log() {
 }
 
 wait_ready() {
-  local url="http://$HOST:$SERVER_PORT/plaintext" deadline=$((SECONDS + 10)) log="$1"
+  local url="http://$HOST:$SERVER_PORT/plaintext" deadline=$((SECONDS + 30)) log="$1"
   until curl -fsS --max-time 1 "$url" >/dev/null 2>&1; do
     if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
       fail_with_log "Server exited before it was ready." "$log"
@@ -334,31 +410,63 @@ print(cell)
 PY
 }
 
+print_summary_row() {
+  local target="$1" venv_python="$2"
+  local endpoint stats_file cell
+  printf '| %s ' "$(target_label "$target")"
+  for endpoint in "${ENDPOINTS[@]}"; do
+    stats_file="$RUN_DIR/$target.$endpoint.stats.json"
+    if [[ -f "$stats_file" ]]; then
+      cell="$(format_cell "$stats_file" "$venv_python")"
+      printf '| %s ' "$cell"
+    else
+      printf '| - '
+    fi
+  done
+  echo "|"
+}
+
+target_selected() {
+  local target="$1" selected
+  for selected in "${SELECTED_TARGETS[@]}"; do
+    [[ "$selected" == "$target" ]] && return 0
+  done
+  return 1
+}
+
 print_summary() {
-  local target endpoint stats_file table="$RUN_DIR/summary.md" venv_python
+  local group_entry group_name group_targets target table="$RUN_DIR/summary.md" venv_python
+  local printed_header target_in_group printed_any=0
+  SELECTED_TARGETS=("$@")
   : >"$table"
   {
-    echo "## Single-worker framework comparison"
+    echo "## Single-worker HTTP server comparison"
     echo
     echo "Median requests/sec ± sample stdev after discarding $WARMUP warmup run(s)"
     echo "and applying IQR outlier trimming across $RUNS measured samples per endpoint."
-    echo
-    echo "| Target | Plaintext | JSON | Params | Validate |"
-    echo "| --- | ---: | ---: | ---: | ---: |"
-    for target in "$@"; do
-      venv_python="$(python_for "$target")"
-      printf '| %s ' "$target"
-      for endpoint in "${ENDPOINTS[@]}"; do
-        stats_file="$RUN_DIR/$target.$endpoint.stats.json"
-        if [[ -f "$stats_file" ]]; then
-          cell="$(format_cell "$stats_file" "$venv_python")"
-          printf '| %s ' "$cell"
-        else
-          printf '| - '
+    for group_entry in "${SUMMARY_GROUPS[@]}"; do
+      group_name="${group_entry%%|*}"
+      group_targets="${group_entry#*|}"
+      printed_header=0
+      for target_in_group in $group_targets; do
+        target_selected "$target_in_group" || continue
+        if [[ "$printed_header" == 0 ]]; then
+          echo
+          echo "### $group_name"
+          echo
+          echo "| Server | Plaintext | JSON | Params | Validate |"
+          echo "| --- | ---: | ---: | ---: | ---: |"
+          printed_header=1
+          printed_any=1
         fi
+        venv_python="$(python_for "$target_in_group")"
+        print_summary_row "$target_in_group" "$venv_python"
       done
-      echo "|"
     done
+    if [[ "$printed_any" == 0 ]]; then
+      echo
+      echo "_No results recorded._"
+    fi
   } | tee "$table"
   rm -f "$RUN_DIR"/*.rps "$RUN_DIR"/*.samples
 }
