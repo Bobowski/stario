@@ -11,9 +11,13 @@ PORT="${PORT:-3000}"
 DURATION="${DURATION:-10s}"
 THREADS="${THREADS:-2}"
 CONNECTIONS="${CONNECTIONS:-${CONCURRENCY:-128}}"
+RUNS="${RUNS:-7}"
+WARMUP="${WARMUP:-2}"
 PYTHON="${PYTHON:-3.14}"
 KEEP_RAW="${KEEP_RAW:-0}"
-TARGETS=(stario fastapi blacksheep-uvicorn blacksheep-granian sanic)
+WRK="${WRK:-wrk}"
+BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
+TARGETS=(stario stario-cython fastapi blacksheep-uvicorn blacksheep-granian sanic)
 ENDPOINTS=(plaintext json params validate)
 
 RUN_DIR=""
@@ -23,12 +27,16 @@ SERVER_CMD=()
 
 usage() {
   cat <<'EOF'
-Usage: benchmarks/server/run.sh [stario|fastapi|blacksheep-uvicorn|blacksheep-granian|sanic ...]
+Usage: benchmarks/server/run.sh [stario|stario-cython|fastapi|blacksheep-uvicorn|blacksheep-granian|sanic ...]
 
-Environment: DURATION=10s THREADS=2 CONNECTIONS=128 HOST=127.0.0.1 PORT=3000 PYTHON=3.14 REFRESH_ENVS=1 KEEP_RAW=1
+Environment: DURATION=10s THREADS=2 CONNECTIONS=128 RUNS=7 WARMUP=2 HOST=127.0.0.1
+             PORT=3000 PYTHON=3.14 REFRESH_ENVS=1 KEEP_RAW=1 WRK=wrk
 
-PORT is the base port. Targets use fixed offsets: stario=PORT, fastapi=PORT+1,
-blacksheep-uvicorn=PORT+2, blacksheep-granian=PORT+3, sanic=PORT+4.
+Each endpoint is measured RUNS times; the first WARMUP samples are discarded,
+then IQR outlier trimming is applied before reporting median RPS ± stdev.
+
+PORT is the base port. Targets use fixed offsets: stario=PORT, stario-cython=PORT+1,
+fastapi=PORT+2, blacksheep-uvicorn=PORT+3, blacksheep-granian=PORT+4, sanic=PORT+5.
 EOF
 }
 
@@ -119,9 +127,36 @@ ensure_env() {
   fi
 }
 
+build_stario_cython() {
+  local python="$1"
+  local pkg_config_path="$BROTLI_PKG_CONFIG"
+  if [[ -z "$pkg_config_path" ]]; then
+    for candidate in \
+      /tmp/brotli-install/lib/pkgconfig \
+      /usr/lib/x86_64-linux-gnu/pkgconfig \
+      /usr/local/lib/pkgconfig; do
+      if [[ -f "$candidate/libbrotlienc.pc" ]]; then
+        pkg_config_path="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$pkg_config_path" ]] || ! PKG_CONFIG_PATH="$pkg_config_path" pkg-config --exists libbrotlienc libbrotlicommon; then
+    echo "Missing Brotli development libraries for stario-cython." >&2
+    echo "Install libbrotli-dev or set BROTLI_PKG_CONFIG to a directory with libbrotlienc.pc." >&2
+    exit 1
+  fi
+  echo "  building stario_cython extensions (PKG_CONFIG_PATH=$pkg_config_path)"
+  (cd "$ROOT" && PKG_CONFIG_PATH="$pkg_config_path" "$python" setup.py)
+}
+
 ensure_target() {
   case "$1" in
     stario) ensure_env stario "stario @ file://$ROOT" uvloop ujson ;;
+    stario-cython)
+      ensure_env stario-cython "stario @ file://$ROOT" uvloop ujson cython setuptools wheel
+      build_stario_cython "$(python_for stario-cython)"
+      ;;
     fastapi) ensure_env fastapi fastapi 'uvicorn[standard]' ujson ;;
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
@@ -144,7 +179,7 @@ uvicorn_cmd() {
 
 command_for() {
   case "$1" in
-    stario)
+    stario|stario-cython)
       export STARIO_HOST="$HOST"
       export STARIO_PORT="$SERVER_PORT"
       export STARIO_LOOP=uvloop
@@ -152,9 +187,16 @@ command_for() {
       export STARIO_COMPRESS_ZSTD_LEVEL=-1
       export STARIO_COMPRESS_BROTLI_LEVEL=-1
       export STARIO_COMPRESS_GZIP_LEVEL=-1
-      SERVER_CMD=(
-        "$(python_for stario)" -m stario.cli serve apps.stario_app:bootstrap
-      )
+      if [[ "$1" == stario-cython ]]; then
+        SERVER_CMD=(
+          env PYTHONPATH="$ROOT/src:$BENCHMARK_DIR"
+          "$(python_for stario-cython)" -m stario_cython apps.stario_app:bootstrap
+        )
+      else
+        SERVER_CMD=(
+          "$(python_for stario)" -m stario.cli serve apps.stario_app:bootstrap
+        )
+      fi
       ;;
     fastapi)
       uvicorn_cmd fastapi apps.fastapi_app:app
@@ -223,13 +265,39 @@ start_server() {
   wait_ready "$log"
 }
 
+aggregate_samples() {
+  local stats_file="$1" python="$2"
+  "$python" "$BENCHMARK_DIR/stats.py" >"$stats_file"
+}
+
 run_endpoint() {
-  local target="$1" endpoint="$2" out="$RUN_DIR/$target.$endpoint.txt"
-  local cmd=(wrk -t "$THREADS" -c "$CONNECTIONS" -d "$DURATION")
+  local target="$1" endpoint="$2" venv_python samples_file stats_file sample raw_out run_idx total
+  local url="http://$HOST:$SERVER_PORT$(path_for "$endpoint")"
+  local cmd=("$WRK" -t "$THREADS" -c "$CONNECTIONS" -d "$DURATION")
   [[ "$endpoint" == validate ]] && cmd+=(-s "$BENCHMARK_DIR/validate.lua")
-  echo "  $endpoint"
-  "${cmd[@]}" "http://$HOST:$SERVER_PORT$(path_for "$endpoint")" >"$out"
-  awk '/Requests\/sec:/ {print $2}' "$out" >"$RUN_DIR/$target.$endpoint.rps"
+
+  samples_file="$RUN_DIR/$target.$endpoint.samples"
+  stats_file="$RUN_DIR/$target.$endpoint.stats.json"
+  : >"$samples_file"
+  venv_python="$(python_for "$target")"
+
+  total=$((RUNS + WARMUP))
+  echo "  $endpoint ($RUNS measured runs, $WARMUP warmup discarded)"
+  for ((run_idx = 1; run_idx <= total; run_idx++)); do
+    raw_out="$RUN_DIR/$target.$endpoint.run${run_idx}.txt"
+    "${cmd[@]}" "$url" >"$raw_out"
+    sample="$(awk '/Requests\/sec:/ {print $2; exit}' "$raw_out")"
+    [[ -n "$sample" ]] || { echo "Failed to parse wrk output: $raw_out" >&2; exit 1; }
+    if ((run_idx > WARMUP)); then
+      echo "$sample" >>"$samples_file"
+    fi
+    if [[ "$KEEP_RAW" != 1 ]]; then
+      rm -f "$raw_out"
+    fi
+  done
+
+  aggregate_samples "$stats_file" "$venv_python" <"$samples_file"
+  "$venv_python" -c 'import json,sys; print(f"{json.load(sys.stdin)["median"]:.2f}")' <"$stats_file" >"$RUN_DIR/$target.$endpoint.rps"
 }
 
 run_target() {
@@ -244,24 +312,55 @@ run_target() {
   stop_server
 }
 
+format_cell() {
+  local stats_file="$1" python="$2"
+  "$python" - "$stats_file" <<'PY'
+import json
+import pathlib
+import sys
+
+stats = json.loads(pathlib.Path(sys.argv[1]).read_text())
+
+def fmt(value: float) -> str:
+    return f"{value:,.0f}"
+
+median = fmt(stats["median"])
+stdev = fmt(stats["stdev"])
+outliers = stats["outliers_removed"]
+cell = f"{median} ± {stdev}"
+if outliers:
+    cell += f" ({outliers} outlier{'s' if outliers != 1 else ''} removed)"
+print(cell)
+PY
+}
+
 print_summary() {
-  local target endpoint value rps_file table="$RUN_DIR/summary.md"
+  local target endpoint stats_file table="$RUN_DIR/summary.md" venv_python
   : >"$table"
   {
-    echo "## Single-worker framework comparison"; echo
+    echo "## Single-worker framework comparison"
+    echo
+    echo "Median requests/sec ± sample stdev after discarding $WARMUP warmup run(s)"
+    echo "and applying IQR outlier trimming across $RUNS measured samples per endpoint."
+    echo
     echo "| Target | Plaintext | JSON | Params | Validate |"
     echo "| --- | ---: | ---: | ---: | ---: |"
     for target in "$@"; do
+      venv_python="$(python_for "$target")"
       printf '| %s ' "$target"
       for endpoint in "${ENDPOINTS[@]}"; do
-        value="-"; rps_file="$RUN_DIR/$target.$endpoint.rps"
-        [[ -f "$rps_file" ]] && value="$(format_int "$(printf '%.0f' "$(cat "$rps_file")")")"
-        printf '| %s ' "$value"
+        stats_file="$RUN_DIR/$target.$endpoint.stats.json"
+        if [[ -f "$stats_file" ]]; then
+          cell="$(format_cell "$stats_file" "$venv_python")"
+          printf '| %s ' "$cell"
+        else
+          printf '| - '
+        fi
       done
       echo "|"
     done
   } | tee "$table"
-  rm -f "$RUN_DIR"/*.rps
+  rm -f "$RUN_DIR"/*.rps "$RUN_DIR"/*.samples
 }
 
 cleanup_raw_outputs() {
@@ -271,13 +370,19 @@ cleanup_raw_outputs() {
   for target in "$@"; do
     rm -f "$RUN_DIR/$target.server.log"
     for endpoint in "${ENDPOINTS[@]}"; do
-      rm -f "$RUN_DIR/$target.$endpoint.txt"
+      rm -f "$RUN_DIR/$target.$endpoint.txt" "$RUN_DIR/$target.$endpoint.run"*.txt
+      rm -f "$RUN_DIR/$target.$endpoint.stats.json"
     done
   done
 }
 
 main() {
-  need uv; need wrk; need curl
+  need uv; need curl
+  if ! command -v "$WRK" >/dev/null 2>&1; then
+    echo "Missing wrk executable: $WRK" >&2
+    echo "Install wrk or set WRK=/path/to/wrk." >&2
+    exit 1
+  fi
   trap stop_server EXIT INT TERM
 
   local selected=("$@") target
@@ -293,9 +398,13 @@ base_port=$PORT
 duration=$DURATION
 threads=$THREADS
 connections=$CONNECTIONS
+runs=$RUNS
+warmup=$WARMUP
 python=$PYTHON
-client=wrk
+client=$WRK
 keep_raw=$KEEP_RAW
+git_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 payload_file=benchmarks/server/validate.lua
 ports=$(port_list)
 EOF

@@ -57,7 +57,8 @@ server cannot be reused by accident.
 
 Targets:
 
-- `stario` — this checkout with no-op tracing
+- `stario` — this checkout with no-op tracing (Python httptools protocol)
+- `stario-cython` — same app on the Cython/llhttp protocol stack (`cython-core`)
 - `fastapi` — FastAPI on one Uvicorn worker
 - `blacksheep-uvicorn` — BlackSheep on one Uvicorn worker
 - `blacksheep-granian` — BlackSheep on one Granian worker
@@ -68,6 +69,9 @@ Targets:
 - One worker/process per framework.
 - Same paths: `/plaintext`, `/json`, `/user/42`, and `POST /validate`.
 - Same `wrk` settings for every run.
+- Each endpoint is measured multiple times (`RUNS`, default 7). The first
+  `WARMUP` samples are discarded, then IQR outlier trimming is applied before
+  reporting median requests/sec ± sample stdev.
 - Stario response compression disabled with negative codec levels.
 - JSON response bodies use `ujson` for Stario and FastAPI to match Sanic's
   `ujson` dependency more closely.
@@ -105,6 +109,7 @@ The default run is the standard comparison shape:
 - `DURATION=10s`
 - `THREADS=2`
 - `CONNECTIONS=128`
+- `RUNS=7` measured samples per endpoint (plus `WARMUP=2` discarded warmup runs)
 - `PORT=3000` as the base port
 - one process or worker per target
 
@@ -115,15 +120,17 @@ that run.
 Common options:
 
 ```bash
-DURATION=30s THREADS=2 CONNECTIONS=128 benchmarks/server/run.sh
-benchmarks/server/run.sh stario blacksheep-granian
+DURATION=30s THREADS=2 CONNECTIONS=128 RUNS=9 WARMUP=2 benchmarks/server/run.sh
+benchmarks/server/run.sh stario stario-cython blacksheep-granian
 PORT=3999 benchmarks/server/run.sh
 REFRESH_ENVS=1 benchmarks/server/run.sh
 KEEP_RAW=1 benchmarks/server/run.sh
+WRK=/path/to/wrk benchmarks/server/run.sh
+BROTLI_PKG_CONFIG=/opt/brotli/lib/pkgconfig benchmarks/server/run.sh stario-cython
 ```
 
 `PORT` is a base port, not a shared port. The runner assigns fixed offsets per
-target (`stario` on `PORT`, `fastapi` on `PORT+1`, and so on) and checks each
+target (`stario` on `PORT`, `stario-cython` on `PORT+1`, and so on) and checks each
 port before starting a server.
 
 Each run writes a timestamped directory under `benchmarks/server/results/`:
