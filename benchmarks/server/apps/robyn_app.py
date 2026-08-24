@@ -55,18 +55,21 @@ async def post_echo_json(request):
 
 @app.post("/ingest/64k")
 @app.post("/ingest/2m")
-@app.post("/ingest/stream/2m")
 async def ingest_buffer(request):
+    body = _body_bytes(request)
+    return {"bytes": len(body)}
+
+
+@app.post("/ingest/stream/2m")
+async def ingest_stream(request):
     body = _body_bytes(request)
     return {"bytes": len(body)}
 
 
 @app.post("/upload")
 async def upload(request):
-    total = sum(len(data) for data in request.files.values())
-    if total == 0:
-        total = len(_body_bytes(request))
-    return {"bytes": total}
+    body = _body_bytes(request)
+    return {"bytes": len(body)}
 
 
 if __name__ == "__main__":

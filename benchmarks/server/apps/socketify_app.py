@@ -81,9 +81,33 @@ async def ingest_buffer(res, req):
     res.end({"bytes": len(data)})
 
 
+async def _read_stream(res) -> int:
+    res = _pin(res)
+    done = res.app.loop.create_future()
+    total = 0
+
+    def on_chunk(_response, chunk, is_end):
+        nonlocal total
+        if chunk is not None:
+            total += len(chunk)
+        if is_end and not done.done():
+            done.set_result(total)
+
+    def on_aborted(_response):
+        if not done.done():
+            done.set_result(0)
+
+    try:
+        res.on_aborted(on_aborted)
+        res.on_data(on_chunk)
+        return await done
+    finally:
+        _unpin(res)
+
+
 async def ingest_stream(res, req):
-    data = await _read_body(res)
-    res.end({"bytes": len(data)})
+    total = await _read_stream(res)
+    res.end({"bytes": total})
 
 
 async def upload(res, req):

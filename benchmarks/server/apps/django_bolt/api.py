@@ -49,8 +49,12 @@ async def post_echo_json(request):
 
 @api.post("/ingest/64k")
 @api.post("/ingest/2m")
-@api.post("/ingest/stream/2m")
 async def ingest_buffer(request):
+    return {"bytes": len(request.body)}
+
+
+@api.post("/ingest/stream/2m")
+async def ingest_stream(request):
     return {"bytes": len(request.body)}
 
 

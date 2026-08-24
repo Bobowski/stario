@@ -127,8 +127,29 @@ Upload endpoints (all targets implement the same semantics):
 Binary fixtures live under `benchmarks/server/fixtures/` (generated on demand,
 gitignored). Lua scripts under `benchmarks/server/scripts/` load those fixtures.
 
-Robyn and Django-Bolt buffer the full body on stream routes (no native streaming
-API).
+Robyn and Django-Bolt buffer the full body on the stream route (no request
+streaming API). All other targets use chunked streaming reads on
+`POST /ingest/stream/2m`.
+
+### Route parity
+
+Every app exposes the same paths and response shapes:
+
+| Route | Method | Response |
+| --- | --- | --- |
+| `/plaintext` | GET | `Hello, World!` |
+| `/json` | GET | `{"message":"Hello, World!"}` |
+| `/user/{id}` | GET | `{"id":"…","name":"User …"}` |
+| `/validate` | POST | `validate_fields()` → JSON + status |
+| `/form` | POST | read body → `204` |
+| `/echo/json` | POST | read body → `{"bytes":N}` |
+| `/ingest/64k`, `/ingest/2m` | POST | buffered read → `{"bytes":N}` |
+| `/ingest/stream/2m` | POST | stream read → `{"bytes":N}` (buffered on Robyn/Django-Bolt) |
+| `/upload` | POST | read raw body → `{"bytes":N}` |
+
+Validation uses `apps.common.validate_fields()` everywhere except Django-Bolt,
+which uses msgspec struct parsing then calls the same helper. JSON responses
+use `ujson` where the stack allows it.
 
 ### Requirements
 
