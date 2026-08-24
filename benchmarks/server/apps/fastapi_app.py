@@ -1,19 +1,15 @@
 # pyright: reportMissingImports=false
 
 import ujson
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, Response
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import PlainTextResponse
+
+from apps.common import validate_fields
 
 HELLO = "Hello, World!"
 JSON_MEDIA_TYPE = "application/json"
 
 app = FastAPI()
-
-
-class UserInput(BaseModel):
-    name: str = Field(min_length=1)
-    age: int = Field(ge=0, le=150)
 
 
 def json_response(value: object, status_code: int = 200) -> Response:
@@ -40,5 +36,39 @@ async def get_user(user_id: str) -> Response:
 
 
 @app.post("/validate")
-async def validate(body: UserInput) -> Response:
-    return json_response({"name": body.name, "age": body.age, "valid": True})
+async def validate(request: Request) -> Response:
+    payload, status = validate_fields(ujson.loads(await request.body()))
+    return json_response(payload, status)
+
+
+@app.post("/form")
+async def post_form(request: Request) -> Response:
+    await request.body()
+    return Response(status_code=204)
+
+
+@app.post("/echo/json")
+async def post_echo_json(request: Request) -> Response:
+    body = await request.body()
+    return json_response({"bytes": len(body)})
+
+
+@app.post("/ingest/64k")
+@app.post("/ingest/2m")
+async def ingest_buffer(request: Request) -> Response:
+    body = await request.body()
+    return json_response({"bytes": len(body)})
+
+
+@app.post("/ingest/stream/2m")
+async def ingest_stream(request: Request) -> Response:
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+    return json_response({"bytes": total})
+
+
+@app.post("/upload")
+async def upload(request: Request) -> Response:
+    body = await request.body()
+    return json_response({"bytes": len(body)})

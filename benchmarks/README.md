@@ -88,8 +88,11 @@ server cannot be reused by accident.
 ### Benchmark shape
 
 - One worker/process per target.
-- Same paths: `/plaintext`, `/json`, `/user/42`, and `POST /validate`.
-- Same `wrk` settings for every run.
+- Same read paths: `/plaintext`, `/json`, `/user/42`.
+- Same upload/body paths (see **Endpoint tiers** below).
+- Same `wrk` settings per tier; large uploads use fewer connections
+  (`UPLOAD_CONNECTIONS`, default 32) than read-heavy cases (`CONNECTIONS`,
+  default 128).
 - Each endpoint is measured multiple times (`RUNS`, default 7). The first
   `WARMUP` samples are discarded, then IQR outlier trimming is applied before
   reporting median requests/sec ± sample stdev.
@@ -100,6 +103,32 @@ server cannot be reused by accident.
 FastAPI uses Pydantic validation, matching the referenced benchmark. Stario,
 BlackSheep, Sanic, Socketify, Robyn, and Granian RSGI validate the JSON body
 manually. Django-Bolt uses msgspec structs.
+
+### Endpoint tiers
+
+| Tier | Endpoints | Paths |
+| --- | --- | --- |
+| **read** | `plaintext`, `json`, `params` | `GET /plaintext`, `GET /json`, `GET /user/42` |
+| **upload** | see below | POST body / multipart cases |
+| **all** | read + upload | default |
+
+Upload endpoints (all targets implement the same semantics):
+
+| Endpoint key | Path | Client payload | Server behavior |
+| --- | --- | --- | --- |
+| `validate` | `POST /validate` | JSON `{"name":"Ada","age":42}` | Validate fields, return JSON |
+| `post-form` | `POST /form` | urlencoded form | Read body, `204 No Content` |
+| `post-json-1k` | `POST /echo/json` | 1 KB JSON | Buffered read, return `{"bytes": N}` |
+| `post-octet-64k` | `POST /ingest/64k` | 64 KB octet stream | Buffered read |
+| `post-octet-2m` | `POST /ingest/2m` | 2 MB octet stream | Buffered read |
+| `post-stream-2m` | `POST /ingest/stream/2m` | 2 MB octet stream | Streaming read (where supported) |
+| `multipart-2m` | `POST /upload` | 2 MB multipart file | Read multipart/raw body |
+
+Binary fixtures live under `benchmarks/server/fixtures/` (generated on demand,
+gitignored). Lua scripts under `benchmarks/server/scripts/` load those fixtures.
+
+Robyn and Django-Bolt buffer the full body on stream routes (no native streaming
+API).
 
 ### Requirements
 
@@ -129,8 +158,10 @@ The default run benchmarks every target above.
 
 - `DURATION=10s`
 - `THREADS=2`
-- `CONNECTIONS=128`
+- `CONNECTIONS=128` (read-heavy and small upload cases)
+- `UPLOAD_CONNECTIONS=32` (64 KB / 2 MB upload cases)
 - `RUNS=7` measured samples per endpoint (plus `WARMUP=2` discarded warmup runs)
+- `ENDPOINT_TIER=all|read|upload` (default `all`)
 - `PORT=3000` as the base port
 - one process or worker per target
 
@@ -144,6 +175,8 @@ Common options:
 ```bash
 DURATION=30s THREADS=2 CONNECTIONS=128 RUNS=9 WARMUP=2 benchmarks/server/run.sh
 benchmarks/server/run.sh stario stario-cython socketify robyn granian-rsgi
+ENDPOINT_TIER=upload benchmarks/server/run.sh
+ENDPOINTS=validate,post-form,post-json-1k benchmarks/server/run.sh stario
 PORT=3999 benchmarks/server/run.sh
 REFRESH_ENVS=1 benchmarks/server/run.sh
 KEEP_RAW=1 benchmarks/server/run.sh
@@ -165,13 +198,14 @@ Successful runs keep only `summary.md` and `config.txt` by default. Use
 `KEEP_RAW=1` to keep the per-endpoint `wrk` output and server logs. Failed
 runs leave the logs in place so startup issues can be inspected.
 
-The `POST /validate` benchmark uses `benchmarks/server/validate.lua` so every
-endpoint runs through `wrk`.
-
-The Lua file is intentionally small:
+POST endpoints use small Lua scripts under `benchmarks/server/` so every case runs
+through `wrk`. `validate.lua` is the simplest example:
 
 ```lua
 wrk.method = "POST"
 wrk.body = '{"name":"Ada","age":42}'
 wrk.headers["Content-Type"] = "application/json"
 ```
+
+Larger payloads load binary fixtures from `benchmarks/server/fixtures/` (see
+`scripts/post-octet-2m.lua`, `scripts/multipart-2m.lua`, etc.).

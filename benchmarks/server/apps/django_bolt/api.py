@@ -2,6 +2,8 @@ import msgspec
 from django_bolt import BoltAPI
 from django_bolt.responses import PlainText
 
+from apps.common import validate_fields
+
 HELLO = "Hello, World!"
 api = BoltAPI()
 
@@ -28,8 +30,30 @@ class UserInput(msgspec.Struct):
 
 @api.post("/validate")
 async def validate(body: UserInput):
-    if not body.name:
-        return {"error": "name must be a non-empty string"}, 400
-    if body.age < 0 or body.age > 150:
-        return {"error": "age must be an integer between 0 and 150"}, 400
-    return {"name": body.name, "age": body.age, "valid": True}
+    payload, status = validate_fields({"name": body.name, "age": body.age})
+    if status != 200:
+        return payload, status
+    return payload
+
+
+@api.post("/form")
+async def post_form(request):
+    _ = request.body
+    return PlainText("", status_code=204)
+
+
+@api.post("/echo/json")
+async def post_echo_json(request):
+    return {"bytes": len(request.body)}
+
+
+@api.post("/ingest/64k")
+@api.post("/ingest/2m")
+@api.post("/ingest/stream/2m")
+async def ingest_buffer(request):
+    return {"bytes": len(request.body)}
+
+
+@api.post("/upload")
+async def upload(request):
+    return {"bytes": len(request.body)}

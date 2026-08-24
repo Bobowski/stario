@@ -4,10 +4,19 @@ import os
 
 from robyn import Config, Robyn
 
+from apps.common import validate_fields
+
 config = Config()
 app = Robyn(__file__, config=config)
 
 HELLO = "Hello, World!"
+
+
+def _body_bytes(request) -> bytes:
+    body = request.body
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    return body or b""
 
 
 @app.get("/plaintext")
@@ -28,14 +37,36 @@ async def get_user(request):
 
 @app.post("/validate")
 async def validate(request):
-    body = request.json() or {}
-    name = body.get("name")
-    age = body.get("age")
-    if not isinstance(name, str) or not name:
-        return {"error": "name must be a non-empty string"}, 400
-    if not isinstance(age, int) or age < 0 or age > 150:
-        return {"error": "age must be an integer between 0 and 150"}, 400
-    return {"name": name, "age": age, "valid": True}
+    payload, status = validate_fields(request.json() or {})
+    return payload, status
+
+
+@app.post("/form")
+async def post_form(request):
+    _body_bytes(request)
+    return "", 204
+
+
+@app.post("/echo/json")
+async def post_echo_json(request):
+    body = _body_bytes(request)
+    return {"bytes": len(body)}
+
+
+@app.post("/ingest/64k")
+@app.post("/ingest/2m")
+@app.post("/ingest/stream/2m")
+async def ingest_buffer(request):
+    body = _body_bytes(request)
+    return {"bytes": len(body)}
+
+
+@app.post("/upload")
+async def upload(request):
+    total = sum(len(data) for data in request.files.values())
+    if total == 0:
+        total = len(_body_bytes(request))
+    return {"bytes": total}
 
 
 if __name__ == "__main__":

@@ -2,14 +2,17 @@
 
 import argparse
 
-from sanic import Sanic, json, text
+from sanic import Sanic, empty, json, text
+
+from apps.common import validate_fields
 
 HELLO = "Hello, World!"
 
 app = Sanic("stario_benchmark_sanic")
 app.config.ACCESS_LOG = False
-app.config.RESPONSE_TIMEOUT = 60
-app.config.REQUEST_TIMEOUT = 60
+app.config.RESPONSE_TIMEOUT = 120
+app.config.REQUEST_TIMEOUT = 120
+app.config.REQUEST_MAX_SIZE = 4 * 1024 * 1024
 
 
 @app.get("/plaintext")
@@ -29,19 +32,41 @@ async def get_user(request, user_id: str):
 
 @app.post("/validate")
 async def validate(request):
-    body = request.json or {}
-    name = body.get("name")
-    age = body.get("age")
+    payload, status = validate_fields(request.json or {})
+    return json(payload, status=status)
 
-    if not isinstance(name, str) or not name:
-        return json({"error": "name must be a non-empty string"}, status=400)
-    if not isinstance(age, int) or age < 0 or age > 150:
-        return json(
-            {"error": "age must be an integer between 0 and 150"},
-            status=400,
-        )
 
-    return json({"name": name, "age": age, "valid": True})
+@app.post("/form")
+async def post_form(request):
+    await request.read()
+    return empty()
+
+
+@app.post("/echo/json")
+async def post_echo_json(request):
+    body = await request.read()
+    return json({"bytes": len(body)})
+
+
+@app.post("/ingest/64k", name="ingest_64k")
+@app.post("/ingest/2m", name="ingest_2m")
+async def ingest_buffer(request):
+    body = await request.read()
+    return json({"bytes": len(body)})
+
+
+@app.post("/ingest/stream/2m", name="ingest_stream_2m")
+async def ingest_stream(request):
+    total = 0
+    async for chunk in request.stream:
+        total += len(chunk)
+    return json({"bytes": total})
+
+
+@app.post("/upload")
+async def upload(request):
+    body = await request.read()
+    return json({"bytes": len(body)})
 
 
 if __name__ == "__main__":
