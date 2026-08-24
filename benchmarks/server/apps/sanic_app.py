@@ -2,7 +2,9 @@
 
 import argparse
 
+import ujson
 from sanic import Sanic, empty, json, text
+from sanic.views import stream
 
 from apps.common import validate_fields
 
@@ -10,6 +12,7 @@ HELLO = "Hello, World!"
 
 app = Sanic("stario_benchmark_sanic")
 app.config.ACCESS_LOG = False
+app.config.MOTD = False
 app.config.RESPONSE_TIMEOUT = 120
 app.config.REQUEST_TIMEOUT = 120
 app.config.REQUEST_MAX_SIZE = 4 * 1024 * 1024
@@ -32,30 +35,29 @@ async def get_user(request, user_id: str):
 
 @app.post("/validate")
 async def validate(request):
-    payload, status = validate_fields(request.json or {})
+    payload, status = validate_fields(ujson.loads(request.body))
     return json(payload, status=status)
 
 
 @app.post("/form")
 async def post_form(request):
-    await request.read()
+    _ = request.body
     return empty()
 
 
 @app.post("/echo/json")
 async def post_echo_json(request):
-    body = await request.read()
-    return json({"bytes": len(body)})
+    return json({"bytes": len(request.body)})
 
 
 @app.post("/ingest/64k", name="ingest_64k")
 @app.post("/ingest/2m", name="ingest_2m")
 async def ingest_buffer(request):
-    body = await request.read()
-    return json({"bytes": len(body)})
+    return json({"bytes": len(request.body)})
 
 
 @app.post("/ingest/stream/2m", name="ingest_stream_2m")
+@stream
 async def ingest_stream(request):
     total = 0
     async for chunk in request.stream:
@@ -65,8 +67,7 @@ async def ingest_stream(request):
 
 @app.post("/upload")
 async def upload(request):
-    body = await request.read()
-    return json({"bytes": len(body)})
+    return json({"bytes": len(request.body)})
 
 
 if __name__ == "__main__":
@@ -80,4 +81,5 @@ if __name__ == "__main__":
         single_process=True,
         access_log=False,
         debug=False,
+        motd=False,
     )
