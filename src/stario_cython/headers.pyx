@@ -104,21 +104,18 @@ cdef object _ACCEPT_ENCODING_NAME = _INTERN_PY[13]
 cdef object _EXPECT_NAME = _INTERN_PY[27]
 
 
-cdef inline uint32_t _lower_copy_hash(
+cdef inline void _lower_copy(
     char* dst,
     const char* src,
     size_t n,
 ) noexcept:
     cdef size_t i
     cdef uint8_t c
-    cdef uint32_t value = <uint32_t>2166136261
     for i in range(n):
         c = <uint8_t>src[i]
         if 65 <= c <= 90:
             c += 32
         dst[i] = <char>c
-        value = (value ^ c) * <uint32_t>16777619
-    return value
 
 
 cdef inline bint _token_equals(
@@ -230,8 +227,17 @@ cdef object _intern_name(const char* src, size_t n):
     cdef int i
     if n >= NAME_STACK:
         raise ValueError("Invalid header name: too long")
-    slot = _lower_copy_hash(buf, src, n) & (INTERN_TABLE_SIZE - 1)
+    _lower_copy(buf, src, n)
     p = buf
+    if n == 4 and memcmp(p, "host", 4) == 0:
+        return _INTERN_PY[0]
+    if n == 10 and memcmp(p, "connection", 10) == 0:
+        return _INTERN_PY[1]
+    if n == 15 and memcmp(p, "accept-encoding", 15) == 0:
+        return _INTERN_PY[13]
+    if n == 6 and memcmp(p, "expect", 6) == 0:
+        return _INTERN_PY[27]
+    slot = _hash_bytes(p, n) & (INTERN_TABLE_SIZE - 1)
     while True:
         entry = _INTERN_SLOT[slot]
         if entry == 0:
