@@ -20,7 +20,7 @@ cdef int F_CONTENT_LENGTH = 0x20
 cdef int PAUSE_WRITE = 1
 cdef int PAUSE_PIPELINE = 2
 cdef int PAUSE_BODY = 4
-cdef int PARSER_QUANTUM = 64 * 1024
+cdef int PARSER_QUANTUM = 512 * 1024
 # Handlers always start at headers-complete. Body bytes accumulate on the exchange;
 # body() awaits one completion Event, stream() drains with backpressure.
 
