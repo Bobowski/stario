@@ -53,13 +53,21 @@ cdef class App(Router):
         self.tasks = set()
         self._task_discard = self.tasks.discard
         self._eager_start = False
+        self._eager_via_create_task = False
         try:
             probe = loop.create_task(_eager_probe(), eager_start=True)
             self._eager_start = True
+            self._eager_via_create_task = True
             if not probe.done():
                 probe.cancel()
         except TypeError:
-            pass
+            try:
+                probe = asyncio.Task(_eager_probe(), loop=loop, eager_start=True)
+                self._eager_start = True
+                if not probe.done():
+                    probe.cancel()
+            except TypeError:
+                pass
         self._error_handlers = {
             HttpException: _default_http_exception,
             RedirectException: _default_redirect_exception,
@@ -102,7 +110,10 @@ cdef class App(Router):
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
         if eager_start and self._eager_start:
-            task = loop.create_task(coro, name=name, eager_start=True)
+            if self._eager_via_create_task:
+                task = loop.create_task(coro, name=name, eager_start=True)
+            else:
+                task = asyncio.Task(coro, loop=loop, name=name, eager_start=True)
         else:
             task = loop.create_task(coro, name=name)
         if not task.done():
