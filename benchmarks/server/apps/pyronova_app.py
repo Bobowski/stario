@@ -70,7 +70,7 @@ def ingest_2m(req: Request):
     return {"bytes": len(req.body or b"")}
 
 
-@app.post("/ingest/stream/2m", stream=True)
+@app.post("/ingest/stream/2m", gil=True, stream=True)
 def ingest_stream(req: Request):
     total = 0
     for chunk in req.stream:
@@ -84,6 +84,8 @@ def upload(req: Request):
 
 
 if __name__ == "__main__":
-    host = os.environ.get("BENCH_HOST", "127.0.0.1")
-    port = int(os.environ.get("BENCH_PORT", "3000"))
-    app.run(host=host, port=port)
+    host = os.environ.get("BENCH_HOST", os.environ.get("PYRONOVA_HOST", "127.0.0.1"))
+    port = int(os.environ.get("BENCH_PORT", os.environ.get("PYRONOVA_PORT", "3000")))
+    workers = int(os.environ.get("PYRONOVA_WORKERS") or (os.cpu_count() or 1))
+    io_workers = int(os.environ.get("PYRONOVA_IO_WORKERS") or workers)
+    app.run(host=host, port=port, workers=workers, io_workers=io_workers)
