@@ -391,11 +391,6 @@ void stario_gzip_release(StarioGzip* gzip) {
         return;
     }
     trim_output(&gzip->out, &gzip->out_cap);
-    if (deflateReset(&gzip->strm) != Z_OK) {
-        stario_gzip_free(gzip);
-        return;
-    }
-    gzip->finished = 0;
     if (gzip_pool_count < STARIO_CODEC_POOL_MAX) {
         gzip_pool[gzip_pool_count++] = gzip;
     } else {
