@@ -76,6 +76,7 @@ cdef class RequestExchange:
     cdef void reset_body(self, bint expect_continue)
     cdef void _clear_hot_request_headers(self)
     cdef void cache_hot_request_headers(self)
+    cdef void prepare_body_capacity(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)
     cdef void c_abort(self)

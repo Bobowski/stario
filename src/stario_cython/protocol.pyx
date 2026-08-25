@@ -442,6 +442,8 @@ cdef class HttpProtocol:
                 and not exchange._req_connection_close
             )
         )
+        if flags & F_CONTENT_LENGTH:
+            exchange.prepare_body_capacity(<Py_ssize_t>content_length)
         self.complete_headers(exchange._req_expect_continue)
 
     cdef void _on_body(self, const char* at, size_t length):

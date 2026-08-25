@@ -862,6 +862,14 @@ cdef class RequestExchange:
         self._acc_pos = 0
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
+    cdef void prepare_body_capacity(self, Py_ssize_t expected_size):
+        # Preserve the small-body fast path without reserving an entire upload
+        # before the handler chooses body() or stream().
+        if expected_size > DEFAULT_STREAM_CHUNK:
+            expected_size = DEFAULT_STREAM_CHUNK
+        if expected_size > 0:
+            self._acc_reserve(expected_size)
+
     cdef int _acc_compact(self) except -1:
         cdef Py_ssize_t unread
         if self._acc_pos == 0:
