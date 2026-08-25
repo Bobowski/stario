@@ -14,7 +14,7 @@ A Go process is not the same unit of work as a CPython process.
 | --- | --- | --- |
 | Normal deploy | **One process**, goroutines on `GOMAXPROCS` OS threads (default: all CPUs) | **N processes** (one worker ≈ one core for bytecode; native extensions can use more) |
 | Fair “code path” test | One process, `GOMAXPROCS=1` | One worker (the existing suite) |
-| Fair “fill the box” test | One process, `GOMAXPROCS=nCPU` | N workers (`granian-rsgi-n`, uvicorn `--workers N`, …) |
+| Fair “fill the box” test | One process, `GOMAXPROCS=nCPU` | N processes on one port (`stario-n` / `stario-cython-n` with `STARIO_REUSE_PORT=1`, or `granian-rsgi-n`) |
 
 **Do not** compare default Go (`GOMAXPROCS=4` on this box) to one Stario
 worker and call that a language result. That is four cores vs one.
@@ -24,15 +24,16 @@ multi-threaded inside one process. The knob is `GOMAXPROCS`, not process
 count.
 
 **Do** scale Python to N processes when you want the deploy-shaped
-comparison. Stario has no worker pool today; Granian does, which is why
-`granian-rsgi-n` exists.
+comparison. Set `STARIO_REUSE_PORT=1` and start several `stario serve`
+processes on the same host/port (`stario-n` / `stario-cython-n` in the
+runner). Granian’s `--workers` is the same idea.
 
 ```bash
 # same 1-core budget as baseline-20260824.md
 benchmarks/server/run.sh stario stario-cython go-nethttp go-fasthttp granian-rsgi
 
-# fill a 4-vCPU box
-BENCH_PROCS=4 benchmarks/server/run.sh go-nethttp-n granian-rsgi-n
+# fill a 4-vCPU box — Stario starts N processes on one SO_REUSEPORT socket
+BENCH_PROCS=4 benchmarks/server/run.sh stario-n stario-cython-n go-nethttp-n granian-rsgi-n
 ```
 
 ## This run
@@ -43,8 +44,8 @@ BENCH_PROCS=4 benchmarks/server/run.sh go-nethttp-n granian-rsgi-n
 | Client | wrk 4.1.0, `-t2 -c128` (read/small upload), `-c32` (64KB/2MB) |
 | Samples | 10s × 3 measured + 1 warmup, IQR trim |
 | Topology | wrk + server on `127.0.0.1` |
-| Commit | `6a1c075` (`cursor/go-benchmark-apps-f638`) |
-| Raw | `benchmarks/server/results/20260825T175710Z/` (gitignored) |
+| Commit | `df931cb` (`cursor/go-benchmark-apps-f638`) |
+| Raw | `20260825T175710Z` (1-worker), `20260825T185107Z` (`*-n`, gitignored) |
 
 Handlers compute JSON and validation **per request** (`encoding/json` in Go,
 `ujson` in Python). No cached response bytes.
@@ -97,31 +98,46 @@ fasthttp is ahead on every body size.
 
 ## Fill the box (4 vCPUs)
 
-Go still uses **one process**. Granian uses **4 worker processes**.
+Go still uses **one process**. Stario and Granian use **4 processes** sharing
+one port (`STARIO_REUSE_PORT=1` / Granian `--workers`). Run
+`20260825T185107Z` for the `-n` rows; 1-worker rows are from the earlier
+same-machine suite.
 
 | Server | Plaintext | JSON | Params | Validate |
 | --- | ---: | ---: | ---: | ---: |
-| Granian RSGI (4 workers) | **221,079 ± 2,600** | **214,319 ± 2,980** | **208,552 ± 4,399** | 153,364 ± 6,225 |
-| Go net/http (`GOMAXPROCS=4`) | 198,547 ± 458 | 187,731 ± 2,253 | 187,846 ± 5,123 | 144,093 ± 174 |
+| Stario Cython (4 processes, `SO_REUSEPORT`) | **293,998 ± 7,025** | **283,780 ± 7,127** | **272,658 ± 5,467** | **252,150 ± 8,106** |
+| Granian RSGI (4 workers) | 223,691 ± 1,873 | 212,601 ± 27,200 | 208,766 ± 1,719 | 144,139 ± 2,036 |
+| Stario Python (4 processes, `SO_REUSEPORT`) | 211,540 ± 1,382 | 207,714 ± 803 | 211,574 ± 2,007 | 170,263 ± 4,424 |
+| Go net/http (`GOMAXPROCS=4`) | 199,980 ± 1,407 | 195,180 ± 315 | 189,863 ± 529 | 145,315 ± 143 |
 | Go fasthttp (`GOMAXPROCS=1`) | 177,185 ± 219 | 170,949 ± 5,180 | 154,793 ± 5,753 | 123,353 ± 2,135 |
 | Granian RSGI (1 worker) | 147,367 ± 2,543 | 135,630 ± 6,862 | 145,077 ± 3,100 | 107,832 ± 1,288 |
 | Stario Cython (1 worker) | 96,506 ± 3,149 | 104,528 ± 8,428 | 101,712 ± 21,262 | 81,124 ± 3,552 |
+| Stario Python (1 worker) | 71,343 ± 294 | 69,287 ± 433 | 63,607 ± 1,911 | 53,098 ± 1,202 |
 
-Scaling:
+Scaling (plaintext, 1 unit → 4 units):
 
-| | 1 unit → 4 units | Notes |
+| | 1 → 4 | Notes |
 | --- | ---: | --- |
-| Go net/http plaintext | 86k → 199k (**2.31×**) | one process, `GOMAXPROCS` 1→4 |
-| Granian plaintext | 147k → 221k (**1.50×**) | 1→4 processes |
-| fasthttp | 177k on **1** core | already near 4-worker Granian |
+| Stario Cython | 97k → 294k (**3.05×**) | 4 processes, `STARIO_REUSE_PORT=1` |
+| Stario Python | 71k → 212k (**2.97×**) | same |
+| Go net/http | 86k → 200k (**2.33×**) | one process, `GOMAXPROCS` 1→4 |
+| Granian | 147k → 224k (**1.52×**) | 1→4 workers |
 
-On uploads, 4-worker Granian wins 64KB (67k vs fasthttp 43k / nethttp-n 12k).
-4-core `net/http` still trails on buffered 2MB (1.3k vs Granian-n 3.5k /
-fasthttp 3.7k) and leads on the stream path (7.9k).
+Uploads on the 4-unit rows:
 
-If you only compared `go-nethttp-n` (199k) to 1-worker Cython (97k) you would
-report “Go is 2×.” That 2× is mostly the extra cores. The 1-core table is
-the language comparison; this table is the deploy comparison.
+| Server | Form | JSON 1KB | 64KB | 2MB buf | 2MB stream | Multipart |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Stario Cython ×4 | **287,489** | **255,842** | **92,789** | **5,433** | 6,232 | **6,382** |
+| Stario Python ×4 | 182,492 | 172,915 | 64,172 | 3,112 | 4,126 | 3,197 |
+| Granian ×4 | 149,775 | 119,738 | 69,120 | 3,964 | 4,627 | 3,740 |
+| Go net/http P=4 | 195,733 | 143,730 | 12,292 | 1,334 | **7,795** | 1,321 |
+
+`net/http` still lags on buffered 64KB+; it keeps the stream-path lead.
+Shared-socket Stario Cython is the fastest fill-the-box stack on this box.
+
+If you only compared `go-nethttp-n` (200k) to 1-worker Cython (97k) you would
+report “Go is 2×.” That 2× is mostly the extra cores. Four Cython processes
+on one `SO_REUSEPORT` socket are **1.47×** 4-core `net/http` on plaintext.
 
 ## Recommendation
 
