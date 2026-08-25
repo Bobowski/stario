@@ -145,6 +145,59 @@ cdef bint _contains_token(
     return False
 
 
+cdef int _parse_qvalue(
+    const char* value,
+    size_t start,
+    size_t end,
+) noexcept:
+    cdef int q = 0
+    cdef int digits = 0
+    cdef unsigned char c
+    while start < end and (
+        value[start] == <char>32 or value[start] == <char>9
+    ):
+        start += 1
+    while end > start and (
+        value[end - 1] == <char>32 or value[end - 1] == <char>9
+    ):
+        end -= 1
+    if start >= end:
+        return 0
+    if value[start] == <char>49:
+        start += 1
+        if start == end:
+            return 1000
+        if value[start] != <char>46:
+            return 0
+        start += 1
+        while start < end:
+            if value[start] != <char>48:
+                return 0
+            start += 1
+        return 1000
+    if value[start] != <char>48:
+        return 0
+    start += 1
+    if start == end:
+        return 0
+    if value[start] != <char>46:
+        return 0
+    start += 1
+    while start < end and digits < 3:
+        c = <unsigned char>value[start]
+        if c < 48 or c > 57:
+            return 0
+        q = q * 10 + c - 48
+        digits += 1
+        start += 1
+    if start != end:
+        return 0
+    while digits < 3:
+        q *= 10
+        digits += 1
+    return q
+
+
 cdef object _intern_name(const char* src, size_t n):
     cdef char buf[NAME_STACK]
     cdef const char* p
@@ -186,9 +239,13 @@ cdef object _encode_value(str value):
 cdef class Headers:
     def __init__(self, raw_header_data=None):
         self._data = raw_header_data if raw_header_data is not None else {}
-        self._request_accept_encoding = None
         self._request_connection_close = False
         self._request_expect_continue = False
+        self._request_accept_present = False
+        self._request_br_q = -1
+        self._request_gzip_q = -1
+        self._request_wildcard_q = -1
+        self._request_identity_q = -1
 
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen):
         cdef object key = _intern_name(name, nlen)
@@ -199,18 +256,124 @@ cdef class Headers:
         elif key is _EXPECT_NAME:
             if _contains_token(value, vlen, "100-continue", 12):
                 self._request_expect_continue = True
-        elif key is _ACCEPT_ENCODING_NAME and self._request_accept_encoding is None:
-            self._request_accept_encoding = val
+        elif key is _ACCEPT_ENCODING_NAME:
+            self._scan_request_accept_encoding(value, vlen)
         self.c_add(key, val)
 
-    cdef object c_request_accept_encoding(self):
-        return self._request_accept_encoding
+    cdef void _scan_request_accept_encoding(
+        self,
+        const char* value,
+        size_t length,
+    ) noexcept:
+        cdef size_t start = 0
+        cdef size_t segment_end
+        cdef size_t separator
+        cdef size_t token_end
+        cdef size_t param_start
+        cdef size_t param_end
+        cdef size_t equals
+        cdef size_t key_start
+        cdef size_t key_end
+        cdef int q
+        self._request_accept_present = True
+        while start < length:
+            segment_end = start
+            while segment_end < length and value[segment_end] != <char>44:
+                segment_end += 1
+            while start < segment_end and (
+                value[start] == <char>32 or value[start] == <char>9
+            ):
+                start += 1
+            separator = start
+            while separator < segment_end and value[separator] != <char>59:
+                separator += 1
+            token_end = separator
+            while token_end > start and (
+                value[token_end - 1] == <char>32
+                or value[token_end - 1] == <char>9
+            ):
+                token_end -= 1
+            q = 1000
+            param_start = separator
+            while param_start < segment_end:
+                param_start += 1
+                param_end = param_start
+                while param_end < segment_end and value[param_end] != <char>59:
+                    param_end += 1
+                equals = param_start
+                while equals < param_end and value[equals] != <char>61:
+                    equals += 1
+                key_start = param_start
+                while key_start < equals and (
+                    value[key_start] == <char>32
+                    or value[key_start] == <char>9
+                ):
+                    key_start += 1
+                key_end = equals
+                while key_end > key_start and (
+                    value[key_end - 1] == <char>32
+                    or value[key_end - 1] == <char>9
+                ):
+                    key_end -= 1
+                if (
+                    equals < param_end
+                    and key_end - key_start == 1
+                    and (
+                        value[key_start] == <char>113
+                        or value[key_start] == <char>81
+                    )
+                ):
+                    q = _parse_qvalue(value, equals + 1, param_end)
+                    break
+                param_start = param_end
+            if _token_equals(value, start, token_end, "br", 2):
+                self._request_br_q = q
+            elif _token_equals(value, start, token_end, "gzip", 4):
+                self._request_gzip_q = q
+            elif _token_equals(value, start, token_end, "*", 1):
+                self._request_wildcard_q = q
+            elif _token_equals(value, start, token_end, "identity", 8):
+                self._request_identity_q = q
+            start = segment_end + 1
 
     cdef bint c_request_connection_close(self) noexcept:
         return self._request_connection_close
 
     cdef bint c_request_expect_continue(self) noexcept:
         return self._request_expect_continue
+
+    cdef int c_select_request_encoding(
+        self,
+        bint brotli_enabled,
+        bint gzip_enabled,
+    ) noexcept:
+        cdef int wildcard
+        cdef int br_q
+        cdef int gzip_q
+        cdef int best_q = 0
+        cdef int selected = 0
+        if not self._request_accept_present:
+            return 0
+        wildcard = (
+            self._request_wildcard_q
+            if self._request_wildcard_q >= 0
+            else 0
+        )
+        br_q = self._request_br_q if self._request_br_q >= 0 else wildcard
+        gzip_q = (
+            self._request_gzip_q
+            if self._request_gzip_q >= 0
+            else wildcard
+        )
+        if brotli_enabled and br_q > best_q:
+            best_q = br_q
+            selected = 1
+        if gzip_enabled and gzip_q > best_q:
+            best_q = gzip_q
+            selected = 2
+        if self._request_identity_q >= best_q:
+            return 0
+        return selected
 
     cdef object c_get(self, object name):
         cdef object value = self._data.get(name)
@@ -239,9 +402,13 @@ cdef class Headers:
 
     cdef void c_clear(self):
         self._data.clear()
-        self._request_accept_encoding = None
         self._request_connection_close = False
         self._request_expect_continue = False
+        self._request_accept_present = False
+        self._request_br_q = -1
+        self._request_gzip_q = -1
+        self._request_wildcard_q = -1
+        self._request_identity_q = -1
 
     cdef bint c_empty(self):
         return not self._data

@@ -24,7 +24,6 @@ from stario.http.compression import (
     DEFAULT_GZIP_LEVEL,
     DEFAULT_MIN_SIZE,
     content_type_is_compressible,
-    negotiate_content_encoding,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
 from stario.http.request import DEFAULT_BODY_TIMEOUT
@@ -57,6 +56,10 @@ cdef object BODY_TYPE_ERROR = (
 cdef int CONSUMED_NONE = 0
 cdef int CONSUMED_BODY = 1
 cdef int CONSUMED_STREAM = 2
+
+cdef int ENCODING_NONE = 0
+cdef int ENCODING_BR = 1
+cdef int ENCODING_GZIP = 2
 
 cdef int ABORT_NONE = 0
 cdef int ABORT_TOO_LARGE = 1
@@ -239,7 +242,8 @@ cdef class RequestExchange:
         self._data_ready = None
         self._stall_handle = None
         self._compression = _UNBOUND
-        self._available = ()
+        self._brotli_enabled = False
+        self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
         self._state = None
         self.in_pool = False
@@ -250,9 +254,9 @@ cdef class RequestExchange:
     def __dealloc__(self):
         self._free_compressors()
 
-    cdef void reset_response(self, object accept_encoding):
+    cdef void reset_response(self, int encoding):
         self._free_compressors()
-        self._accept = accept_encoding
+        self._req_encoding = encoding
         self._status_code = -1
         self._declared_length = -1
         self._bytes_written = 0
@@ -265,7 +269,8 @@ cdef class RequestExchange:
         self._brotli_level = DEFAULT_BROTLI_LEVEL
         self._brotli_window = 0
         self._gzip_level = DEFAULT_GZIP_LEVEL
-        self._available = ()
+        self._brotli_enabled = False
+        self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
         if compression is None:
             return
@@ -275,11 +280,8 @@ cdef class RequestExchange:
         self._brotli_window = 0 if window is None else window
         self._gzip_level = compression.gzip_level
         self._compress_min_size = compression.min_size
-        self._available = tuple(
-            enc
-            for enc in compression.enabled_encodings()
-            if enc == b"br" or enc == b"gzip"
-        )
+        self._brotli_enabled = self._brotli_level >= 0
+        self._gzip_enabled = self._gzip_level >= 0
 
     cdef int _ensure_brotli(self) except -1:
         if self._brotli != NULL:
@@ -425,7 +427,7 @@ cdef class RequestExchange:
         bint streaming,
         Py_ssize_t nbytes,
     ):
-        if not self._available or self._accept is None:
+        if self._req_encoding == ENCODING_NONE:
             return False
         if not streaming:
             if data is None or nbytes < self._compress_min_size:
@@ -512,7 +514,9 @@ cdef class RequestExchange:
     ):
         if not self._may_compress(data, content_type, streaming, nbytes):
             return None
-        return negotiate_content_encoding(self._accept, self._available)
+        if self._req_encoding == ENCODING_BR:
+            return b"br"
+        return b"gzip"
 
     cdef void reset(
         self,
@@ -543,20 +547,23 @@ cdef class RequestExchange:
         self.handler_started = False
 
     cdef void _clear_hot_request_headers(self):
-        self._req_accept_encoding = None
+        self._req_encoding = ENCODING_NONE
         self._req_expect_continue = False
         self._req_connection_close = False
 
     cdef void cache_hot_request_headers(self):
         """Snapshot keep-alive / expect / accept-encoding (Headers API unchanged)."""
         cdef Headers h = self.request_headers
-        self._req_accept_encoding = h.c_request_accept_encoding()
+        self._req_encoding = h.c_select_request_encoding(
+            self._brotli_enabled,
+            self._gzip_enabled,
+        )
         self._req_connection_close = h.c_request_connection_close()
         self._req_expect_continue = h.c_request_expect_continue()
 
     cdef void start_response(self):
         self.handler_started = True
-        self.reset_response(self._req_accept_encoding)
+        self.reset_response(self._req_encoding)
 
     cdef void handler_finished(self):
         self.handler_done = True
@@ -600,7 +607,6 @@ cdef class RequestExchange:
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
-        self._accept = None
         self._clear_hot_request_headers()
         self.app = None
         self._connection = None

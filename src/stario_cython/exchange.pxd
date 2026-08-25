@@ -6,8 +6,7 @@ cdef class RequestExchange:
     cdef object _transport
     cdef list _date_box
     cdef object _compression
-    cdef object _accept
-    cdef object _req_accept_encoding
+    cdef int _req_encoding
     cdef bint _req_expect_continue
     cdef bint _req_connection_close
     cdef public Headers headers
@@ -19,7 +18,8 @@ cdef class RequestExchange:
     cdef int _status_code
     cdef Py_ssize_t _declared_length
     cdef Py_ssize_t _bytes_written
-    cdef object _available
+    cdef bint _brotli_enabled
+    cdef bint _gzip_enabled
     cdef int _brotli_level
     cdef int _brotli_window
     cdef int _gzip_level
@@ -83,7 +83,7 @@ cdef class RequestExchange:
     cdef int _ensure_body_tail(self, Py_ssize_t received_before) except -1
     cdef int _seal_body_tail(self) except -1
     cdef object _body_to_bytes(self)
-    cdef void reset_response(self, object accept_encoding)
+    cdef void reset_response(self, int encoding)
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
     cdef int _buf_bytes(self, object data) except -1
