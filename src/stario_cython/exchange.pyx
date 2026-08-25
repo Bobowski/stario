@@ -77,6 +77,7 @@ cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
 cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
 cdef bytes ZERO_CL = b"content-length: 0\r\n\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
+cdef bytes CL_HEADER = b"content-length: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
@@ -709,7 +710,6 @@ cdef class RequestExchange:
         else:
             if not _may_have_body(status):
                 body = b""
-                h.c_set(b"content-length", b"0")
             elif h.c_get(b"content-encoding") is None:
                 encoding = self._select(body, content_type, False, nbytes)
                 if encoding is not None:
@@ -737,16 +737,19 @@ cdef class RequestExchange:
                     self._completed = True
                     self._done()
                     return
-            h.c_set(b"content-type", content_type)
-            h.c_set(b"content-length", _dec(<size_t>nbytes))
             self._declared_length = nbytes
             self._bytes_written = 0
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:
                 self._out_buf = bytearray(256)
-            h.c_write_wire_ba(self._out_buf, &self._out_len)
+            h.c_write_response_wire_ba(self._out_buf, &self._out_len)
+            self._buf_bytes(CT_PREFIX)
+            self._buf_bytes(content_type)
             self._buf_bytes(CRLF)
+            self._buf_bytes(CL_HEADER)
+            self._buf_uint(<size_t>nbytes, 10)
+            self._buf_bytes(CRLF2)
             self._flush()
             self._status_code = status
             if nbytes:
