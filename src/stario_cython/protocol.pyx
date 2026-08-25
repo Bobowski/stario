@@ -18,9 +18,8 @@ from stario_cython.request cimport Request
 
 cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
-# Fixed Content-Length bodies are fully buffered in C before the handler runs
-# (up to max_body_bytes). Early dispatch is reserved for chunked uploads and
-# Expect: 100-continue, where the handler must start before the body finishes.
+# Handlers always start at headers-complete. Body bytes accumulate on the exchange;
+# body() awaits one completion Future, stream() drains with backpressure.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"
@@ -190,7 +189,6 @@ cdef class HttpProtocol:
     cdef int max_body_bytes
     cdef bint have_value
     cdef bint rejected
-    cdef bint stream_body
     cdef bint request_dispatched
     cdef bint request_keep_alive
 
@@ -258,7 +256,6 @@ cdef class HttpProtocol:
         self.max_body_bytes = max_body_bytes
         self.have_value = False
         self.rejected = False
-        self.stream_body = False
         self.request_dispatched = False
         self.request_keep_alive = True
 
@@ -384,7 +381,6 @@ cdef class HttpProtocol:
                 self.max_body_bytes,
             )
         self.head_bytes = 40
-        self.stream_body = False
         self.request_dispatched = False
         self.request_keep_alive = True
         self.url = b""
@@ -449,14 +445,12 @@ cdef class HttpProtocol:
         expect_continue = (
             (headers.c_get(b"expect") or b"").lower() == b"100-continue"
         )
-        # Chunked / 100-continue need the handler before the body finishes.
-        # Known Content-Length bodies stay in the C accumulator until complete,
-        # then dispatch with a single bytes object (same fast path as small POSTs).
-        self.stream_body = expect_continue or (flags & F_CHUNKED) != 0
-        if self.stream_body:
-            self.complete_headers(expect_continue)
-        elif flags & F_CONTENT_LENGTH:
-            self.reading_exchange.prepare_fixed_body(<Py_ssize_t>content_length)
+        # Always start the handler at headers-complete. Pre-size _acc when the
+        # Content-Length is known so body() can materialize without realloc churn.
+        if flags & F_CONTENT_LENGTH:
+            self.complete_headers(expect_continue, <Py_ssize_t>content_length)
+        else:
+            self.complete_headers(expect_continue, -1)
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)
@@ -466,18 +460,8 @@ cdef class HttpProtocol:
         if self.rejected:
             return
         exchange = self.reading_exchange
-        if self.stream_body:
+        if exchange is not None and exchange._body_active:
             exchange.c_complete()
-            self.reading_exchange = None
-            return
-        if exchange._body_active:
-            exchange.c_complete()
-            # Pass materialized bytes so req.body() is a sync return (no async read).
-            self.complete_request(
-                exchange._cached if exchange._cached is not None else b""
-            )
-        else:
-            self.complete_request(None)
         self.reading_exchange = None
 
     cdef Request _build_request(self, RequestExchange exchange, object body):
@@ -508,7 +492,7 @@ cdef class HttpProtocol:
         )
         return request
 
-    cdef void complete_headers(self, bint expect_continue):
+    cdef void complete_headers(self, bint expect_continue, Py_ssize_t expected_body):
         cdef RequestExchange exchange
         cdef Request request
         if self.request_dispatched or self.rejected:
@@ -518,16 +502,9 @@ cdef class HttpProtocol:
         exchange = self.reading_exchange
         request = self._build_request(exchange, exchange)
         exchange.reset_body(expect_continue)
+        if expected_body > 0:
+            exchange.prepare_body_capacity(expected_body)
         self._dispatch(exchange, request)
-
-    cdef void complete_request(self, object body):
-        cdef RequestExchange exchange
-        if self.request_dispatched or self.rejected:
-            return
-        if self.transport is None or self.transport.is_closing():
-            return
-        exchange = self.reading_exchange
-        self._dispatch(exchange, self._build_request(exchange, body))
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
         cdef object span

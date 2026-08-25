@@ -6,7 +6,7 @@ import asyncio
 from libc.stddef cimport size_t
 from libc.stdio cimport sprintf
 from libc.stdlib cimport free, realloc
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memmove
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_GET_SIZE,
@@ -41,10 +41,11 @@ from stario_cython.compression_buf cimport (
 from stario_cython.headers cimport Headers
 from stario_cython.request cimport Request
 
-cdef int LOW_WATER = 16 * 1024
-cdef int HIGH_WATER = 64 * 1024
-# Yield / chunk batch size for stream() consumers — keep data in _acc until this big.
-cdef int STREAM_BATCH = 64 * 1024
+# Stream backpressure window. max_chunk must be strictly below HIGH_WATER.
+cdef int LOW_WATER = 64 * 1024
+cdef int HIGH_WATER = 256 * 1024
+# Default stream() yield size — keep bytes in _acc until this big (or message done).
+cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef double DEFAULT_TIMEOUT = 30.0
 cdef int POOL_MAX = 1024
 
@@ -140,11 +141,13 @@ cdef class RequestExchange:
         self._chunks = None
         self._cached = None
         self._data_ready = None
+        self._body_fut = None
         self._compression = _UNBOUND
         self._available = ()
         self._state = None
         self.in_pool = False
         self._body_active = False
+        self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
     def __dealloc__(self):
         self._free_compressors()
@@ -413,8 +416,10 @@ cdef class RequestExchange:
         self.in_pool = True
         self._cached = None
         self._data_ready = None
+        self._body_fut = None
         self._acc_len = 0
         self._body_active = False
+        self._stream_max_chunk = DEFAULT_STREAM_CHUNK
         if self._chunks is not None:
             self._chunks.clear()
 
@@ -720,6 +725,7 @@ cdef class RequestExchange:
             self._chunks.clear()
         self._cached = None
         self._data_ready = None
+        self._body_fut = None
         self._expect_continue = expect_continue
         self._buffered = 0
         self._total_read = 0
@@ -729,10 +735,10 @@ cdef class RequestExchange:
         self._waiting = False
         self._acc_len = 0
         self._expected_body = -1
+        self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
-    cdef void prepare_fixed_body(self, Py_ssize_t expected_size):
-        """Start buffering a known Content-Length body before the handler runs."""
-        self.reset_body(False)
+    cdef void prepare_body_capacity(self, Py_ssize_t expected_size):
+        """Pre-size the C accumulator for a known Content-Length (handler already running)."""
         self._expected_body = expected_size
         if expected_size > 0:
             self._acc_reserve(expected_size)
@@ -767,14 +773,23 @@ cdef class RequestExchange:
         self._acc_len = 0
         return out
 
-    cdef void _drain_acc(self):
-        if self._acc_len == 0:
+    cdef void _emit_from_acc(self, Py_ssize_t n):
+        """Peel ``n`` bytes from the front of ``_acc`` into the stream chunk list."""
+        cdef Py_ssize_t rest
+        cdef object chunk
+        if n <= 0 or self._acc_len == 0:
             return
+        if n > self._acc_len:
+            n = self._acc_len
         if self._chunks is None:
             self._chunks = []
-        self._chunks.append(PyBytes_FromStringAndSize(self._acc, self._acc_len))
-        self._buffered += self._acc_len
-        self._acc_len = 0
+        chunk = PyBytes_FromStringAndSize(self._acc, n)
+        self._chunks.append(chunk)
+        self._buffered += n
+        rest = self._acc_len - n
+        if rest > 0:
+            memmove(self._acc, self._acc + n, <size_t>rest)
+        self._acc_len = rest
 
     cdef void _raise_abort(self):
         if self._abort_reason == ABORT_TOO_LARGE:
@@ -791,6 +806,11 @@ cdef class RequestExchange:
     cdef void _wake(self):
         if self._data_ready is not None:
             self._data_ready.set()
+
+    cdef void _resolve_body_fut(self, object value):
+        cdef object fut = self._body_fut
+        if fut is not None and not fut.done():
+            fut.set_result(value)
 
     cdef object _take_chunk(self, int index):
         cdef object chunk = self._chunks[index]
@@ -810,8 +830,8 @@ cdef class RequestExchange:
 
     cdef void _maybe_pause(self):
         cdef object transport
-        # Only apply read backpressure when a stream consumer is draining chunks.
-        # body()/pre-dispatch paths keep a single _acc buffer up to Content-Length.
+        # Backpressure only while a stream consumer is draining — body() keeps one
+        # contiguous _acc up to max_body_bytes / Content-Length.
         if self._consumed_as != CONSUMED_STREAM:
             return
         if self._buffered + self._acc_len > HIGH_WATER:
@@ -820,19 +840,22 @@ cdef class RequestExchange:
                 transport.pause_reading()
 
     cdef void c_feed(self, const char* at, size_t length):
+        cdef Py_ssize_t max_chunk
         if not self._body_active:
             self.reset_body(False)
         self._total_read += <int>length
         if self._total_read > self._max_size:
             self._abort_reason = ABORT_TOO_LARGE
+            self._resolve_body_fut(None)
             self._wake()
             return
-        # Always append into the C accumulator. body() materializes once at the end;
-        # stream() drains in STREAM_BATCH-sized Python bytes chunks.
+        # Always append into the C accumulator. body() materializes once at complete;
+        # stream() peels DEFAULT_STREAM_CHUNK / max_chunk-sized Python bytes.
         self._acc_add(at, length)
         if self._consumed_as == CONSUMED_STREAM:
-            if self._acc_len >= STREAM_BATCH or self._waiting:
-                self._drain_acc()
+            max_chunk = self._stream_max_chunk
+            while self._acc_len >= max_chunk:
+                self._emit_from_acc(max_chunk)
                 self._wake()
             self._maybe_pause()
             return
@@ -843,23 +866,25 @@ cdef class RequestExchange:
         if not self._body_active:
             return
         self._body_complete = True
-        if self._abort_reason == ABORT_NONE and self._consumed_as != CONSUMED_STREAM:
-            # Single allocation for the full body (pre-dispatch or body() waiters).
-            if self._cached is None:
-                self._cached = self._acc_to_bytes()
-            elif self._acc_len > 0:
-                # Should not happen for body path; fold any remainder.
-                if self._chunks is None:
-                    self._chunks = []
-                self._chunks.append(self._acc_to_bytes())
-                self._cached = self._cached + b"".join(self._chunks)
-                self._chunks.clear()
-            self._buffered = 0
+        if self._consumed_as == CONSUMED_STREAM:
+            if self._acc_len > 0:
+                self._emit_from_acc(self._acc_len)
             self._wake()
             self._maybe_recycle()
             return
-        # Streaming consumer: flush remainder into the chunk list.
-        self._drain_acc()
+        if self._abort_reason != ABORT_NONE:
+            self._acc_len = 0
+            self._resolve_body_fut(None)
+            self._wake()
+            self._maybe_recycle()
+            return
+        # body() already waiting: materialize once and resolve the Future.
+        # Otherwise leave bytes in _acc until body() (or never — then park drops them).
+        if self._consumed_as == CONSUMED_BODY or self._body_fut is not None:
+            if self._cached is None:
+                self._cached = self._acc_to_bytes()
+            self._buffered = 0
+            self._resolve_body_fut(self._cached)
         self._wake()
         self._maybe_recycle()
 
@@ -869,6 +894,7 @@ cdef class RequestExchange:
         self._free_compressors()
         self._abort_reason = ABORT_DISCONNECTED
         self._body_complete = True
+        self._resolve_body_fut(None)
         self._wake()
         self._maybe_recycle()
 
@@ -891,14 +917,16 @@ cdef class RequestExchange:
             self._abort_reason = ABORT_TIMEOUT
             if self._chunks is not None:
                 self._chunks.clear()
+            self._resolve_body_fut(None)
             self._raise_abort()
         finally:
             self._waiting = False
         self._data_ready.clear()
 
-    async def stream(self):
+    async def stream(self, max_chunk=None):
         cdef int index
         cdef object chunk
+        cdef Py_ssize_t chunk_size
         if self._abort_reason != ABORT_NONE:
             self._raise_abort()
         if self._consumed_as == CONSUMED_BODY:
@@ -912,13 +940,26 @@ cdef class RequestExchange:
                 "Body already streaming. Each request body can only be streamed once.",
                 help_text="Call stream() only once per request.",
             )
+        if max_chunk is None:
+            chunk_size = DEFAULT_STREAM_CHUNK
+        else:
+            chunk_size = <Py_ssize_t>max_chunk
+            if chunk_size <= 0:
+                raise ValueError("max_chunk must be positive")
+            if chunk_size >= HIGH_WATER:
+                raise ValueError(
+                    f"max_chunk ({chunk_size}) must be lower than "
+                    f"high water mark ({HIGH_WATER})"
+                )
+        self._stream_max_chunk = chunk_size
         self._consumed_as = CONSUMED_STREAM
         if self._cached is not None:
             yield self._cached
             return
         self._maybe_continue()
-        # Move any bytes already buffered in _acc into yieldable chunks.
-        self._drain_acc()
+        # Emit any already-buffered full batches; leave a partial in _acc.
+        while self._acc_len >= chunk_size:
+            self._emit_from_acc(chunk_size)
         index = 0
         while True:
             while self._chunks is not None and index < len(self._chunks):
@@ -926,15 +967,16 @@ cdef class RequestExchange:
                 yield chunk
             if self._body_complete:
                 if self._acc_len > 0:
-                    self._drain_acc()
+                    self._emit_from_acc(self._acc_len)
                     continue
                 if self._chunks is not None:
                     self._chunks.clear()
                 return
             await self._wait_for_body_data()
-            self._drain_acc()
 
     async def read(self, max_size=None):
+        cdef object fut
+        cdef object result
         if max_size is not None and max_size < 0:
             raise ValueError("max_size must be non-negative.")
         if self._abort_reason != ABORT_NONE:
@@ -951,20 +993,36 @@ cdef class RequestExchange:
             return self._cached
         self._consumed_as = CONSUMED_BODY
         self._maybe_continue()
-        while not self._body_complete:
+        if self._body_complete:
+            if self._cached is None:
+                self._cached = self._acc_to_bytes()
+            if max_size is not None and len(self._cached) > max_size:
+                raise HttpException(413, "Request body too large")
+            self._buffered = 0
+            return self._cached
+        # One-shot Future resolved in c_complete / c_abort; stall timeout via Event.
+        fut = asyncio.get_running_loop().create_future()
+        self._body_fut = fut
+        try:
+            while not fut.done():
+                if self._abort_reason != ABORT_NONE:
+                    self._raise_abort()
+                if max_size is not None and self._acc_len > max_size:
+                    raise HttpException(413, "Request body too large")
+                await self._wait_for_body_data()
             if self._abort_reason != ABORT_NONE:
                 self._raise_abort()
-            if max_size is not None and self._acc_len > max_size:
+            result = fut.result()
+            if result is None:
+                if self._cached is None:
+                    self._cached = self._acc_to_bytes()
+                result = self._cached
+            if max_size is not None and len(result) > max_size:
                 raise HttpException(413, "Request body too large")
-            await self._wait_for_body_data()
-        if self._abort_reason != ABORT_NONE:
-            self._raise_abort()
-        if self._cached is None:
-            self._cached = self._acc_to_bytes()
-        if max_size is not None and len(self._cached) > max_size:
-            raise HttpException(413, "Request body too large")
-        self._buffered = 0
-        return self._cached
+            self._buffered = 0
+            return result
+        finally:
+            self._body_fut = None
 
 
 cdef RequestExchange acquire_exchange(
