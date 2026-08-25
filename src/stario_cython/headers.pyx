@@ -2,7 +2,7 @@
 """Bytes-backed headers. Parser lowercases and interns names in C."""
 
 from libc.string cimport memcmp, memcpy
-from libc.stdlib cimport free, realloc
+from libc.stdlib cimport free, malloc, realloc
 from libc.stdint cimport uint8_t, uint32_t
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
@@ -275,12 +275,13 @@ cdef object _encode_value(str value):
 
 cdef class Headers:
     def __cinit__(self):
-        self._raw_arena = NULL
+        self._raw_arena = &self._raw_inline[0]
         self._raw_len = 0
-        self._raw_cap = 0
-        self._raw_headers = NULL
+        self._raw_cap = 2048
+        self._raw_headers = &self._raw_headers_inline[0]
         self._raw_count = 0
-        self._raw_headers_cap = 0
+        self._raw_headers_cap = 16
+        self._pending_header = False
         self._request_host_index = -1
 
     def __init__(self, raw_header_data=None):
@@ -295,9 +296,9 @@ cdef class Headers:
         self._request_identity_q = -1
 
     def __dealloc__(self):
-        if self._raw_arena != NULL:
+        if self._raw_arena != &self._raw_inline[0]:
             free(self._raw_arena)
-        if self._raw_headers != NULL:
+        if self._raw_headers != &self._raw_headers_inline[0]:
             free(self._raw_headers)
 
     cdef int _reserve_raw(self, Py_ssize_t bytes_needed) except -1:
@@ -309,7 +310,12 @@ cdef class Headers:
         cap = 256 if self._raw_cap == 0 else self._raw_cap * 2
         if cap < need:
             cap = need
-        arena = <char*>realloc(self._raw_arena, <size_t>cap)
+        if self._raw_arena == &self._raw_inline[0]:
+            arena = <char*>malloc(<size_t>cap)
+            if arena != NULL and self._raw_len:
+                memcpy(arena, self._raw_arena, <size_t>self._raw_len)
+        else:
+            arena = <char*>realloc(self._raw_arena, <size_t>cap)
         if arena == NULL:
             raise MemoryError()
         self._raw_arena = arena
@@ -322,10 +328,19 @@ cdef class Headers:
         if self._raw_count < self._raw_headers_cap:
             return 0
         cap = 16 if self._raw_headers_cap == 0 else self._raw_headers_cap * 2
-        headers = <RawHeader*>realloc(
-            self._raw_headers,
-            <size_t>cap * sizeof(RawHeader),
-        )
+        if self._raw_headers == &self._raw_headers_inline[0]:
+            headers = <RawHeader*>malloc(<size_t>cap * sizeof(RawHeader))
+            if headers != NULL and self._raw_count:
+                memcpy(
+                    headers,
+                    self._raw_headers,
+                    <size_t>self._raw_count * sizeof(RawHeader),
+                )
+        else:
+            headers = <RawHeader*>realloc(
+                self._raw_headers,
+                <size_t>cap * sizeof(RawHeader),
+            )
         if headers == NULL:
             raise MemoryError()
         self._raw_headers = headers
@@ -333,24 +348,64 @@ cdef class Headers:
         return 0
 
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen):
-        cdef RawHeader* header
-        cdef Py_ssize_t name_offset
-        cdef Py_ssize_t value_offset
-        if nlen >= NAME_STACK:
+        self.start_raw_header()
+        self.append_raw_name(name, nlen)
+        self.append_raw_value(value, vlen)
+        self.finish_raw_header()
+
+    cdef void start_raw_header(self):
+        if self._pending_header:
+            self.finish_raw_header()
+        self._pending_header = True
+        self._pending_name_offset = self._raw_len
+        self._pending_name_length = 0
+        self._pending_value_offset = -1
+        self._pending_value_length = 0
+
+    cdef void append_raw_name(self, const char* data, size_t length):
+        if not self._pending_header:
+            self.start_raw_header()
+        if self._pending_value_offset >= 0:
+            raise ValueError("Invalid fragmented header field")
+        if self._pending_name_length + <Py_ssize_t>length >= NAME_STACK:
             raise ValueError("Invalid header name: too long")
-        self._reserve_raw(<Py_ssize_t>(nlen + vlen))
+        self._reserve_raw(<Py_ssize_t>length)
+        _lower_copy(self._raw_arena + self._raw_len, data, length)
+        self._raw_len += <Py_ssize_t>length
+        self._pending_name_length += <Py_ssize_t>length
+
+    cdef void append_raw_value(self, const char* data, size_t length):
+        if not self._pending_header:
+            raise ValueError("Invalid header value without field")
+        if self._pending_value_offset < 0:
+            self._pending_value_offset = self._raw_len
+        self._reserve_raw(<Py_ssize_t>length)
+        if length:
+            memcpy(self._raw_arena + self._raw_len, data, length)
+        self._raw_len += <Py_ssize_t>length
+        self._pending_value_length += <Py_ssize_t>length
+
+    cdef void finish_raw_header(self):
+        cdef RawHeader* header
+        cdef const char* name
+        cdef const char* value
+        cdef size_t nlen
+        cdef size_t vlen
+        if not self._pending_header:
+            return
+        if self._pending_name_length == 0:
+            raise ValueError("Invalid header name: empty")
+        if self._pending_value_offset < 0:
+            self._pending_value_offset = self._raw_len
+        name = self._raw_arena + self._pending_name_offset
+        value = self._raw_arena + self._pending_value_offset
+        nlen = <size_t>self._pending_name_length
+        vlen = <size_t>self._pending_value_length
         self._reserve_raw_headers()
-        name_offset = self._raw_len
-        _lower_copy(self._raw_arena + name_offset, name, nlen)
-        self._raw_len += <Py_ssize_t>nlen
-        value_offset = self._raw_len
-        if vlen:
-            memcpy(self._raw_arena + value_offset, value, vlen)
-        self._raw_len += <Py_ssize_t>vlen
         header = &self._raw_headers[self._raw_count]
-        header.name_offset = <uint32_t>name_offset
+        header.name_offset = <uint32_t>self._pending_name_offset
         header.name_length = <uint32_t>nlen
-        header.value_offset = <uint32_t>value_offset
+        header.value_offset = <uint32_t>self._pending_value_offset
         header.value_length = <uint32_t>vlen
         if _token_equals(name, 0, nlen, "host", 4):
             if self._request_host_index < 0:
@@ -364,6 +419,7 @@ cdef class Headers:
         elif _token_equals(name, 0, nlen, "accept-encoding", 15):
             self._scan_request_accept_encoding(value, vlen)
         self._raw_count += 1
+        self._pending_header = False
 
     cdef void _materialize(self):
         cdef Py_ssize_t i
@@ -549,8 +605,20 @@ cdef class Headers:
 
     cdef void c_clear(self):
         self._data.clear()
+        if self._raw_arena != &self._raw_inline[0] and self._raw_cap > 8192:
+            free(self._raw_arena)
+            self._raw_arena = &self._raw_inline[0]
+            self._raw_cap = 2048
+        if (
+            self._raw_headers != &self._raw_headers_inline[0]
+            and self._raw_headers_cap > 64
+        ):
+            free(self._raw_headers)
+            self._raw_headers = &self._raw_headers_inline[0]
+            self._raw_headers_cap = 16
         self._raw_len = 0
         self._raw_count = 0
+        self._pending_header = False
         self._request_host_index = -1
         self._materialized = False
         self._request_connection_close = False

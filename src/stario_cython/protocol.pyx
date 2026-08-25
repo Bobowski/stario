@@ -78,6 +78,7 @@ cdef void _bind_settings() noexcept:
     _SETTINGS.on_url = _cb_url
     _SETTINGS.on_header_field = _cb_header_field
     _SETTINGS.on_header_value = _cb_header_value
+    _SETTINGS.on_header_value_complete = _cb_header_value_complete
     _SETTINGS.on_headers_complete = _cb_headers_complete
     _SETTINGS.on_body = _cb_body
     _SETTINGS.on_message_complete = _cb_message_complete
@@ -114,6 +115,14 @@ cdef int _cb_header_field(llhttp_t* parser, const char* at, size_t length) noexc
 cdef int _cb_header_value(llhttp_t* parser, const char* at, size_t length) noexcept:
     try:
         _proto(parser)._on_header_value(at, length)
+    except Exception:
+        return -1
+    return 0
+
+
+cdef int _cb_header_value_complete(llhttp_t* parser) noexcept:
+    try:
+        _proto(parser)._on_header_value_complete()
     except Exception:
         return -1
     return 0
@@ -178,19 +187,12 @@ cdef class HttpProtocol:
     cdef RequestExchange idle_exchange
     cdef object pending_exchanges
     cdef bytes url
-    cdef char* name_buf
-    cdef char* value_buf
     cdef char* url_buf
-    cdef Py_ssize_t name_len
-    cdef Py_ssize_t name_cap
-    cdef Py_ssize_t value_len
-    cdef Py_ssize_t value_cap
     cdef Py_ssize_t url_len
     cdef Py_ssize_t url_cap
     cdef int head_bytes
     cdef int max_header_bytes
     cdef int max_body_bytes
-    cdef bint have_value
     cdef bint rejected
     cdef bint request_dispatched
     cdef bint request_keep_alive
@@ -207,13 +209,7 @@ cdef class HttpProtocol:
             raise MemoryError()
         llhttp_init(self.parser, HTTP_REQUEST, _SETTINGS)
         stario_parser_set_data(self.parser, <void*>self)
-        self.name_buf = NULL
-        self.value_buf = NULL
         self.url_buf = NULL
-        self.name_len = 0
-        self.name_cap = 0
-        self.value_len = 0
-        self.value_cap = 0
         self.url_len = 0
         self.url_cap = 0
         self.closed = False
@@ -231,12 +227,6 @@ cdef class HttpProtocol:
         if self.parser != NULL:
             stario_parser_del(self.parser)
             self.parser = NULL
-        if self.name_buf != NULL:
-            free(self.name_buf)
-            self.name_buf = NULL
-        if self.value_buf != NULL:
-            free(self.value_buf)
-            self.value_buf = NULL
         if self.url_buf != NULL:
             free(self.url_buf)
             self.url_buf = NULL
@@ -267,7 +257,6 @@ cdef class HttpProtocol:
         self.head_bytes = 0
         self.max_header_bytes = max_header_bytes
         self.max_body_bytes = max_body_bytes
-        self.have_value = False
         self.rejected = False
         self.request_dispatched = False
         self.request_keep_alive = True
@@ -433,32 +422,8 @@ cdef class HttpProtocol:
         length[0] += <Py_ssize_t>n
         return 0
 
-    cdef void _flush_header(self):
-        cdef Headers headers
-        if self.reading_exchange is None or self.name_len == 0:
-            self.name_len = 0
-            self.value_len = 0
-            self.have_value = False
-            return
-        headers = self.reading_exchange.request_headers
-        if self.value_buf == NULL:
-            headers.add_raw(self.name_buf, <size_t>self.name_len, "", 0)
-        else:
-            headers.add_raw(
-                self.name_buf,
-                <size_t>self.name_len,
-                self.value_buf,
-                <size_t>self.value_len,
-            )
-        self.name_len = 0
-        self.value_len = 0
-        self.have_value = False
-
     cdef void _on_message_begin(self):
         self.url_len = 0
-        self.name_len = 0
-        self.value_len = 0
-        self.have_value = False
         if self.idle_exchange is not None:
             self.reading_exchange = self.idle_exchange
             self.idle_exchange = None
@@ -493,24 +458,22 @@ cdef class HttpProtocol:
             self._close_error(431, "Request header fields too large")
 
     cdef void _on_header_field(self, const char* at, size_t length):
-        if self.have_value:
-            self._flush_header()
         self.head_bytes += <int>length
         if self.head_bytes > self.max_header_bytes:
             self._close_error(431, "Request header fields too large")
             return
-        if self._append(&self.name_buf, &self.name_len, &self.name_cap, at, length) != 0:
-            self._close_error(431, "Request header fields too large")
+        self.reading_exchange.request_headers.append_raw_name(at, length)
 
     cdef void _on_header_value(self, const char* at, size_t length):
         self.head_bytes += <int>length
         if self.head_bytes > self.max_header_bytes:
             self._close_error(431, "Request header fields too large")
             return
-        if self._append(&self.value_buf, &self.value_len, &self.value_cap, at, length) != 0:
-            self._close_error(431, "Request header fields too large")
-            return
-        self.have_value = True
+        self.reading_exchange.request_headers.append_raw_value(at, length)
+
+    cdef void _on_header_value_complete(self):
+        if self.reading_exchange is not None:
+            self.reading_exchange.request_headers.finish_raw_header()
 
     cdef void _on_headers_complete(self):
         cdef RequestExchange exchange
@@ -520,10 +483,10 @@ cdef class HttpProtocol:
             self.url = PyBytes_FromStringAndSize(self.url_buf, self.url_len)
         else:
             self.url = b""
-        self._flush_header()
         if self.rejected or self.reading_exchange is None:
             return
         exchange = self.reading_exchange
+        exchange.request_headers.finish_raw_header()
         if llhttp_get_upgrade(self.parser):
             self._close_error(400, "Upgrade not supported")
             return

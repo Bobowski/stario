@@ -8,12 +8,19 @@ ctypedef struct RawHeader:
 
 cdef class Headers:
     cdef dict _data
+    cdef char _raw_inline[2048]
     cdef char* _raw_arena
     cdef Py_ssize_t _raw_len
     cdef Py_ssize_t _raw_cap
+    cdef RawHeader _raw_headers_inline[16]
     cdef RawHeader* _raw_headers
     cdef Py_ssize_t _raw_count
     cdef Py_ssize_t _raw_headers_cap
+    cdef Py_ssize_t _pending_name_offset
+    cdef Py_ssize_t _pending_name_length
+    cdef Py_ssize_t _pending_value_offset
+    cdef Py_ssize_t _pending_value_length
+    cdef bint _pending_header
     cdef Py_ssize_t _request_host_index
     cdef bint _materialized
     cdef bint _request_connection_close
@@ -25,6 +32,10 @@ cdef class Headers:
     cdef int _request_identity_q
 
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen)
+    cdef void start_raw_header(self)
+    cdef void append_raw_name(self, const char* data, size_t length)
+    cdef void append_raw_value(self, const char* data, size_t length)
+    cdef void finish_raw_header(self)
     cdef int _reserve_raw(self, Py_ssize_t bytes_needed) except -1
     cdef int _reserve_raw_headers(self) except -1
     cdef void _materialize(self)
