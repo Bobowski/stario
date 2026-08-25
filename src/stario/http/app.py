@@ -146,12 +146,15 @@ class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        task = asyncio.Task(
-            coro,
-            loop=loop,
-            name=name,
-            eager_start=eager_start,
-        )
+        if eager_start:
+            task = asyncio.Task(
+                coro,
+                loop=loop,
+                name=name,
+                eager_start=True,
+            )
+        else:
+            task = loop.create_task(coro, name=name)
         if not task.done():
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
