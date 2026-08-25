@@ -46,7 +46,6 @@ from stario_cython.request cimport Request
 cdef int LOW_WATER = 64 * 1024
 cdef int HIGH_WATER = 256 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
-cdef int IDENTITY_COALESCE_MAX = 4 * 1024
 cdef int POOL_MAX = 1024
 
 cdef object BODY_TYPE_ERROR = (
@@ -134,86 +133,6 @@ cdef object _dec(size_t n):
     cdef char buf[16]
     cdef int i = sprintf(buf, "%zu", n)
     return PyBytes_FromStringAndSize(buf, i)
-
-
-cdef inline int _uint_digits(size_t n) noexcept:
-    cdef int digits = 1
-    while n >= 10:
-        n //= 10
-        digits += 1
-    return digits
-
-
-cdef inline int _write_uint(char* dst, size_t n) noexcept:
-    cdef int digits = _uint_digits(n)
-    cdef int i = digits
-    while i:
-        i -= 1
-        dst[i] = <char>(48 + n % 10)
-        n //= 10
-    return digits
-
-
-cdef object _serialize_identity_response(
-    object status,
-    object date,
-    object content_type,
-    object body,
-):
-    cdef Py_ssize_t status_len = len(status)
-    cdef Py_ssize_t date_len = len(date)
-    cdef Py_ssize_t content_type_len = len(content_type)
-    cdef Py_ssize_t body_len = len(body)
-    cdef int length_digits = _uint_digits(<size_t>body_len)
-    cdef Py_ssize_t total = (
-        status_len
-        + date_len
-        + len(CT_PREFIX)
-        + content_type_len
-        + len(CL_PREFIX)
-        + length_digits
-        + len(CRLF2)
-        + body_len
-    )
-    cdef object out
-    cdef char* dst
-    cdef Py_ssize_t pos = 0
-    if total > IDENTITY_COALESCE_MAX:
-        return None
-    out = PyBytes_FromStringAndSize(NULL, total)
-    dst = PyBytes_AS_STRING(out)
-    memcpy(dst + pos, <const char*>status, <size_t>status_len)
-    pos += status_len
-    memcpy(dst + pos, <const char*>date, <size_t>date_len)
-    pos += date_len
-    memcpy(dst + pos, <const char*>CT_PREFIX, <size_t>len(CT_PREFIX))
-    pos += len(CT_PREFIX)
-    memcpy(dst + pos, <const char*>content_type, <size_t>content_type_len)
-    pos += content_type_len
-    memcpy(dst + pos, <const char*>CL_PREFIX, <size_t>len(CL_PREFIX))
-    pos += len(CL_PREFIX)
-    pos += _write_uint(dst + pos, <size_t>body_len)
-    memcpy(dst + pos, <const char*>CRLF2, <size_t>len(CRLF2))
-    pos += len(CRLF2)
-    if body_len:
-        memcpy(dst + pos, <const char*>body, <size_t>body_len)
-    return out
-
-
-cdef object _serialize_empty_response(object status, object date):
-    cdef Py_ssize_t status_len = len(status)
-    cdef Py_ssize_t date_len = len(date)
-    cdef Py_ssize_t total = status_len + date_len + len(ZERO_CL)
-    cdef object out = PyBytes_FromStringAndSize(NULL, total)
-    cdef char* dst = PyBytes_AS_STRING(out)
-    memcpy(dst, <const char*>status, <size_t>status_len)
-    memcpy(dst + status_len, <const char*>date, <size_t>date_len)
-    memcpy(
-        dst + status_len + date_len,
-        <const char*>ZERO_CL,
-        <size_t>len(ZERO_CL),
-    )
-    return out
 
 
 cdef class RequestExchange:
@@ -622,7 +541,6 @@ cdef class RequestExchange:
         cdef Headers h = self.headers
         cdef object encoding
         cdef object flat
-        cdef object serialized
         cdef Py_ssize_t nbytes
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
@@ -653,32 +571,9 @@ cdef class RequestExchange:
             or not self._may_compress(body, content_type, False, nbytes)
         ):
             if not _may_have_body(status):
-                self._transport.write(
-                    _serialize_empty_response(
-                        _status_line(status),
-                        self._date_box[0],
-                    )
+                self._transport.writelines(
+                    (_status_line(status), self._date_box[0], ZERO_CL)
                 )
-            elif type(body) is bytes and type(content_type) is bytes:
-                serialized = _serialize_identity_response(
-                    _status_line(status),
-                    self._date_box[0],
-                    content_type,
-                    body,
-                )
-                if serialized is not None:
-                    self._transport.write(serialized)
-                else:
-                    self._transport.writelines((
-                        _status_line(status),
-                        self._date_box[0],
-                        CT_PREFIX,
-                        content_type,
-                        CL_PREFIX,
-                        _dec(<size_t>nbytes),
-                        CRLF2,
-                        body,
-                    ))
             else:
                 flat = [
                     _status_line(status),
