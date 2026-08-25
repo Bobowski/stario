@@ -8,13 +8,8 @@ cdef class RequestExchange:
     cdef object _compression
     cdef object _accept
     cdef object _req_accept_encoding
-    cdef object _req_connection
-    cdef object _req_expect
-    cdef object _req_content_type
-    cdef object _req_host
     cdef bint _req_expect_continue
     cdef bint _req_connection_close
-    cdef bint _resp_connection_close
     cdef public Headers headers
     cdef StarioBrotli* _brotli
     cdef StarioGzip* _gzip
@@ -29,7 +24,6 @@ cdef class RequestExchange:
     cdef int _brotli_window
     cdef int _gzip_level
     cdef Py_ssize_t _compress_min_size
-    cdef bint _compress_enabled
     cdef bint _completed
 
     cdef public object app
@@ -62,7 +56,6 @@ cdef class RequestExchange:
     cdef Py_ssize_t _acc_len
     cdef Py_ssize_t _acc_cap
     cdef Py_ssize_t _acc_pos
-    cdef Py_ssize_t _expected_body
     cdef Py_ssize_t _stream_max_chunk
 
     cdef void reset(
@@ -81,6 +74,7 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue)
+    cdef void _clear_hot_request_headers(self)
     cdef void cache_hot_request_headers(self)
     cdef void prepare_body_capacity(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
@@ -102,7 +96,13 @@ cdef class RequestExchange:
     cdef Py_ssize_t _body_nbytes(self, object body) except -2
     cdef object _body_as_bytes(self, object body)
     cdef int _write_body_raw(self, object body) except -1
-    cdef bint _may_compress(self, object data, object content_type, bint streaming)
+    cdef bint _may_compress(
+        self,
+        object data,
+        object content_type,
+        bint streaming,
+        Py_ssize_t nbytes,
+    )
     cdef int _frame(self, object data, object encoding, const unsigned char** out, size_t* out_len) except -1
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1
     cdef int _finish(self, const unsigned char** out, size_t* out_len) except -1
@@ -110,7 +110,13 @@ cdef class RequestExchange:
     cdef int _ensure_brotli(self) except -1
     cdef int _ensure_gzip(self) except -1
     cdef void _free_compressors(self)
-    cdef object _select(self, object data, object content_type, bint streaming)
+    cdef object _select(
+        self,
+        object data,
+        object content_type,
+        bint streaming,
+        Py_ssize_t nbytes,
+    )
     cdef void _raise_abort(self)
     cdef void _wake(self)
     cdef void _cancel_stall_timer(self)

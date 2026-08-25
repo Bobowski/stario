@@ -19,7 +19,7 @@ from stario_cython.request cimport Request
 cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
 # Handlers always start at headers-complete. Body bytes accumulate on the exchange;
-# body() awaits one completion Future, stream() drains with backpressure.
+# body() awaits one completion Event, stream() drains with backpressure.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"
@@ -433,8 +433,7 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
-        # One dict pass into exchange slots; keep-alive / expect / accept-encoding
-        # then use those fields (Headers public API unchanged).
+        # Snapshot keep-alive / expect / accept-encoding into exchange slots.
         exchange.cache_hot_request_headers()
         self.request_keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
@@ -560,10 +559,6 @@ cdef class HttpProtocol:
             return
         self.active_exchange = None
         if transport is None or transport.is_closing():
-            self._drop_pending()
-            return
-        if exchange._resp_connection_close:
-            transport.close()
             self._drop_pending()
             return
         # User may have set Connection: close on the response Headers dict.
