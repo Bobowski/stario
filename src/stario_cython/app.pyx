@@ -20,6 +20,10 @@ from stario_cython.router cimport Router
 cdef object NOOP_SPAN_TYPE = NoOpSpan
 
 
+async def _eager_probe():
+    return None
+
+
 async def _default_http_exception(_c, w, exc):
     responses.text(w, exc.detail or "Error", exc.status_code)
 
@@ -48,6 +52,14 @@ cdef class App(Router):
         self.shutdown = loop.create_future()
         self.tasks = set()
         self._task_discard = self.tasks.discard
+        self._eager_start = False
+        try:
+            probe = loop.create_task(_eager_probe(), eager_start=True)
+            self._eager_start = True
+            if not probe.done():
+                probe.cancel()
+        except TypeError:
+            pass
         self._error_handlers = {
             HttpException: _default_http_exception,
             RedirectException: _default_redirect_exception,
@@ -89,7 +101,7 @@ cdef class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        if eager_start:
+        if eager_start and self._eager_start:
             task = loop.create_task(coro, name=name, eager_start=True)
         else:
             task = loop.create_task(coro, name=name)

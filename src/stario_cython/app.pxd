@@ -7,3 +7,4 @@ cdef class App(Router):
     cdef object _find_error_handler
     cdef object _loop
     cdef object _task_discard
+    cdef bint _eager_start

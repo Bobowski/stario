@@ -877,3 +877,49 @@ async def test_stream_respects_max_chunk_batches() -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+def test_uvloop_plaintext_and_params() -> None:
+    """uvloop.Loop.create_task does not accept eager_start; App must still dispatch."""
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        app = App()
+
+        async def plaintext(_c, w):
+            responses.text(w, "Hello, World!")
+
+        async def get_user(c, w):
+            responses.text(w, c.route.params["user_id"])
+
+        app.get("/plaintext", plaintext)
+        app.get("/user/{user_id}", get_user)
+        connections: set[HttpProtocol] = set()
+
+        def factory():
+            return HttpProtocol(
+                loop,
+                app,
+                NoOpTracer(),
+                [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+                CompressionConfig(),
+                connections,
+            )
+
+        port = _free_port()
+        server = await loop.create_server(factory, "127.0.0.1", port)
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"GET /plaintext HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            await writer.drain()
+            assert b"Hello, World!" in await _read_response(reader)
+            writer.write(b"GET /user/42 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            await writer.drain()
+            assert b"42" in await _read_response(reader)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    uvloop.run(main())
