@@ -70,6 +70,7 @@ def ingest_2m(req: Request):
     return {"bytes": len(req.body or b"")}
 
 
+# stream=True requires gil=True on Pyronova 2.7 (engine limitation).
 @app.post("/ingest/stream/2m", gil=True, stream=True)
 def ingest_stream(req: Request):
     total = 0

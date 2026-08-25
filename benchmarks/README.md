@@ -99,9 +99,9 @@ paths, status codes, and per-request JSON/validation work as the Python apps.
 | `blacksheep-granian` | BlackSheep + Granian ASGI |
 | `blacksheep-uvicorn` | BlackSheep + Uvicorn |
 | `fastapi` | FastAPI + Uvicorn + Pydantic |
-| `aiohttp-n` | aiohttp + uvloop, `$BENCH_PROCS` processes, `SO_REUSEPORT` |
-| `litestar-n` | Litestar + Uvicorn, `$BENCH_PROCS` workers, uvloop/httptools |
-| `pyronova-n` | [Pyronova](https://github.com/leocaolab/pyronova), `$BENCH_PROCS` sub-interpreters |
+| `aiohttp` / `aiohttp-n` | aiohttp + uvloop; 1 process or `$BENCH_PROCS` + `SO_REUSEPORT` |
+| `litestar` / `litestar-n` | Litestar + Uvicorn uvloop/httptools; 1 or `$BENCH_PROCS` workers |
+| `pyronova` / `pyronova-n` | [Pyronova](https://github.com/leocaolab/pyronova); 1 or `$BENCH_PROCS` sub-interpreters |
 
 ### Comparing Go to Python
 
