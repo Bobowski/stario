@@ -475,7 +475,7 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
 
 
 @pytest.mark.asyncio
-async def test_large_single_read_pipeline_resumes_without_losing_bytes() -> None:
+async def test_large_single_read_pipeline_is_bounded() -> None:
     loop = asyncio.get_running_loop()
     app = App()
     release = asyncio.Event()
@@ -503,29 +503,24 @@ async def test_large_single_read_pipeline_resumes_without_losing_bytes() -> None
         _free_port(),
     )
     port = server.sockets[0].getsockname()[1]
-    request_count = 64
+    request_count = 128
     requests = []
     for index in range(request_count):
-        connection = b"Connection: close\r\n" if index == request_count - 1 else b""
         requests.append(
             b"GET /?"
             + str(index).encode("ascii")
             + b" HTTP/1.1\r\nHost: localhost\r\n"
-            + connection
             + b"\r\n"
         )
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"".join(requests))
         await writer.drain()
-        await asyncio.sleep(0)
-        assert handled == [0]
+        response = await _read_response(reader)
+        assert response.startswith(b"HTTP/1.1 429")
         release.set()
-        for index in range(request_count):
-            async with asyncio.timeout(2):
-                response = await _read_response(reader)
-            assert response.endswith(str(index).encode("ascii"))
-        assert handled == list(range(request_count))
+        assert handled == [0]
+        assert await reader.read() == b""
         writer.close()
         await writer.wait_closed()
     finally:
