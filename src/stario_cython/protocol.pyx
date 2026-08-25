@@ -513,16 +513,14 @@ cdef class HttpProtocol:
             if self.transport is not None:
                 self.transport.pause_reading()
 
-    cdef void _start_exchange(self, RequestExchange exchange, bint eager):
-        cdef object task
+    cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
         self.active_exchange = exchange
         exchange.start_response()
-        if eager:
-            self.app.create_task(self._run(exchange), loop=self.loop)
-            return
-        task = asyncio.Task(self._run(exchange), loop=self.loop)
-        self.app.tasks.add(task)
-        task.add_done_callback(self.app.tasks.discard)
+        self.app.create_task(
+            self._run(exchange),
+            loop=self.loop,
+            eager_start=eager_start,
+        )
 
     async def _run(self, RequestExchange exchange):
         try:

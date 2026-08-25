@@ -12,6 +12,16 @@ from stario.telemetry.noop import NoOpTracer
 from stario_cython.protocol import HttpProtocol
 
 
+class TrackingApp(App):
+    def __init__(self) -> None:
+        super().__init__()
+        self.eager_starts: list[bool] = []
+
+    def create_task(self, coro, **kwargs):
+        self.eager_starts.append(kwargs.get("eager_start", False))
+        return super().create_task(coro, **kwargs)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -33,7 +43,7 @@ async def _read_response(reader: asyncio.StreamReader) -> bytes:
 @pytest.mark.asyncio
 async def test_plaintext_and_post_and_keepalive() -> None:
     loop = asyncio.get_running_loop()
-    app = App()
+    app = TrackingApp()
     writers = []
 
     async def plaintext(_c, w):
@@ -83,6 +93,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         await writer.drain()
         second = await _read_response(reader)
         assert b"abcde" in second
+        assert app.eager_starts == [True, True]
         assert writers[0] is writers[1]
         writer.close()
         await writer.wait_closed()

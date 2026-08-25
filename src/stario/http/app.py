@@ -121,6 +121,7 @@ class App(Router):
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         name: str | None = None,
+        eager_start: bool = False,
     ) -> asyncio.Task[T]:
         """Schedule a coroutine on the running loop and retain the task until it completes.
 
@@ -131,6 +132,7 @@ class App(Router):
         - `coro`: Coroutine to run.
         - `loop`: Optional loop to schedule on when the caller already has it.
         - `name`: Optional task name for debuggers.
+        - `eager_start`: Run immediately until the first suspension.
 
         The new `asyncio.Task`.
 
@@ -144,9 +146,15 @@ class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        task = loop.create_task(coro, name=name)
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task = asyncio.Task(
+            coro,
+            loop=loop,
+            name=name,
+            eager_start=eager_start,
+        )
+        if not task.done():
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
         return task
 
     async def drain_tasks(self) -> None:
