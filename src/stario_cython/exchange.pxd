@@ -52,10 +52,10 @@ cdef class RequestExchange:
     cdef bint _body_complete
     cdef bint _expect_continue
     cdef bint _waiting
-    cdef char* _acc
-    cdef Py_ssize_t _acc_len
-    cdef Py_ssize_t _acc_cap
-    cdef Py_ssize_t _acc_pos
+    cdef object _body_tail
+    cdef Py_ssize_t _tail_used
+    cdef Py_ssize_t _tail_cap
+    cdef Py_ssize_t _expected_size
     cdef Py_ssize_t _stream_max_chunk
 
     cdef void reset(
@@ -73,19 +73,16 @@ cdef class RequestExchange:
     cdef void _maybe_recycle(self)
     cdef void park(self)
     cdef void release_global(self)
-    cdef void reset_body(self, bint expect_continue)
+    cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size)
     cdef void _clear_hot_request_headers(self)
     cdef void cache_hot_request_headers(self)
-    cdef void prepare_body_capacity(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)
     cdef void c_abort(self)
-    cdef int _acc_add(self, const char* at, size_t length) except -1
-    cdef int _acc_reserve(self, Py_ssize_t need) except -1
-    cdef int _acc_compact(self) except -1
-    cdef Py_ssize_t _acc_unread(self) noexcept
-    cdef object _acc_to_bytes(self)
-    cdef void _emit_from_acc(self, Py_ssize_t n)
+    cdef void _clear_body_storage(self)
+    cdef int _ensure_body_tail(self, Py_ssize_t received_before) except -1
+    cdef int _seal_body_tail(self) except -1
+    cdef object _body_to_bytes(self)
     cdef void reset_response(self, object accept_encoding)
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
@@ -120,7 +117,6 @@ cdef class RequestExchange:
     cdef void _wake(self)
     cdef void _cancel_stall_timer(self)
     cdef void _reset_stall_timer(self)
-    cdef object _take_chunk(self, int index)
     cdef void _maybe_continue(self)
     cdef void _done(self)
     cdef void _maybe_pause(self)

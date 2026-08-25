@@ -442,9 +442,10 @@ cdef class HttpProtocol:
                 and not exchange._req_connection_close
             )
         )
-        if flags & F_CONTENT_LENGTH:
-            exchange.prepare_body_capacity(<Py_ssize_t>content_length)
-        self.complete_headers(exchange._req_expect_continue)
+        self.complete_headers(
+            exchange._req_expect_continue,
+            <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
+        )
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)
@@ -486,7 +487,11 @@ cdef class HttpProtocol:
         )
         return request
 
-    cdef void complete_headers(self, bint expect_continue):
+    cdef void complete_headers(
+        self,
+        bint expect_continue,
+        Py_ssize_t expected_body,
+    ):
         cdef RequestExchange exchange
         cdef Request request
         if self.request_dispatched or self.rejected:
@@ -495,7 +500,7 @@ cdef class HttpProtocol:
             return
         exchange = self.reading_exchange
         request = self._build_request(exchange, exchange)
-        exchange.reset_body(expect_continue)
+        exchange.reset_body(expect_continue, expected_body)
         self._dispatch(exchange, request)
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
