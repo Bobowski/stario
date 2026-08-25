@@ -24,6 +24,7 @@ TARGETS=(
   socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt
   blacksheep-granian blacksheep-uvicorn fastapi
   aiohttp-n litestar-n pyronova-n
+  aiohttp litestar pyronova
 )
 TARGET_LABELS=(
   "stario|Stario (Python httptools)"
@@ -45,13 +46,17 @@ TARGET_LABELS=(
   "aiohttp-n|aiohttp + uvloop (${BENCH_PROCS} processes, SO_REUSEPORT)"
   "litestar-n|Litestar + Uvicorn (${BENCH_PROCS} workers, uvloop/httptools)"
   "pyronova-n|Pyronova (${BENCH_PROCS} sub-interpreters)"
+  "aiohttp|aiohttp + uvloop (1 process)"
+  "litestar|Litestar + Uvicorn (1 worker, uvloop/httptools)"
+  "pyronova|Pyronova (1 sub-interpreter)"
 )
 SUMMARY_GROUPS=(
   "Stario (this checkout)|stario stario-n stario-cython stario-cython-n"
   "Go|go-nethttp go-nethttp-n go-fasthttp"
   "Native HTTP servers|socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt"
   "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
-  "Production Python peers|aiohttp-n litestar-n pyronova-n"
+  "Production Python peers (fill the box)|aiohttp-n litestar-n pyronova-n stario-cython-n"
+  "Production Python peers (1 worker)|aiohttp litestar pyronova stario-cython"
 )
 READ_ENDPOINTS=(plaintext json params)
 UPLOAD_ENDPOINTS=(validate post-form post-json-1k post-octet-64k post-octet-2m post-stream-2m multipart-2m)
@@ -93,6 +98,7 @@ Targets (default: all):
   Native HTTP servers: socketify, robyn, granian-rsgi, granian-rsgi-n, sanic, django-bolt
   ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
   Production peers:    aiohttp-n, litestar-n, pyronova-n
+                       aiohttp, litestar, pyronova (1 worker)
 
   go-nethttp / go-fasthttp pin GOMAXPROCS=1 (same 1-core budget as the
   Python/Cython one-worker rows). *-n targets fill the box: Go uses
@@ -392,9 +398,9 @@ ensure_target() {
     sanic) ensure_env sanic sanic uvloop ujson ;;
     django-bolt) ensure_env django-bolt django django-bolt msgspec ujson ;;
     fastapi) ensure_env fastapi fastapi 'uvicorn[standard]' ujson ;;
-    aiohttp-n) ensure_env aiohttp aiohttp uvloop ujson ;;
-    litestar-n) ensure_env litestar litestar 'uvicorn[standard]' msgspec ;;
-    pyronova-n) ensure_env pyronova pyronova ;;
+    aiohttp|aiohttp-n) ensure_env aiohttp aiohttp uvloop ujson ;;
+    litestar|litestar-n) ensure_env litestar litestar 'uvicorn[standard]' msgspec ;;
+    pyronova|pyronova-n) ensure_env pyronova pyronova ;;
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
     granian-rsgi-n) ensure_env granian-rsgi granian uvloop ujson ;;
@@ -530,32 +536,41 @@ command_for() {
         runbolt --host "$HOST" --port "$SERVER_PORT" --processes 1
       )
       ;;
-    aiohttp-n)
+    aiohttp|aiohttp-n)
       export BENCH_HOST="$HOST"
       export BENCH_PORT="$SERVER_PORT"
-      export AIOHTTP_REUSE_PORT=1
+      if [[ "$1" == aiohttp-n ]]; then
+        export AIOHTTP_REUSE_PORT=1
+      else
+        export AIOHTTP_REUSE_PORT=0
+      fi
       SERVER_CMD=(
         "$(python_for aiohttp)" "$BENCHMARK_DIR/apps/aiohttp_app.py"
         --host "$HOST" --port "$SERVER_PORT"
       )
       ;;
-    litestar-n)
+    litestar|litestar-n)
+      local uv_workers=1
+      [[ "$1" == litestar-n ]] && uv_workers="$BENCH_PROCS"
       SERVER_CMD=(
         "$(python_for litestar)" -m uvicorn apps.litestar_app:app
         --host "$HOST" --port "$SERVER_PORT"
-        --workers "$BENCH_PROCS"
+        --workers "$uv_workers"
         --loop uvloop
         --http httptools
         --no-access-log
         --log-level warning
       )
       ;;
-    pyronova-n)
+    pyronova|pyronova-n)
+      local pyro_workers=1
+      [[ "$1" == pyronova-n ]] && pyro_workers="$BENCH_PROCS"
       export BENCH_HOST="$HOST"
       export BENCH_PORT="$SERVER_PORT"
       export PYRONOVA_HOST="$HOST"
       export PYRONOVA_PORT="$SERVER_PORT"
-      export PYRONOVA_WORKERS="$BENCH_PROCS"
+      export PYRONOVA_WORKERS="$pyro_workers"
+      export PYRONOVA_IO_WORKERS="$pyro_workers"
       SERVER_CMD=(
         "$(python_for pyronova)" "$BENCHMARK_DIR/apps/pyronova_app.py"
       )
