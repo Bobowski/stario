@@ -704,7 +704,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
         _free_port(),
     )
     port = server.sockets[0].getsockname()[1]
-    payload = b"z" * (40 * 1024)
+    payload = b"z" * (2 * 1024 * 1024)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
@@ -716,7 +716,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
             + payload
         )
         await writer.drain()
-        assert b"40960" in await _read_response(reader)
+        assert b"2097152" in await _read_response(reader)
         assert sizes
         assert all(size <= 8 * 1024 for size in sizes)
         assert any(size == 8 * 1024 for size in sizes[:-1] or sizes)
