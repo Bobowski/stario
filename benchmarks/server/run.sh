@@ -23,6 +23,7 @@ TARGETS=(
   go-nethttp go-nethttp-n go-fasthttp
   socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt
   blacksheep-granian blacksheep-uvicorn fastapi
+  aiohttp-n litestar-n pyronova-n
 )
 TARGET_LABELS=(
   "stario|Stario (Python httptools)"
@@ -41,12 +42,16 @@ TARGET_LABELS=(
   "blacksheep-granian|BlackSheep + Granian ASGI"
   "blacksheep-uvicorn|BlackSheep + Uvicorn ASGI"
   "fastapi|FastAPI + Uvicorn ASGI"
+  "aiohttp-n|aiohttp + uvloop (${BENCH_PROCS} processes, SO_REUSEPORT)"
+  "litestar-n|Litestar + Uvicorn (${BENCH_PROCS} workers, uvloop/httptools)"
+  "pyronova-n|Pyronova (${BENCH_PROCS} sub-interpreters)"
 )
 SUMMARY_GROUPS=(
   "Stario (this checkout)|stario stario-n stario-cython stario-cython-n"
   "Go|go-nethttp go-nethttp-n go-fasthttp"
   "Native HTTP servers|socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt"
   "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
+  "Production Python peers|aiohttp-n litestar-n pyronova-n"
 )
 READ_ENDPOINTS=(plaintext json params)
 UPLOAD_ENDPOINTS=(validate post-form post-json-1k post-octet-64k post-octet-2m post-stream-2m multipart-2m)
@@ -87,12 +92,14 @@ Targets (default: all):
   Go:                  go-nethttp, go-nethttp-n, go-fasthttp
   Native HTTP servers: socketify, robyn, granian-rsgi, granian-rsgi-n, sanic, django-bolt
   ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
+  Production peers:    aiohttp-n, litestar-n, pyronova-n
 
   go-nethttp / go-fasthttp pin GOMAXPROCS=1 (same 1-core budget as the
   Python/Cython one-worker rows). *-n targets fill the box: Go uses
   GOMAXPROCS=\$BENCH_PROCS in one process; stario-n / stario-cython-n start
-  N processes on one port with STARIO_REUSE_PORT=1; granian-rsgi-n uses
-  N workers.
+  N processes on one port with STARIO_REUSE_PORT=1; granian-rsgi-n and
+  litestar-n use N workers; aiohttp-n forks N processes with SO_REUSEPORT;
+  pyronova-n uses N sub-interpreters in one process.
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 UPLOAD_CONNECTIONS=32
              RUNS=7 WARMUP=2 HOST=127.0.0.1 PORT=3000 PYTHON=3.14
@@ -261,6 +268,9 @@ env_name_for() {
     stario-n) echo stario ;;
     stario-cython-n) echo stario-cython ;;
     granian-rsgi-n) echo granian-rsgi ;;
+    aiohttp-n) echo aiohttp ;;
+    litestar-n) echo litestar ;;
+    pyronova-n) echo pyronova ;;
     *) echo "$1" ;;
   esac
 }
@@ -276,7 +286,7 @@ python_for() {
 
 workers_for() {
   case "$1" in
-    stario-n|stario-cython-n) echo "$BENCH_PROCS" ;;
+    stario-n|stario-cython-n|aiohttp-n) echo "$BENCH_PROCS" ;;
     *) echo 1 ;;
   esac
 }
@@ -382,6 +392,9 @@ ensure_target() {
     sanic) ensure_env sanic sanic uvloop ujson ;;
     django-bolt) ensure_env django-bolt django django-bolt msgspec ujson ;;
     fastapi) ensure_env fastapi fastapi 'uvicorn[standard]' ujson ;;
+    aiohttp-n) ensure_env aiohttp aiohttp uvloop ujson ;;
+    litestar-n) ensure_env litestar litestar 'uvicorn[standard]' msgspec ;;
+    pyronova-n) ensure_env pyronova pyronova ;;
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
     granian-rsgi-n) ensure_env granian-rsgi granian uvloop ujson ;;
@@ -517,6 +530,36 @@ command_for() {
         runbolt --host "$HOST" --port "$SERVER_PORT" --processes 1
       )
       ;;
+    aiohttp-n)
+      export BENCH_HOST="$HOST"
+      export BENCH_PORT="$SERVER_PORT"
+      export AIOHTTP_REUSE_PORT=1
+      SERVER_CMD=(
+        "$(python_for aiohttp)" "$BENCHMARK_DIR/apps/aiohttp_app.py"
+        --host "$HOST" --port "$SERVER_PORT"
+      )
+      ;;
+    litestar-n)
+      SERVER_CMD=(
+        "$(python_for litestar)" -m uvicorn apps.litestar_app:app
+        --host "$HOST" --port "$SERVER_PORT"
+        --workers "$BENCH_PROCS"
+        --loop uvloop
+        --http httptools
+        --no-access-log
+        --log-level warning
+      )
+      ;;
+    pyronova-n)
+      export BENCH_HOST="$HOST"
+      export BENCH_PORT="$SERVER_PORT"
+      export PYRONOVA_HOST="$HOST"
+      export PYRONOVA_PORT="$SERVER_PORT"
+      export PYRONOVA_WORKERS="$BENCH_PROCS"
+      SERVER_CMD=(
+        "$(python_for pyronova)" "$BENCHMARK_DIR/apps/pyronova_app.py"
+      )
+      ;;
   esac
 }
 
@@ -584,7 +627,7 @@ start_server() {
   workers="$(workers_for "$target")"
   echo "+ ${SERVER_CMD[*]}"
   if ((workers > 1)); then
-    echo "  $workers processes on $HOST:$SERVER_PORT (STARIO_REUSE_PORT=1)"
+    echo "  $workers processes on $HOST:$SERVER_PORT (SO_REUSEPORT)"
   fi
   SERVER_PIDS=()
   : >"$log"
@@ -746,7 +789,7 @@ print_summary() {
     echo "Median requests/sec ± sample stdev after discarding $WARMUP warmup run(s)"
     echo "and applying IQR outlier trimming across $RUNS measured samples per endpoint."
     echo "Large uploads use $UPLOAD_CONNECTIONS connections; other cases use $CONNECTIONS."
-    echo "Go \`*-n\` uses BENCH_PROCS=$BENCH_PROCS in one process; stario-n / stario-cython-n start $BENCH_PROCS processes with STARIO_REUSE_PORT=1; granian-rsgi-n uses $BENCH_PROCS workers. Other rows stay 1 worker / GOMAXPROCS=1."
+    echo "Go \`*-n\` uses BENCH_PROCS=$BENCH_PROCS in one process; stario-n / stario-cython-n / aiohttp-n start $BENCH_PROCS processes with SO_REUSEPORT; litestar-n and granian-rsgi-n use $BENCH_PROCS workers; pyronova-n uses $BENCH_PROCS sub-interpreters. Other rows stay 1 worker / GOMAXPROCS=1."
     for group_entry in "${SUMMARY_GROUPS[@]}"; do
       group_name="${group_entry%%|*}"
       group_targets="${group_entry#*|}"

@@ -99,6 +99,9 @@ paths, status codes, and per-request JSON/validation work as the Python apps.
 | `blacksheep-granian` | BlackSheep + Granian ASGI |
 | `blacksheep-uvicorn` | BlackSheep + Uvicorn |
 | `fastapi` | FastAPI + Uvicorn + Pydantic |
+| `aiohttp-n` | aiohttp + uvloop, `$BENCH_PROCS` processes, `SO_REUSEPORT` |
+| `litestar-n` | Litestar + Uvicorn, `$BENCH_PROCS` workers, uvloop/httptools |
+| `pyronova-n` | [Pyronova](https://github.com/leocaolab/pyronova), `$BENCH_PROCS` sub-interpreters |
 
 ### Comparing Go to Python
 
@@ -116,7 +119,7 @@ and call it a language result — that is cores vs one core. Two fair setups:
 | Question | Go | Python / Cython / Granian |
 | --- | --- | --- |
 | How fast is the code path? | `go-nethttp` or `go-fasthttp` (`GOMAXPROCS=1`) | existing 1-worker rows |
-| How much can this box do? | `go-nethttp-n` (one process, all cores) | `stario-n` / `stario-cython-n` (N processes, `STARIO_REUSE_PORT=1`) or `granian-rsgi-n` |
+| How much can this box do? | `go-nethttp-n` (one process, all cores) | `stario-n` / `stario-cython-n` / `aiohttp-n` (N processes, `SO_REUSEPORT`), `litestar-n` / `granian-rsgi-n` (N workers), or `pyronova-n` (N sub-interpreters) |
 
 Pinning Go to one process with `GOMAXPROCS=1` is the right match for the
 committed one-worker baselines. Scaling Python to N processes is the right
