@@ -46,6 +46,8 @@ cdef extern from "llhttp.h":
 
     void llhttp_init(llhttp_t* parser, llhttp_type type, const llhttp_settings_t* settings)
     int llhttp_execute(llhttp_t* parser, const char* data, size_t len)
+    void llhttp_resume(llhttp_t* parser)
+    const char* llhttp_get_error_pos(const llhttp_t* parser)
     int llhttp_should_keep_alive(const llhttp_t* parser)
     uint8_t llhttp_get_method(llhttp_t* parser)
     uint8_t llhttp_get_http_major(llhttp_t* parser)

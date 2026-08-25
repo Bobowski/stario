@@ -22,6 +22,8 @@ cdef enum:
     INTERN_MAX = 36
     INTERN_TABLE_SIZE = 64
     NAME_STACK = 256
+    RAW_ARENA_RETAIN_MAX = 8 * 1024
+    RAW_HEADERS_RETAIN_MAX = 64
 
 cdef const char* _INTERN_C[INTERN_MAX]
 cdef Py_ssize_t _INTERN_N[INTERN_MAX]
@@ -99,11 +101,6 @@ cdef void _init_intern() noexcept:
 
 
 _init_intern()
-
-cdef object _CONNECTION_NAME = _INTERN_PY[1]
-cdef object _ACCEPT_ENCODING_NAME = _INTERN_PY[13]
-cdef object _EXPECT_NAME = _INTERN_PY[27]
-
 
 cdef inline void _lower_copy(
     char* dst,
@@ -333,12 +330,6 @@ cdef class Headers:
         self._raw_headers_cap = cap
         return 0
 
-    cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen):
-        self.start_raw_header()
-        self.append_raw_name(name, nlen)
-        self.append_raw_value(value, vlen)
-        self.finish_raw_header()
-
     cdef void start_raw_header(self):
         if self._pending_header:
             self.finish_raw_header()
@@ -377,6 +368,8 @@ cdef class Headers:
         cdef const char* value
         cdef size_t nlen
         cdef size_t vlen
+        cdef object key
+        cdef object materialized_value
         if not self._pending_header:
             return
         if self._pending_name_length == 0:
@@ -404,6 +397,10 @@ cdef class Headers:
                 self._request_expect_continue = True
         elif _token_equals(name, 0, nlen, "accept-encoding", 15):
             self._scan_request_accept_encoding(value, vlen)
+        if self._materialized:
+            key = _intern_name(name, nlen)
+            materialized_value = PyBytes_FromStringAndSize(value, vlen)
+            self.c_add(key, materialized_value)
         self._raw_count += 1
         self._pending_header = False
 
@@ -591,13 +588,13 @@ cdef class Headers:
 
     cdef void c_clear(self):
         self._data.clear()
-        if self._raw_arena != NULL and self._raw_cap > 8192:
+        if self._raw_arena != NULL and self._raw_cap > RAW_ARENA_RETAIN_MAX:
             free(self._raw_arena)
             self._raw_arena = NULL
             self._raw_cap = 0
         if (
             self._raw_headers != NULL
-            and self._raw_headers_cap > 64
+            and self._raw_headers_cap > RAW_HEADERS_RETAIN_MAX
         ):
             free(self._raw_headers)
             self._raw_headers = NULL

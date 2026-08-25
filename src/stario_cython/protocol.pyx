@@ -1,8 +1,6 @@
 # cython: language_level=3
 """uvloop connection protocol; each request runs in a pooled RequestExchange."""
 
-import asyncio
-
 from libc.stdlib cimport realloc, free
 from libc.string cimport memcpy
 from cpython.bytes cimport PyBytes_FromStringAndSize
@@ -12,7 +10,6 @@ from stario.http.writer import get_status_line
 from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport RequestExchange, acquire_exchange
-from stario_cython.headers cimport Headers
 from stario_cython.llhttp cimport *
 from stario_cython.request cimport Request
 
@@ -130,10 +127,9 @@ cdef int _cb_header_value_complete(llhttp_t* parser) noexcept:
 
 cdef int _cb_headers_complete(llhttp_t* parser) noexcept:
     try:
-        _proto(parser)._on_headers_complete()
+        return _proto(parser)._on_headers_complete()
     except Exception:
         return -1
-    return 0
 
 
 cdef int _cb_body(llhttp_t* parser, const char* at, size_t length) noexcept:
@@ -201,6 +197,7 @@ cdef class HttpProtocol:
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
+    cdef bint parser_paused
 
     def __cinit__(self):
         _bind_settings()
@@ -222,6 +219,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.parser_paused = False
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -270,6 +268,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.parser_paused = False
         self.connections.add(self)
 
     def ensure_disconnect(self):
@@ -305,6 +304,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.parser_paused = False
         self.transport = None
 
     def recycle_exchange(self, RequestExchange exchange):
@@ -335,10 +335,21 @@ cdef class HttpProtocol:
         cdef Py_ssize_t n
         cdef Py_ssize_t end
         cdef int err
+        cdef const char* error_pos
         n = len(data)
         ptr = <const char*>data
         if n <= PARSER_QUANTUM:
             err = llhttp_execute(self.parser, ptr + offset, <size_t>(n - offset))
+            if err == HPE_PAUSED:
+                error_pos = llhttp_get_error_pos(self.parser)
+                self.parser_paused = True
+                self.held_data = data
+                self.held_offset = (
+                    <Py_ssize_t>(error_pos - ptr)
+                    if error_pos != NULL
+                    else n
+                )
+                return
             if err != HPE_OK:
                 self._close_error(400, "Invalid HTTP request")
             return
@@ -351,6 +362,16 @@ cdef class HttpProtocol:
                 ptr + offset,
                 <size_t>(end - offset),
             )
+            if err == HPE_PAUSED:
+                error_pos = llhttp_get_error_pos(self.parser)
+                self.parser_paused = True
+                self.held_data = data
+                self.held_offset = (
+                    <Py_ssize_t>(error_pos - ptr)
+                    if error_pos != NULL
+                    else end
+                )
+                return
             if err != HPE_OK:
                 self._close_error(400, "Invalid HTTP request")
                 return
@@ -395,6 +416,9 @@ cdef class HttpProtocol:
         offset = self.held_offset
         self.held_data = None
         self.held_offset = 0
+        if self.parser_paused:
+            llhttp_resume(self.parser)
+            self.parser_paused = False
         self._pump_data(data, offset)
         if self.pause_reasons == 0 and self.held_data is None:
             transport = self.transport
@@ -475,7 +499,7 @@ cdef class HttpProtocol:
         if self.reading_exchange is not None:
             self.reading_exchange.request_headers.finish_raw_header()
 
-    cdef void _on_headers_complete(self):
+    cdef int _on_headers_complete(self):
         cdef RequestExchange exchange
         cdef uint16_t flags
         cdef uint64_t content_length
@@ -484,17 +508,17 @@ cdef class HttpProtocol:
         else:
             self.url = b""
         if self.rejected or self.reading_exchange is None:
-            return
+            return 0
         exchange = self.reading_exchange
         exchange.request_headers.finish_raw_header()
         if llhttp_get_upgrade(self.parser):
             self._close_error(400, "Upgrade not supported")
-            return
+            return 0
         flags = stario_parser_flags(self.parser)
         content_length = stario_parser_content_length(self.parser)
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
-            return
+            return 0
         # Snapshot keep-alive / expect / accept-encoding into exchange slots.
         exchange.cache_hot_request_headers()
         self.request_keep_alive = (
@@ -509,6 +533,9 @@ cdef class HttpProtocol:
             exchange._req_expect_continue,
             <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
         )
+        if self.pause_reasons & PAUSE_PIPELINE:
+            return HPE_PAUSED
+        return 0
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)

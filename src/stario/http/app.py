@@ -147,9 +147,8 @@ class App(Router):
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
         if eager_start:
-            task = asyncio.Task(
+            task = loop.create_task(
                 coro,
-                loop=loop,
                 name=name,
                 eager_start=True,
             )

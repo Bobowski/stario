@@ -42,10 +42,11 @@ from stario_cython.compression_buf cimport (
 from stario_cython.headers cimport Headers
 from stario_cython.request cimport Request
 
-# Stream backpressure window. max_chunk must be strictly below HIGH_WATER.
+# Stream batching limit and independent transport backpressure window.
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
-cdef int MAX_STREAM_CHUNK = 256 * 1024
+cdef int STREAM_CHUNK_LIMIT = 256 * 1024
+cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
 
@@ -628,6 +629,16 @@ cdef class RequestExchange:
         self._read_max_size = -1
         self._clear_hot_request_headers()
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
+        if (
+            self._out_buf is not None
+            and PyByteArray_GET_SIZE(self._out_buf) > OUTPUT_BUFFER_RETAIN_MAX
+        ):
+            self._out_buf = None
+        if (
+            self._out_hold is not None
+            and PyByteArray_GET_SIZE(self._out_hold) > OUTPUT_BUFFER_RETAIN_MAX
+        ):
+            self._out_hold = None
 
     cdef void release_global(self):
         self._free_compressors()
@@ -1250,10 +1261,10 @@ cdef class RequestExchange:
             chunk_size = <Py_ssize_t>max_chunk
             if chunk_size <= 0:
                 raise ValueError("max_chunk must be positive")
-            if chunk_size >= MAX_STREAM_CHUNK:
+            if chunk_size >= STREAM_CHUNK_LIMIT:
                 raise ValueError(
                     f"max_chunk ({chunk_size}) must be lower than "
-                    f"high water mark ({MAX_STREAM_CHUNK})"
+                    f"stream chunk limit ({STREAM_CHUNK_LIMIT})"
                 )
         self._stream_max_chunk = chunk_size
         self._consumed_as = CONSUMED_STREAM

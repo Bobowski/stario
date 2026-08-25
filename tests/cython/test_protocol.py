@@ -475,6 +475,64 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
 
 
 @pytest.mark.asyncio
+async def test_large_single_read_pipeline_resumes_without_losing_bytes() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    release = asyncio.Event()
+    handled: list[int] = []
+
+    async def endpoint(c, w):
+        index = int(c.req.query_bytes)
+        handled.append(index)
+        if index == 0:
+            await release.wait()
+        w.respond(str(index).encode("ascii"), b"text/plain")
+
+    app.get("/", endpoint)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    request_count = 64
+    requests = []
+    for index in range(request_count):
+        connection = b"Connection: close\r\n" if index == request_count - 1 else b""
+        requests.append(
+            b"GET /?"
+            + str(index).encode("ascii")
+            + b" HTTP/1.1\r\nHost: localhost\r\n"
+            + connection
+            + b"\r\n"
+        )
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"".join(requests))
+        await writer.drain()
+        await asyncio.sleep(0)
+        assert handled == [0]
+        release.set()
+        for index in range(request_count):
+            response = await _read_response(reader)
+            assert response.endswith(str(index).encode("ascii"))
+        assert handled == list(range(request_count))
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_pipelined_streaming_bodies_are_request_owned() -> None:
     loop = asyncio.get_running_loop()
     app = App()
@@ -728,7 +786,7 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stream_max_chunk_must_be_below_high_water() -> None:
+async def test_stream_max_chunk_must_be_below_limit() -> None:
     loop = asyncio.get_running_loop()
     app = App()
     errors: list[ValueError] = []
@@ -769,7 +827,7 @@ async def test_stream_max_chunk_must_be_below_high_water() -> None:
         response = await _read_response(reader)
         assert b"500" in response.split(b"\r\n", 1)[0]
         assert errors
-        assert "high water" in str(errors[0])
+        assert "stream chunk limit" in str(errors[0])
         writer.close()
         await writer.wait_closed()
     finally:

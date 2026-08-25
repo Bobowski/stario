@@ -29,7 +29,6 @@ cdef class Headers:
     cdef int _request_wildcard_q
     cdef int _request_identity_q
 
-    cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen)
     cdef void start_raw_header(self)
     cdef void append_raw_name(self, const char* data, size_t length)
     cdef void append_raw_value(self, const char* data, size_t length)
