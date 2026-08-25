@@ -52,6 +52,7 @@ cdef class RequestExchange:
     cdef bint _body_complete
     cdef bint _expect_continue
     cdef bint _waiting
+    cdef bint _discard_body
     cdef object _body_tail
     cdef Py_ssize_t _tail_used
     cdef Py_ssize_t _tail_cap

@@ -168,6 +168,7 @@ cdef class RequestExchange:
         self._state = None
         self.in_pool = False
         self._body_active = False
+        self._discard_body = False
         self._read_max_size = -1
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
@@ -490,6 +491,12 @@ cdef class RequestExchange:
 
     cdef void handler_finished(self):
         self.handler_done = True
+        if self._body_active and not self._body_complete:
+            self._discard_body = True
+            self._cached = None
+            self._clear_body_storage()
+            self._cancel_stall_timer()
+            self._connection.set_body_paused(self, False)
         self._maybe_recycle()
 
     cdef void cancel_before_start(self):
@@ -852,6 +859,7 @@ cdef class RequestExchange:
         self._abort_reason = ABORT_NONE
         self._body_complete = False
         self._waiting = False
+        self._discard_body = False
         self._expected_size = expected_size
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
@@ -989,6 +997,8 @@ cdef class RequestExchange:
             self._clear_body_storage()
             self._connection.set_body_paused(self, False)
             self._wake()
+            if self._discard_body and not self._transport.is_closing():
+                self._transport.close()
             return
         if (
             self._read_max_size >= 0
@@ -999,6 +1009,11 @@ cdef class RequestExchange:
             self._clear_body_storage()
             self._connection.set_body_paused(self, False)
             self._wake()
+            if self._discard_body and not self._transport.is_closing():
+                self._transport.close()
+            return
+        if self._discard_body:
+            self._total_read = new_total
             return
         emitted = False
         offset = 0
@@ -1035,6 +1050,10 @@ cdef class RequestExchange:
             return
         self._body_complete = True
         self._cancel_stall_timer()
+        if self._discard_body:
+            self._clear_body_storage()
+            self._maybe_recycle()
+            return
         self._seal_body_tail()
         if self._consumed_as == CONSUMED_STREAM:
             self._wake()
@@ -1094,6 +1113,10 @@ cdef class RequestExchange:
         cdef Py_ssize_t offset
         cdef Py_ssize_t remaining
         cdef Py_ssize_t consumed
+        if self._discard_body:
+            raise StarioRuntime(
+                "Request body is no longer available after its handler finished."
+            )
         if self._abort_reason != ABORT_NONE:
             self._raise_abort()
         if self._consumed_as == CONSUMED_BODY:
@@ -1151,6 +1174,10 @@ cdef class RequestExchange:
             await self._wait_for_body_data()
 
     async def read(self, max_size=None):
+        if self._discard_body:
+            raise StarioRuntime(
+                "Request body is no longer available after its handler finished."
+            )
         if max_size is not None and max_size < 0:
             raise ValueError("max_size must be non-negative.")
         if self._abort_reason != ABORT_NONE:
