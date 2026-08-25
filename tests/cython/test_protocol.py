@@ -12,6 +12,16 @@ from stario.telemetry.noop import NoOpTracer
 from stario_cython.protocol import HttpProtocol
 
 
+class TrackingApp(App):
+    def __init__(self) -> None:
+        super().__init__()
+        self.eager_starts: list[bool] = []
+
+    def create_task(self, coro, **kwargs):
+        self.eager_starts.append(kwargs.get("eager_start", False))
+        return super().create_task(coro, **kwargs)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -33,7 +43,7 @@ async def _read_response(reader: asyncio.StreamReader) -> bytes:
 @pytest.mark.asyncio
 async def test_plaintext_and_post_and_keepalive() -> None:
     loop = asyncio.get_running_loop()
-    app = App()
+    app = TrackingApp()
     writers = []
 
     async def plaintext(_c, w):
@@ -83,7 +93,54 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         await writer.drain()
         second = await _read_response(reader)
         assert b"abcde" in second
+        assert app.eager_starts == [True, True]
         assert writers[0] is writers[1]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_fragmented_headers_materialize_correctly() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def inspect(c, w):
+        assert c.req.host == "example.com"
+        assert c.req.headers.getlist("x-test") == ["one", "two"]
+        responses.text(w, "ok")
+
+    app.get("/", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    request = (
+        b"GET / HTTP/1.1\r\n"
+        b"Host: Example.COM:80\r\n"
+        b"X-Test: one\r\n"
+        b"x-test: two\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        for byte in request:
+            writer.write(bytes((byte,)))
+            await writer.drain()
+            await asyncio.sleep(0)
+        assert b"ok" in await _read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -205,6 +262,59 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
         assert b"/next" in await _read_response(reader)
         assert len(seen) == 2
         assert seen[0] is seen[1]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_stream_discards_remainder_and_advances_pipeline() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def partial(c, w):
+        async for _ in c.req.stream():
+            break
+        responses.text(w, "partial")
+
+    async def next_request(_c, w):
+        responses.text(w, "next")
+
+    app.post("/partial", partial)
+    app.get("/next", next_request)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"x" * (2 * 1024 * 1024)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /partial HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+            + b"GET /next HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"partial" in await _read_response(reader)
+        assert b"next" in await _read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -356,6 +466,60 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
         assert events == [("second-start", "/second"), ("first-done", "/first")]
         assert exchanges["first"].completed
         assert exchanges["second"].completed
+        assert await reader.read() == b""
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_large_single_read_pipeline_is_bounded() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    release = asyncio.Event()
+    handled: list[int] = []
+
+    async def endpoint(c, w):
+        index = int(c.req.query_bytes)
+        handled.append(index)
+        if index == 0:
+            await release.wait()
+        w.respond(str(index).encode("ascii"), b"text/plain")
+
+    app.get("/", endpoint)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    request_count = 128
+    requests = []
+    for index in range(request_count):
+        requests.append(
+            b"GET /?"
+            + str(index).encode("ascii")
+            + b" HTTP/1.1\r\nHost: localhost\r\n"
+            + b"\r\n"
+        )
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"".join(requests))
+        await writer.drain()
+        response = await _read_response(reader)
+        assert response.startswith(b"HTTP/1.1 429")
+        release.set()
+        assert handled == [0]
         assert await reader.read() == b""
         writer.close()
         await writer.wait_closed()
@@ -618,16 +782,16 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stream_max_chunk_must_be_below_high_water() -> None:
+async def test_stream_max_chunk_must_be_below_limit() -> None:
     loop = asyncio.get_running_loop()
     app = App()
-    errors: list[BaseException] = []
+    errors: list[ValueError] = []
 
     async def upload(c, w):
         try:
             async for _ in c.req.stream(max_chunk=256 * 1024):
                 pass
-        except BaseException as exc:
+        except ValueError as exc:
             errors.append(exc)
             raise
         w.respond(b"ok", b"text/plain")
@@ -657,10 +821,9 @@ async def test_stream_max_chunk_must_be_below_high_water() -> None:
         )
         await writer.drain()
         response = await _read_response(reader)
-        assert b"500" in response.split(b"\r\n", 1)[0] or errors
+        assert b"500" in response.split(b"\r\n", 1)[0]
         assert errors
-        assert isinstance(errors[0], ValueError)
-        assert "high water" in str(errors[0])
+        assert "stream chunk limit" in str(errors[0])
         writer.close()
         await writer.wait_closed()
     finally:
@@ -694,7 +857,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
         _free_port(),
     )
     port = server.sockets[0].getsockname()[1]
-    payload = b"z" * (40 * 1024)
+    payload = b"z" * (2 * 1024 * 1024)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
@@ -706,7 +869,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
             + payload
         )
         await writer.drain()
-        assert b"40960" in await _read_response(reader)
+        assert b"2097152" in await _read_response(reader)
         assert sizes
         assert all(size <= 8 * 1024 for size in sizes)
         assert any(size == 8 * 1024 for size in sizes[:-1] or sizes)

@@ -5,14 +5,13 @@ import asyncio
 
 from libc.stddef cimport size_t
 from libc.stdio cimport sprintf
-from libc.stdlib cimport free, realloc
-from libc.string cimport memcpy, memmove
+from libc.string cimport memcpy
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_GET_SIZE,
     PyByteArray_Resize,
 )
-from cpython.bytes cimport PyBytes_FromStringAndSize
+from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
 
 from stario.exceptions import (
     ClientDisconnected,
@@ -25,7 +24,6 @@ from stario.http.compression import (
     DEFAULT_GZIP_LEVEL,
     DEFAULT_MIN_SIZE,
     content_type_is_compressible,
-    negotiate_content_encoding,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
 from stario.http.request import DEFAULT_BODY_TIMEOUT
@@ -33,20 +31,22 @@ from stario.http.writer import get_status_line
 
 from stario_cython.compression_buf cimport (
     stario_brotli_block_borrowed,
+    stario_brotli_acquire,
     stario_brotli_finish_borrowed,
-    stario_brotli_free,
-    stario_brotli_new,
+    stario_brotli_release,
     stario_gzip_block_borrowed,
+    stario_gzip_acquire,
     stario_gzip_finish_borrowed,
-    stario_gzip_free,
-    stario_gzip_new,
+    stario_gzip_release,
 )
 from stario_cython.headers cimport Headers
 from stario_cython.request cimport Request
 
-# Stream backpressure window. max_chunk must be strictly below HIGH_WATER.
-cdef int LOW_WATER = 64 * 1024
-cdef int HIGH_WATER = 256 * 1024
+# Stream batching limit and independent transport backpressure window.
+cdef int LOW_WATER = 128 * 1024
+cdef int HIGH_WATER = 512 * 1024
+cdef int STREAM_CHUNK_LIMIT = 256 * 1024
+cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
 
@@ -57,6 +57,10 @@ cdef object BODY_TYPE_ERROR = (
 cdef int CONSUMED_NONE = 0
 cdef int CONSUMED_BODY = 1
 cdef int CONSUMED_STREAM = 2
+
+cdef int ENCODING_NONE = 0
+cdef int ENCODING_BR = 1
+cdef int ENCODING_GZIP = 2
 
 cdef int ABORT_NONE = 0
 cdef int ABORT_TOO_LARGE = 1
@@ -74,10 +78,12 @@ cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
 cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
 cdef bytes ZERO_CL = b"content-length: 0\r\n\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
+cdef bytes CL_HEADER = b"content-length: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
 cdef bytes CHUNK_END = b"0\r\n\r\n"
+cdef tuple _DEC_SMALL = tuple(str(i).encode("ascii") for i in range(256))
 
 cdef object STARTED_ERROR = (
     "Response already started (headers sent). "
@@ -97,6 +103,92 @@ cdef inline void _require_bytes_like(object part):
         raise TypeError(
             "body parts must be bytes-like, got " + type(part).__name__
         )
+
+
+cdef inline bint _range_equals_ci(
+    const char* value,
+    Py_ssize_t length,
+    const char* expected,
+    Py_ssize_t expected_length,
+) noexcept:
+    cdef Py_ssize_t i
+    cdef unsigned char c
+    if length != expected_length:
+        return False
+    for i in range(length):
+        c = <unsigned char>value[i]
+        if 65 <= c <= 90:
+            c += 32
+        if c != <unsigned char>expected[i]:
+            return False
+    return True
+
+
+cdef inline bint _range_starts_ci(
+    const char* value,
+    Py_ssize_t length,
+    const char* prefix,
+    Py_ssize_t prefix_length,
+) noexcept:
+    if length < prefix_length:
+        return False
+    return _range_equals_ci(value, prefix_length, prefix, prefix_length)
+
+
+cdef bint _content_type_is_compressible(object content_type):
+    cdef bytes raw
+    cdef const char* value
+    cdef Py_ssize_t start
+    cdef Py_ssize_t end
+    cdef Py_ssize_t i
+    if type(content_type) is not bytes:
+        return content_type_is_compressible(content_type)
+    raw = content_type
+    value = raw
+    end = len(raw)
+    for i in range(end):
+        if value[i] == <char>59:
+            end = i
+            break
+    start = 0
+    while start < end and (
+        value[start] == <char>32
+        or 9 <= <unsigned char>value[start] <= 13
+    ):
+        start += 1
+    while end > start and (
+        value[end - 1] == <char>32
+        or 9 <= <unsigned char>value[end - 1] <= 13
+    ):
+        end -= 1
+    value += start
+    end -= start
+    if end == 0:
+        return False
+    if (
+        _range_starts_ci(value, end, "image/", 6)
+        or _range_starts_ci(value, end, "audio/", 6)
+        or _range_starts_ci(value, end, "video/", 6)
+    ):
+        return False
+    if (
+        _range_equals_ci(value, end, "application/gzip", 16)
+        or _range_equals_ci(value, end, "application/x-gzip", 18)
+        or _range_equals_ci(value, end, "application/zip", 15)
+        or _range_equals_ci(value, end, "application/x-zip-compressed", 28)
+        or _range_equals_ci(value, end, "application/x-7z-compressed", 27)
+        or _range_equals_ci(value, end, "application/vnd.rar", 19)
+        or _range_equals_ci(value, end, "application/x-rar-compressed", 28)
+        or _range_equals_ci(value, end, "application/x-bzip", 18)
+        or _range_equals_ci(value, end, "application/x-bzip2", 19)
+        or _range_equals_ci(value, end, "application/x-xz", 16)
+        or _range_equals_ci(value, end, "application/zstd", 16)
+        or _range_equals_ci(value, end, "application/x-zstd", 18)
+        or _range_equals_ci(value, end, "font/woff", 9)
+        or _range_equals_ci(value, end, "font/woff2", 10)
+    ):
+        return False
+    return True
 
 
 cdef inline bint _may_have_body(int status) noexcept:
@@ -129,7 +221,10 @@ cdef object _status_line(int status):
 
 cdef object _dec(size_t n):
     cdef char buf[16]
-    cdef int i = sprintf(buf, "%zu", n)
+    cdef int i
+    if n < 256:
+        return _DEC_SMALL[n]
+    i = sprintf(buf, "%zu", n)
     return PyBytes_FromStringAndSize(buf, i)
 
 
@@ -145,10 +240,10 @@ cdef class RequestExchange:
         self._bytes_written = 0
         self._completed = False
         self._date_box = None
-        self._acc = NULL
-        self._acc_len = 0
-        self._acc_cap = 0
-        self._acc_pos = 0
+        self._body_tail = None
+        self._tail_used = 0
+        self._tail_cap = 0
+        self._expected_size = -1
 
     def __init__(self):
         self.headers = Headers()
@@ -159,23 +254,22 @@ cdef class RequestExchange:
         self._data_ready = None
         self._stall_handle = None
         self._compression = _UNBOUND
-        self._available = ()
+        self._brotli_enabled = False
+        self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
         self._state = None
         self.in_pool = False
         self._body_active = False
+        self._discard_body = False
         self._read_max_size = -1
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
     def __dealloc__(self):
         self._free_compressors()
-        if self._acc != NULL:
-            free(self._acc)
-            self._acc = NULL
 
-    cdef void reset_response(self, object accept_encoding):
+    cdef void reset_response(self, int encoding):
         self._free_compressors()
-        self._accept = accept_encoding
+        self._req_encoding = encoding
         self._status_code = -1
         self._declared_length = -1
         self._bytes_written = 0
@@ -188,7 +282,9 @@ cdef class RequestExchange:
         self._brotli_level = DEFAULT_BROTLI_LEVEL
         self._brotli_window = 0
         self._gzip_level = DEFAULT_GZIP_LEVEL
-        self._available = ()
+        self._gzip_window = 15
+        self._brotli_enabled = False
+        self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
         if compression is None:
             return
@@ -197,17 +293,19 @@ cdef class RequestExchange:
         window = compression.brotli_window_log
         self._brotli_window = 0 if window is None else window
         self._gzip_level = compression.gzip_level
+        window = compression.gzip_window_bits
+        self._gzip_window = 15 if window is None else window
         self._compress_min_size = compression.min_size
-        self._available = tuple(
-            enc
-            for enc in compression.enabled_encodings()
-            if enc == b"br" or enc == b"gzip"
-        )
+        self._brotli_enabled = self._brotli_level >= 0
+        self._gzip_enabled = self._gzip_level >= 0
 
     cdef int _ensure_brotli(self) except -1:
         if self._brotli != NULL:
             return 0
-        self._brotli = stario_brotli_new(self._brotli_level, self._brotli_window)
+        self._brotli = stario_brotli_acquire(
+            self._brotli_level,
+            self._brotli_window,
+        )
         if self._brotli == NULL:
             raise StarioError("brotli stream init failed")
         return 0
@@ -215,17 +313,20 @@ cdef class RequestExchange:
     cdef int _ensure_gzip(self) except -1:
         if self._gzip != NULL:
             return 0
-        self._gzip = stario_gzip_new(self._gzip_level)
+        self._gzip = stario_gzip_acquire(
+            self._gzip_level,
+            self._gzip_window,
+        )
         if self._gzip == NULL:
             raise StarioError("gzip stream init failed")
         return 0
 
     cdef void _free_compressors(self):
         if self._brotli != NULL:
-            stario_brotli_free(self._brotli)
+            stario_brotli_release(self._brotli)
             self._brotli = NULL
         if self._gzip != NULL:
-            stario_gzip_free(self._gzip)
+            stario_gzip_release(self._gzip)
             self._gzip = NULL
 
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1:
@@ -304,23 +405,6 @@ cdef class RequestExchange:
             return 0
         raise TypeError(BODY_TYPE_ERROR)
 
-    cdef int _write_body_raw(self, object body) except -1:
-        """Write body parts directly to the transport (known Content-Length)."""
-        cdef object part
-        if body is None:
-            return 0
-        if _is_bytes_like(body):
-            if len(body):
-                self._transport.write(body)
-            return 0
-        if isinstance(body, (list, tuple)):
-            for part in body:
-                _require_bytes_like(part)
-                if len(part):
-                    self._transport.write(part)
-            return 0
-        raise TypeError(BODY_TYPE_ERROR)
-
     cdef int _buf_uint(self, size_t n, int base) except -1:
         cdef char tmp[16]
         cdef int i
@@ -365,17 +449,13 @@ cdef class RequestExchange:
         bint streaming,
         Py_ssize_t nbytes,
     ):
-        if not self._available or self._accept is None:
-            return False
-        if content_type is not None and not content_type_is_compressible(content_type):
+        if self._req_encoding == ENCODING_NONE:
             return False
         if not streaming:
-            if data is None:
+            if data is None or nbytes < self._compress_min_size:
                 return False
-            if nbytes < 0:
-                nbytes = self._body_nbytes(data)
-            if nbytes < self._compress_min_size:
-                return False
+        if content_type is not None and not _content_type_is_compressible(content_type):
+            return False
         return True
 
     cdef int _frame(
@@ -456,7 +536,9 @@ cdef class RequestExchange:
     ):
         if not self._may_compress(data, content_type, streaming, nbytes):
             return None
-        return negotiate_content_encoding(self._accept, self._available)
+        if self._req_encoding == ENCODING_BR:
+            return b"br"
+        return b"gzip"
 
     cdef void reset(
         self,
@@ -487,30 +569,35 @@ cdef class RequestExchange:
         self.handler_started = False
 
     cdef void _clear_hot_request_headers(self):
-        self._req_accept_encoding = None
+        self._req_encoding = ENCODING_NONE
         self._req_expect_continue = False
         self._req_connection_close = False
 
     cdef void cache_hot_request_headers(self):
         """Snapshot keep-alive / expect / accept-encoding (Headers API unchanged)."""
         cdef Headers h = self.request_headers
-        cdef object v
-        self._req_accept_encoding = h.c_get(b"accept-encoding")
-        v = h.c_get(b"connection")
-        self._req_connection_close = (
-            v is not None and v.lower() == b"close"
-        )
-        v = h.c_get(b"expect")
-        self._req_expect_continue = (
-            v is not None and v.lower() == b"100-continue"
-        )
+        if self._brotli_enabled or self._gzip_enabled:
+            self._req_encoding = h.c_select_request_encoding(
+                self._brotli_enabled,
+                self._gzip_enabled,
+            )
+        else:
+            self._req_encoding = ENCODING_NONE
+        self._req_connection_close = h.c_request_connection_close()
+        self._req_expect_continue = h.c_request_expect_continue()
 
     cdef void start_response(self):
         self.handler_started = True
-        self.reset_response(self._req_accept_encoding)
+        self.reset_response(self._req_encoding)
 
     cdef void handler_finished(self):
         self.handler_done = True
+        if self._body_active and not self._body_complete:
+            self._discard_body = True
+            self._cached = None
+            self._clear_body_storage()
+            self._cancel_stall_timer()
+            self._connection.set_body_paused(self, False)
         self._maybe_recycle()
 
     cdef void cancel_before_start(self):
@@ -537,14 +624,21 @@ cdef class RequestExchange:
         self._cached = None
         self._data_ready = None
         self._cancel_stall_timer()
-        self._acc_len = 0
-        self._acc_pos = 0
+        self._clear_body_storage()
         self._body_active = False
         self._read_max_size = -1
         self._clear_hot_request_headers()
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
-        if self._chunks is not None:
-            self._chunks.clear()
+        if (
+            self._out_buf is not None
+            and PyByteArray_GET_SIZE(self._out_buf) > OUTPUT_BUFFER_RETAIN_MAX
+        ):
+            self._out_buf = None
+        if (
+            self._out_hold is not None
+            and PyByteArray_GET_SIZE(self._out_hold) > OUTPUT_BUFFER_RETAIN_MAX
+        ):
+            self._out_hold = None
 
     cdef void release_global(self):
         self._free_compressors()
@@ -554,7 +648,6 @@ cdef class RequestExchange:
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
-        self._accept = None
         self._clear_hot_request_headers()
         self.app = None
         self._connection = None
@@ -603,8 +696,8 @@ cdef class RequestExchange:
                 self._transport.writelines(
                     (_status_line(status), self._date_box[0], ZERO_CL)
                 )
-            else:
-                flat = [
+            elif isinstance(body, (list, tuple)):
+                self._transport.writelines((
                     _status_line(status),
                     self._date_box[0],
                     CT_PREFIX,
@@ -612,16 +705,22 @@ cdef class RequestExchange:
                     CL_PREFIX,
                     _dec(<size_t>nbytes),
                     CRLF2,
-                ]
-                if isinstance(body, (list, tuple)):
-                    flat.extend(body)
-                else:
-                    flat.append(body)
-                self._transport.writelines(flat)
+                ))
+                self._transport.writelines(body)
+            else:
+                self._transport.writelines((
+                    _status_line(status),
+                    self._date_box[0],
+                    CT_PREFIX,
+                    content_type,
+                    CL_PREFIX,
+                    _dec(<size_t>nbytes),
+                    CRLF2,
+                    body,
+                ))
         else:
             if not _may_have_body(status):
                 body = b""
-                h.c_set(b"content-length", b"0")
             elif h.c_get(b"content-encoding") is None:
                 encoding = self._select(body, content_type, False, nbytes)
                 if encoding is not None:
@@ -649,18 +748,26 @@ cdef class RequestExchange:
                     self._completed = True
                     self._done()
                     return
-            h.c_set(b"content-type", content_type)
-            h.c_set(b"content-length", _dec(<size_t>nbytes))
             self._declared_length = nbytes
             self._bytes_written = 0
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:
                 self._out_buf = bytearray(256)
-            h.c_write_wire_ba(self._out_buf, &self._out_len)
+            h.c_write_response_wire_ba(self._out_buf, &self._out_len)
+            self._buf_bytes(CT_PREFIX)
+            self._buf_bytes(content_type)
             self._buf_bytes(CRLF)
-            self._buf_body(body)
+            self._buf_bytes(CL_HEADER)
+            self._buf_uint(<size_t>nbytes, 10)
+            self._buf_bytes(CRLF2)
             self._flush()
+            self._status_code = status
+            if nbytes:
+                if isinstance(body, (list, tuple)):
+                    self._transport.writelines(body)
+                else:
+                    self._transport.write(body)
         self._status_code = status
         self._bytes_written = self._declared_length if self._declared_length > 0 else 0
         self._completed = True
@@ -768,7 +875,10 @@ cdef class RequestExchange:
             return self
         if self._declared_length >= 0:
             self._bytes_written += n
-            self._write_body_raw(data)
+            if isinstance(data, (list, tuple)):
+                self._transport.writelines(data)
+            else:
+                self._transport.write(data)
             return self
         if self._brotli != NULL or self._gzip != NULL:
             if isinstance(data, (list, tuple)):
@@ -861,105 +971,86 @@ cdef class RequestExchange:
     def alive(self, source=None):
         return _Alive(self, source)
 
-    cdef void reset_body(self, bint expect_continue):
+    cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size):
         self._body_active = True
-        if self._chunks is not None:
-            self._chunks.clear()
+        self._clear_body_storage()
         self._cached = None
         self._data_ready = None
         self._cancel_stall_timer()
         self._expect_continue = expect_continue
-        self._buffered = 0
         self._total_read = 0
         self._read_max_size = -1
         self._consumed_as = CONSUMED_NONE
         self._abort_reason = ABORT_NONE
         self._body_complete = False
         self._waiting = False
-        self._acc_len = 0
-        self._acc_pos = 0
+        self._discard_body = False
+        self._expected_size = expected_size
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
-    cdef void prepare_body_capacity(self, Py_ssize_t expected_size):
-        """Pre-size the C accumulator for a known Content-Length."""
-        if expected_size > 0:
-            self._acc_reserve(expected_size)
+    cdef void _clear_body_storage(self):
+        if self._chunks is not None:
+            self._chunks.clear()
+        self._body_tail = None
+        self._tail_used = 0
+        self._tail_cap = 0
+        self._buffered = 0
 
-    cdef int _acc_compact(self) except -1:
-        cdef Py_ssize_t unread
-        if self._acc_pos == 0:
+    cdef int _ensure_body_tail(self, Py_ssize_t received_before) except -1:
+        cdef Py_ssize_t cap
+        cdef Py_ssize_t remaining
+        if self._body_tail is not None:
             return 0
-        unread = self._acc_len - self._acc_pos
-        if unread == 0:
-            self._acc_pos = 0
-            self._acc_len = 0
-            return 0
-        memmove(self._acc, self._acc + self._acc_pos, <size_t>unread)
-        self._acc_len = unread
-        self._acc_pos = 0
-        return 0
-
-    cdef int _acc_reserve(self, Py_ssize_t need) except -1:
-        cdef Py_ssize_t next_cap
-        cdef char* p
-        if need <= self._acc_cap:
-            return 0
-        next_cap = 64 if self._acc_cap == 0 else self._acc_cap * 2
-        if next_cap < need:
-            next_cap = need
-        p = <char*>realloc(self._acc, <size_t>next_cap)
-        if p == NULL:
-            raise MemoryError()
-        self._acc = p
-        self._acc_cap = next_cap
-        return 0
-
-    cdef int _acc_add(self, const char* at, size_t length) except -1:
-        cdef Py_ssize_t need
+        cap = self._stream_max_chunk
         if (
-            self._acc_pos > 0
-            and self._acc_len + <Py_ssize_t>length > self._acc_cap
+            self._consumed_as == CONSUMED_BODY
+            and self._expected_size > 0
+            and received_before == 0
         ):
-            self._acc_compact()
-        need = self._acc_len + <Py_ssize_t>length
-        self._acc_reserve(need)
-        memcpy(self._acc + self._acc_len, at, length)
-        self._acc_len = need
+            cap = self._expected_size
+        elif self._consumed_as != CONSUMED_STREAM:
+            cap = DEFAULT_STREAM_CHUNK
+        if self._expected_size >= 0:
+            remaining = self._expected_size - received_before
+            if 0 < remaining < cap:
+                cap = remaining
+        self._body_tail = PyBytes_FromStringAndSize(NULL, cap)
+        self._tail_used = 0
+        self._tail_cap = cap
         return 0
 
-    cdef object _acc_to_bytes(self):
-        cdef object out
-        cdef Py_ssize_t unread = self._acc_len - self._acc_pos
-        if unread <= 0:
-            self._acc_pos = 0
-            self._acc_len = 0
-            return b""
-        out = PyBytes_FromStringAndSize(self._acc + self._acc_pos, unread)
-        self._acc_pos = 0
-        self._acc_len = 0
-        return out
-
-    cdef void _emit_from_acc(self, Py_ssize_t n):
-        """Peel ``n`` unread bytes from ``_acc`` into the stream chunk list."""
-        cdef Py_ssize_t unread
+    cdef int _seal_body_tail(self) except -1:
         cdef object chunk
-        unread = self._acc_len - self._acc_pos
-        if n <= 0 or unread <= 0:
-            return
-        if n > unread:
-            n = unread
+        if self._body_tail is None or self._tail_used == 0:
+            return 0
+        if self._tail_used == self._tail_cap:
+            chunk = self._body_tail
+        else:
+            chunk = PyBytes_FromStringAndSize(
+                PyBytes_AS_STRING(self._body_tail),
+                self._tail_used,
+            )
         if self._chunks is None:
             self._chunks = []
-        chunk = PyBytes_FromStringAndSize(self._acc + self._acc_pos, n)
         self._chunks.append(chunk)
-        self._buffered += n
-        self._acc_pos += n
-        if self._acc_pos >= self._acc_len:
-            self._acc_pos = 0
-            self._acc_len = 0
+        self._buffered += self._tail_used
+        self._body_tail = None
+        self._tail_used = 0
+        self._tail_cap = 0
+        return 0
 
-    cdef Py_ssize_t _acc_unread(self) noexcept:
-        return self._acc_len - self._acc_pos
+    cdef object _body_to_bytes(self):
+        cdef object out
+        self._seal_body_tail()
+        if self._chunks is None or not self._chunks:
+            return b""
+        if len(self._chunks) == 1:
+            out = self._chunks[0]
+        else:
+            out = b"".join(self._chunks)
+        self._chunks.clear()
+        self._buffered = 0
+        return out
 
     cdef void _raise_abort(self):
         if self._abort_reason == ABORT_TOO_LARGE:
@@ -1000,19 +1091,9 @@ cdef class RequestExchange:
         if self._abort_reason != ABORT_NONE or self._body_complete:
             return
         self._abort_reason = ABORT_TIMEOUT
-        if self._chunks is not None:
-            self._chunks.clear()
+        self._clear_body_storage()
+        self._connection.set_body_paused(self, False)
         self._wake()
-
-    cdef object _take_chunk(self, int index):
-        cdef object chunk = self._chunks[index]
-        cdef object transport
-        self._buffered -= len(chunk)
-        if self._buffered < LOW_WATER:
-            transport = self._transport
-            if transport is not None and not transport.is_closing():
-                transport.resume_reading()
-        return index + 1, chunk
 
     cdef void _maybe_continue(self):
         if self._expect_continue:
@@ -1021,41 +1102,64 @@ cdef class RequestExchange:
                 self._transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
 
     cdef void _maybe_pause(self):
-        cdef object transport
-        # Pause only for stream consumers; body() keeps one contiguous _acc.
         if self._consumed_as != CONSUMED_STREAM:
             return
-        if self._buffered + self._acc_unread() > HIGH_WATER:
-            transport = self._transport
-            if transport is not None and not transport.is_closing():
-                transport.pause_reading()
+        if self._buffered + self._tail_used > HIGH_WATER:
+            self._connection.set_body_paused(self, True)
 
     cdef void c_feed(self, const char* at, size_t length):
-        cdef Py_ssize_t max_chunk
+        cdef Py_ssize_t new_total
+        cdef Py_ssize_t offset
+        cdef Py_ssize_t available
+        cdef Py_ssize_t take
         cdef bint emitted
         if not self._body_active:
-            self.reset_body(False)
-        self._total_read += <int>length
-        if self._total_read > self._max_size:
+            self.reset_body(False, -1)
+        new_total = self._total_read + <Py_ssize_t>length
+        if new_total > self._max_size:
             self._abort_reason = ABORT_TOO_LARGE
             self._cancel_stall_timer()
+            self._clear_body_storage()
+            self._connection.set_body_paused(self, False)
             self._wake()
+            if self._discard_body and not self._transport.is_closing():
+                self._transport.close()
             return
-        self._acc_add(at, length)
         if (
             self._read_max_size >= 0
-            and self._acc_unread() > self._read_max_size
+            and new_total > self._read_max_size
         ):
             self._abort_reason = ABORT_TOO_LARGE
             self._cancel_stall_timer()
+            self._clear_body_storage()
+            self._connection.set_body_paused(self, False)
             self._wake()
+            if self._discard_body and not self._transport.is_closing():
+                self._transport.close()
             return
-        if self._consumed_as == CONSUMED_STREAM:
-            max_chunk = self._stream_max_chunk
-            emitted = False
-            while self._acc_unread() >= max_chunk:
-                self._emit_from_acc(max_chunk)
+        if self._discard_body:
+            self._total_read = new_total
+            return
+        emitted = False
+        offset = 0
+        while offset < <Py_ssize_t>length:
+            self._ensure_body_tail(self._total_read + offset)
+            available = self._tail_cap - self._tail_used
+            take = <Py_ssize_t>length - offset
+            if take > available:
+                take = available
+            memcpy(
+                PyBytes_AS_STRING(self._body_tail) + self._tail_used,
+                at + offset,
+                <size_t>take,
+            )
+            self._tail_used += take
+            offset += take
+            if self._tail_used == self._tail_cap:
+                self._seal_body_tail()
                 emitted = True
+        self._total_read = new_total
+        if self._consumed_as == CONSUMED_STREAM:
             if emitted:
                 self._wake()
             if self._waiting:
@@ -1071,22 +1175,23 @@ cdef class RequestExchange:
             return
         self._body_complete = True
         self._cancel_stall_timer()
+        if self._discard_body:
+            self._clear_body_storage()
+            self._maybe_recycle()
+            return
+        self._seal_body_tail()
         if self._consumed_as == CONSUMED_STREAM:
-            if self._acc_unread() > 0:
-                self._emit_from_acc(self._acc_unread())
             self._wake()
             self._maybe_recycle()
             return
         if self._abort_reason != ABORT_NONE:
-            self._acc_pos = 0
-            self._acc_len = 0
+            self._clear_body_storage()
             self._wake()
             self._maybe_recycle()
             return
         if self._consumed_as == CONSUMED_BODY:
             if self._cached is None:
-                self._cached = self._acc_to_bytes()
-            self._buffered = 0
+                self._cached = self._body_to_bytes()
         self._wake()
         self._maybe_recycle()
 
@@ -1097,17 +1202,18 @@ cdef class RequestExchange:
         self._abort_reason = ABORT_DISCONNECTED
         self._body_complete = True
         self._cancel_stall_timer()
+        self._clear_body_storage()
+        if self._connection is not None:
+            self._connection.set_body_paused(self, False)
         self._wake()
         self._maybe_recycle()
 
     async def _wait_for_body_data(self):
         if self._abort_reason != ABORT_NONE:
-            if self._chunks is not None:
-                self._chunks.clear()
+            self._clear_body_storage()
             self._raise_abort()
         if self.disconnected:
-            if self._chunks is not None:
-                self._chunks.clear()
+            self._clear_body_storage()
             self._abort_reason = ABORT_DISCONNECTED
             self._raise_abort()
         if self._data_ready is None:
@@ -1121,14 +1227,21 @@ cdef class RequestExchange:
             self._cancel_stall_timer()
         self._data_ready.clear()
         if self._abort_reason != ABORT_NONE:
-            if self._chunks is not None:
-                self._chunks.clear()
+            self._clear_body_storage()
             self._raise_abort()
 
     async def stream(self, max_chunk=None):
         cdef int index
         cdef object chunk
+        cdef object out
         cdef Py_ssize_t chunk_size
+        cdef Py_ssize_t offset
+        cdef Py_ssize_t remaining
+        cdef Py_ssize_t consumed
+        if self._discard_body:
+            raise StarioRuntime(
+                "Request body is no longer available after its handler finished."
+            )
         if self._abort_reason != ABORT_NONE:
             self._raise_abort()
         if self._consumed_as == CONSUMED_BODY:
@@ -1148,10 +1261,10 @@ cdef class RequestExchange:
             chunk_size = <Py_ssize_t>max_chunk
             if chunk_size <= 0:
                 raise ValueError("max_chunk must be positive")
-            if chunk_size >= HIGH_WATER:
+            if chunk_size >= STREAM_CHUNK_LIMIT:
                 raise ValueError(
                     f"max_chunk ({chunk_size}) must be lower than "
-                    f"high water mark ({HIGH_WATER})"
+                    f"stream chunk limit ({STREAM_CHUNK_LIMIT})"
                 )
         self._stream_max_chunk = chunk_size
         self._consumed_as = CONSUMED_STREAM
@@ -1159,23 +1272,37 @@ cdef class RequestExchange:
             yield self._cached
             return
         self._maybe_continue()
-        while self._acc_unread() >= chunk_size:
-            self._emit_from_acc(chunk_size)
         index = 0
+        offset = 0
         while True:
             while self._chunks is not None and index < len(self._chunks):
-                index, chunk = self._take_chunk(index)
-                yield chunk
+                chunk = self._chunks[index]
+                remaining = len(chunk) - offset
+                if remaining <= chunk_size:
+                    out = chunk if offset == 0 else chunk[offset:]
+                    consumed = remaining
+                    index += 1
+                    offset = 0
+                else:
+                    out = chunk[offset : offset + chunk_size]
+                    consumed = chunk_size
+                    offset += chunk_size
+                self._buffered -= consumed
+                if self._buffered < LOW_WATER:
+                    self._connection.set_body_paused(self, False)
+                yield out
+            if index:
+                self._chunks.clear()
+                index = 0
             if self._body_complete:
-                if self._acc_unread() > 0:
-                    self._emit_from_acc(self._acc_unread())
-                    continue
-                if self._chunks is not None:
-                    self._chunks.clear()
                 return
             await self._wait_for_body_data()
 
     async def read(self, max_size=None):
+        if self._discard_body:
+            raise StarioRuntime(
+                "Request body is no longer available after its handler finished."
+            )
         if max_size is not None and max_size < 0:
             raise ValueError("max_size must be non-negative.")
         if self._abort_reason != ABORT_NONE:
@@ -1198,17 +1325,16 @@ cdef class RequestExchange:
                 self._raise_abort()
             if (
                 self._read_max_size >= 0
-                and self._acc_unread() > self._read_max_size
+                and self._total_read > self._read_max_size
             ):
                 raise HttpException(413, "Request body too large")
             await self._wait_for_body_data()
         if self._abort_reason != ABORT_NONE:
             self._raise_abort()
         if self._cached is None:
-            self._cached = self._acc_to_bytes()
+            self._cached = self._body_to_bytes()
         if max_size is not None and len(self._cached) > max_size:
             raise HttpException(413, "Request body too large")
-        self._buffered = 0
         return self._cached
 
 

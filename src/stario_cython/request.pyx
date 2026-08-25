@@ -7,6 +7,8 @@ from stario import cookies as cookie_helpers
 from stario.exceptions import HttpException
 from stario.http.query import ParsedQuery
 
+from stario_cython.headers cimport Headers
+
 
 cdef class Request:
     def __init__(
@@ -49,13 +51,22 @@ cdef class Request:
     def host(self):
         cdef object host_str
         cdef object host
+        cdef object host_wire
         cdef object rest
         cdef object host_part
         cdef object port_part
         cdef Py_ssize_t bracket_end
         if self._host is not None:
             return self._host
-        host_str = (self.headers.get("host") or "").strip()
+        if isinstance(self.headers, Headers):
+            host_wire = (<Headers>self.headers).c_request_host()
+            host_str = (
+                host_wire.decode("latin-1").strip()
+                if host_wire is not None
+                else ""
+            )
+        else:
+            host_str = (self.headers.get("host") or "").strip()
         if not host_str:
             self._host = ""
         elif host_str.startswith("["):

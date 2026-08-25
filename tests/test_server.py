@@ -43,6 +43,43 @@ class TestContextCreateTask:
         await asyncio.sleep(0)
         assert not context.app.tasks
 
+    async def test_eager_task_completes_without_registration(self) -> None:
+        context = make_context(loop=asyncio.get_running_loop())
+        started = False
+
+        async def worker() -> int:
+            nonlocal started
+            started = True
+            return 42
+
+        task = context.app.create_task(worker(), eager_start=True)
+
+        assert started
+        assert task.done()
+        assert task.result() == 42
+        assert task not in context.app.tasks
+
+    async def test_eager_task_uses_loop_task_factory(self) -> None:
+        loop = asyncio.get_running_loop()
+        context = make_context(loop=loop)
+        calls: list[bool] = []
+        previous = loop.get_task_factory()
+
+        def factory(loop, coro, **kwargs):
+            calls.append(kwargs.get("eager_start", False))
+            return asyncio.Task(coro, loop=loop, **kwargs)
+
+        async def worker() -> int:
+            return 42
+
+        loop.set_task_factory(factory)
+        try:
+            task = context.app.create_task(worker(), eager_start=True)
+            assert task.result() == 42
+            assert calls == [True]
+        finally:
+            loop.set_task_factory(previous)
+
 
 class TestServerConstructorValidation:
     def test_header_limit_below_minimum_raises(self) -> None:
