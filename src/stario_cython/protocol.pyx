@@ -349,6 +349,9 @@ cdef class HttpProtocol:
                     if error_pos != NULL
                     else n
                 )
+                if self.pause_reasons == 0 and not self.pump_scheduled:
+                    self.pump_scheduled = True
+                    self.loop.call_soon(self._resume_held_input)
                 return
             if err != HPE_OK:
                 self._close_error(400, "Invalid HTTP request")
@@ -371,6 +374,9 @@ cdef class HttpProtocol:
                     if error_pos != NULL
                     else end
                 )
+                if self.pause_reasons == 0 and not self.pump_scheduled:
+                    self.pump_scheduled = True
+                    self.loop.call_soon(self._resume_held_input)
                 return
             if err != HPE_OK:
                 self._close_error(400, "Invalid HTTP request")
