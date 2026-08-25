@@ -81,6 +81,10 @@ cdef void _init_intern() noexcept:
 
 _init_intern()
 
+cdef object _CONNECTION_NAME = _INTERN_PY[1]
+cdef object _ACCEPT_ENCODING_NAME = _INTERN_PY[13]
+cdef object _EXPECT_NAME = _INTERN_PY[26]
+
 
 cdef inline void _lower_copy(char* dst, const char* src, size_t n) noexcept:
     cdef size_t i
@@ -91,6 +95,54 @@ cdef inline void _lower_copy(char* dst, const char* src, size_t n) noexcept:
             dst[i] = <char>(c + 32)
         else:
             dst[i] = <char>c
+
+
+cdef inline bint _token_equals(
+    const char* value,
+    size_t start,
+    size_t end,
+    const char* token,
+    size_t token_len,
+) noexcept:
+    cdef size_t i
+    cdef unsigned char c
+    if end - start != token_len:
+        return False
+    for i in range(token_len):
+        c = <unsigned char>value[start + i]
+        if 65 <= c <= 90:
+            c += 32
+        if c != <unsigned char>token[i]:
+            return False
+    return True
+
+
+cdef bint _contains_token(
+    const char* value,
+    size_t length,
+    const char* token,
+    size_t token_len,
+) noexcept:
+    cdef size_t start = 0
+    cdef size_t end
+    while start < length:
+        while start < length and (
+            value[start] == <char>32
+            or value[start] == <char>9
+            or value[start] == <char>44
+        ):
+            start += 1
+        end = start
+        while end < length and value[end] != <char>44:
+            end += 1
+        while end > start and (
+            value[end - 1] == <char>32 or value[end - 1] == <char>9
+        ):
+            end -= 1
+        if _token_equals(value, start, end, token, token_len):
+            return True
+        start = end + 1
+    return False
 
 
 cdef object _intern_name(const char* src, size_t n):
@@ -134,11 +186,31 @@ cdef object _encode_value(str value):
 cdef class Headers:
     def __init__(self, raw_header_data=None):
         self._data = raw_header_data if raw_header_data is not None else {}
+        self._request_accept_encoding = None
+        self._request_connection_close = False
+        self._request_expect_continue = False
 
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen):
         cdef object key = _intern_name(name, nlen)
         cdef object val = PyBytes_FromStringAndSize(value, <Py_ssize_t>vlen)
+        if key is _CONNECTION_NAME:
+            if _contains_token(value, vlen, "close", 5):
+                self._request_connection_close = True
+        elif key is _EXPECT_NAME:
+            if _contains_token(value, vlen, "100-continue", 12):
+                self._request_expect_continue = True
+        elif key is _ACCEPT_ENCODING_NAME and self._request_accept_encoding is None:
+            self._request_accept_encoding = val
         self.c_add(key, val)
+
+    cdef object c_request_accept_encoding(self):
+        return self._request_accept_encoding
+
+    cdef bint c_request_connection_close(self) noexcept:
+        return self._request_connection_close
+
+    cdef bint c_request_expect_continue(self) noexcept:
+        return self._request_expect_continue
 
     cdef object c_get(self, object name):
         cdef object value = self._data.get(name)
@@ -167,6 +239,9 @@ cdef class Headers:
 
     cdef void c_clear(self):
         self._data.clear()
+        self._request_accept_encoding = None
+        self._request_connection_close = False
+        self._request_expect_continue = False
 
     cdef bint c_empty(self):
         return not self._data

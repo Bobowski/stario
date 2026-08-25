@@ -1,7 +1,13 @@
 cdef class Headers:
     cdef dict _data
+    cdef object _request_accept_encoding
+    cdef bint _request_connection_close
+    cdef bint _request_expect_continue
 
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen)
+    cdef object c_request_accept_encoding(self)
+    cdef bint c_request_connection_close(self) noexcept
+    cdef bint c_request_expect_continue(self) noexcept
     cdef object c_get(self, object name)
     cdef void c_set(self, object name, object value)
     cdef void c_add(self, object name, object value)

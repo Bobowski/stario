@@ -469,16 +469,9 @@ cdef class RequestExchange:
     cdef void cache_hot_request_headers(self):
         """Snapshot keep-alive / expect / accept-encoding (Headers API unchanged)."""
         cdef Headers h = self.request_headers
-        cdef object v
-        self._req_accept_encoding = h.c_get(b"accept-encoding")
-        v = h.c_get(b"connection")
-        self._req_connection_close = (
-            v is not None and v.lower() == b"close"
-        )
-        v = h.c_get(b"expect")
-        self._req_expect_continue = (
-            v is not None and v.lower() == b"100-continue"
-        )
+        self._req_accept_encoding = h.c_request_accept_encoding()
+        self._req_connection_close = h.c_request_connection_close()
+        self._req_expect_continue = h.c_request_expect_continue()
 
     cdef void start_response(self):
         self.handler_started = True
