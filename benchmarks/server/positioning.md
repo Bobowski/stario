@@ -182,6 +182,14 @@ aiohttp is **Class B**. On this machine, production setup, we are
 (`production-peers.md`). That is not an HttpArena rank. Full
 write-up: `httparena-aiohttp.md`.
 
+## HttpArena / Litestar
+
+[Litestar](https://github.com/litestar-org/litestar) is Class B
+(uvicorn + msgspec). HttpArena composite 236, just behind aiohttp.
+On this machine it is the slowest of the three peers: **~4.3×**
+behind 1-worker Cython, **~2.8×** behind ×4. Write-up:
+`httparena-litestar.md`.
+
 ## HttpArena / Pyronova
 
 [Pyronova](https://github.com/leocaolab/pyronova) is Hyper + Tokio
