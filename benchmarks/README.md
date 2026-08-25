@@ -120,6 +120,9 @@ Pinning Go to one process with `GOMAXPROCS=1` is the right match for the
 committed one-worker baselines. Scaling Python to N processes is the right
 match for "run Go normally". Use `BENCH_PROCS` (default `nproc`) for both.
 
+Measured numbers (this machine vs `baseline-20260824.md`) live in
+`benchmarks/server/go-comparison.md`.
+
 ### Benchmark shape
 
 - One worker/process per target unless the name ends in `-n`.
