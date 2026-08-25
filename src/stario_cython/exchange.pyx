@@ -103,6 +103,92 @@ cdef inline void _require_bytes_like(object part):
         )
 
 
+cdef inline bint _range_equals_ci(
+    const char* value,
+    Py_ssize_t length,
+    const char* expected,
+    Py_ssize_t expected_length,
+) noexcept:
+    cdef Py_ssize_t i
+    cdef unsigned char c
+    if length != expected_length:
+        return False
+    for i in range(length):
+        c = <unsigned char>value[i]
+        if 65 <= c <= 90:
+            c += 32
+        if c != <unsigned char>expected[i]:
+            return False
+    return True
+
+
+cdef inline bint _range_starts_ci(
+    const char* value,
+    Py_ssize_t length,
+    const char* prefix,
+    Py_ssize_t prefix_length,
+) noexcept:
+    if length < prefix_length:
+        return False
+    return _range_equals_ci(value, prefix_length, prefix, prefix_length)
+
+
+cdef bint _content_type_is_compressible(object content_type):
+    cdef bytes raw
+    cdef const char* value
+    cdef Py_ssize_t start
+    cdef Py_ssize_t end
+    cdef Py_ssize_t i
+    if type(content_type) is not bytes:
+        return content_type_is_compressible(content_type)
+    raw = content_type
+    value = raw
+    end = len(raw)
+    for i in range(end):
+        if value[i] == <char>59:
+            end = i
+            break
+    start = 0
+    while start < end and (
+        value[start] == <char>32
+        or 9 <= <unsigned char>value[start] <= 13
+    ):
+        start += 1
+    while end > start and (
+        value[end - 1] == <char>32
+        or 9 <= <unsigned char>value[end - 1] <= 13
+    ):
+        end -= 1
+    value += start
+    end -= start
+    if end == 0:
+        return False
+    if (
+        _range_starts_ci(value, end, "image/", 6)
+        or _range_starts_ci(value, end, "audio/", 6)
+        or _range_starts_ci(value, end, "video/", 6)
+    ):
+        return False
+    if (
+        _range_equals_ci(value, end, "application/gzip", 16)
+        or _range_equals_ci(value, end, "application/x-gzip", 18)
+        or _range_equals_ci(value, end, "application/zip", 15)
+        or _range_equals_ci(value, end, "application/x-zip-compressed", 28)
+        or _range_equals_ci(value, end, "application/x-7z-compressed", 27)
+        or _range_equals_ci(value, end, "application/vnd.rar", 19)
+        or _range_equals_ci(value, end, "application/x-rar-compressed", 28)
+        or _range_equals_ci(value, end, "application/x-bzip", 18)
+        or _range_equals_ci(value, end, "application/x-bzip2", 19)
+        or _range_equals_ci(value, end, "application/x-xz", 16)
+        or _range_equals_ci(value, end, "application/zstd", 16)
+        or _range_equals_ci(value, end, "application/x-zstd", 18)
+        or _range_equals_ci(value, end, "font/woff", 9)
+        or _range_equals_ci(value, end, "font/woff2", 10)
+    ):
+        return False
+    return True
+
+
 cdef inline bint _may_have_body(int status) noexcept:
     if status == 204 or status == 304:
         return False
@@ -357,7 +443,7 @@ cdef class RequestExchange:
         if not streaming:
             if data is None or nbytes < self._compress_min_size:
                 return False
-        if content_type is not None and not content_type_is_compressible(content_type):
+        if content_type is not None and not _content_type_is_compressible(content_type):
             return False
         return True
 
