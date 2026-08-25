@@ -123,7 +123,10 @@ committed one-worker baselines. Scaling Python to N processes is the right
 match for "run Go normally". Use `BENCH_PROCS` (default `nproc`) for both.
 
 Measured numbers (this machine vs `baseline-20260824.md`) live in
-`benchmarks/server/go-comparison.md`.
+`benchmarks/server/go-comparison.md`. How to claim “fastest Python
+framework” without fighting Granian/Socketify on hello-world:
+`benchmarks/server/positioning.md`. HttpArena’s #1 Python (aiohttp)
+vs what our suite can and cannot say: `benchmarks/server/httparena-aiohttp.md`.
 
 ### Benchmark shape
 

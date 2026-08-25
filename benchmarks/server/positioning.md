@@ -149,3 +149,19 @@ fill the machine.”
 
 **Do not say:** “Faster than Go.” Say “ahead of stdlib `net/http` on
 one core and on the box; 1-core fasthttp is a different class.”
+
+## HttpArena / aiohttp
+
+[HttpArena](https://www.http-arena.com/) is the public table now that
+TechEmpower is gone. **aiohttp is #1 Python on the HTTP/1.1 composite**
+(240, gold within language). That is a complete standard-mode suite
+on a 64-core box, not a plaintext RPS crown — tuned Sanic already
+beats aiohttp on baseline/JSON and then loses the composite by
+skipping TLS/static/DB.
+
+aiohttp is **Class B** (router, `json_response`, gzip, fork +
+`SO_REUSEPORT`). It is the opponent the headline has to beat in
+public. We are **not entered**, so there is no rank and no honest
+“faster than aiohttp” line. Shared peers (FastAPI, Sanic, Robyn)
+suggest a **same-band** fight on connection/JSON, not a 2× gap.
+Full write-up: `httparena-aiohttp.md`.
