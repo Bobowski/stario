@@ -132,6 +132,7 @@ cdef class RequestExchange:
         self._acc = NULL
         self._acc_len = 0
         self._acc_cap = 0
+        self._acc_pos = 0
         self._expected_body = -1
 
     def __init__(self):
@@ -418,6 +419,7 @@ cdef class RequestExchange:
         self._data_ready = None
         self._body_fut = None
         self._acc_len = 0
+        self._acc_pos = 0
         self._body_active = False
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
         if self._chunks is not None:
@@ -734,6 +736,7 @@ cdef class RequestExchange:
         self._body_complete = False
         self._waiting = False
         self._acc_len = 0
+        self._acc_pos = 0
         self._expected_body = -1
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
@@ -743,9 +746,24 @@ cdef class RequestExchange:
         if expected_size > 0:
             self._acc_reserve(expected_size)
 
+    cdef int _acc_compact(self) except -1:
+        cdef Py_ssize_t unread
+        if self._acc_pos == 0:
+            return 0
+        unread = self._acc_len - self._acc_pos
+        if unread == 0:
+            self._acc_pos = 0
+            self._acc_len = 0
+            return 0
+        memmove(self._acc, self._acc + self._acc_pos, <size_t>unread)
+        self._acc_len = unread
+        self._acc_pos = 0
+        return 0
+
     cdef int _acc_reserve(self, Py_ssize_t need) except -1:
         cdef Py_ssize_t next_cap
         cdef char* p
+        # ``need`` is the absolute write-end offset (_acc_len after the next append).
         if need <= self._acc_cap:
             return 0
         next_cap = 64 if self._acc_cap == 0 else self._acc_cap * 2
@@ -759,7 +777,13 @@ cdef class RequestExchange:
         return 0
 
     cdef int _acc_add(self, const char* at, size_t length) except -1:
-        cdef Py_ssize_t need = self._acc_len + <Py_ssize_t>length
+        cdef Py_ssize_t need
+        if (
+            self._acc_pos > 0
+            and self._acc_len + <Py_ssize_t>length > self._acc_cap
+        ):
+            self._acc_compact()
+        need = self._acc_len + <Py_ssize_t>length
         self._acc_reserve(need)
         memcpy(self._acc + self._acc_len, at, length)
         self._acc_len = need
@@ -767,29 +791,37 @@ cdef class RequestExchange:
 
     cdef object _acc_to_bytes(self):
         cdef object out
-        if self._acc_len == 0:
+        cdef Py_ssize_t unread = self._acc_len - self._acc_pos
+        if unread <= 0:
+            self._acc_pos = 0
+            self._acc_len = 0
             return b""
-        out = PyBytes_FromStringAndSize(self._acc, self._acc_len)
+        out = PyBytes_FromStringAndSize(self._acc + self._acc_pos, unread)
+        self._acc_pos = 0
         self._acc_len = 0
         return out
 
     cdef void _emit_from_acc(self, Py_ssize_t n):
-        """Peel ``n`` bytes from the front of ``_acc`` into the stream chunk list."""
-        cdef Py_ssize_t rest
+        """Peel ``n`` unread bytes from ``_acc`` into the stream chunk list (no slide)."""
+        cdef Py_ssize_t unread
         cdef object chunk
-        if n <= 0 or self._acc_len == 0:
+        unread = self._acc_len - self._acc_pos
+        if n <= 0 or unread <= 0:
             return
-        if n > self._acc_len:
-            n = self._acc_len
+        if n > unread:
+            n = unread
         if self._chunks is None:
             self._chunks = []
-        chunk = PyBytes_FromStringAndSize(self._acc, n)
+        chunk = PyBytes_FromStringAndSize(self._acc + self._acc_pos, n)
         self._chunks.append(chunk)
         self._buffered += n
-        rest = self._acc_len - n
-        if rest > 0:
-            memmove(self._acc, self._acc + n, <size_t>rest)
-        self._acc_len = rest
+        self._acc_pos += n
+        if self._acc_pos >= self._acc_len:
+            self._acc_pos = 0
+            self._acc_len = 0
+
+    cdef Py_ssize_t _acc_unread(self) noexcept:
+        return self._acc_len - self._acc_pos
 
     cdef void _raise_abort(self):
         if self._abort_reason == ABORT_TOO_LARGE:
@@ -834,7 +866,7 @@ cdef class RequestExchange:
         # contiguous _acc up to max_body_bytes / Content-Length.
         if self._consumed_as != CONSUMED_STREAM:
             return
-        if self._buffered + self._acc_len > HIGH_WATER:
+        if self._buffered + self._acc_unread() > HIGH_WATER:
             transport = self._transport
             if transport is not None and not transport.is_closing():
                 transport.pause_reading()
@@ -854,7 +886,7 @@ cdef class RequestExchange:
         self._acc_add(at, length)
         if self._consumed_as == CONSUMED_STREAM:
             max_chunk = self._stream_max_chunk
-            while self._acc_len >= max_chunk:
+            while self._acc_unread() >= max_chunk:
                 self._emit_from_acc(max_chunk)
                 self._wake()
             self._maybe_pause()
@@ -867,12 +899,13 @@ cdef class RequestExchange:
             return
         self._body_complete = True
         if self._consumed_as == CONSUMED_STREAM:
-            if self._acc_len > 0:
-                self._emit_from_acc(self._acc_len)
+            if self._acc_unread() > 0:
+                self._emit_from_acc(self._acc_unread())
             self._wake()
             self._maybe_recycle()
             return
         if self._abort_reason != ABORT_NONE:
+            self._acc_pos = 0
             self._acc_len = 0
             self._resolve_body_fut(None)
             self._wake()
@@ -958,7 +991,7 @@ cdef class RequestExchange:
             return
         self._maybe_continue()
         # Emit any already-buffered full batches; leave a partial in _acc.
-        while self._acc_len >= chunk_size:
+        while self._acc_unread() >= chunk_size:
             self._emit_from_acc(chunk_size)
         index = 0
         while True:
@@ -966,8 +999,8 @@ cdef class RequestExchange:
                 index, chunk = self._take_chunk(index)
                 yield chunk
             if self._body_complete:
-                if self._acc_len > 0:
-                    self._emit_from_acc(self._acc_len)
+                if self._acc_unread() > 0:
+                    self._emit_from_acc(self._acc_unread())
                     continue
                 if self._chunks is not None:
                     self._chunks.clear()
@@ -1007,7 +1040,7 @@ cdef class RequestExchange:
             while not fut.done():
                 if self._abort_reason != ABORT_NONE:
                     self._raise_abort()
-                if max_size is not None and self._acc_len > max_size:
+                if max_size is not None and self._acc_unread() > max_size:
                     raise HttpException(413, "Request body too large")
                 await self._wait_for_body_data()
             if self._abort_reason != ABORT_NONE:

@@ -50,6 +50,7 @@ cdef class RequestExchange:
     cdef char* _acc
     cdef Py_ssize_t _acc_len
     cdef Py_ssize_t _acc_cap
+    cdef Py_ssize_t _acc_pos
     cdef Py_ssize_t _expected_body
     cdef Py_ssize_t _stream_max_chunk
 
@@ -75,6 +76,8 @@ cdef class RequestExchange:
     cdef void c_abort(self)
     cdef int _acc_add(self, const char* at, size_t length) except -1
     cdef int _acc_reserve(self, Py_ssize_t need) except -1
+    cdef int _acc_compact(self) except -1
+    cdef Py_ssize_t _acc_unread(self) noexcept
     cdef object _acc_to_bytes(self)
     cdef void _emit_from_acc(self, Py_ssize_t n)
     cdef void reset_response(self, object accept_encoding)
