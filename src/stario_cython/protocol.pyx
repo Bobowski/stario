@@ -17,6 +17,10 @@ from stario_cython.llhttp cimport *
 from stario_cython.request cimport Request
 
 cdef int F_CONTENT_LENGTH = 0x20
+cdef int PAUSE_WRITE = 1
+cdef int PAUSE_PIPELINE = 2
+cdef int PAUSE_BODY = 4
+cdef int PARSER_QUANTUM = 64 * 1024
 # Handlers always start at headers-complete. Body bytes accumulate on the exchange;
 # body() awaits one completion Event, stream() drains with backpressure.
 
@@ -190,6 +194,11 @@ cdef class HttpProtocol:
     cdef bint rejected
     cdef bint request_dispatched
     cdef bint request_keep_alive
+    cdef int pause_reasons
+    cdef object body_pause_owner
+    cdef object held_data
+    cdef Py_ssize_t held_offset
+    cdef bint pump_scheduled
 
     def __cinit__(self):
         _bind_settings()
@@ -212,6 +221,11 @@ cdef class HttpProtocol:
         self.reading_exchange = None
         self.active_exchange = None
         self.idle_exchange = None
+        self.pause_reasons = 0
+        self.body_pause_owner = None
+        self.held_data = None
+        self.held_offset = 0
+        self.pump_scheduled = False
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -262,6 +276,11 @@ cdef class HttpProtocol:
         self.transport = transport
         self.closed = False
         self.disconnect = None
+        self.pause_reasons = 0
+        self.body_pause_owner = None
+        self.held_data = None
+        self.held_offset = 0
+        self.pump_scheduled = False
         self.connections.add(self)
 
     def ensure_disconnect(self):
@@ -292,6 +311,11 @@ cdef class HttpProtocol:
             self.active_exchange.c_abort()
         if self.disconnect is not None and not self.disconnect.done():
             self.disconnect.set_result(None)
+        self.pause_reasons = 0
+        self.body_pause_owner = None
+        self.held_data = None
+        self.held_offset = 0
+        self.pump_scheduled = False
         self.transport = None
 
     def recycle_exchange(self, RequestExchange exchange):
@@ -305,26 +329,97 @@ cdef class HttpProtocol:
         return False
 
     def data_received(self, data):
+        if self.rejected or self.parser == NULL or not data:
+            return
+        if self.held_data is not None:
+            self.held_data = self.held_data[self.held_offset :] + data
+            self.held_offset = 0
+            return
+        if self.pause_reasons:
+            self.held_data = data
+            self.held_offset = 0
+            return
+        self._pump_data(data, 0)
+
+    cdef void _pump_data(self, object data, Py_ssize_t offset):
         cdef const char* ptr
         cdef Py_ssize_t n
+        cdef Py_ssize_t end
         cdef int err
-        if self.rejected or self.parser == NULL:
-            return
         n = len(data)
-        if n == 0:
-            return
         ptr = <const char*>data
-        err = llhttp_execute(self.parser, ptr, <size_t>n)
-        if err != HPE_OK:
-            self._close_error(400, "Invalid HTTP request")
+        while offset < n:
+            end = offset + PARSER_QUANTUM
+            if end > n:
+                end = n
+            err = llhttp_execute(
+                self.parser,
+                ptr + offset,
+                <size_t>(end - offset),
+            )
+            if err != HPE_OK:
+                self._close_error(400, "Invalid HTTP request")
+                return
+            offset = end
+            if self.pause_reasons:
+                if offset < n:
+                    self.held_data = data
+                    self.held_offset = offset
+                return
+
+    cdef void _set_pause_reason(self, int reason, bint paused):
+        cdef int previous = self.pause_reasons
+        cdef object transport = self.transport
+        if paused:
+            self.pause_reasons |= reason
+        else:
+            self.pause_reasons &= ~reason
+        if previous == self.pause_reasons:
+            return
+        if previous == 0:
+            if transport is not None and not transport.is_closing():
+                transport.pause_reading()
+            return
+        if self.pause_reasons != 0:
+            return
+        if self.held_data is not None:
+            if not self.pump_scheduled:
+                self.pump_scheduled = True
+                self.loop.call_soon(self._resume_held_input)
+            return
+        if transport is not None and not transport.is_closing():
+            transport.resume_reading()
+
+    def _resume_held_input(self):
+        cdef object data
+        cdef Py_ssize_t offset
+        cdef object transport
+        self.pump_scheduled = False
+        if self.pause_reasons or self.held_data is None:
+            return
+        data = self.held_data
+        offset = self.held_offset
+        self.held_data = None
+        self.held_offset = 0
+        self._pump_data(data, offset)
+        if self.pause_reasons == 0 and self.held_data is None:
+            transport = self.transport
+            if transport is not None and not transport.is_closing():
+                transport.resume_reading()
+
+    def set_body_paused(self, exchange, paused):
+        if paused:
+            self.body_pause_owner = exchange
+            self._set_pause_reason(PAUSE_BODY, True)
+        elif self.body_pause_owner is exchange:
+            self.body_pause_owner = None
+            self._set_pause_reason(PAUSE_BODY, False)
 
     def pause_writing(self):
-        if self.transport is not None and not self.transport.is_closing():
-            self.transport.pause_reading()
+        self._set_pause_reason(PAUSE_WRITE, True)
 
     def resume_writing(self):
-        if self.transport is not None and not self.transport.is_closing():
-            self.transport.resume_reading()
+        self._set_pause_reason(PAUSE_WRITE, False)
 
     cdef int _append(self, char** buf, Py_ssize_t* length, Py_ssize_t* cap, const char* at, size_t n):
         if _grow(buf, cap, length[0] + <Py_ssize_t>n) != 0:
@@ -515,8 +610,7 @@ cdef class HttpProtocol:
             self._start_exchange(exchange, True)
         else:
             self.pending_exchanges.append(exchange)
-            if self.transport is not None:
-                self.transport.pause_reading()
+            self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
         self.active_exchange = exchange
@@ -569,8 +663,10 @@ cdef class HttpProtocol:
         if self.pending_exchanges:
             next_exchange = self.pending_exchanges.pop(0)
             self._start_exchange(next_exchange, False)
+            if not self.pending_exchanges:
+                self._set_pause_reason(PAUSE_PIPELINE, False)
             return
-        transport.resume_reading()
+        self._set_pause_reason(PAUSE_PIPELINE, False)
 
     cdef void _close_error(self, int status, object message):
         cdef object transport

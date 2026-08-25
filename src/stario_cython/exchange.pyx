@@ -1048,6 +1048,7 @@ cdef class RequestExchange:
             return
         self._abort_reason = ABORT_TIMEOUT
         self._clear_body_storage()
+        self._connection.set_body_paused(self, False)
         self._wake()
 
     cdef void _maybe_continue(self):
@@ -1057,13 +1058,10 @@ cdef class RequestExchange:
                 self._transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
 
     cdef void _maybe_pause(self):
-        cdef object transport
         if self._consumed_as != CONSUMED_STREAM:
             return
         if self._buffered + self._tail_used > HIGH_WATER:
-            transport = self._transport
-            if transport is not None and not transport.is_closing():
-                transport.pause_reading()
+            self._connection.set_body_paused(self, True)
 
     cdef void c_feed(self, const char* at, size_t length):
         cdef Py_ssize_t new_total
@@ -1078,6 +1076,7 @@ cdef class RequestExchange:
             self._abort_reason = ABORT_TOO_LARGE
             self._cancel_stall_timer()
             self._clear_body_storage()
+            self._connection.set_body_paused(self, False)
             self._wake()
             return
         if (
@@ -1087,6 +1086,7 @@ cdef class RequestExchange:
             self._abort_reason = ABORT_TOO_LARGE
             self._cancel_stall_timer()
             self._clear_body_storage()
+            self._connection.set_body_paused(self, False)
             self._wake()
             return
         emitted = False
@@ -1148,6 +1148,8 @@ cdef class RequestExchange:
         self._body_complete = True
         self._cancel_stall_timer()
         self._clear_body_storage()
+        if self._connection is not None:
+            self._connection.set_body_paused(self, False)
         self._wake()
         self._maybe_recycle()
 
@@ -1181,7 +1183,6 @@ cdef class RequestExchange:
         cdef Py_ssize_t offset
         cdef Py_ssize_t remaining
         cdef Py_ssize_t consumed
-        cdef object transport
         if self._abort_reason != ABORT_NONE:
             self._raise_abort()
         if self._consumed_as == CONSUMED_BODY:
@@ -1229,9 +1230,7 @@ cdef class RequestExchange:
                     offset += chunk_size
                 self._buffered -= consumed
                 if self._buffered < LOW_WATER:
-                    transport = self._transport
-                    if transport is not None and not transport.is_closing():
-                        transport.resume_reading()
+                    self._connection.set_body_paused(self, False)
                 yield out
             if index:
                 self._chunks.clear()
