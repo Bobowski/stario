@@ -148,6 +148,58 @@ async def test_exchange_respond_native_compression_round_trip(
             await writer.wait_closed()
 
 
+@pytest.mark.parametrize(
+    ("accept_encoding", "expected"),
+    [
+        (b"gzip;q=1, br;q=0.5", b"gzip"),
+        (b"gzip;q=0.5, br;q=0.5", b"br"),
+        (b"BR;Q=1", b"br"),
+        (b"*;q=0.8, identity;q=1", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_compression_qvalue_negotiation(
+    accept_encoding: bytes,
+    expected: bytes | None,
+) -> None:
+    app = App()
+    body = b"compression negotiation " * 32
+
+    async def compressed(_c, w):
+        w.respond(body, b"text/plain")
+
+    app.get("/", compressed)
+    async with _running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            min_size=0,
+            brotli_level=4,
+            zstd_level=-1,
+            gzip_level=6,
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: "
+                + accept_encoding
+                + b"\r\nConnection: keep-alive, CLOSE\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await _read_response(reader)
+            header = payload.split(b"\r\n\r\n", 1)[0] + b"\r\n"
+            if expected is None:
+                assert b"content-encoding:" not in header
+            else:
+                assert b"content-encoding: " + expected + b"\r\n" in header
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_exchange_sse_gzip_flushes_each_write() -> None:
     app = App()
