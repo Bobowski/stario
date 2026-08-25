@@ -153,9 +153,11 @@ framework we have measured: **~2×** BlackSheep/Uvicorn and Stario
 Python, **~2.3×** Sanic, **~2.5×** FastAPI, **~4×** Robyn and
 Django-Bolt, on the same routes and honest handlers.
 
-**Class A:** Native servers without a framework (Granian, Socketify)
-match us on hello-world. We stay with them on JSON/params and move
-ahead on body work; with several processes we out-scale Granian.
+**Class A:** Native servers without a Python HTTP engine (Granian,
+Socketify, **Pyronova**) match or beat us on hello-world. We stay
+with Granian/Socketify on JSON/params and move ahead on body work;
+with several processes we out-scale Granian. Pyronova has no
+same-machine row — treat it as the fast Robyn, not as FastAPI.
 
 **Do not say:** “Faster than Granian.” Say “faster than every Python
 framework; 1–1 with thin native servers; faster than Granian when you
@@ -182,3 +184,12 @@ public. We are **not entered**, so there is no rank and no honest
 “faster than aiohttp” line. Shared peers (FastAPI, Sanic, Robyn)
 suggest a **same-band** fight on connection/JSON, not a 2× gap.
 Full write-up: `httparena-aiohttp.md`.
+
+## HttpArena / Pyronova
+
+[Pyronova](https://github.com/leocaolab/pyronova) is Hyper + Tokio
+with PEP 684 sub-interpreters. HttpArena: **experimental + tuned**,
+composite 431, baseline **826k** (~1.4× aiohttp). JSON 723k is a
+per-worker byte cache; `/pipeline` is a Rust fast-path. Self-published
+429k GET `/` is 16 workers on 8C/16T. Class A, not the 2× table.
+Full write-up: `httparena-pyronova.md`.
