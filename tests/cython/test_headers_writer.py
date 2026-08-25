@@ -344,6 +344,29 @@ async def test_respond_accepts_list_of_bytes_parts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_respond_accepts_tuple_of_bytes_parts() -> None:
+    app = App()
+
+    async def multi(_c, w):
+        w.respond((b"tup", b"le"), b"text/plain; charset=utf-8")
+
+    app.get("/", multi)
+    async with _running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await _read_response(reader)
+            assert b"content-length: 5\r\n" in payload
+            assert payload.endswith(b"tuple")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_write_known_length_accepts_list_of_bytes_parts() -> None:
     app = App()
 
