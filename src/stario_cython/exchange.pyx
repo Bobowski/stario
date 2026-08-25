@@ -43,8 +43,9 @@ from stario_cython.headers cimport Headers
 from stario_cython.request cimport Request
 
 # Stream backpressure window. max_chunk must be strictly below HIGH_WATER.
-cdef int LOW_WATER = 64 * 1024
-cdef int HIGH_WATER = 256 * 1024
+cdef int LOW_WATER = 128 * 1024
+cdef int HIGH_WATER = 512 * 1024
+cdef int MAX_STREAM_CHUNK = 256 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
 
@@ -1112,10 +1113,10 @@ cdef class RequestExchange:
             chunk_size = <Py_ssize_t>max_chunk
             if chunk_size <= 0:
                 raise ValueError("max_chunk must be positive")
-            if chunk_size >= HIGH_WATER:
+            if chunk_size >= MAX_STREAM_CHUNK:
                 raise ValueError(
                     f"max_chunk ({chunk_size}) must be lower than "
-                    f"high water mark ({HIGH_WATER})"
+                    f"high water mark ({MAX_STREAM_CHUNK})"
                 )
         self._stream_max_chunk = chunk_size
         self._consumed_as = CONSUMED_STREAM
