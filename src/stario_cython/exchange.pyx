@@ -569,24 +569,32 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
-        # Empty custom headers + no compression: one _out_buf assemble + flush.
-        # Body parts are copied into the write buffer (no b"".join of the entity).
+        # Empty custom headers + no compression: writelines of existing buffers.
+        # Avoids (a) b"".join copying the entity and (b) _out_buf/memoryview churn
+        # that regressed tiny plaintext/json vs the old join path.
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False)
         ):
-            self._buf_bytes(_status_line(status))
-            self._buf_bytes(self._date_box[0])
             if not _may_have_body(status):
-                self._buf_bytes(ZERO_CL)
+                self._transport.writelines(
+                    (_status_line(status), self._date_box[0], ZERO_CL)
+                )
             else:
-                self._buf_bytes(CT_PREFIX)
-                self._buf_bytes(content_type)
-                self._buf_bytes(CL_PREFIX)
-                self._buf_uint(<size_t>nbytes, 10)
-                self._buf_bytes(CRLF2)
-                self._buf_body(body)
-            self._flush()
+                flat = [
+                    _status_line(status),
+                    self._date_box[0],
+                    CT_PREFIX,
+                    content_type,
+                    CL_PREFIX,
+                    _dec(<size_t>nbytes),
+                    CRLF2,
+                ]
+                if isinstance(body, (list, tuple)):
+                    flat.extend(body)
+                else:
+                    flat.append(body)
+                self._transport.writelines(flat)
         else:
             if not _may_have_body(status):
                 body = b""
@@ -623,7 +631,7 @@ cdef class RequestExchange:
             h.c_set(b"content-length", _dec(<size_t>nbytes))
             self._declared_length = nbytes
             self._bytes_written = 0
-            # Headers + body in one flush (one-shot respond).
+            # Custom headers: one _out_buf assemble + flush (headers + body parts).
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:
