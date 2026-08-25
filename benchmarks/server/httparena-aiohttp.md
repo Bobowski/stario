@@ -39,6 +39,12 @@ The Python HTTP/1.1 board (Alpha Round):
 | robyn | 59 | incomplete; pipelined looks broken (~16M) |
 | django | 44 | |
 
+**Not on this gold-medal table:** [Pyronova](https://www.http-arena.com/frameworks/pyronova/)
+is **experimental + tuned**, composite **431**, baseline **826k**.
+HttpArena ranks that league apart so it does not take aiohttp’s
+flagship gold. JSON 723k is a per-worker byte cache in their Arena
+app. Write-up: `httparena-pyronova.md`.
+
 Sanic’s own server + ujson + httptools **beats aiohttp on raw
 connection and JSON**, then drops the composite because it skipped
 TLS, static, DB, CRUD, and the API-4/API-16 cliffs:

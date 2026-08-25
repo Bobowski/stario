@@ -18,9 +18,16 @@ two classes, then only fight the class that ships the same product.
 - **Socketify** — uWebSockets + a micro `app.get` / `:param` table. No
   host routing, no middleware tree, no HTML/SSE stack. Hello-world is a
   C++ server with a Python callback.
+- **Pyronova** — Hyper + Tokio + PEP 684 sub-interpreters. Real
+  decorator router, WS/H2/SSE, completeness 4/4. The HTTP engine is
+  still Rust. HttpArena marks the entry **experimental + tuned**
+  (cached JSON bytes, Rust `add_fast_response` for `/pipeline`).
+  Details: `httparena-pyronova.md`.
 
 Socketify *has* path params. Treat it as Class A anyway: it is a native
 server with a route table, not a framework you would build a product in.
+Pyronova has more framework than Socketify; it still does not belong
+in the Class B 2× table.
 
 **Class B** — this is the claim:
 
@@ -76,6 +83,13 @@ this table.
   That is allowed. On 64KB we already tie (~30.8k). At **4 processes**
   (`STARIO_REUSE_PORT` vs `--workers`) Cython is **294k vs 224k**
   plaintext and **252k vs 144k** validate — we win the box.
+- **Pyronova:** no same-machine row. HttpArena baseline (honest sum of
+  query ints) is **826k vs aiohttp 591k** on the 64-core box — ~1.4×,
+  Rust accept. Their JSON 723k is a per-worker byte cache; ignore it.
+  Self-published **429k** GET `/` is 16 workers on 8C/16T, not 1-worker;
+  nearest published Cython is **294k ×4 on 4 vCPU**. Per-core, same
+  band; fill-the-box Rust, they should lead. Do not put 429k next to
+  120k.
 
 BlackSheep + Granian (112k plaintext) is **not** a Class B counterexample.
 Take Granian away (BlackSheep + Uvicorn = 59k) and it falls into the 2×
@@ -149,6 +163,9 @@ fill the machine.”
 
 **Do not say:** “Faster than Go.” Say “ahead of stdlib `net/http` on
 one core and on the box; 1-core fasthttp is a different class.”
+
+**Do not say:** “Faster than Pyronova.” Say “Rust HTTP engine, Python
+handlers; experimental+tuned on HttpArena; no same-machine number.”
 
 ## HttpArena / aiohttp
 
