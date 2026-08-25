@@ -865,7 +865,13 @@ cdef class RequestExchange:
         if self._body_tail is not None:
             return 0
         cap = self._stream_max_chunk
-        if self._consumed_as != CONSUMED_STREAM:
+        if (
+            self._consumed_as == CONSUMED_BODY
+            and self._expected_size > 0
+            and received_before == 0
+        ):
+            cap = self._expected_size
+        elif self._consumed_as != CONSUMED_STREAM:
             cap = DEFAULT_STREAM_CHUNK
         if self._expected_size >= 0:
             remaining = self._expected_size - received_before
