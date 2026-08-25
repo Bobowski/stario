@@ -224,6 +224,59 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_abandoned_stream_discards_remainder_and_advances_pipeline() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def partial(c, w):
+        async for _ in c.req.stream():
+            break
+        responses.text(w, "partial")
+
+    async def next_request(_c, w):
+        responses.text(w, "next")
+
+    app.post("/partial", partial)
+    app.get("/next", next_request)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"x" * (2 * 1024 * 1024)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /partial HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+            + b"GET /next HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"partial" in await _read_response(reader)
+        assert b"next" in await _read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_small_expect_continue_is_sent_before_body() -> None:
     loop = asyncio.get_running_loop()
     app = App()

@@ -200,6 +200,52 @@ async def test_native_compression_qvalue_negotiation(
             await writer.wait_closed()
 
 
+@pytest.mark.parametrize(
+    ("content_type", "compressed"),
+    [
+        (b" Text/Plain ; charset=utf-8", True),
+        (b"IMAGE/PNG; charset=binary", False),
+        (b"application/zip", False),
+        (b"; charset=utf-8", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_content_type_compression_check(
+    content_type: bytes,
+    compressed: bool,
+) -> None:
+    app = App()
+
+    async def respond(_c, w):
+        w.respond(b"x" * 1024, content_type)
+
+    app.get("/", respond)
+    async with _running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            min_size=0,
+            brotli_level=-1,
+            zstd_level=-1,
+            gzip_level=6,
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: gzip\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            header = (await _read_response(reader)).split(b"\r\n\r\n", 1)[0]
+            assert (b"content-encoding: gzip\r\n" in header + b"\r\n") is compressed
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_exchange_sse_gzip_flushes_each_write() -> None:
     app = App()
