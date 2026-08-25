@@ -6,6 +6,12 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- `STARIO_REUSE_PORT` — TCP `SO_REUSEPORT` so several Stario processes can
+  share one listen port. Off by default. Set `1` and start multiple
+  `stario serve` (or `python -m stario_cython`) processes on the same host/port.
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

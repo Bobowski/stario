@@ -417,3 +417,57 @@ def test_unix_socket_cleanup_only_unlinks_owned_socket() -> None:
             replacement.close()
             if os.path.exists(path):
                 os.unlink(path)
+
+
+async def test_reuse_port_lets_two_servers_share_a_tcp_port() -> None:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    apps: list[App] = []
+
+    async def serve_bootstrap(app: App, span: Any):
+        apps.append(app)
+
+        async def hello(c, w):
+            responses.text(w, "shared")
+
+        app.get("/plaintext", hello)
+        yield
+
+    def make() -> Server:
+        return Server(
+            serve_bootstrap,
+            JsonTracer(StringIO()),
+            config=ServerConfig(
+                host="127.0.0.1",
+                port=port,
+                reuse_port=True,
+                graceful_shutdown_timeout=0.3,
+            ),
+        )
+
+    tasks = [asyncio.create_task(_serve(make())), asyncio.create_task(_serve(make()))]
+    try:
+        async with asyncio.timeout(2.0):
+            while True:
+                try:
+                    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                    break
+                except OSError:
+                    await asyncio.sleep(0.01)
+        writer.write(b"GET /plaintext HTTP/1.1\r\nHost: t\r\n\r\n")
+        await writer.drain()
+        status, body = await _read_http_response(reader)
+        writer.close()
+        assert status == 200
+        assert body == b"shared"
+        assert len(apps) == 2
+    finally:
+        for app in apps:
+            drain = app.shutdown
+            if drain is not None and not drain.done():
+                drain.set_result(None)
+        async with asyncio.timeout(2.0):
+            await asyncio.gather(*tasks)

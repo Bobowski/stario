@@ -13,6 +13,7 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     monkeypatch.setenv("STARIO_UNIX_SOCKET", "/tmp/stario.sock")
     monkeypatch.setenv("STARIO_GRACEFUL_SHUTDOWN_TIMEOUT", "12.5")
     monkeypatch.setenv("STARIO_REUSE_ADDR", "0")
+    monkeypatch.setenv("STARIO_REUSE_PORT", "1")
 
     config = server_config_from_env()
     assert config.host == "0.0.0.0"
@@ -21,6 +22,7 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     assert config.unix_socket == "/tmp/stario.sock"
     assert config.graceful_shutdown_timeout == 12.5
     assert config.reuse_addr is False
+    assert config.reuse_port is True
 
 
 @pytest.mark.parametrize(
@@ -35,6 +37,7 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
             "header_timeout must be greater than 0",
         ),
         ("STARIO_REUSE_ADDR", "maybe", "STARIO_REUSE_ADDR"),
+        ("STARIO_REUSE_PORT", "maybe", "STARIO_REUSE_PORT"),
     ],
 )
 def test_invalid_server_env_raises(monkeypatch, env_name, value, fragment) -> None:

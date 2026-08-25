@@ -66,6 +66,8 @@ server cannot be reused by accident.
 | --- | --- |
 | `stario` | Python httptools protocol |
 | `stario-cython` | Cython llhttp protocol (`cython-core`) |
+| `stario-n` | `$BENCH_PROCS` Python processes, `STARIO_REUSE_PORT=1` |
+| `stario-cython-n` | `$BENCH_PROCS` Cython processes, `STARIO_REUSE_PORT=1` |
 
 **Go (same routes as `apps/stario_app.py`)**
 
@@ -114,7 +116,7 @@ and call it a language result — that is cores vs one core. Two fair setups:
 | Question | Go | Python / Cython / Granian |
 | --- | --- | --- |
 | How fast is the code path? | `go-nethttp` or `go-fasthttp` (`GOMAXPROCS=1`) | existing 1-worker rows |
-| How much can this box do? | `go-nethttp-n` (one process, all cores) | `granian-rsgi-n` (N workers). Stario is still 1 process. |
+| How much can this box do? | `go-nethttp-n` (one process, all cores) | `stario-n` / `stario-cython-n` (N processes, `STARIO_REUSE_PORT=1`) or `granian-rsgi-n` |
 
 Pinning Go to one process with `GOMAXPROCS=1` is the right match for the
 committed one-worker baselines. Scaling Python to N processes is the right
@@ -236,7 +238,7 @@ The default run benchmarks every target above.
 - `RUNS=7` measured samples per endpoint (plus `WARMUP=2` discarded warmup runs)
 - `ENDPOINT_TIER=all|read|upload` (default `all`)
 - `PORT=3000` as the base port
-- one process or worker per target (`go-nethttp-n` / `granian-rsgi-n` use `BENCH_PROCS`)
+- one process or worker per target (`*-n` uses `BENCH_PROCS`; Stario `-n` shares the listen socket with `STARIO_REUSE_PORT=1`)
 
 Use those defaults when you want numbers that are easiest to compare with
 other local runs. The generated `config.txt` records the exact settings for

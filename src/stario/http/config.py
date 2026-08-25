@@ -32,6 +32,7 @@ DEFAULT_UNIX_SOCKET_MODE = 0o660
 DEFAULT_HEADER_TIMEOUT = 5.0
 DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
 DEFAULT_REUSE_ADDR = True
+DEFAULT_REUSE_PORT = False
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
 DEFAULT_EVENT_LOOP = "asyncio"
 
@@ -130,8 +131,8 @@ def request_policy_from_env() -> RequestPolicy:
 class ServerConfig:
     """Listen address, transport policy, request policy, compression, and shutdown.
 
-    When `unix_socket` is set, `host`, `port`, and `reuse_addr` are ignored; only
-    `backlog` and `unix_socket_mode` apply to the Unix listener.
+    When `unix_socket` is set, `host`, `port`, `reuse_addr`, and `reuse_port`
+    are ignored; only `backlog` and `unix_socket_mode` apply to the Unix listener.
 
     Nested `requests` and `compression` objects are stored by reference; treat
     as immutable after construction.
@@ -151,6 +152,7 @@ class ServerConfig:
         "port",
         "requests",
         "reuse_addr",
+        "reuse_port",
         "unix_socket",
         "unix_socket_mode",
     )
@@ -167,6 +169,7 @@ class ServerConfig:
         graceful_shutdown_timeout: float = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
         backlog: int = DEFAULT_BACKLOG,
         reuse_addr: bool = DEFAULT_REUSE_ADDR,
+        reuse_port: bool = DEFAULT_REUSE_PORT,
         event_loop: EventLoopKind = DEFAULT_EVENT_LOOP,
     ) -> None:
         if not 1 <= port <= 65535:
@@ -216,6 +219,7 @@ class ServerConfig:
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
         self.backlog = backlog
         self.reuse_addr = reuse_addr
+        self.reuse_port = reuse_port
         self.event_loop: EventLoopKind = event_loop
 
 
@@ -246,6 +250,7 @@ def server_config_from_env() -> ServerConfig:
             ),
             backlog=env_int("STARIO_BACKLOG", DEFAULT_BACKLOG),
             reuse_addr=env_bool("STARIO_REUSE_ADDR", DEFAULT_REUSE_ADDR),
+            reuse_port=env_bool("STARIO_REUSE_PORT", DEFAULT_REUSE_PORT),
             event_loop=_event_loop_from_env(),
         )
     )

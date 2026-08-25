@@ -127,9 +127,9 @@ the language comparison; this table is the deploy comparison.
 
 - Keep the default suite at **1 worker / `GOMAXPROCS=1`** so new Go rows stay
   comparable to `baseline-20260824.md`.
-- Use `go-nethttp-n` + `granian-rsgi-n` when you want hardware-saturation
-  numbers. Stario would need a process supervisor (or `SO_REUSEPORT` workers)
-  before it can join that row.
+- Use `go-nethttp-n` + `stario-n` / `stario-cython-n` + `granian-rsgi-n` when
+  you want hardware-saturation numbers. Stario `-n` starts N processes on one
+  port with `STARIO_REUSE_PORT=1` (`SO_REUSEPORT`).
 - Prefer **fasthttp** as the “how fast is a Go HTTP stack” target. Prefer
   **net/http** as the “idiomatic Go stdlib” target. They are different
   questions; both apps implement the same routes.

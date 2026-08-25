@@ -11,6 +11,7 @@ from email.utils import format_datetime
 
 import uvloop
 
+from stario._env import env_bool
 from stario.http.app import App
 from stario.http.bootstrap import Bootstrap, bootstrap_run
 from stario.http.compression import compression_config_from_env
@@ -67,6 +68,7 @@ async def serve(
             port,
             backlog=backlog,
             reuse_address=True,
+            reuse_port=env_bool("STARIO_REUSE_PORT", False),
         )
         span.attr("server.listening", True)
         span.attr("server.http_core", "cython")

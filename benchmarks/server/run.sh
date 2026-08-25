@@ -19,7 +19,7 @@ WRK="${WRK:-wrk}"
 BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
 BENCH_PROCS="${BENCH_PROCS:-$(nproc 2>/dev/null || echo 4)}"
 TARGETS=(
-  stario stario-cython
+  stario stario-cython stario-n stario-cython-n
   go-nethttp go-nethttp-n go-fasthttp
   socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt
   blacksheep-granian blacksheep-uvicorn fastapi
@@ -27,6 +27,8 @@ TARGETS=(
 TARGET_LABELS=(
   "stario|Stario (Python httptools)"
   "stario-cython|Stario (Cython llhttp)"
+  "stario-n|Stario (Python, ${BENCH_PROCS} processes, SO_REUSEPORT)"
+  "stario-cython-n|Stario (Cython, ${BENCH_PROCS} processes, SO_REUSEPORT)"
   "go-nethttp|Go net/http (GOMAXPROCS=1)"
   "go-nethttp-n|Go net/http (GOMAXPROCS=${BENCH_PROCS})"
   "go-fasthttp|Go fasthttp (GOMAXPROCS=1)"
@@ -41,7 +43,7 @@ TARGET_LABELS=(
   "fastapi|FastAPI + Uvicorn ASGI"
 )
 SUMMARY_GROUPS=(
-  "Stario (this checkout)|stario stario-cython"
+  "Stario (this checkout)|stario stario-n stario-cython stario-cython-n"
   "Go|go-nethttp go-nethttp-n go-fasthttp"
   "Native HTTP servers|socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt"
   "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
@@ -71,6 +73,7 @@ ENDPOINT_LABELS=(
 
 RUN_DIR=""
 SERVER_PID=""
+SERVER_PIDS=()
 SERVER_PORT=""
 SERVER_CMD=()
 SELECTED_TARGETS=()
@@ -80,14 +83,16 @@ usage() {
 Usage: benchmarks/server/run.sh [target ...]
 
 Targets (default: all):
-  Stario:              stario, stario-cython
+  Stario:              stario, stario-cython, stario-n, stario-cython-n
   Go:                  go-nethttp, go-nethttp-n, go-fasthttp
   Native HTTP servers: socketify, robyn, granian-rsgi, granian-rsgi-n, sanic, django-bolt
   ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
 
   go-nethttp / go-fasthttp pin GOMAXPROCS=1 (same 1-core budget as the
-  Python/Cython one-worker rows). go-nethttp-n and granian-rsgi-n fill the
-  box: one Go process with GOMAXPROCS=\$BENCH_PROCS, or N Granian workers.
+  Python/Cython one-worker rows). *-n targets fill the box: Go uses
+  GOMAXPROCS=\$BENCH_PROCS in one process; stario-n / stario-cython-n start
+  N processes on one port with STARIO_REUSE_PORT=1; granian-rsgi-n uses
+  N workers.
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 UPLOAD_CONNECTIONS=32
              RUNS=7 WARMUP=2 HOST=127.0.0.1 PORT=3000 PYTHON=3.14
@@ -251,13 +256,29 @@ host_python() {
   echo "python3"
 }
 
+env_name_for() {
+  case "$1" in
+    stario-n) echo stario ;;
+    stario-cython-n) echo stario-cython ;;
+    granian-rsgi-n) echo granian-rsgi ;;
+    *) echo "$1" ;;
+  esac
+}
+
 python_for() {
-  local candidate="$ENVS_DIR/$1/bin/python"
+  local candidate="$ENVS_DIR/$(env_name_for "$1")/bin/python"
   if [[ -x "$candidate" ]]; then
     echo "$candidate"
   else
     host_python
   fi
+}
+
+workers_for() {
+  case "$1" in
+    stario-n|stario-cython-n) echo "$BENCH_PROCS" ;;
+    *) echo 1 ;;
+  esac
 }
 
 needs_uv() {
@@ -350,8 +371,8 @@ target_label() {
 
 ensure_target() {
   case "$1" in
-    stario) ensure_env stario "stario @ file://$ROOT" uvloop ujson ;;
-    stario-cython)
+    stario|stario-n) ensure_env stario "stario @ file://$ROOT" uvloop ujson ;;
+    stario-cython|stario-cython-n)
       ensure_env stario-cython "stario @ file://$ROOT" uvloop ujson cython setuptools wheel
       build_stario_cython "$(python_for stario-cython)"
       ;;
@@ -392,7 +413,7 @@ uvicorn_cmd() {
 
 command_for() {
   case "$1" in
-    stario|stario-cython)
+    stario|stario-cython|stario-n|stario-cython-n)
       export STARIO_HOST="$HOST"
       export STARIO_PORT="$SERVER_PORT"
       export STARIO_LOOP=uvloop
@@ -400,9 +421,14 @@ command_for() {
       export STARIO_COMPRESS_ZSTD_LEVEL=-1
       export STARIO_COMPRESS_BROTLI_LEVEL=-1
       export STARIO_COMPRESS_GZIP_LEVEL=-1
-      if [[ "$1" == stario-cython ]]; then
+      case "$1" in
+        stario-n|stario-cython-n) export STARIO_REUSE_PORT=1 ;;
+        *) export STARIO_REUSE_PORT=0 ;;
+      esac
+      if [[ "$1" == stario-cython || "$1" == stario-cython-n ]]; then
         SERVER_CMD=(
           env PYTHONPATH="$ROOT/src:$BENCHMARK_DIR"
+          STARIO_REUSE_PORT="$STARIO_REUSE_PORT"
           "$(python_for stario-cython)" -m stario_cython apps.stario_app:bootstrap
         )
       else
@@ -495,19 +521,38 @@ command_for() {
 }
 
 stop_server() {
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-    kill "$SERVER_PID" >/dev/null 2>&1 || true
-    local deadline=$((SECONDS + 5))
-    while kill -0 "$SERVER_PID" >/dev/null 2>&1; do
-      if ((SECONDS >= deadline)); then
-        kill -9 "$SERVER_PID" >/dev/null 2>&1 || true
-        break
+  local pid deadline=$((SECONDS + 5))
+  if ((${#SERVER_PIDS[@]})); then
+    for pid in "${SERVER_PIDS[@]}"; do
+      if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+        kill "$pid" >/dev/null 2>&1 || true
       fi
-      sleep 0.1
     done
-    wait "$SERVER_PID" >/dev/null 2>&1 || true
+    for pid in "${SERVER_PIDS[@]}"; do
+      [[ -n "$pid" ]] || continue
+      while kill -0 "$pid" >/dev/null 2>&1; do
+        if ((SECONDS >= deadline)); then
+          kill -9 "$pid" >/dev/null 2>&1 || true
+          break
+        fi
+        sleep 0.1
+      done
+      wait "$pid" >/dev/null 2>&1 || true
+    done
   fi
   SERVER_PID=""
+  SERVER_PIDS=()
+}
+
+workers_alive() {
+  local pid
+  ((${#SERVER_PIDS[@]})) || return 1
+  for pid in "${SERVER_PIDS[@]}"; do
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" >/dev/null 2>&1; then
+      return 1
+    fi
+  done
+  return 0
 }
 
 fail_with_log() {
@@ -520,7 +565,7 @@ fail_with_log() {
 wait_ready() {
   local url="http://$HOST:$SERVER_PORT/plaintext" deadline=$((SECONDS + 30)) log="$1"
   until curl -fsS --max-time 1 "$url" >/dev/null 2>&1; do
-    if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    if ! workers_alive; then
       fail_with_log "Server exited before it was ready." "$log"
     fi
     if ((SECONDS >= deadline)); then
@@ -528,17 +573,26 @@ wait_ready() {
     fi
     sleep 0.1
   done
-  if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+  if ! workers_alive; then
     fail_with_log "Server exited after readiness check." "$log"
   fi
 }
 
 start_server() {
-  local target="$1" log="$RUN_DIR/$target.server.log"
+  local target="$1" log="$RUN_DIR/$target.server.log" workers i
   command_for "$target"
+  workers="$(workers_for "$target")"
   echo "+ ${SERVER_CMD[*]}"
-  (cd "$ROOT" && exec env PYTHONPATH="$BENCHMARK_DIR" "${SERVER_CMD[@]}") >"$log" 2>&1 &
-  SERVER_PID="$!"
+  if ((workers > 1)); then
+    echo "  $workers processes on $HOST:$SERVER_PORT (STARIO_REUSE_PORT=1)"
+  fi
+  SERVER_PIDS=()
+  : >"$log"
+  for ((i = 0; i < workers; i++)); do
+    (cd "$ROOT" && exec env PYTHONPATH="$ROOT/src:$BENCHMARK_DIR" "${SERVER_CMD[@]}") >>"$log" 2>&1 &
+    SERVER_PIDS+=("$!")
+  done
+  SERVER_PID="${SERVER_PIDS[0]}"
   wait_ready "$log"
 }
 
@@ -692,7 +746,7 @@ print_summary() {
     echo "Median requests/sec ± sample stdev after discarding $WARMUP warmup run(s)"
     echo "and applying IQR outlier trimming across $RUNS measured samples per endpoint."
     echo "Large uploads use $UPLOAD_CONNECTIONS connections; other cases use $CONNECTIONS."
-    echo "Go \`*-n\` / Granian \`*-n\` use BENCH_PROCS=$BENCH_PROCS cores or workers; other rows stay 1 worker / GOMAXPROCS=1."
+    echo "Go \`*-n\` uses BENCH_PROCS=$BENCH_PROCS in one process; stario-n / stario-cython-n start $BENCH_PROCS processes with STARIO_REUSE_PORT=1; granian-rsgi-n uses $BENCH_PROCS workers. Other rows stay 1 worker / GOMAXPROCS=1."
     for group_entry in "${SUMMARY_GROUPS[@]}"; do
       group_name="${group_entry%%|*}"
       group_targets="${group_entry#*|}"

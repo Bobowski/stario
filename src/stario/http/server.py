@@ -192,6 +192,7 @@ class Server:
             self.config.port,
             backlog=self.config.backlog,
             reuse_address=self.config.reuse_addr,
+            reuse_port=self.config.reuse_port,
         )
 
     async def _drain_listener(
@@ -494,6 +495,7 @@ class Server:
             attrs["server.host"] = self.config.host
             attrs["server.port"] = self.config.port
             attrs["server.reuse_addr"] = self.config.reuse_addr
+            attrs["server.reuse_port"] = self.config.reuse_port
         attrs["server.limits.max_request_header_bytes"] = (
             self.config.requests.max_header_bytes
         )

@@ -11,6 +11,7 @@ Listen:
   STARIO_UNIX_SOCKET_MODE=660  (octal; after bind on unix socket)
   STARIO_BACKLOG=2048
   STARIO_REUSE_ADDR=1          (TCP only; set 0 to disable SO_REUSEADDR)
+  STARIO_REUSE_PORT=0          (TCP only; set 1 for SO_REUSEPORT / shared listen)
   STARIO_GRACEFUL_SHUTDOWN_TIMEOUT=5
 
 Telemetry (STARIO_TRACER plus json/sqlite backend tuning):
