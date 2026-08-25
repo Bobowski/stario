@@ -414,10 +414,9 @@ cdef class HttpProtocol:
         self.have_value = True
 
     cdef void _on_headers_complete(self):
-        cdef Headers headers
+        cdef RequestExchange exchange
         cdef uint16_t flags
         cdef uint64_t content_length
-        cdef bint expect_continue
         if self.url_buf != NULL and self.url_len > 0:
             self.url = PyBytes_FromStringAndSize(self.url_buf, self.url_len)
         else:
@@ -425,7 +424,7 @@ cdef class HttpProtocol:
         self._flush_header()
         if self.rejected or self.reading_exchange is None:
             return
-        headers = self.reading_exchange.request_headers
+        exchange = self.reading_exchange
         if llhttp_get_upgrade(self.parser):
             self._close_error(400, "Upgrade not supported")
             return
@@ -434,23 +433,25 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
+        # One dict pass into exchange slots; keep-alive / expect / accept-encoding
+        # then use those fields (Headers public API unchanged).
+        exchange.cache_hot_request_headers()
         self.request_keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
             or (
                 llhttp_get_http_major(self.parser) == 1
                 and llhttp_get_http_minor(self.parser) == 1
-                and (headers.c_get(b"connection") or b"").lower() != b"close"
+                and not exchange._req_connection_close
             )
-        )
-        expect_continue = (
-            (headers.c_get(b"expect") or b"").lower() == b"100-continue"
         )
         # Always start the handler at headers-complete. Pre-size _acc when the
         # Content-Length is known so body() can materialize without realloc churn.
         if flags & F_CONTENT_LENGTH:
-            self.complete_headers(expect_continue, <Py_ssize_t>content_length)
+            self.complete_headers(
+                exchange._req_expect_continue, <Py_ssize_t>content_length
+            )
         else:
-            self.complete_headers(expect_continue, -1)
+            self.complete_headers(exchange._req_expect_continue, -1)
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)
@@ -561,6 +562,11 @@ cdef class HttpProtocol:
         if transport is None or transport.is_closing():
             self._drop_pending()
             return
+        if exchange._resp_connection_close:
+            transport.close()
+            self._drop_pending()
+            return
+        # User may have set Connection: close on the response Headers dict.
         conn = exchange.headers.c_get(b"connection")
         if conn is not None and conn.lower() == b"close":
             transport.close()

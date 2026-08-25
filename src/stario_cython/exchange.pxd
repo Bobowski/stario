@@ -7,6 +7,14 @@ cdef class RequestExchange:
     cdef list _date_box
     cdef object _compression
     cdef object _accept
+    cdef object _req_accept_encoding
+    cdef object _req_connection
+    cdef object _req_expect
+    cdef object _req_content_type
+    cdef object _req_host
+    cdef bint _req_expect_continue
+    cdef bint _req_connection_close
+    cdef bint _resp_connection_close
     cdef public Headers headers
     cdef StarioBrotli* _brotli
     cdef StarioGzip* _gzip
@@ -73,6 +81,7 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue)
+    cdef void cache_hot_request_headers(self)
     cdef void prepare_body_capacity(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)

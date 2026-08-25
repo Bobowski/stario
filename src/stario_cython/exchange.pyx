@@ -484,12 +484,43 @@ cdef class RequestExchange:
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
         self.request_headers.c_clear()
+        self._req_accept_encoding = None
+        self._req_connection = None
+        self._req_expect = None
+        self._req_content_type = None
+        self._req_host = None
+        self._req_expect_continue = False
+        self._req_connection_close = False
+        self._resp_connection_close = False
         self.handler_done = False
         self.handler_started = False
 
+    cdef void cache_hot_request_headers(self):
+        """Snapshot hot request headers for protocol/compression (dict API unchanged)."""
+        cdef Headers h = self.request_headers
+        cdef object v
+        self._req_accept_encoding = h.c_get(b"accept-encoding")
+        v = h.c_get(b"connection")
+        if v is None:
+            self._req_connection = None
+            self._req_connection_close = False
+        else:
+            self._req_connection = v.lower()
+            self._req_connection_close = self._req_connection == b"close"
+        v = h.c_get(b"expect")
+        if v is None:
+            self._req_expect = None
+            self._req_expect_continue = False
+        else:
+            self._req_expect = v.lower()
+            self._req_expect_continue = self._req_expect == b"100-continue"
+        self._req_content_type = h.c_get(b"content-type")
+        self._req_host = h.c_get(b"host")
+
     cdef void start_response(self):
         self.handler_started = True
-        self.reset_response(self.request_headers.c_get(b"accept-encoding"))
+        self._resp_connection_close = False
+        self.reset_response(self._req_accept_encoding)
 
     cdef void handler_finished(self):
         self.handler_done = True
@@ -523,6 +554,14 @@ cdef class RequestExchange:
         self._acc_pos = 0
         self._body_active = False
         self._read_max_size = -1
+        self._req_accept_encoding = None
+        self._req_connection = None
+        self._req_expect = None
+        self._req_content_type = None
+        self._req_host = None
+        self._req_expect_continue = False
+        self._req_connection_close = False
+        self._resp_connection_close = False
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
         if self._chunks is not None:
             self._chunks.clear()
@@ -536,6 +575,14 @@ cdef class RequestExchange:
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
         self._accept = None
+        self._req_accept_encoding = None
+        self._req_connection = None
+        self._req_expect = None
+        self._req_content_type = None
+        self._req_host = None
+        self._req_expect_continue = False
+        self._req_connection_close = False
+        self._resp_connection_close = False
         self.app = None
         self._connection = None
         self._transport = None
@@ -654,6 +701,7 @@ cdef class RequestExchange:
             return
         self._free_compressors()
         self._completed = True
+        self._resp_connection_close = True
         self.headers.c_set(b"connection", b"close")
         self._transport.close()
         self._done()
