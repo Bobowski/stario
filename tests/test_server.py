@@ -44,7 +44,7 @@ class TestContextCreateTask:
         assert not context.app.tasks
 
     async def test_eager_task_completes_without_registration(self) -> None:
-        context = make_context()
+        context = make_context(loop=asyncio.get_running_loop())
         started = False
 
         async def worker() -> int:
