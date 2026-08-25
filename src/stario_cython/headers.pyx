@@ -2,6 +2,7 @@
 """Bytes-backed headers. Parser lowercases and interns names in C."""
 
 from libc.string cimport memcmp, memcpy
+from libc.stdlib cimport free, realloc
 from libc.stdint cimport uint8_t, uint32_t
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
@@ -273,8 +274,18 @@ cdef object _encode_value(str value):
 
 
 cdef class Headers:
+    def __cinit__(self):
+        self._raw_arena = NULL
+        self._raw_len = 0
+        self._raw_cap = 0
+        self._raw_headers = NULL
+        self._raw_count = 0
+        self._raw_headers_cap = 0
+        self._request_host_index = -1
+
     def __init__(self, raw_header_data=None):
         self._data = raw_header_data if raw_header_data is not None else {}
+        self._materialized = raw_header_data is not None
         self._request_connection_close = False
         self._request_expect_continue = False
         self._request_accept_present = False
@@ -283,18 +294,108 @@ cdef class Headers:
         self._request_wildcard_q = -1
         self._request_identity_q = -1
 
+    def __dealloc__(self):
+        if self._raw_arena != NULL:
+            free(self._raw_arena)
+        if self._raw_headers != NULL:
+            free(self._raw_headers)
+
+    cdef int _reserve_raw(self, Py_ssize_t bytes_needed) except -1:
+        cdef Py_ssize_t need = self._raw_len + bytes_needed
+        cdef Py_ssize_t cap
+        cdef char* arena
+        if need <= self._raw_cap:
+            return 0
+        cap = 256 if self._raw_cap == 0 else self._raw_cap * 2
+        if cap < need:
+            cap = need
+        arena = <char*>realloc(self._raw_arena, <size_t>cap)
+        if arena == NULL:
+            raise MemoryError()
+        self._raw_arena = arena
+        self._raw_cap = cap
+        return 0
+
+    cdef int _reserve_raw_headers(self) except -1:
+        cdef Py_ssize_t cap
+        cdef RawHeader* headers
+        if self._raw_count < self._raw_headers_cap:
+            return 0
+        cap = 16 if self._raw_headers_cap == 0 else self._raw_headers_cap * 2
+        headers = <RawHeader*>realloc(
+            self._raw_headers,
+            <size_t>cap * sizeof(RawHeader),
+        )
+        if headers == NULL:
+            raise MemoryError()
+        self._raw_headers = headers
+        self._raw_headers_cap = cap
+        return 0
+
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen):
-        cdef object key = _intern_name(name, nlen)
-        cdef object val = PyBytes_FromStringAndSize(value, <Py_ssize_t>vlen)
-        if key is _CONNECTION_NAME:
+        cdef RawHeader* header
+        cdef Py_ssize_t name_offset
+        cdef Py_ssize_t value_offset
+        if nlen >= NAME_STACK:
+            raise ValueError("Invalid header name: too long")
+        self._reserve_raw(<Py_ssize_t>(nlen + vlen))
+        self._reserve_raw_headers()
+        name_offset = self._raw_len
+        _lower_copy(self._raw_arena + name_offset, name, nlen)
+        self._raw_len += <Py_ssize_t>nlen
+        value_offset = self._raw_len
+        if vlen:
+            memcpy(self._raw_arena + value_offset, value, vlen)
+        self._raw_len += <Py_ssize_t>vlen
+        header = &self._raw_headers[self._raw_count]
+        header.name_offset = <uint32_t>name_offset
+        header.name_length = <uint32_t>nlen
+        header.value_offset = <uint32_t>value_offset
+        header.value_length = <uint32_t>vlen
+        if _token_equals(name, 0, nlen, "host", 4):
+            if self._request_host_index < 0:
+                self._request_host_index = self._raw_count
+        elif _token_equals(name, 0, nlen, "connection", 10):
             if _contains_token(value, vlen, "close", 5):
                 self._request_connection_close = True
-        elif key is _EXPECT_NAME:
+        elif _token_equals(name, 0, nlen, "expect", 6):
             if _contains_token(value, vlen, "100-continue", 12):
                 self._request_expect_continue = True
-        elif key is _ACCEPT_ENCODING_NAME:
+        elif _token_equals(name, 0, nlen, "accept-encoding", 15):
             self._scan_request_accept_encoding(value, vlen)
-        self.c_add(key, val)
+        self._raw_count += 1
+
+    cdef void _materialize(self):
+        cdef Py_ssize_t i
+        cdef RawHeader* header
+        cdef object key
+        cdef object value
+        if self._materialized:
+            return
+        self._materialized = True
+        for i in range(self._raw_count):
+            header = &self._raw_headers[i]
+            key = _intern_name(
+                self._raw_arena + header.name_offset,
+                header.name_length,
+            )
+            value = PyBytes_FromStringAndSize(
+                self._raw_arena + header.value_offset,
+                header.value_length,
+            )
+            self.c_add(key, value)
+
+    cdef object c_request_host(self):
+        cdef RawHeader* header
+        if self._materialized:
+            return self.c_get(b"host")
+        if self._request_host_index < 0:
+            return None
+        header = &self._raw_headers[self._request_host_index]
+        return PyBytes_FromStringAndSize(
+            self._raw_arena + header.value_offset,
+            header.value_length,
+        )
 
     cdef void _scan_request_accept_encoding(
         self,
@@ -417,7 +518,9 @@ cdef class Headers:
         return selected
 
     cdef object c_get(self, object name):
-        cdef object value = self._data.get(name)
+        cdef object value
+        self._materialize()
+        value = self._data.get(name)
         if value is None:
             return None
         if type(value) is bytes:
@@ -425,10 +528,12 @@ cdef class Headers:
         return value[0]
 
     cdef void c_set(self, object name, object value):
+        self._materialize()
         self._data[name] = value
 
     cdef void c_add(self, object name, object value):
         cdef object existing
+        self._materialize()
         if name not in self._data:
             self._data[name] = value
             return
@@ -439,16 +544,21 @@ cdef class Headers:
             self._data[name] = [existing, value]
 
     cdef void c_remove(self, object name):
+        self._materialize()
         self._data.pop(name, None)
 
     cdef void c_clear(self):
         self._data.clear()
+        self._raw_len = 0
+        self._raw_count = 0
+        self._request_host_index = -1
+        self._materialized = False
         self._request_connection_close = False
         self._request_expect_continue = False
         self._request_accept_present = False
 
     cdef bint c_empty(self):
-        return not self._data
+        return self._raw_count == 0 and not self._data
 
     cdef void c_merge_vary(self, object token):
         cdef object existing = self.c_get(b"vary")
@@ -502,6 +612,7 @@ cdef class Headers:
         cdef object header_value
         cdef const char* p
         cdef Py_ssize_t n
+        self._materialize()
         for name, value in self._data.items():
             if type(value) is bytes:
                 p = name
@@ -558,7 +669,9 @@ cdef class Headers:
         return [v.decode("latin-1") for v in self.unsafe_getlist(_encode_name(name))]
 
     def unsafe_getlist(self, name):
-        cdef object value = self._data.get(name)
+        cdef object value
+        self._materialize()
+        value = self._data.get(name)
         if value is None:
             return []
         if type(value) is bytes:
@@ -582,6 +695,7 @@ cdef class Headers:
         cdef object name
         cdef object value
         cdef object v
+        self._materialize()
         for name, value in self._data.items():
             if type(value) is list:
                 for v in value:
@@ -592,12 +706,15 @@ cdef class Headers:
 
     def __contains__(self, name):
         try:
+            self._materialize()
             return _encode_name(name) in self._data
         except ValueError:
             return False
 
     def __len__(self):
+        self._materialize()
         return len(self._data)
 
     def __repr__(self):
+        self._materialize()
         return f"Headers({self._data!r})"

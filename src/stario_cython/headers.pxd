@@ -1,5 +1,21 @@
+from libc.stdint cimport uint32_t
+
+ctypedef struct RawHeader:
+    uint32_t name_offset
+    uint32_t name_length
+    uint32_t value_offset
+    uint32_t value_length
+
 cdef class Headers:
     cdef dict _data
+    cdef char* _raw_arena
+    cdef Py_ssize_t _raw_len
+    cdef Py_ssize_t _raw_cap
+    cdef RawHeader* _raw_headers
+    cdef Py_ssize_t _raw_count
+    cdef Py_ssize_t _raw_headers_cap
+    cdef Py_ssize_t _request_host_index
+    cdef bint _materialized
     cdef bint _request_connection_close
     cdef bint _request_expect_continue
     cdef bint _request_accept_present
@@ -9,6 +25,10 @@ cdef class Headers:
     cdef int _request_identity_q
 
     cdef void add_raw(self, const char* name, size_t nlen, const char* value, size_t vlen)
+    cdef int _reserve_raw(self, Py_ssize_t bytes_needed) except -1
+    cdef int _reserve_raw_headers(self) except -1
+    cdef void _materialize(self)
+    cdef object c_request_host(self)
     cdef void _scan_request_accept_encoding(
         self,
         const char* value,
