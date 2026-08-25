@@ -176,14 +176,15 @@ framework on HttpArena. It is the Class B opponent the “fastest
 Python framework” claim has to beat in public. We are not on that
 board, so we have **no HttpArena rank**.
 
-**True from our suite:** vs the ASGI frameworks HttpArena also runs
-(FastAPI, Starlette via FastAPI, Sanic-as-we-ran-it), Cython is
-~2–2.5× on honest 1-worker routes. That still supports the Class B
-headline **on our machine, our routes**.
+**True from our suite (same machine, production setup):** Cython is
+**~2.5×** 1-worker aiohttp and **~1.8×** aiohttp ×4 on plaintext
+(`production-peers.md`). Litestar is slower still (~4.3× / ~2.8×).
+That is the Class B claim with the actual HttpArena #1 Python stack
+on this box.
 
-**Do not say:** “We are faster than aiohttp.” Different hardware,
-different client, different payloads, and their tuned Sanic already
-ties them on the closest profiles.
+**Do not say:** “Faster than HttpArena’s 591k aiohttp.” Different
+iron and client. Say “faster than production aiohttp on this
+machine, same routes.”
 
 **Do not say:** “aiohttp is slow.” It is mid-pack overall (240) and
 the efficiency leader in Python. The Python ceiling on this board is

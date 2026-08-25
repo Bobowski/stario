@@ -55,6 +55,8 @@ honest handlers. Cython plaintext anchor **120k** (isolated re-run here
 | BlackSheep + Uvicorn | 59,195 | 50,554 | **2.0×** |
 | Sanic | 52,746 | 34,731 | **2.3×** |
 | FastAPI + Uvicorn | 47,533 | 34,263 | **2.5×** |
+| aiohttp (later 1-worker, `production-peers.md`) | 51,264 | 34,887 | **~2.5×** |
+| Litestar (later 1-worker) | 30,353 | 19,796 | **~4.3×** |
 | Django-Bolt | 28,084 | 23,067 | **4.3×** |
 | Robyn | 25,416 | 18,070 | **4.7×** |
 
@@ -83,13 +85,10 @@ this table.
   That is allowed. On 64KB we already tie (~30.8k). At **4 processes**
   (`STARIO_REUSE_PORT` vs `--workers`) Cython is **294k vs 224k**
   plaintext and **252k vs 144k** validate — we win the box.
-- **Pyronova:** no same-machine row. HttpArena baseline (honest sum of
-  query ints) is **826k vs aiohttp 591k** on the 64-core box — ~1.4×,
-  Rust accept. Their JSON 723k is a per-worker byte cache; ignore it.
-  Self-published **429k** GET `/` is 16 workers on 8C/16T, not 1-worker;
-  nearest published Cython is **294k ×4 on 4 vCPU**. Per-core, same
-  band; fill-the-box Rust, they should lead. Do not put 429k next to
-  120k.
+- **Pyronova:** 1-worker they take plaintext **143k vs 129k**; we take
+  validate **106k vs 87k**. `PYRONOVA_WORKERS>=2` crashes on this
+  CPython 3.14 host. HttpArena 826k / their 429k are other boxes.
+  Details: `httparena-pyronova.md`, `production-peers.md`.
 
 BlackSheep + Granian (112k plaintext) is **not** a Class B counterexample.
 Take Granian away (BlackSheep + Uvicorn = 59k) and it falls into the 2×
@@ -166,8 +165,8 @@ fill the machine.”
 **Do not say:** “Faster than Go.” Say “ahead of stdlib `net/http` on
 one core and on the box; 1-core fasthttp is a different class.”
 
-**Do not say:** “Faster than Pyronova.” Say “Rust HTTP engine, Python
-handlers; experimental+tuned on HttpArena; no same-machine number.”
+**Do not say:** “Faster than Pyronova.” Say “1–1 on hello (they edge
+plaintext); we win validate; they crash at 2+ TPC threads here.”
 
 ## HttpArena / aiohttp
 
@@ -178,12 +177,10 @@ on a 64-core box, not a plaintext RPS crown — tuned Sanic already
 beats aiohttp on baseline/JSON and then loses the composite by
 skipping TLS/static/DB.
 
-aiohttp is **Class B** (router, `json_response`, gzip, fork +
-`SO_REUSEPORT`). It is the opponent the headline has to beat in
-public. We are **not entered**, so there is no rank and no honest
-“faster than aiohttp” line. Shared peers (FastAPI, Sanic, Robyn)
-suggest a **same-band** fight on connection/JSON, not a 2× gap.
-Full write-up: `httparena-aiohttp.md`.
+aiohttp is **Class B**. On this machine, production setup, we are
+**~2.5×** (1 worker) and **~1.8×** (×4) on plaintext
+(`production-peers.md`). That is not an HttpArena rank. Full
+write-up: `httparena-aiohttp.md`.
 
 ## HttpArena / Pyronova
 
@@ -192,4 +189,5 @@ with PEP 684 sub-interpreters. HttpArena: **experimental + tuned**,
 composite 431, baseline **826k** (~1.4× aiohttp). JSON 723k is a
 per-worker byte cache; `/pipeline` is a Rust fast-path. Self-published
 429k GET `/` is 16 workers on 8C/16T. Class A, not the 2× table.
-Full write-up: `httparena-pyronova.md`.
+1-worker here: they edge plaintext (143k vs 129k); we win validate;
+2+ TPC threads crash. Full write-up: `httparena-pyronova.md`.

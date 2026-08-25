@@ -115,17 +115,15 @@ our Robyn being the slow one, not with Stario being the slow one.
 peers: FastAPI, Sanic, BlackSheep, Stario Python) Cython is still
 ~2–2.5× on this machine. That claim does not include Pyronova.
 
-**Estimate, not a measurement:** Stario’s scale model is aiohttp’s
-(fork + `SO_REUSEPORT`), not Hyper-in-process. On HttpArena we
-would expect to land near aiohttp/Sanic on connection (~600–750k
-if the FastAPI transfer holds), **behind** Pyronova’s 826k
-baseline, and far behind their cached JSON. On 4 vCPU, 294k
-Cython vs a hypothetical 16-worker Pyronova is unknown; their
-8C/16T 429k suggests we would not be embarrassed per core and
-would not win a fill-the-box Rust race.
+**Measured on this box** (`production-peers.md`): 1-worker Pyronova
+takes plaintext **143k vs Cython 129k (1.11×)** and stream 2MB;
+Cython takes validate and buffered 2MB. `PYRONOVA_WORKERS>=2`
+aborts here (double-free / SIGSEGV on CPython 3.14). No fill-the-box
+row.
 
-**Do not say:** “Faster than Pyronova.” We have no same-machine
-row, and their Arena JSON/pipeline numbers are tuned.
+**Do not say:** “Faster than Pyronova.” Say “1–1 on hello (they
+edge plaintext); we win validate; they crash at 2+ TPC threads on
+this host.”
 
 **Do not say:** “Pyronova is just Socketify.” More framework, real
 HttpArena completeness, production CLI, WS/H2. Say “Rust HTTP
@@ -133,9 +131,5 @@ engine, Python handlers, experimental+tuned on the public board.”
 
 **Do not use their 429k or 723k in a Class B slide.**
 
-**To actually know:** add an honest `apps/pyronova_app.py` (same 10
-routes, per-request JSON, no cache, no `add_fast_response`) and
-run `pyronova` with `PYRONOVA_WORKERS=$nproc` next to
-`stario-cython-n` and a production aiohttp. Until that run exists,
-the only fair public number is HttpArena baseline 826k vs aiohttp
-591k.
+Honest `apps/pyronova_app.py` is in the suite. 1-worker numbers are
+in `production-peers.md`. Fill-the-box waits on their TPC crash.

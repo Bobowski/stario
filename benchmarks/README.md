@@ -131,6 +131,8 @@ framework” without fighting Granian/Socketify on hello-world:
 `benchmarks/server/positioning.md`. HttpArena’s #1 Python (aiohttp)
 vs what our suite can and cannot say: `benchmarks/server/httparena-aiohttp.md`.
 Pyronova (Rust core, experimental+tuned): `benchmarks/server/httparena-pyronova.md`.
+Same-machine production + 1-worker numbers vs aiohttp / Litestar /
+Pyronova: `benchmarks/server/production-peers.md`.
 
 ### Benchmark shape
 
