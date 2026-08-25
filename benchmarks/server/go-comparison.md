@@ -77,10 +77,16 @@ on **one core** is the fastest 1-worker row — above 1-worker Granian and
 well above Cython. Stario Python remains ~1.2× behind 1-core `net/http` and
 ~2.5× behind 1-core fasthttp on plaintext.
 
-This-run Cython plaintext (97k) is below the committed primary (120k ± 25k)
-and closer to the confirmatory refresh (125k). Treat ratios against
-**this-run** Cython; the committed table is the historical anchor, not a
-second clock.
+The long-suite Cython plaintext median (97k) is **not** a different case
+and is **not** a real drop from the published ~120–125k. Same app, same
+`GET /plaintext`, same `wrk -t2 -c128`, one worker. That 97k window was
+three noisy 10s samples (93k / 101k / 97k) in a busy suite — params in
+the same run swung 74k–116k. An isolated re-run on this box
+(`20260825T191938Z`, 10s × 5 + 2 warmup) is **118,189 ± 3,338** (samples
+118–125k), matching the committed primary **120,378 ± 24,710** and the
+5s refresh **125,436 ± 4,971** (the ~130k figure). Use 118–125k as the
+1-worker Cython plaintext anchor; keep the 97k row only as “what that
+noisy suite printed.”
 
 ## Large-body (1-core)
 
@@ -118,7 +124,7 @@ Scaling (plaintext, 1 unit → 4 units):
 
 | | 1 → 4 | Notes |
 | --- | ---: | --- |
-| Stario Cython | 97k → 294k (**3.05×**) | 4 processes, `STARIO_REUSE_PORT=1` |
+| Stario Cython | 97k suite / 118k isolated → 294k (**~2.5–3.0×**) | 4 processes, `STARIO_REUSE_PORT=1` |
 | Stario Python | 71k → 212k (**2.97×**) | same |
 | Go net/http | 86k → 200k (**2.33×**) | one process, `GOMAXPROCS` 1→4 |
 | Granian | 147k → 224k (**1.52×**) | 1→4 workers |
