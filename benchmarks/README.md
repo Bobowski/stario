@@ -249,7 +249,7 @@ Common options:
 
 ```bash
 DURATION=30s THREADS=2 CONNECTIONS=128 RUNS=9 WARMUP=2 benchmarks/server/run.sh
-benchmarks/server/run.sh stario stario-cython go-nethttp go-nethttp-n go-fasthttp granian-rsgi granian-rsgi-n
+benchmarks/server/run.sh stario stario-cython stario-n stario-cython-n go-nethttp go-nethttp-n go-fasthttp granian-rsgi granian-rsgi-n
 benchmarks/server/run.sh stario stario-cython socketify robyn granian-rsgi
 ENDPOINT_TIER=upload benchmarks/server/run.sh
 ENDPOINTS=validate,post-form,post-json-1k benchmarks/server/run.sh stario
