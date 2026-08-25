@@ -17,17 +17,23 @@ PYTHON="${PYTHON:-3.14}"
 KEEP_RAW="${KEEP_RAW:-0}"
 WRK="${WRK:-wrk}"
 BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
+BENCH_PROCS="${BENCH_PROCS:-$(nproc 2>/dev/null || echo 4)}"
 TARGETS=(
   stario stario-cython
-  socketify robyn granian-rsgi sanic django-bolt
+  go-nethttp go-nethttp-n go-fasthttp
+  socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt
   blacksheep-granian blacksheep-uvicorn fastapi
 )
 TARGET_LABELS=(
   "stario|Stario (Python httptools)"
   "stario-cython|Stario (Cython llhttp)"
+  "go-nethttp|Go net/http (GOMAXPROCS=1)"
+  "go-nethttp-n|Go net/http (GOMAXPROCS=${BENCH_PROCS})"
+  "go-fasthttp|Go fasthttp (GOMAXPROCS=1)"
   "socketify|Socketify (uWebSockets/libuv)"
   "robyn|Robyn (Rust/Actix)"
   "granian-rsgi|Granian RSGI (Rust, no framework)"
+  "granian-rsgi-n|Granian RSGI (${BENCH_PROCS} workers)"
   "sanic|Sanic (uvloop)"
   "django-bolt|Django-Bolt (Actix/Tokio)"
   "blacksheep-granian|BlackSheep + Granian ASGI"
@@ -36,7 +42,8 @@ TARGET_LABELS=(
 )
 SUMMARY_GROUPS=(
   "Stario (this checkout)|stario stario-cython"
-  "Native HTTP servers|socketify robyn granian-rsgi sanic django-bolt"
+  "Go|go-nethttp go-nethttp-n go-fasthttp"
+  "Native HTTP servers|socketify robyn granian-rsgi granian-rsgi-n sanic django-bolt"
   "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
 )
 READ_ENDPOINTS=(plaintext json params)
@@ -74,12 +81,18 @@ Usage: benchmarks/server/run.sh [target ...]
 
 Targets (default: all):
   Stario:              stario, stario-cython
-  Native HTTP servers: socketify, robyn, granian-rsgi, sanic, django-bolt
+  Go:                  go-nethttp, go-nethttp-n, go-fasthttp
+  Native HTTP servers: socketify, robyn, granian-rsgi, granian-rsgi-n, sanic, django-bolt
   ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
+
+  go-nethttp / go-fasthttp pin GOMAXPROCS=1 (same 1-core budget as the
+  Python/Cython one-worker rows). go-nethttp-n and granian-rsgi-n fill the
+  box: one Go process with GOMAXPROCS=\$BENCH_PROCS, or N Granian workers.
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 UPLOAD_CONNECTIONS=32
              RUNS=7 WARMUP=2 HOST=127.0.0.1 PORT=3000 PYTHON=3.14
-             ENDPOINT_TIER=all|read|upload  ENDPOINTS=csv  REFRESH_ENVS=1 KEEP_RAW=1
+             BENCH_PROCS=\$(nproc) ENDPOINT_TIER=all|read|upload
+             ENDPOINTS=csv  REFRESH_ENVS=1 KEEP_RAW=1
 
 Endpoint tiers:
   read   — plaintext, json, params
@@ -226,7 +239,47 @@ format_int() {
   printf '%s%s' "$value" "$out"
 }
 
-python_for() { echo "$ENVS_DIR/$1/bin/python"; }
+host_python() {
+  if [[ -n "${STATS_PYTHON:-}" ]]; then
+    echo "$STATS_PYTHON"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return
+  fi
+  echo "python3"
+}
+
+python_for() {
+  local candidate="$ENVS_DIR/$1/bin/python"
+  if [[ -x "$candidate" ]]; then
+    echo "$candidate"
+  else
+    host_python
+  fi
+}
+
+needs_uv() {
+  local target
+  for target in "$@"; do
+    case "$target" in
+      go-nethttp|go-nethttp-n|go-fasthttp) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+needs_go() {
+  local target
+  for target in "$@"; do
+    case "$target" in
+      go-nethttp|go-nethttp-n|go-fasthttp) return 0 ;;
+    esac
+  done
+  return 1
+}
 
 require_port_free() {
   local python="$1" target="$2" port="$3"
@@ -310,7 +363,18 @@ ensure_target() {
     fastapi) ensure_env fastapi fastapi 'uvicorn[standard]' ujson ;;
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
+    granian-rsgi-n) ensure_env granian-rsgi granian uvloop ujson ;;
+    go-nethttp|go-nethttp-n|go-fasthttp) build_go ;;
   esac
+}
+
+build_go() {
+  local bin="$BENCHMARK_DIR/.bin/stario-go-bench"
+  if [[ ! -x "$bin" || "${REFRESH_ENVS:-0}" == 1 ]]; then
+    echo "  building Go benchmark servers"
+    mkdir -p "$BENCHMARK_DIR/.bin"
+    (cd "$BENCHMARK_DIR/apps/go" && go build -o "$bin" .)
+  fi
 }
 
 uvicorn_cmd() {
@@ -396,6 +460,29 @@ command_for() {
         --loop uvloop
         --no-access-log
         --log-level warning
+      )
+      ;;
+    granian-rsgi-n)
+      SERVER_CMD=(
+        "$(python_for granian-rsgi)" -m granian apps.granian_rsgi_app:app
+        --interface rsgi
+        --host "$HOST" --port "$SERVER_PORT"
+        --workers "$BENCH_PROCS"
+        --runtime-threads 1
+        --loop uvloop
+        --no-access-log
+        --log-level warning
+      )
+      ;;
+    go-nethttp|go-nethttp-n|go-fasthttp)
+      local gomax=1 impl=nethttp
+      [[ "$1" == go-nethttp-n ]] && gomax="$BENCH_PROCS"
+      [[ "$1" == go-fasthttp ]] && impl=fasthttp
+      SERVER_CMD=(
+        env GOMAXPROCS="$gomax"
+        BENCH_HOST="$HOST" BENCH_PORT="$SERVER_PORT"
+        "$BENCHMARK_DIR/.bin/stario-go-bench" -impl "$impl"
+        -host "$HOST" -port "$SERVER_PORT"
       )
       ;;
     django-bolt)
@@ -600,11 +687,12 @@ print_summary() {
   SELECTED_TARGETS=("$@")
   : >"$table"
   {
-    echo "## Single-worker HTTP server comparison"
+    echo "## HTTP server comparison"
     echo
     echo "Median requests/sec ± sample stdev after discarding $WARMUP warmup run(s)"
     echo "and applying IQR outlier trimming across $RUNS measured samples per endpoint."
     echo "Large uploads use $UPLOAD_CONNECTIONS connections; other cases use $CONNECTIONS."
+    echo "Go \`*-n\` / Granian \`*-n\` use BENCH_PROCS=$BENCH_PROCS cores or workers; other rows stay 1 worker / GOMAXPROCS=1."
     for group_entry in "${SUMMARY_GROUPS[@]}"; do
       group_name="${group_entry%%|*}"
       group_targets="${group_entry#*|}"
@@ -645,7 +733,11 @@ target_selected() {
 }
 
 main() {
-  need uv; need curl
+  need curl
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Missing required command: python3 (used for fixture generation and wrk stats)" >&2
+    exit 1
+  fi
   if ! command -v "$WRK" >/dev/null 2>&1; then
     echo "Missing wrk executable: $WRK" >&2
     echo "Install wrk or set WRK=/path/to/wrk." >&2
@@ -659,6 +751,12 @@ main() {
   case "${selected[0]}" in -h|--help|help) usage; exit 0 ;; esac
   for target in "${selected[@]}"; do known_target "$target" || { echo "Unknown target: $target" >&2; usage >&2; exit 1; }; done
   for endpoint in "${ENDPOINTS[@]}"; do path_for "$endpoint" >/dev/null || exit 1; done
+  if needs_uv "${selected[@]}"; then
+    need uv
+  fi
+  if needs_go "${selected[@]}"; then
+    need go
+  fi
 
   ensure_fixtures "$(python_for "${selected[0]}")"
   if [[ ! -x "$(python_for "${selected[0]}")" ]]; then
@@ -678,6 +776,7 @@ upload_connections=$UPLOAD_CONNECTIONS
 runs=$RUNS
 warmup=$WARMUP
 python=$PYTHON
+bench_procs=$BENCH_PROCS
 client=$WRK
 keep_raw=$KEEP_RAW
 endpoints=${ENDPOINTS[*]}

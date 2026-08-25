@@ -67,6 +67,18 @@ server cannot be reused by accident.
 | `stario` | Python httptools protocol |
 | `stario-cython` | Cython llhttp protocol (`cython-core`) |
 
+**Go (same routes as `apps/stario_app.py`)**
+
+| Target | Server |
+| --- | --- |
+| `go-nethttp` | Go `net/http`, `GOMAXPROCS=1` |
+| `go-nethttp-n` | Go `net/http`, `GOMAXPROCS=$BENCH_PROCS` (default: `nproc`) |
+| `go-fasthttp` | [fasthttp](https://github.com/valyala/fasthttp), `GOMAXPROCS=1` |
+
+The Go servers live in `benchmarks/server/apps/go/` and implement the same
+paths, status codes, and per-request JSON/validation work as the Python apps.
+`encoding/json` is used on every response (no pre-serialized buffers).
+
 **Native HTTP servers**
 
 | Target | Server |
@@ -74,6 +86,7 @@ server cannot be reused by accident.
 | `socketify` | [Socketify.py](https://github.com/cirospaciari/socketify.py) (uWebSockets + libuv) |
 | `robyn` | [Robyn](https://github.com/sparckles/Robyn) (Rust/Actix) |
 | `granian-rsgi` | [Granian](https://github.com/emmett-framework/granian) RSGI (Rust, no framework) |
+| `granian-rsgi-n` | Granian RSGI with `$BENCH_PROCS` workers |
 | `sanic` | [Sanic](https://sanic.dev/) (uvloop) |
 | `django-bolt` | [Django-Bolt](https://bolt.farhana.li/) (Actix/Tokio) |
 
@@ -85,9 +98,31 @@ server cannot be reused by accident.
 | `blacksheep-uvicorn` | BlackSheep + Uvicorn |
 | `fastapi` | FastAPI + Uvicorn + Pydantic |
 
+### Comparing Go to Python
+
+A Go process is not the same unit of work as a Python process.
+
+- One **Go** process schedules goroutines on `GOMAXPROCS` OS threads (default:
+  every CPU). That is the normal way to run Go.
+- One **CPython** process is limited by the GIL for bytecode. Native bits
+  (Cython, uvloop, Rust servers) can use more than one core, but the usual
+  way to fill a box is still **N worker processes**.
+
+Do **not** compare default Go (`GOMAXPROCS=nCPU`) to one Python/Cython worker
+and call it a language result — that is cores vs one core. Two fair setups:
+
+| Question | Go | Python / Cython / Granian |
+| --- | --- | --- |
+| How fast is the code path? | `go-nethttp` or `go-fasthttp` (`GOMAXPROCS=1`) | existing 1-worker rows |
+| How much can this box do? | `go-nethttp-n` (one process, all cores) | `granian-rsgi-n` (N workers). Stario is still 1 process. |
+
+Pinning Go to one process with `GOMAXPROCS=1` is the right match for the
+committed one-worker baselines. Scaling Python to N processes is the right
+match for "run Go normally". Use `BENCH_PROCS` (default `nproc`) for both.
+
 ### Benchmark shape
 
-- One worker/process per target.
+- One worker/process per target unless the name ends in `-n`.
 - Same read paths: `/plaintext`, `/json`, `/user/42`.
 - Same upload/body paths (see **Endpoint tiers** below).
 - Same `wrk` settings per tier; large uploads use fewer connections
@@ -168,6 +203,7 @@ wire throughput of prebuilt buffers.
 
 - `uv`
 - `wrk`
+- `go` 1.22+ for the `go-*` targets
 - Python compatible with Stario (3.14+)
 - `libbrotli-dev` (or set `BROTLI_PKG_CONFIG`) for `stario-cython`
 
@@ -197,7 +233,7 @@ The default run benchmarks every target above.
 - `RUNS=7` measured samples per endpoint (plus `WARMUP=2` discarded warmup runs)
 - `ENDPOINT_TIER=all|read|upload` (default `all`)
 - `PORT=3000` as the base port
-- one process or worker per target
+- one process or worker per target (`go-nethttp-n` / `granian-rsgi-n` use `BENCH_PROCS`)
 
 Use those defaults when you want numbers that are easiest to compare with
 other local runs. The generated `config.txt` records the exact settings for
@@ -208,6 +244,7 @@ Common options:
 
 ```bash
 DURATION=30s THREADS=2 CONNECTIONS=128 RUNS=9 WARMUP=2 benchmarks/server/run.sh
+benchmarks/server/run.sh stario stario-cython go-nethttp go-nethttp-n go-fasthttp granian-rsgi granian-rsgi-n
 benchmarks/server/run.sh stario stario-cython socketify robyn granian-rsgi
 ENDPOINT_TIER=upload benchmarks/server/run.sh
 ENDPOINTS=validate,post-form,post-json-1k benchmarks/server/run.sh stario

@@ -1,4 +1,5 @@
 .venvs/
+.bin/
 results/
 fixtures/*.bin
 fixtures/*.json
