@@ -81,6 +81,7 @@ cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
 cdef bytes CHUNK_END = b"0\r\n\r\n"
+cdef tuple _DEC_SMALL = tuple(str(i).encode("ascii") for i in range(256))
 
 cdef object STARTED_ERROR = (
     "Response already started (headers sent). "
@@ -132,7 +133,10 @@ cdef object _status_line(int status):
 
 cdef object _dec(size_t n):
     cdef char buf[16]
-    cdef int i = sprintf(buf, "%zu", n)
+    cdef int i
+    if n < 256:
+        return _DEC_SMALL[n]
+    i = sprintf(buf, "%zu", n)
     return PyBytes_FromStringAndSize(buf, i)
 
 
@@ -585,8 +589,8 @@ cdef class RequestExchange:
                 self._transport.writelines(
                     (_status_line(status), self._date_box[0], ZERO_CL)
                 )
-            else:
-                flat = [
+            elif isinstance(body, (list, tuple)):
+                self._transport.writelines((
                     _status_line(status),
                     self._date_box[0],
                     CT_PREFIX,
@@ -594,12 +598,19 @@ cdef class RequestExchange:
                     CL_PREFIX,
                     _dec(<size_t>nbytes),
                     CRLF2,
-                ]
-                if isinstance(body, (list, tuple)):
-                    flat.extend(body)
-                else:
-                    flat.append(body)
-                self._transport.writelines(flat)
+                ))
+                self._transport.writelines(body)
+            else:
+                self._transport.writelines((
+                    _status_line(status),
+                    self._date_box[0],
+                    CT_PREFIX,
+                    content_type,
+                    CL_PREFIX,
+                    _dec(<size_t>nbytes),
+                    CRLF2,
+                    body,
+                ))
         else:
             if not _may_have_body(status):
                 body = b""
@@ -641,8 +652,13 @@ cdef class RequestExchange:
                 self._out_buf = bytearray(256)
             h.c_write_wire_ba(self._out_buf, &self._out_len)
             self._buf_bytes(CRLF)
-            self._buf_body(body)
             self._flush()
+            self._status_code = status
+            if nbytes:
+                if isinstance(body, (list, tuple)):
+                    self._transport.writelines(body)
+                else:
+                    self._transport.write(body)
         self._status_code = status
         self._bytes_written = self._declared_length if self._declared_length > 0 else 0
         self._completed = True
