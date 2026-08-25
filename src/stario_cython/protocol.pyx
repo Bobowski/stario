@@ -16,7 +16,6 @@ from stario_cython.headers cimport Headers
 from stario_cython.llhttp cimport *
 from stario_cython.request cimport Request
 
-cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
 # Handlers always start at headers-complete. Body bytes accumulate on the exchange;
 # body() awaits one completion Event, stream() drains with backpressure.
@@ -443,14 +442,7 @@ cdef class HttpProtocol:
                 and not exchange._req_connection_close
             )
         )
-        # Always start the handler at headers-complete. Pre-size _acc when the
-        # Content-Length is known so body() can materialize without realloc churn.
-        if flags & F_CONTENT_LENGTH:
-            self.complete_headers(
-                exchange._req_expect_continue, <Py_ssize_t>content_length
-            )
-        else:
-            self.complete_headers(exchange._req_expect_continue, -1)
+        self.complete_headers(exchange._req_expect_continue)
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)
@@ -492,7 +484,7 @@ cdef class HttpProtocol:
         )
         return request
 
-    cdef void complete_headers(self, bint expect_continue, Py_ssize_t expected_body):
+    cdef void complete_headers(self, bint expect_continue):
         cdef RequestExchange exchange
         cdef Request request
         if self.request_dispatched or self.rejected:
@@ -502,8 +494,6 @@ cdef class HttpProtocol:
         exchange = self.reading_exchange
         request = self._build_request(exchange, exchange)
         exchange.reset_body(expect_continue)
-        if expected_body > 0:
-            exchange.prepare_body_capacity(expected_body)
         self._dispatch(exchange, request)
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):

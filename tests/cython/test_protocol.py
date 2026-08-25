@@ -621,13 +621,13 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
 async def test_stream_max_chunk_must_be_below_high_water() -> None:
     loop = asyncio.get_running_loop()
     app = App()
-    errors: list[BaseException] = []
+    errors: list[ValueError] = []
 
     async def upload(c, w):
         try:
             async for _ in c.req.stream(max_chunk=256 * 1024):
                 pass
-        except BaseException as exc:
+        except ValueError as exc:
             errors.append(exc)
             raise
         w.respond(b"ok", b"text/plain")
@@ -657,9 +657,8 @@ async def test_stream_max_chunk_must_be_below_high_water() -> None:
         )
         await writer.drain()
         response = await _read_response(reader)
-        assert b"500" in response.split(b"\r\n", 1)[0] or errors
+        assert b"500" in response.split(b"\r\n", 1)[0]
         assert errors
-        assert isinstance(errors[0], ValueError)
         assert "high water" in str(errors[0])
         writer.close()
         await writer.wait_closed()

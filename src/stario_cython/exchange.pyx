@@ -304,23 +304,6 @@ cdef class RequestExchange:
             return 0
         raise TypeError(BODY_TYPE_ERROR)
 
-    cdef int _write_body_raw(self, object body) except -1:
-        """Write body parts directly to the transport (known Content-Length)."""
-        cdef object part
-        if body is None:
-            return 0
-        if _is_bytes_like(body):
-            if len(body):
-                self._transport.write(body)
-            return 0
-        if isinstance(body, (list, tuple)):
-            for part in body:
-                _require_bytes_like(part)
-                if len(part):
-                    self._transport.write(part)
-            return 0
-        raise TypeError(BODY_TYPE_ERROR)
-
     cdef int _buf_uint(self, size_t n, int base) except -1:
         cdef char tmp[16]
         cdef int i
@@ -367,15 +350,11 @@ cdef class RequestExchange:
     ):
         if not self._available or self._accept is None:
             return False
+        if not streaming:
+            if data is None or nbytes < self._compress_min_size:
+                return False
         if content_type is not None and not content_type_is_compressible(content_type):
             return False
-        if not streaming:
-            if data is None:
-                return False
-            if nbytes < 0:
-                nbytes = self._body_nbytes(data)
-            if nbytes < self._compress_min_size:
-                return False
         return True
 
     cdef int _frame(
@@ -768,7 +747,10 @@ cdef class RequestExchange:
             return self
         if self._declared_length >= 0:
             self._bytes_written += n
-            self._write_body_raw(data)
+            if isinstance(data, (list, tuple)):
+                self._transport.writelines(data)
+            else:
+                self._transport.write(data)
             return self
         if self._brotli != NULL or self._gzip != NULL:
             if isinstance(data, (list, tuple)):
@@ -879,11 +861,6 @@ cdef class RequestExchange:
         self._acc_len = 0
         self._acc_pos = 0
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
-
-    cdef void prepare_body_capacity(self, Py_ssize_t expected_size):
-        """Pre-size the C accumulator for a known Content-Length."""
-        if expected_size > 0:
-            self._acc_reserve(expected_size)
 
     cdef int _acc_compact(self) except -1:
         cdef Py_ssize_t unread
@@ -1086,7 +1063,6 @@ cdef class RequestExchange:
         if self._consumed_as == CONSUMED_BODY:
             if self._cached is None:
                 self._cached = self._acc_to_bytes()
-            self._buffered = 0
         self._wake()
         self._maybe_recycle()
 
@@ -1166,12 +1142,13 @@ cdef class RequestExchange:
             while self._chunks is not None and index < len(self._chunks):
                 index, chunk = self._take_chunk(index)
                 yield chunk
+            if index:
+                self._chunks.clear()
+                index = 0
             if self._body_complete:
                 if self._acc_unread() > 0:
                     self._emit_from_acc(self._acc_unread())
                     continue
-                if self._chunks is not None:
-                    self._chunks.clear()
                 return
             await self._wait_for_body_data()
 
@@ -1208,7 +1185,6 @@ cdef class RequestExchange:
             self._cached = self._acc_to_bytes()
         if max_size is not None and len(self._cached) > max_size:
             raise HttpException(413, "Request body too large")
-        self._buffered = 0
         return self._cached
 
 

@@ -76,7 +76,6 @@ cdef class RequestExchange:
     cdef void reset_body(self, bint expect_continue)
     cdef void _clear_hot_request_headers(self)
     cdef void cache_hot_request_headers(self)
-    cdef void prepare_body_capacity(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)
     cdef void c_abort(self)
@@ -95,7 +94,6 @@ cdef class RequestExchange:
     cdef void _flush(self)
     cdef Py_ssize_t _body_nbytes(self, object body) except -2
     cdef object _body_as_bytes(self, object body)
-    cdef int _write_body_raw(self, object body) except -1
     cdef bint _may_compress(
         self,
         object data,
