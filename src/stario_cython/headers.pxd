@@ -8,11 +8,9 @@ ctypedef struct RawHeader:
 
 cdef class Headers:
     cdef dict _data
-    cdef char _raw_inline[2048]
     cdef char* _raw_arena
     cdef Py_ssize_t _raw_len
     cdef Py_ssize_t _raw_cap
-    cdef RawHeader _raw_headers_inline[16]
     cdef RawHeader* _raw_headers
     cdef Py_ssize_t _raw_count
     cdef Py_ssize_t _raw_headers_cap

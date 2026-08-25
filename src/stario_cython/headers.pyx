@@ -2,7 +2,7 @@
 """Bytes-backed headers. Parser lowercases and interns names in C."""
 
 from libc.string cimport memcmp, memcpy
-from libc.stdlib cimport free, malloc, realloc
+from libc.stdlib cimport free, realloc
 from libc.stdint cimport uint8_t, uint32_t
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
@@ -275,12 +275,12 @@ cdef object _encode_value(str value):
 
 cdef class Headers:
     def __cinit__(self):
-        self._raw_arena = &self._raw_inline[0]
+        self._raw_arena = NULL
         self._raw_len = 0
-        self._raw_cap = 2048
-        self._raw_headers = &self._raw_headers_inline[0]
+        self._raw_cap = 0
+        self._raw_headers = NULL
         self._raw_count = 0
-        self._raw_headers_cap = 16
+        self._raw_headers_cap = 0
         self._pending_header = False
         self._request_host_index = -1
 
@@ -296,9 +296,9 @@ cdef class Headers:
         self._request_identity_q = -1
 
     def __dealloc__(self):
-        if self._raw_arena != &self._raw_inline[0]:
+        if self._raw_arena != NULL:
             free(self._raw_arena)
-        if self._raw_headers != &self._raw_headers_inline[0]:
+        if self._raw_headers != NULL:
             free(self._raw_headers)
 
     cdef int _reserve_raw(self, Py_ssize_t bytes_needed) except -1:
@@ -310,12 +310,7 @@ cdef class Headers:
         cap = 256 if self._raw_cap == 0 else self._raw_cap * 2
         if cap < need:
             cap = need
-        if self._raw_arena == &self._raw_inline[0]:
-            arena = <char*>malloc(<size_t>cap)
-            if arena != NULL and self._raw_len:
-                memcpy(arena, self._raw_arena, <size_t>self._raw_len)
-        else:
-            arena = <char*>realloc(self._raw_arena, <size_t>cap)
+        arena = <char*>realloc(self._raw_arena, <size_t>cap)
         if arena == NULL:
             raise MemoryError()
         self._raw_arena = arena
@@ -328,19 +323,10 @@ cdef class Headers:
         if self._raw_count < self._raw_headers_cap:
             return 0
         cap = 16 if self._raw_headers_cap == 0 else self._raw_headers_cap * 2
-        if self._raw_headers == &self._raw_headers_inline[0]:
-            headers = <RawHeader*>malloc(<size_t>cap * sizeof(RawHeader))
-            if headers != NULL and self._raw_count:
-                memcpy(
-                    headers,
-                    self._raw_headers,
-                    <size_t>self._raw_count * sizeof(RawHeader),
-                )
-        else:
-            headers = <RawHeader*>realloc(
-                self._raw_headers,
-                <size_t>cap * sizeof(RawHeader),
-            )
+        headers = <RawHeader*>realloc(
+            self._raw_headers,
+            <size_t>cap * sizeof(RawHeader),
+        )
         if headers == NULL:
             raise MemoryError()
         self._raw_headers = headers
@@ -605,17 +591,17 @@ cdef class Headers:
 
     cdef void c_clear(self):
         self._data.clear()
-        if self._raw_arena != &self._raw_inline[0] and self._raw_cap > 8192:
+        if self._raw_arena != NULL and self._raw_cap > 8192:
             free(self._raw_arena)
-            self._raw_arena = &self._raw_inline[0]
-            self._raw_cap = 2048
+            self._raw_arena = NULL
+            self._raw_cap = 0
         if (
-            self._raw_headers != &self._raw_headers_inline[0]
+            self._raw_headers != NULL
             and self._raw_headers_cap > 64
         ):
             free(self._raw_headers)
-            self._raw_headers = &self._raw_headers_inline[0]
-            self._raw_headers_cap = 16
+            self._raw_headers = NULL
+            self._raw_headers_cap = 0
         self._raw_len = 0
         self._raw_count = 0
         self._pending_header = False
