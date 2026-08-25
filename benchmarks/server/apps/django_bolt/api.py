@@ -1,11 +1,11 @@
-import msgspec
+import ujson
 from django_bolt import BoltAPI
 from django_bolt.responses import PlainText
 
 from apps.common import validate_fields
 
 HELLO = "Hello, World!"
-api = BoltAPI()
+api = BoltAPI(validate_response=False)
 
 
 @api.get("/plaintext")
@@ -23,14 +23,9 @@ async def get_user(user_id: str):
     return {"id": user_id, "name": f"User {user_id}"}
 
 
-class UserInput(msgspec.Struct):
-    name: str
-    age: int
-
-
 @api.post("/validate")
-async def validate(body: UserInput):
-    payload, status = validate_fields({"name": body.name, "age": body.age})
+async def validate(request):
+    payload, status = validate_fields(ujson.loads(request.body))
     if status != 200:
         return payload, status
     return payload

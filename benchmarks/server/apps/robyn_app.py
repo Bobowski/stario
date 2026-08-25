@@ -2,7 +2,10 @@
 
 import os
 
+import ujson
 from robyn import Config, Robyn
+from robyn.jsonify import jsonify
+from robyn.robyn import Headers, Response
 
 from apps.common import validate_fields
 
@@ -37,8 +40,15 @@ async def get_user(request):
 
 @app.post("/validate")
 async def validate(request):
-    payload, status = validate_fields(request.json() or {})
-    return payload, status
+    raw = _body_bytes(request)
+    payload, status = validate_fields(ujson.loads(raw) if raw else {})
+    if status != 200:
+        return Response(
+            status_code=status,
+            headers=Headers({"Content-Type": "application/json"}),
+            description=jsonify(payload),
+        )
+    return payload
 
 
 @app.post("/form")

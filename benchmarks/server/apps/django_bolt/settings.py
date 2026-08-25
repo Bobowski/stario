@@ -26,3 +26,5 @@ DATABASES = {
 USE_TZ = True
 
 BOLT_API = ["apps.django_bolt.api:api"]
+BOLT_MAX_UPLOAD_SIZE = 3 * 1024 * 1024
+BOLT_COMPRESSION = None

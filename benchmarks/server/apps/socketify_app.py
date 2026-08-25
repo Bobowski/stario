@@ -3,11 +3,14 @@
 import os
 from io import BytesIO
 
+import ujson
+
 from apps.common import validate_fields
 from socketify import App, AppListenOptions
 
 HELLO = "Hello, World!"
 app = App()
+app.json_serializer(ujson)
 
 # Pin response wrappers while C callbacks are in flight (Py3.14 + socketify ffi GC bug).
 _INFLIGHT: dict[int, object] = {}
@@ -59,7 +62,8 @@ def get_user(res, req):
 
 
 async def validate(res, req):
-    body = await res.get_json() or {}
+    raw = await _read_body(res)
+    body = ujson.loads(raw) if raw else {}
     payload, status = validate_fields(body)
     if status != 200:
         return res.write_status(status).end(payload)

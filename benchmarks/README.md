@@ -147,9 +147,22 @@ Every app exposes the same paths and response shapes:
 | `/ingest/stream/2m` | POST | stream read → `{"bytes":N}` (buffered on Robyn/Django-Bolt) |
 | `/upload` | POST | read raw body → `{"bytes":N}` |
 
-Validation uses `apps.common.validate_fields()` everywhere except Django-Bolt,
-which uses msgspec struct parsing then calls the same helper. JSON responses
+Validation uses `apps.common.validate_fields()` on every target. JSON responses
 use `ujson` where the stack allows it.
+
+### Handler policy (no static responses)
+
+Benchmark handlers must **compute every response on each request**: build dicts,
+run `validate_fields`, call `ujson.dumps` / framework JSON helpers, and construct
+`Response` objects per call. Do **not**:
+
+- Reuse a single `Response` / `PlainTextResponse` instance across requests
+- Pre-serialize JSON at import time and return cached bytes
+- Skip validation or serialization because the wrk payload is fixed
+
+Framework-specific routing or server tuning is fine when output bytes and status
+codes stay identical. The goal is to measure handler + serialization work, not
+wire throughput of prebuilt buffers.
 
 ### Requirements
 
