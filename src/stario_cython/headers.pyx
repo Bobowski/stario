@@ -275,7 +275,12 @@ cdef class Headers:
         cdef size_t key_start
         cdef size_t key_end
         cdef int q
-        self._request_accept_present = True
+        if not self._request_accept_present:
+            self._request_accept_present = True
+            self._request_br_q = -1
+            self._request_gzip_q = -1
+            self._request_wildcard_q = -1
+            self._request_identity_q = -1
         while start < length:
             segment_end = start
             while segment_end < length and value[segment_end] != <char>44:
@@ -405,10 +410,6 @@ cdef class Headers:
         self._request_connection_close = False
         self._request_expect_continue = False
         self._request_accept_present = False
-        self._request_br_q = -1
-        self._request_gzip_q = -1
-        self._request_wildcard_q = -1
-        self._request_identity_q = -1
 
     cdef bint c_empty(self):
         return not self._data

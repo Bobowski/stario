@@ -348,6 +348,11 @@ cdef class HttpProtocol:
         cdef int err
         n = len(data)
         ptr = <const char*>data
+        if n <= PARSER_QUANTUM:
+            err = llhttp_execute(self.parser, ptr + offset, <size_t>(n - offset))
+            if err != HPE_OK:
+                self._close_error(400, "Invalid HTTP request")
+            return
         while offset < n:
             end = offset + PARSER_QUANTUM
             if end > n:

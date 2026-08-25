@@ -473,10 +473,13 @@ cdef class RequestExchange:
     cdef void cache_hot_request_headers(self):
         """Snapshot keep-alive / expect / accept-encoding (Headers API unchanged)."""
         cdef Headers h = self.request_headers
-        self._req_encoding = h.c_select_request_encoding(
-            self._brotli_enabled,
-            self._gzip_enabled,
-        )
+        if self._brotli_enabled or self._gzip_enabled:
+            self._req_encoding = h.c_select_request_encoding(
+                self._brotli_enabled,
+                self._gzip_enabled,
+            )
+        else:
+            self._req_encoding = ENCODING_NONE
         self._req_connection_close = h.c_request_connection_close()
         self._req_expect_continue = h.c_request_expect_continue()
 
