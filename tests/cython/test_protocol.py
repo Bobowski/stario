@@ -505,6 +505,119 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
 
 
 @pytest.mark.asyncio
+async def test_body_wait_survives_multi_segment_upload() -> None:
+    """body() must not require per-segment Event wakes — only completion."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    started = asyncio.Event()
+
+    async def echo(c, w):
+        started.set()
+        body = await c.req.body()
+        w.respond(body, b"text/plain")
+
+    app.post("/echo", echo)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        payload = b"abcdefghij" * 1000  # 10 KiB
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+        )
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        # Deliver body in small segments with yields so body() is waiting.
+        for i in range(0, len(payload), 512):
+            writer.write(payload[i : i + 512])
+            await writer.drain()
+            await asyncio.sleep(0)
+        assert payload in await _read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_next_request_starts_after_respond_before_handler_returns() -> None:
+    """Connection advances on response send, not when the handler coroutine ends."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    first_responded = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    order: list[str] = []
+
+    async def first(_c, w):
+        order.append("first-enter")
+        w.respond(b"one", b"text/plain")
+        first_responded.set()
+        await release_first.wait()
+        order.append("first-exit")
+
+    async def second(_c, w):
+        order.append("second-enter")
+        second_started.set()
+        w.respond(b"two", b"text/plain")
+
+    app.get("/first", first)
+    app.get("/second", second)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            b"GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"one" in await _read_response(reader)
+        await asyncio.wait_for(first_responded.wait(), timeout=1.0)
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        assert "second-enter" in order
+        assert "first-exit" not in order
+        release_first.set()
+        assert b"two" in await _read_response(reader)
+        await asyncio.sleep(0)
+        assert order == ["first-enter", "second-enter", "first-exit"]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_stream_max_chunk_must_be_below_high_water() -> None:
     loop = asyncio.get_running_loop()
     app = App()

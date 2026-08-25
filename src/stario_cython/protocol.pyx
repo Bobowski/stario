@@ -545,6 +545,13 @@ cdef class HttpProtocol:
         self.pending_exchanges.clear()
 
     def response_completed(self, RequestExchange exchange):
+        """Advance the connection after the response is fully sent.
+
+        Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
+        the handler coroutine returns. The handler (or ``app.create_task`` work)
+        may still run after this; the connection is free to start the next
+        pipelined/keep-alive exchange immediately.
+        """
         cdef object transport = self.transport
         cdef object conn
         cdef RequestExchange next_exchange

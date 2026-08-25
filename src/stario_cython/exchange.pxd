@@ -38,9 +38,11 @@ cdef class RequestExchange:
     cdef object _chunks
     cdef object _cached
     cdef object _data_ready
+    cdef object _stall_handle
     cdef int _buffered
     cdef int _total_read
     cdef int _max_size
+    cdef Py_ssize_t _read_max_size
     cdef double _timeout
     cdef int _consumed_as
     cdef int _abort_reason
@@ -102,6 +104,8 @@ cdef class RequestExchange:
     cdef object _select(self, object data, object content_type, bint streaming)
     cdef void _raise_abort(self)
     cdef void _wake(self)
+    cdef void _cancel_stall_timer(self)
+    cdef void _reset_stall_timer(self)
     cdef object _take_chunk(self, int index)
     cdef void _maybe_continue(self)
     cdef void _done(self)

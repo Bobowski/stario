@@ -144,6 +144,7 @@ cdef class RequestExchange:
         self._chunks = None
         self._cached = None
         self._data_ready = None
+        self._stall_handle = None
         self._compression = _UNBOUND
         self._available = ()
         self._compress_min_size = DEFAULT_MIN_SIZE
@@ -151,6 +152,7 @@ cdef class RequestExchange:
         self._state = None
         self.in_pool = False
         self._body_active = False
+        self._read_max_size = -1
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
     def __dealloc__(self):
@@ -516,9 +518,11 @@ cdef class RequestExchange:
         self.in_pool = True
         self._cached = None
         self._data_ready = None
+        self._cancel_stall_timer()
         self._acc_len = 0
         self._acc_pos = 0
         self._body_active = False
+        self._read_max_size = -1
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
         if self._chunks is not None:
             self._chunks.clear()
@@ -857,9 +861,11 @@ cdef class RequestExchange:
             self._chunks.clear()
         self._cached = None
         self._data_ready = None
+        self._cancel_stall_timer()
         self._expect_continue = expect_continue
         self._buffered = 0
         self._total_read = 0
+        self._read_max_size = -1
         self._consumed_as = CONSUMED_NONE
         self._abort_reason = ABORT_NONE
         self._body_complete = False
@@ -968,6 +974,33 @@ cdef class RequestExchange:
         if self._data_ready is not None:
             self._data_ready.set()
 
+    cdef void _cancel_stall_timer(self):
+        cdef object handle = self._stall_handle
+        if handle is not None:
+            handle.cancel()
+            self._stall_handle = None
+
+    cdef void _reset_stall_timer(self):
+        """Arm/refresh slowloris stall timeout while a body consumer is waiting."""
+        cdef object loop
+        self._cancel_stall_timer()
+        if not self._waiting or self._body_complete or self._timeout <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._stall_handle = loop.call_later(self._timeout, self._on_stall_timeout)
+
+    def _on_stall_timeout(self):
+        self._stall_handle = None
+        if self._abort_reason != ABORT_NONE or self._body_complete:
+            return
+        self._abort_reason = ABORT_TIMEOUT
+        if self._chunks is not None:
+            self._chunks.clear()
+        self._wake()
+
     cdef object _take_chunk(self, int index):
         cdef object chunk = self._chunks[index]
         cdef object transport
@@ -1002,25 +1035,40 @@ cdef class RequestExchange:
         self._total_read += <int>length
         if self._total_read > self._max_size:
             self._abort_reason = ABORT_TOO_LARGE
+            self._cancel_stall_timer()
             self._wake()
             return
         # Always append into the C accumulator. body() materializes once at complete;
         # stream() peels max_chunk-sized Python bytes.
         self._acc_add(at, length)
+        if (
+            self._read_max_size >= 0
+            and self._acc_unread() > self._read_max_size
+        ):
+            self._abort_reason = ABORT_TOO_LARGE
+            self._cancel_stall_timer()
+            self._wake()
+            return
         if self._consumed_as == CONSUMED_STREAM:
             max_chunk = self._stream_max_chunk
             while self._acc_unread() >= max_chunk:
                 self._emit_from_acc(max_chunk)
                 self._wake()
+            # Progress resets stall; do not rely on wait_for.
+            if self._waiting:
+                self._reset_stall_timer()
             self._maybe_pause()
             return
+        # body() waits only for message complete — refresh stall on progress,
+        # but do not Event-wake on every TCP segment.
         if self._waiting:
-            self._wake()
+            self._reset_stall_timer()
 
     cdef void c_complete(self):
         if not self._body_active:
             return
         self._body_complete = True
+        self._cancel_stall_timer()
         if self._consumed_as == CONSUMED_STREAM:
             if self._acc_unread() > 0:
                 self._emit_from_acc(self._acc_unread())
@@ -1048,6 +1096,7 @@ cdef class RequestExchange:
         self._free_compressors()
         self._abort_reason = ABORT_DISCONNECTED
         self._body_complete = True
+        self._cancel_stall_timer()
         self._wake()
         self._maybe_recycle()
 
@@ -1064,16 +1113,17 @@ cdef class RequestExchange:
         if self._data_ready is None:
             self._data_ready = asyncio.Event()
         self._waiting = True
+        self._reset_stall_timer()
         try:
-            await asyncio.wait_for(self._data_ready.wait(), self._timeout)
-        except TimeoutError:
-            self._abort_reason = ABORT_TIMEOUT
+            await self._data_ready.wait()
+        finally:
+            self._waiting = False
+            self._cancel_stall_timer()
+        self._data_ready.clear()
+        if self._abort_reason != ABORT_NONE:
             if self._chunks is not None:
                 self._chunks.clear()
             self._raise_abort()
-        finally:
-            self._waiting = False
-        self._data_ready.clear()
 
     async def stream(self, max_chunk=None):
         cdef int index
@@ -1142,12 +1192,17 @@ cdef class RequestExchange:
             self._consumed_as = CONSUMED_BODY
             return self._cached
         self._consumed_as = CONSUMED_BODY
+        self._read_max_size = -1 if max_size is None else <Py_ssize_t>max_size
         self._maybe_continue()
-        # Stall-aware Event wait until message complete, then one materialization.
+        # Stall-aware Event wait until message complete (wake only from
+        # c_complete / abort — not every TCP segment), then one materialization.
         while not self._body_complete:
             if self._abort_reason != ABORT_NONE:
                 self._raise_abort()
-            if max_size is not None and self._acc_unread() > max_size:
+            if (
+                self._read_max_size >= 0
+                and self._acc_unread() > self._read_max_size
+            ):
                 raise HttpException(413, "Request body too large")
             await self._wait_for_body_data()
         if self._abort_reason != ABORT_NONE:
