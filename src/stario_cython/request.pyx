@@ -105,11 +105,11 @@ cdef class Request:
             return self._body
         return await self._body.read(max_size=max_size)
 
-    async def stream(self):
+    async def stream(self, max_chunk=None):
         if self._body is None:
             return
         if type(self._body) is bytes:
             yield self._body
             return
-        async for chunk in self._body.stream():
+        async for chunk in self._body.stream(max_chunk=max_chunk):
             yield chunk

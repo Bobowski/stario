@@ -7,6 +7,9 @@ cdef class RequestExchange:
     cdef list _date_box
     cdef object _compression
     cdef object _accept
+    cdef object _req_accept_encoding
+    cdef bint _req_expect_continue
+    cdef bint _req_connection_close
     cdef public Headers headers
     cdef StarioBrotli* _brotli
     cdef StarioGzip* _gzip
@@ -20,6 +23,7 @@ cdef class RequestExchange:
     cdef int _brotli_level
     cdef int _brotli_window
     cdef int _gzip_level
+    cdef Py_ssize_t _compress_min_size
     cdef bint _completed
 
     cdef public object app
@@ -36,9 +40,11 @@ cdef class RequestExchange:
     cdef object _chunks
     cdef object _cached
     cdef object _data_ready
+    cdef object _stall_handle
     cdef int _buffered
     cdef int _total_read
     cdef int _max_size
+    cdef Py_ssize_t _read_max_size
     cdef double _timeout
     cdef int _consumed_as
     cdef int _abort_reason
@@ -49,6 +55,8 @@ cdef class RequestExchange:
     cdef char* _acc
     cdef Py_ssize_t _acc_len
     cdef Py_ssize_t _acc_cap
+    cdef Py_ssize_t _acc_pos
+    cdef Py_ssize_t _stream_max_chunk
 
     cdef void reset(
         self,
@@ -66,17 +74,35 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue)
+    cdef void _clear_hot_request_headers(self)
+    cdef void cache_hot_request_headers(self)
+    cdef void prepare_body_capacity(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)
     cdef void c_abort(self)
     cdef int _acc_add(self, const char* at, size_t length) except -1
+    cdef int _acc_reserve(self, Py_ssize_t need) except -1
+    cdef int _acc_compact(self) except -1
+    cdef Py_ssize_t _acc_unread(self) noexcept
+    cdef object _acc_to_bytes(self)
+    cdef void _emit_from_acc(self, Py_ssize_t n)
     cdef void reset_response(self, object accept_encoding)
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
     cdef int _buf_bytes(self, object data) except -1
+    cdef int _buf_body(self, object body) except -1
     cdef int _buf_uint(self, size_t n, int base) except -1
     cdef void _flush(self)
-    cdef bint _may_compress(self, object data, object content_type, bint streaming)
+    cdef Py_ssize_t _body_nbytes(self, object body) except -2
+    cdef object _body_as_bytes(self, object body)
+    cdef int _write_body_raw(self, object body) except -1
+    cdef bint _may_compress(
+        self,
+        object data,
+        object content_type,
+        bint streaming,
+        Py_ssize_t nbytes,
+    )
     cdef int _frame(self, object data, object encoding, const unsigned char** out, size_t* out_len) except -1
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1
     cdef int _finish(self, const unsigned char** out, size_t* out_len) except -1
@@ -84,13 +110,21 @@ cdef class RequestExchange:
     cdef int _ensure_brotli(self) except -1
     cdef int _ensure_gzip(self) except -1
     cdef void _free_compressors(self)
-    cdef object _select(self, object data, object content_type, bint streaming)
-    cdef void _drain_acc(self)
+    cdef object _select(
+        self,
+        object data,
+        object content_type,
+        bint streaming,
+        Py_ssize_t nbytes,
+    )
     cdef void _raise_abort(self)
     cdef void _wake(self)
+    cdef void _cancel_stall_timer(self)
+    cdef void _reset_stall_timer(self)
     cdef object _take_chunk(self, int index)
     cdef void _maybe_continue(self)
     cdef void _done(self)
+    cdef void _maybe_pause(self)
 
 cdef RequestExchange acquire_exchange(
     object connection,

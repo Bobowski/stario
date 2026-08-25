@@ -18,7 +18,8 @@ from stario_cython.request cimport Request
 
 cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
-cdef int STREAM_BODY_AFTER = 65536
+# Handlers always start at headers-complete. Body bytes accumulate on the exchange;
+# body() awaits one completion Event, stream() drains with backpressure.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"
@@ -188,7 +189,6 @@ cdef class HttpProtocol:
     cdef int max_body_bytes
     cdef bint have_value
     cdef bint rejected
-    cdef bint stream_body
     cdef bint request_dispatched
     cdef bint request_keep_alive
 
@@ -256,7 +256,6 @@ cdef class HttpProtocol:
         self.max_body_bytes = max_body_bytes
         self.have_value = False
         self.rejected = False
-        self.stream_body = False
         self.request_dispatched = False
         self.request_keep_alive = True
 
@@ -382,7 +381,6 @@ cdef class HttpProtocol:
                 self.max_body_bytes,
             )
         self.head_bytes = 40
-        self.stream_body = False
         self.request_dispatched = False
         self.request_keep_alive = True
         self.url = b""
@@ -416,10 +414,9 @@ cdef class HttpProtocol:
         self.have_value = True
 
     cdef void _on_headers_complete(self):
-        cdef Headers headers
+        cdef RequestExchange exchange
         cdef uint16_t flags
         cdef uint64_t content_length
-        cdef bint expect_continue
         if self.url_buf != NULL and self.url_len > 0:
             self.url = PyBytes_FromStringAndSize(self.url_buf, self.url_len)
         else:
@@ -427,7 +424,7 @@ cdef class HttpProtocol:
         self._flush_header()
         if self.rejected or self.reading_exchange is None:
             return
-        headers = self.reading_exchange.request_headers
+        exchange = self.reading_exchange
         if llhttp_get_upgrade(self.parser):
             self._close_error(400, "Upgrade not supported")
             return
@@ -436,22 +433,24 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
+        # Snapshot keep-alive / expect / accept-encoding into exchange slots.
+        exchange.cache_hot_request_headers()
         self.request_keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
             or (
                 llhttp_get_http_major(self.parser) == 1
                 and llhttp_get_http_minor(self.parser) == 1
-                and (headers.c_get(b"connection") or b"").lower() != b"close"
+                and not exchange._req_connection_close
             )
         )
-        expect_continue = (
-            (headers.c_get(b"expect") or b"").lower() == b"100-continue"
-        )
-        self.stream_body = expect_continue or (flags & F_CHUNKED) != 0 or (
-            (flags & F_CONTENT_LENGTH) != 0 and content_length > STREAM_BODY_AFTER
-        )
-        if self.stream_body:
-            self.complete_headers(expect_continue)
+        # Always start the handler at headers-complete. Pre-size _acc when the
+        # Content-Length is known so body() can materialize without realloc churn.
+        if flags & F_CONTENT_LENGTH:
+            self.complete_headers(
+                exchange._req_expect_continue, <Py_ssize_t>content_length
+            )
+        else:
+            self.complete_headers(exchange._req_expect_continue, -1)
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)
@@ -461,15 +460,8 @@ cdef class HttpProtocol:
         if self.rejected:
             return
         exchange = self.reading_exchange
-        if self.stream_body:
+        if exchange is not None and exchange._body_active:
             exchange.c_complete()
-            self.reading_exchange = None
-            return
-        if exchange._body_active:
-            exchange.c_complete()
-            self.complete_request(exchange)
-        else:
-            self.complete_request(None)
         self.reading_exchange = None
 
     cdef Request _build_request(self, RequestExchange exchange, object body):
@@ -500,7 +492,7 @@ cdef class HttpProtocol:
         )
         return request
 
-    cdef void complete_headers(self, bint expect_continue):
+    cdef void complete_headers(self, bint expect_continue, Py_ssize_t expected_body):
         cdef RequestExchange exchange
         cdef Request request
         if self.request_dispatched or self.rejected:
@@ -510,16 +502,9 @@ cdef class HttpProtocol:
         exchange = self.reading_exchange
         request = self._build_request(exchange, exchange)
         exchange.reset_body(expect_continue)
+        if expected_body > 0:
+            exchange.prepare_body_capacity(expected_body)
         self._dispatch(exchange, request)
-
-    cdef void complete_request(self, object body):
-        cdef RequestExchange exchange
-        if self.request_dispatched or self.rejected:
-            return
-        if self.transport is None or self.transport.is_closing():
-            return
-        exchange = self.reading_exchange
-        self._dispatch(exchange, self._build_request(exchange, body))
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
         cdef object span
@@ -560,6 +545,13 @@ cdef class HttpProtocol:
         self.pending_exchanges.clear()
 
     def response_completed(self, RequestExchange exchange):
+        """Advance the connection after the response is fully sent.
+
+        Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
+        the handler coroutine returns. The handler (or ``app.create_task`` work)
+        may still run after this; the connection is free to start the next
+        pipelined/keep-alive exchange immediately.
+        """
         cdef object transport = self.transport
         cdef object conn
         cdef RequestExchange next_exchange
@@ -569,6 +561,7 @@ cdef class HttpProtocol:
         if transport is None or transport.is_closing():
             self._drop_pending()
             return
+        # User may have set Connection: close on the response Headers dict.
         conn = exchange.headers.c_get(b"connection")
         if conn is not None and conn.lower() == b"close":
             transport.close()
