@@ -3,3 +3,5 @@
 results/
 fixtures/*.bin
 fixtures/*.json
+server/fixtures/*.bin
+server/fixtures/*.json
