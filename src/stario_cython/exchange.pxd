@@ -49,6 +49,7 @@ cdef class RequestExchange:
     cdef char* _acc
     cdef Py_ssize_t _acc_len
     cdef Py_ssize_t _acc_cap
+    cdef Py_ssize_t _expected_body
 
     cdef void reset(
         self,
@@ -66,10 +67,13 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue)
+    cdef void prepare_fixed_body(self, Py_ssize_t expected_size)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)
     cdef void c_abort(self)
     cdef int _acc_add(self, const char* at, size_t length) except -1
+    cdef int _acc_reserve(self, Py_ssize_t need) except -1
+    cdef object _acc_to_bytes(self)
     cdef void reset_response(self, object accept_encoding)
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
@@ -91,6 +95,7 @@ cdef class RequestExchange:
     cdef object _take_chunk(self, int index)
     cdef void _maybe_continue(self)
     cdef void _done(self)
+    cdef void _maybe_pause(self)
 
 cdef RequestExchange acquire_exchange(
     object connection,

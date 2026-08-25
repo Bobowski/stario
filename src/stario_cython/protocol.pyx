@@ -18,7 +18,9 @@ from stario_cython.request cimport Request
 
 cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
-cdef int STREAM_BODY_AFTER = 65536
+# Fixed Content-Length bodies are fully buffered in C before the handler runs
+# (up to max_body_bytes). Early dispatch is reserved for chunked uploads and
+# Expect: 100-continue, where the handler must start before the body finishes.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"
@@ -447,11 +449,14 @@ cdef class HttpProtocol:
         expect_continue = (
             (headers.c_get(b"expect") or b"").lower() == b"100-continue"
         )
-        self.stream_body = expect_continue or (flags & F_CHUNKED) != 0 or (
-            (flags & F_CONTENT_LENGTH) != 0 and content_length > STREAM_BODY_AFTER
-        )
+        # Chunked / 100-continue need the handler before the body finishes.
+        # Known Content-Length bodies stay in the C accumulator until complete,
+        # then dispatch with a single bytes object (same fast path as small POSTs).
+        self.stream_body = expect_continue or (flags & F_CHUNKED) != 0
         if self.stream_body:
             self.complete_headers(expect_continue)
+        elif flags & F_CONTENT_LENGTH:
+            self.reading_exchange.prepare_fixed_body(<Py_ssize_t>content_length)
 
     cdef void _on_body(self, const char* at, size_t length):
         self.reading_exchange.c_feed(at, length)
@@ -467,7 +472,10 @@ cdef class HttpProtocol:
             return
         if exchange._body_active:
             exchange.c_complete()
-            self.complete_request(exchange)
+            # Pass materialized bytes so req.body() is a sync return (no async read).
+            self.complete_request(
+                exchange._cached if exchange._cached is not None else b""
+            )
         else:
             self.complete_request(None)
         self.reading_exchange = None
