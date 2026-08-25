@@ -36,7 +36,6 @@ cdef class RequestExchange:
     cdef object _chunks
     cdef object _cached
     cdef object _data_ready
-    cdef object _body_fut
     cdef int _buffered
     cdef int _total_read
     cdef int _max_size
@@ -97,7 +96,6 @@ cdef class RequestExchange:
     cdef object _select(self, object data, object content_type, bint streaming)
     cdef void _raise_abort(self)
     cdef void _wake(self)
-    cdef void _resolve_body_fut(self, object value)
     cdef object _take_chunk(self, int index)
     cdef void _maybe_continue(self)
     cdef void _done(self)

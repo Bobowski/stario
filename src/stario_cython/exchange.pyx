@@ -142,7 +142,6 @@ cdef class RequestExchange:
         self._chunks = None
         self._cached = None
         self._data_ready = None
-        self._body_fut = None
         self._compression = _UNBOUND
         self._available = ()
         self._state = None
@@ -417,7 +416,6 @@ cdef class RequestExchange:
         self.in_pool = True
         self._cached = None
         self._data_ready = None
-        self._body_fut = None
         self._acc_len = 0
         self._acc_pos = 0
         self._body_active = False
@@ -727,7 +725,6 @@ cdef class RequestExchange:
             self._chunks.clear()
         self._cached = None
         self._data_ready = None
-        self._body_fut = None
         self._expect_continue = expect_continue
         self._buffered = 0
         self._total_read = 0
@@ -839,11 +836,6 @@ cdef class RequestExchange:
         if self._data_ready is not None:
             self._data_ready.set()
 
-    cdef void _resolve_body_fut(self, object value):
-        cdef object fut = self._body_fut
-        if fut is not None and not fut.done():
-            fut.set_result(value)
-
     cdef object _take_chunk(self, int index):
         cdef object chunk = self._chunks[index]
         cdef object transport
@@ -878,11 +870,10 @@ cdef class RequestExchange:
         self._total_read += <int>length
         if self._total_read > self._max_size:
             self._abort_reason = ABORT_TOO_LARGE
-            self._resolve_body_fut(None)
             self._wake()
             return
         # Always append into the C accumulator. body() materializes once at complete;
-        # stream() peels DEFAULT_STREAM_CHUNK / max_chunk-sized Python bytes.
+        # stream() peels max_chunk-sized Python bytes.
         self._acc_add(at, length)
         if self._consumed_as == CONSUMED_STREAM:
             max_chunk = self._stream_max_chunk
@@ -907,17 +898,15 @@ cdef class RequestExchange:
         if self._abort_reason != ABORT_NONE:
             self._acc_pos = 0
             self._acc_len = 0
-            self._resolve_body_fut(None)
             self._wake()
             self._maybe_recycle()
             return
-        # body() already waiting: materialize once and resolve the Future.
-        # Otherwise leave bytes in _acc until body() (or never — then park drops them).
-        if self._consumed_as == CONSUMED_BODY or self._body_fut is not None:
+        # body() already waiting: materialize once. Otherwise leave bytes in _acc
+        # until body() (or never — then park drops them).
+        if self._consumed_as == CONSUMED_BODY:
             if self._cached is None:
                 self._cached = self._acc_to_bytes()
             self._buffered = 0
-            self._resolve_body_fut(self._cached)
         self._wake()
         self._maybe_recycle()
 
@@ -927,7 +916,6 @@ cdef class RequestExchange:
         self._free_compressors()
         self._abort_reason = ABORT_DISCONNECTED
         self._body_complete = True
-        self._resolve_body_fut(None)
         self._wake()
         self._maybe_recycle()
 
@@ -950,7 +938,6 @@ cdef class RequestExchange:
             self._abort_reason = ABORT_TIMEOUT
             if self._chunks is not None:
                 self._chunks.clear()
-            self._resolve_body_fut(None)
             self._raise_abort()
         finally:
             self._waiting = False
@@ -1008,8 +995,6 @@ cdef class RequestExchange:
             await self._wait_for_body_data()
 
     async def read(self, max_size=None):
-        cdef object fut
-        cdef object result
         if max_size is not None and max_size < 0:
             raise ValueError("max_size must be non-negative.")
         if self._abort_reason != ABORT_NONE:
@@ -1026,36 +1011,21 @@ cdef class RequestExchange:
             return self._cached
         self._consumed_as = CONSUMED_BODY
         self._maybe_continue()
-        if self._body_complete:
-            if self._cached is None:
-                self._cached = self._acc_to_bytes()
-            if max_size is not None and len(self._cached) > max_size:
-                raise HttpException(413, "Request body too large")
-            self._buffered = 0
-            return self._cached
-        # One-shot Future resolved in c_complete / c_abort; stall timeout via Event.
-        fut = asyncio.get_running_loop().create_future()
-        self._body_fut = fut
-        try:
-            while not fut.done():
-                if self._abort_reason != ABORT_NONE:
-                    self._raise_abort()
-                if max_size is not None and self._acc_unread() > max_size:
-                    raise HttpException(413, "Request body too large")
-                await self._wait_for_body_data()
+        # Stall-aware Event wait until message complete, then one materialization.
+        while not self._body_complete:
             if self._abort_reason != ABORT_NONE:
                 self._raise_abort()
-            result = fut.result()
-            if result is None:
-                if self._cached is None:
-                    self._cached = self._acc_to_bytes()
-                result = self._cached
-            if max_size is not None and len(result) > max_size:
+            if max_size is not None and self._acc_unread() > max_size:
                 raise HttpException(413, "Request body too large")
-            self._buffered = 0
-            return result
-        finally:
-            self._body_fut = None
+            await self._wait_for_body_data()
+        if self._abort_reason != ABORT_NONE:
+            self._raise_abort()
+        if self._cached is None:
+            self._cached = self._acc_to_bytes()
+        if max_size is not None and len(self._cached) > max_size:
+            raise HttpException(413, "Request body too large")
+        self._buffered = 0
+        return self._cached
 
 
 cdef RequestExchange acquire_exchange(
