@@ -103,6 +103,52 @@ async def test_plaintext_and_post_and_keepalive() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fragmented_headers_materialize_correctly() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def inspect(c, w):
+        assert c.req.host == "example.com"
+        assert c.req.headers.getlist("x-test") == ["one", "two"]
+        responses.text(w, "ok")
+
+    app.get("/", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        _free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    request = (
+        b"GET / HTTP/1.1\r\n"
+        b"Host: Example.COM:80\r\n"
+        b"X-Test: one\r\n"
+        b"x-test: two\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        for byte in request:
+            writer.write(bytes((byte,)))
+            await writer.drain()
+            await asyncio.sleep(0)
+        assert b"ok" in await _read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_stream_large_and_chunked_upload() -> None:
     loop = asyncio.get_running_loop()
     app = App()
