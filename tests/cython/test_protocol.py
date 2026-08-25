@@ -522,7 +522,8 @@ async def test_large_single_read_pipeline_resumes_without_losing_bytes() -> None
         assert handled == [0]
         release.set()
         for index in range(request_count):
-            response = await _read_response(reader)
+            async with asyncio.timeout(2):
+                response = await _read_response(reader)
             assert response.endswith(str(index).encode("ascii"))
         assert handled == list(range(request_count))
         writer.close()
