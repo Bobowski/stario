@@ -83,7 +83,7 @@ _init_intern()
 
 cdef object _CONNECTION_NAME = _INTERN_PY[1]
 cdef object _ACCEPT_ENCODING_NAME = _INTERN_PY[13]
-cdef object _EXPECT_NAME = _INTERN_PY[26]
+cdef object _EXPECT_NAME = _INTERN_PY[27]
 
 
 cdef inline void _lower_copy(char* dst, const char* src, size_t n) noexcept:
