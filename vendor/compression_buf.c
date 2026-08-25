@@ -15,6 +15,8 @@ struct StarioBrotli {
     unsigned char* out;
     size_t out_cap;
     int finished;
+    int level;
+    int window_log;
 };
 
 struct StarioGzip {
@@ -22,7 +24,25 @@ struct StarioGzip {
     unsigned char* out;
     size_t out_cap;
     int finished;
+    int level;
+    int window_bits;
 };
+
+#define STARIO_CODEC_POOL_MAX 32
+#define STARIO_RETAINED_OUTPUT_MAX (64 * 1024)
+
+static StarioBrotli* brotli_pool[STARIO_CODEC_POOL_MAX];
+static size_t brotli_pool_count = 0;
+static StarioGzip* gzip_pool[STARIO_CODEC_POOL_MAX];
+static size_t gzip_pool_count = 0;
+
+static void trim_output(unsigned char** out, size_t* cap) {
+    if (*cap > STARIO_RETAINED_OUTPUT_MAX) {
+        free(*out);
+        *out = NULL;
+        *cap = 0;
+    }
+}
 
 static int grow_buffer(unsigned char** buf, size_t* cap, size_t used) {
     size_t next_cap;
@@ -135,20 +155,12 @@ static int brotli_emit(
     return 0;
 }
 
-StarioBrotli* stario_brotli_new(int level, int window_log) {
-    StarioBrotli* brotli = (StarioBrotli*)malloc(sizeof(StarioBrotli));
+static int brotli_start(StarioBrotli* brotli, int level, int window_log) {
     uint32_t lgwin;
-
-    if (brotli == NULL) {
-        return NULL;
-    }
     brotli->state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
-    brotli->out = NULL;
-    brotli->out_cap = 0;
     brotli->finished = 0;
     if (brotli->state == NULL) {
-        free(brotli);
-        return NULL;
+        return -1;
     }
     lgwin = window_log > 0 ? (uint32_t)window_log : STARIO_BROTLI_HTTP_WINDOW;
     if (
@@ -158,10 +170,39 @@ StarioBrotli* stario_brotli_new(int level, int window_log) {
         !BrotliEncoderSetParameter(brotli->state, BROTLI_PARAM_LGWIN, lgwin)
     ) {
         BrotliEncoderDestroyInstance(brotli->state);
+        brotli->state = NULL;
+        return -1;
+    }
+    brotli->level = level;
+    brotli->window_log = (int)lgwin;
+    return 0;
+}
+
+StarioBrotli* stario_brotli_new(int level, int window_log) {
+    StarioBrotli* brotli = (StarioBrotli*)calloc(1, sizeof(StarioBrotli));
+    if (brotli == NULL || brotli_start(brotli, level, window_log) != 0) {
         free(brotli);
         return NULL;
     }
     return brotli;
+}
+
+StarioBrotli* stario_brotli_acquire(int level, int window_log) {
+    StarioBrotli* brotli;
+    int resolved_window = window_log > 0 ? window_log : STARIO_BROTLI_HTTP_WINDOW;
+    size_t i;
+    for (i = 0; i < brotli_pool_count; i++) {
+        brotli = brotli_pool[i];
+        if (brotli->level == level && brotli->window_log == resolved_window) {
+            brotli_pool[i] = brotli_pool[--brotli_pool_count];
+            if (brotli_start(brotli, level, resolved_window) == 0) {
+                return brotli;
+            }
+            stario_brotli_free(brotli);
+            return NULL;
+        }
+    }
+    return stario_brotli_new(level, resolved_window);
 }
 
 int stario_brotli_block_borrowed(
@@ -209,6 +250,23 @@ void stario_brotli_free(StarioBrotli* brotli) {
     }
     free(brotli->out);
     free(brotli);
+}
+
+void stario_brotli_release(StarioBrotli* brotli) {
+    if (brotli == NULL) {
+        return;
+    }
+    if (brotli->state != NULL) {
+        BrotliEncoderDestroyInstance(brotli->state);
+        brotli->state = NULL;
+    }
+    brotli->finished = 0;
+    trim_output(&brotli->out, &brotli->out_cap);
+    if (brotli_pool_count < STARIO_CODEC_POOL_MAX) {
+        brotli_pool[brotli_pool_count++] = brotli;
+    } else {
+        stario_brotli_free(brotli);
+    }
 }
 
 static int gzip_deflate(
@@ -260,7 +318,7 @@ static int gzip_deflate(
     return 0;
 }
 
-StarioGzip* stario_gzip_new(int level) {
+StarioGzip* stario_gzip_new(int level, int window_bits) {
     StarioGzip* gzip = (StarioGzip*)malloc(sizeof(StarioGzip));
 
     if (gzip == NULL) {
@@ -268,7 +326,7 @@ StarioGzip* stario_gzip_new(int level) {
     }
     memset(&gzip->strm, 0, sizeof(gzip->strm));
     if (deflateInit2(
-        &gzip->strm, level, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY
+        &gzip->strm, level, Z_DEFLATED, 16 + window_bits, 8, Z_DEFAULT_STRATEGY
     ) != Z_OK) {
         free(gzip);
         return NULL;
@@ -276,7 +334,27 @@ StarioGzip* stario_gzip_new(int level) {
     gzip->out = NULL;
     gzip->out_cap = 0;
     gzip->finished = 0;
+    gzip->level = level;
+    gzip->window_bits = window_bits;
     return gzip;
+}
+
+StarioGzip* stario_gzip_acquire(int level, int window_bits) {
+    StarioGzip* gzip;
+    size_t i;
+    for (i = 0; i < gzip_pool_count; i++) {
+        gzip = gzip_pool[i];
+        if (gzip->level == level && gzip->window_bits == window_bits) {
+            gzip_pool[i] = gzip_pool[--gzip_pool_count];
+            if (deflateReset(&gzip->strm) != Z_OK) {
+                stario_gzip_free(gzip);
+                return NULL;
+            }
+            gzip->finished = 0;
+            return gzip;
+        }
+    }
+    return stario_gzip_new(level, window_bits);
 }
 
 int stario_gzip_block_borrowed(
@@ -306,4 +384,21 @@ void stario_gzip_free(StarioGzip* gzip) {
     deflateEnd(&gzip->strm);
     free(gzip->out);
     free(gzip);
+}
+
+void stario_gzip_release(StarioGzip* gzip) {
+    if (gzip == NULL) {
+        return;
+    }
+    trim_output(&gzip->out, &gzip->out_cap);
+    if (deflateReset(&gzip->strm) != Z_OK) {
+        stario_gzip_free(gzip);
+        return;
+    }
+    gzip->finished = 0;
+    if (gzip_pool_count < STARIO_CODEC_POOL_MAX) {
+        gzip_pool[gzip_pool_count++] = gzip;
+    } else {
+        stario_gzip_free(gzip);
+    }
 }

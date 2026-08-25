@@ -23,6 +23,7 @@ cdef class RequestExchange:
     cdef int _brotli_level
     cdef int _brotli_window
     cdef int _gzip_level
+    cdef int _gzip_window
     cdef Py_ssize_t _compress_min_size
     cdef bint _completed
 

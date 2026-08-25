@@ -31,13 +31,13 @@ from stario.http.writer import get_status_line
 
 from stario_cython.compression_buf cimport (
     stario_brotli_block_borrowed,
+    stario_brotli_acquire,
     stario_brotli_finish_borrowed,
-    stario_brotli_free,
-    stario_brotli_new,
+    stario_brotli_release,
     stario_gzip_block_borrowed,
+    stario_gzip_acquire,
     stario_gzip_finish_borrowed,
-    stario_gzip_free,
-    stario_gzip_new,
+    stario_gzip_release,
 )
 from stario_cython.headers cimport Headers
 from stario_cython.request cimport Request
@@ -280,6 +280,7 @@ cdef class RequestExchange:
         self._brotli_level = DEFAULT_BROTLI_LEVEL
         self._brotli_window = 0
         self._gzip_level = DEFAULT_GZIP_LEVEL
+        self._gzip_window = 15
         self._brotli_enabled = False
         self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
@@ -290,6 +291,8 @@ cdef class RequestExchange:
         window = compression.brotli_window_log
         self._brotli_window = 0 if window is None else window
         self._gzip_level = compression.gzip_level
+        window = compression.gzip_window_bits
+        self._gzip_window = 15 if window is None else window
         self._compress_min_size = compression.min_size
         self._brotli_enabled = self._brotli_level >= 0
         self._gzip_enabled = self._gzip_level >= 0
@@ -297,7 +300,10 @@ cdef class RequestExchange:
     cdef int _ensure_brotli(self) except -1:
         if self._brotli != NULL:
             return 0
-        self._brotli = stario_brotli_new(self._brotli_level, self._brotli_window)
+        self._brotli = stario_brotli_acquire(
+            self._brotli_level,
+            self._brotli_window,
+        )
         if self._brotli == NULL:
             raise StarioError("brotli stream init failed")
         return 0
@@ -305,17 +311,20 @@ cdef class RequestExchange:
     cdef int _ensure_gzip(self) except -1:
         if self._gzip != NULL:
             return 0
-        self._gzip = stario_gzip_new(self._gzip_level)
+        self._gzip = stario_gzip_acquire(
+            self._gzip_level,
+            self._gzip_window,
+        )
         if self._gzip == NULL:
             raise StarioError("gzip stream init failed")
         return 0
 
     cdef void _free_compressors(self):
         if self._brotli != NULL:
-            stario_brotli_free(self._brotli)
+            stario_brotli_release(self._brotli)
             self._brotli = NULL
         if self._gzip != NULL:
-            stario_gzip_free(self._gzip)
+            stario_gzip_release(self._gzip)
             self._gzip = NULL
 
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1:
