@@ -2,6 +2,7 @@
 """Bytes-backed headers. Parser lowercases and interns names in C."""
 
 from libc.string cimport memcmp, memcpy
+from libc.stdint cimport uint8_t, uint32_t
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_GET_SIZE,
@@ -18,18 +19,31 @@ cdef bytes _VALID_VALUE = bytes(
 
 cdef enum:
     INTERN_MAX = 36
+    INTERN_TABLE_SIZE = 64
     NAME_STACK = 256
 
 cdef const char* _INTERN_C[INTERN_MAX]
 cdef Py_ssize_t _INTERN_N[INTERN_MAX]
+cdef uint8_t _INTERN_SLOT[INTERN_TABLE_SIZE]
 cdef list _INTERN_PY = []
 cdef int _INTERN_COUNT = 0
+
+
+cdef inline uint32_t _hash_bytes(const char* src, size_t n) noexcept:
+    cdef uint32_t value = <uint32_t>2166136261
+    cdef size_t i
+    for i in range(n):
+        value = (
+            value ^ <uint8_t>src[i]
+        ) * <uint32_t>16777619
+    return value
 
 
 cdef void _intern_add(const char* s):
     global _INTERN_COUNT
     cdef Py_ssize_t n
     cdef int i = _INTERN_COUNT
+    cdef uint32_t slot
     if i >= INTERN_MAX:
         return
     n = 0
@@ -38,6 +52,10 @@ cdef void _intern_add(const char* s):
     _INTERN_C[i] = s
     _INTERN_N[i] = n
     _INTERN_PY.append(PyBytes_FromStringAndSize(s, n))
+    slot = _hash_bytes(s, <size_t>n) & (INTERN_TABLE_SIZE - 1)
+    while _INTERN_SLOT[slot] != 0:
+        slot = (slot + 1) & (INTERN_TABLE_SIZE - 1)
+    _INTERN_SLOT[slot] = <uint8_t>(i + 1)
     _INTERN_COUNT = i + 1
 
 
@@ -86,15 +104,21 @@ cdef object _ACCEPT_ENCODING_NAME = _INTERN_PY[13]
 cdef object _EXPECT_NAME = _INTERN_PY[27]
 
 
-cdef inline void _lower_copy(char* dst, const char* src, size_t n) noexcept:
+cdef inline uint32_t _lower_copy_hash(
+    char* dst,
+    const char* src,
+    size_t n,
+) noexcept:
     cdef size_t i
-    cdef unsigned char c
+    cdef uint8_t c
+    cdef uint32_t value = <uint32_t>2166136261
     for i in range(n):
-        c = <unsigned char>src[i]
+        c = <uint8_t>src[i]
         if 65 <= c <= 90:
-            dst[i] = <char>(c + 32)
-        else:
-            dst[i] = <char>c
+            c += 32
+        dst[i] = <char>c
+        value = (value ^ c) * <uint32_t>16777619
+    return value
 
 
 cdef inline bint _token_equals(
@@ -201,15 +225,21 @@ cdef int _parse_qvalue(
 cdef object _intern_name(const char* src, size_t n):
     cdef char buf[NAME_STACK]
     cdef const char* p
+    cdef uint32_t slot
+    cdef uint8_t entry
     cdef int i
     if n >= NAME_STACK:
         raise ValueError("Invalid header name: too long")
-    _lower_copy(buf, src, n)
+    slot = _lower_copy_hash(buf, src, n) & (INTERN_TABLE_SIZE - 1)
     p = buf
-    for i in range(_INTERN_COUNT):
+    while True:
+        entry = _INTERN_SLOT[slot]
+        if entry == 0:
+            return PyBytes_FromStringAndSize(p, <Py_ssize_t>n)
+        i = <int>entry - 1
         if _INTERN_N[i] == <Py_ssize_t>n and memcmp(_INTERN_C[i], p, n) == 0:
             return _INTERN_PY[i]
-    return PyBytes_FromStringAndSize(p, <Py_ssize_t>n)
+        slot = (slot + 1) & (INTERN_TABLE_SIZE - 1)
 
 
 cdef object _encode_name(str name):
