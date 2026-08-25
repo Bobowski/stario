@@ -6,6 +6,10 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Changed
+
+- Cython protocol uses compiled `Router` and `App` (`stario_cython.router` / `stario_cython.app`): in-place host/path trie walks, nested match cache, and `create_task` / request entry in C. Python httptools (`stario.http.dispatch` / `stario.http.app`) is unchanged.
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

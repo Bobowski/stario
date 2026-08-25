@@ -45,6 +45,16 @@ codec_link_args = _pkg_config(_CODEC_PACKAGES, "--libs-only-other")
 
 extensions = [
     Extension(
+        "stario_cython.router",
+        sources=["src/stario_cython/router.pyx"],
+        extra_compile_args=["-O3"],
+    ),
+    Extension(
+        "stario_cython.app",
+        sources=["src/stario_cython/app.pyx"],
+        extra_compile_args=["-O3"],
+    ),
+    Extension(
         "stario_cython.headers",
         sources=["src/stario_cython/headers.pyx"],
         extra_compile_args=["-O3"],

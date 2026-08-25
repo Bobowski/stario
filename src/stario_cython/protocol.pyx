@@ -172,6 +172,7 @@ cdef class HttpProtocol:
     cdef llhttp_t* parser
     cdef object loop
     cdef object app
+    cdef object _create_task
     cdef object tracer
     cdef object noop_span
     cdef list date_box
@@ -220,6 +221,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self._create_task = None
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -242,6 +244,7 @@ cdef class HttpProtocol:
     ):
         self.loop = loop
         self.app = app
+        self._create_task = app.create_task
         self.tracer = tracer
         self.noop_span = (
             tracer.create("request") if isinstance(tracer, NoOpTracer) else None
@@ -593,7 +596,7 @@ cdef class HttpProtocol:
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
         self.active_exchange = exchange
         exchange.start_response()
-        self.app.create_task(
+        self._create_task(
             self._run(exchange),
             loop=self.loop,
             eager_start=eager_start,

@@ -11,7 +11,7 @@ from email.utils import format_datetime
 
 import uvloop
 
-from stario.http.app import App
+from stario_cython.app import App
 from stario.http.bootstrap import Bootstrap, bootstrap_run
 from stario.http.compression import compression_config_from_env
 from stario.telemetry.noop import NoOpTracer

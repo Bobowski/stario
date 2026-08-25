@@ -6,10 +6,10 @@ from contextlib import asynccontextmanager
 import brotli
 import pytest
 
-from stario import App
 from stario.exceptions import StarioError
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
+from stario_cython.app import App
 from stario_cython.headers import Headers
 from stario_cython.protocol import HttpProtocol
 
