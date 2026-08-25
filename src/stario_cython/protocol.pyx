@@ -345,10 +345,12 @@ cdef class HttpProtocol:
                 self.parser_paused = True
                 self.held_data = data
                 self.held_offset = (
-                    <Py_ssize_t>(error_pos - ptr)
+                    <Py_ssize_t>(error_pos - ptr) + 1
                     if error_pos != NULL
                     else n
                 )
+                if self.held_offset > n:
+                    self.held_offset = n
                 if self.pause_reasons == 0 and not self.pump_scheduled:
                     self.pump_scheduled = True
                     self.loop.call_soon(self._resume_held_input)
@@ -370,10 +372,12 @@ cdef class HttpProtocol:
                 self.parser_paused = True
                 self.held_data = data
                 self.held_offset = (
-                    <Py_ssize_t>(error_pos - ptr)
+                    <Py_ssize_t>(error_pos - ptr) + 1
                     if error_pos != NULL
                     else end
                 )
+                if self.held_offset > n:
+                    self.held_offset = n
                 if self.pause_reasons == 0 and not self.pump_scheduled:
                     self.pump_scheduled = True
                     self.loop.call_soon(self._resume_held_input)
