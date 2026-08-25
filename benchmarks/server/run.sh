@@ -303,9 +303,9 @@ PY
 }
 
 ensure_env() {
-  local name="$1" python
+  local name="$1"
+  local python="$ENVS_DIR/$name/bin/python"
   shift
-  python="$(python_for "$name")"
   [[ "${REFRESH_ENVS:-0}" == 1 ]] && rm -rf "$ENVS_DIR/$name"
   if [[ ! -x "$python" ]]; then
     uv venv "$ENVS_DIR/$name" --python "$PYTHON"
@@ -758,11 +758,7 @@ main() {
     need go
   fi
 
-  ensure_fixtures "$(python_for "${selected[0]}")"
-  if [[ ! -x "$(python_for "${selected[0]}")" ]]; then
-    ensure_target "${selected[0]}"
-    ensure_fixtures "$(python_for "${selected[0]}")"
-  fi
+  ensure_fixtures "$(host_python)"
 
   RUN_DIR="$RESULTS_DIR/$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$RUN_DIR"
