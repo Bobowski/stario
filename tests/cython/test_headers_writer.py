@@ -318,3 +318,150 @@ async def test_exchange_rejects_negative_content_length() -> None:
         finally:
             writer.close()
             await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_respond_accepts_list_of_bytes_parts() -> None:
+    app = App()
+
+    async def multi(_c, w):
+        w.respond([b"hel", b"lo", b", ", b"parts"], b"text/plain; charset=utf-8")
+
+    app.get("/", multi)
+    async with _running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await _read_response(reader)
+            assert b"content-length: 12\r\n" in payload
+            assert payload.endswith(b"hello, parts")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_write_known_length_accepts_list_of_bytes_parts() -> None:
+    app = App()
+
+    async def multi(_c, w):
+        w.headers.unsafe_set(b"content-type", b"text/plain")
+        w.headers.unsafe_set(b"content-length", b"11")
+        w.write_headers(200)
+        w.write([b"hello", b" ", b"world"])
+        w.end()
+
+    app.get("/", multi)
+    async with _running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await _read_response(reader)
+            assert payload.endswith(b"hello world")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_write_chunked_accepts_list_of_bytes_parts() -> None:
+    app = App()
+
+    async def multi(_c, w):
+        w.headers.set("content-type", "text/plain")
+        w.write_headers(200)
+        w.write([b"aaa", b"bbb", b"ccc"])
+        w.end()
+
+    app.get("/", multi)
+    async with _running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            brotli_level=-1, zstd_level=-1, gzip_level=-1
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            header = await reader.readuntil(b"\r\n\r\n")
+            assert b"transfer-encoding: chunked" in header.lower()
+            assert await _read_chunk(reader) == b"aaabbbccc"
+            assert await _read_chunk(reader) == b""
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_respond_list_parts_native_compression_round_trip() -> None:
+    app = App()
+    parts = [b"native ", b"list ", b"compression " * 32]
+
+    async def compressed(_c, w):
+        w.respond(parts, b"text/plain; charset=utf-8")
+
+    app.get("/", compressed)
+    async with _running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            min_size=0,
+            brotli_level=4,
+            brotli_window_log=18,
+            zstd_level=-1,
+            gzip_level=-1,
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: br\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await _read_response(reader)
+            header, compressed_body = payload.split(b"\r\n\r\n", 1)
+            assert b"content-encoding: br\r\n" in header + b"\r\n"
+            assert brotli.decompress(compressed_body) == b"".join(parts)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_respond_rejects_non_bytes_parts() -> None:
+    app = App()
+    caught = asyncio.get_running_loop().create_future()
+
+    async def bad(_c, w):
+        try:
+            w.respond([b"ok", "nope"], b"text/plain")  # type: ignore[list-item]
+        except TypeError as exc:
+            caught.set_result(exc)
+            w.respond(b"err", b"text/plain", 500)
+
+    app.get("/", bad)
+    async with _running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            async with asyncio.timeout(2):
+                exc = await caught
+            assert "bytes-like" in str(exc)
+            await _read_response(reader)
+        finally:
+            writer.close()
+            await writer.wait_closed()

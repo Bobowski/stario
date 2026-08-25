@@ -20,6 +20,8 @@ cdef class RequestExchange:
     cdef int _brotli_level
     cdef int _brotli_window
     cdef int _gzip_level
+    cdef Py_ssize_t _compress_min_size
+    cdef bint _compress_enabled
     cdef bint _completed
 
     cdef public object app
@@ -83,8 +85,12 @@ cdef class RequestExchange:
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
     cdef int _buf_bytes(self, object data) except -1
+    cdef int _buf_body(self, object body) except -1
     cdef int _buf_uint(self, size_t n, int base) except -1
     cdef void _flush(self)
+    cdef Py_ssize_t _body_nbytes(self, object body) except -2
+    cdef object _body_as_bytes(self, object body)
+    cdef int _write_body_raw(self, object body) except -1
     cdef bint _may_compress(self, object data, object content_type, bint streaming)
     cdef int _frame(self, object data, object encoding, const unsigned char** out, size_t* out_len) except -1
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1

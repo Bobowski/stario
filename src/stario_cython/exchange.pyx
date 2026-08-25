@@ -23,6 +23,8 @@ from stario.exceptions import (
 from stario.http.compression import (
     DEFAULT_BROTLI_LEVEL,
     DEFAULT_GZIP_LEVEL,
+    DEFAULT_MIN_SIZE,
+    content_type_is_compressible,
     negotiate_content_encoding,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
@@ -144,6 +146,8 @@ cdef class RequestExchange:
         self._data_ready = None
         self._compression = _UNBOUND
         self._available = ()
+        self._compress_min_size = DEFAULT_MIN_SIZE
+        self._compress_enabled = False
         self._state = None
         self.in_pool = False
         self._body_active = False
@@ -171,17 +175,23 @@ cdef class RequestExchange:
         self._brotli_window = 0
         self._gzip_level = DEFAULT_GZIP_LEVEL
         self._available = ()
+        self._compress_min_size = DEFAULT_MIN_SIZE
+        self._compress_enabled = False
         if compression is None:
             return
+        # Snapshot user CompressionConfig onto C fields so hot paths don't
+        # re-enter Python for min_size / enabled-encodings on every respond().
         self._brotli_level = compression.brotli_level
         window = compression.brotli_window_log
         self._brotli_window = 0 if window is None else window
         self._gzip_level = compression.gzip_level
+        self._compress_min_size = compression.min_size
         self._available = tuple(
             enc
             for enc in compression.enabled_encodings()
             if enc == b"br" or enc == b"gzip"
         )
+        self._compress_enabled = len(self._available) > 0
 
     cdef int _ensure_brotli(self) except -1:
         if self._brotli != NULL:
@@ -237,6 +247,89 @@ cdef class RequestExchange:
         p = data
         return self._buf_add(p, n)
 
+    cdef Py_ssize_t _body_nbytes(self, object body) except -2:
+        """Total byte length of ``bytes`` or a list/tuple of bytes-like parts."""
+        cdef Py_ssize_t total
+        cdef object part
+        if body is None:
+            return 0
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            return <Py_ssize_t>len(body)
+        if isinstance(body, (list, tuple)):
+            total = 0
+            for part in body:
+                if not isinstance(part, (bytes, bytearray, memoryview)):
+                    raise TypeError(
+                        "body parts must be bytes-like, got "
+                        + type(part).__name__
+                    )
+                total += <Py_ssize_t>len(part)
+            return total
+        raise TypeError(
+            "body must be bytes-like or a list/tuple of bytes-like objects"
+        )
+
+    cdef object _body_as_bytes(self, object body):
+        """Contiguous bytes for one-shot compression (joins list/tuple once)."""
+        if body is None:
+            return b""
+        if isinstance(body, bytes):
+            return body
+        if isinstance(body, (bytearray, memoryview)):
+            return bytes(body)
+        if isinstance(body, (list, tuple)):
+            if not body:
+                return b""
+            if len(body) == 1 and isinstance(body[0], bytes):
+                return body[0]
+            return b"".join(body)
+        raise TypeError(
+            "body must be bytes-like or a list/tuple of bytes-like objects"
+        )
+
+    cdef int _buf_body(self, object body) except -1:
+        """Append body bytes or each list/tuple part into ``_out_buf`` (no join)."""
+        cdef object part
+        if body is None:
+            return 0
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            return self._buf_bytes(body)
+        if isinstance(body, (list, tuple)):
+            for part in body:
+                if not isinstance(part, (bytes, bytearray, memoryview)):
+                    raise TypeError(
+                        "body parts must be bytes-like, got "
+                        + type(part).__name__
+                    )
+                self._buf_bytes(part)
+            return 0
+        raise TypeError(
+            "body must be bytes-like or a list/tuple of bytes-like objects"
+        )
+
+    cdef int _write_body_raw(self, object body) except -1:
+        """Write body parts directly to the transport (known Content-Length)."""
+        cdef object part
+        if body is None:
+            return 0
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            if len(body):
+                self._transport.write(body)
+            return 0
+        if isinstance(body, (list, tuple)):
+            for part in body:
+                if not isinstance(part, (bytes, bytearray, memoryview)):
+                    raise TypeError(
+                        "body parts must be bytes-like, got "
+                        + type(part).__name__
+                    )
+                if len(part):
+                    self._transport.write(part)
+            return 0
+        raise TypeError(
+            "body must be bytes-like or a list/tuple of bytes-like objects"
+        )
+
     cdef int _buf_uint(self, size_t n, int base) except -1:
         cdef char tmp[16]
         cdef int i
@@ -275,14 +368,21 @@ cdef class RequestExchange:
         return self._completed
 
     cdef bint _may_compress(self, object data, object content_type, bint streaming):
-        if self._compression is None or self._compression is _UNBOUND:
+        cdef Py_ssize_t n
+        # Snapshotted from CompressionConfig in _apply_compression — respects
+        # user-defined min_size / enabled encodings without a Python round-trip
+        # on every tiny respond().
+        if not self._compress_enabled or self._accept is None:
             return False
-        return self._compression.may_compress(
-            self._accept,
-            data=data,
-            content_type=content_type,
-            streaming=streaming,
-        )
+        if content_type is not None and not content_type_is_compressible(content_type):
+            return False
+        if not streaming:
+            if data is None:
+                return False
+            n = self._body_nbytes(data)
+            if n < self._compress_min_size:
+                return False
+        return True
 
     cdef int _frame(
         self,
@@ -445,7 +545,8 @@ cdef class RequestExchange:
     def respond(self, body, content_type, int status=200):
         cdef Headers h = self.headers
         cdef object encoding
-        cdef object response
+        cdef object flat
+        cdef Py_ssize_t nbytes
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
         if self._transport.is_closing():
@@ -463,30 +564,29 @@ cdef class RequestExchange:
             )
         if not _may_have_body(status):
             body = b""
-        self._declared_length = 0 if not _may_have_body(status) else len(body)
+            nbytes = 0
+        else:
+            nbytes = self._body_nbytes(body)
+        self._declared_length = nbytes
         self._bytes_written = 0
+        # Empty custom headers + no compression: one _out_buf assemble + flush.
+        # Body parts are copied into the write buffer (no b"".join of the entity).
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False)
         ):
+            self._buf_bytes(_status_line(status))
+            self._buf_bytes(self._date_box[0])
             if not _may_have_body(status):
-                response = b"".join((
-                    _status_line(status),
-                    self._date_box[0],
-                    ZERO_CL,
-                ))
+                self._buf_bytes(ZERO_CL)
             else:
-                response = b"".join((
-                    _status_line(status),
-                    self._date_box[0],
-                    CT_PREFIX,
-                    content_type,
-                    CL_PREFIX,
-                    _dec(<size_t>len(body)),
-                    CRLF2,
-                    body,
-                ))
-            self._transport.write(response)
+                self._buf_bytes(CT_PREFIX)
+                self._buf_bytes(content_type)
+                self._buf_bytes(CL_PREFIX)
+                self._buf_uint(<size_t>nbytes, 10)
+                self._buf_bytes(CRLF2)
+                self._buf_body(body)
+            self._flush()
         else:
             if not _may_have_body(status):
                 body = b""
@@ -494,8 +594,10 @@ cdef class RequestExchange:
             elif h.c_get(b"content-encoding") is None:
                 encoding = self._select(body, content_type, False)
                 if encoding is not None:
+                    # One-shot compressors need contiguous input; join list once.
+                    flat = self._body_as_bytes(body)
                     try:
-                        self._frame(body, encoding, &native_out, &native_len)
+                        self._frame(flat, encoding, &native_out, &native_len)
                         h.c_set(b"content-encoding", encoding)
                         h.c_merge_vary(b"accept-encoding")
                         h.c_set(b"content-type", content_type)
@@ -518,16 +620,17 @@ cdef class RequestExchange:
                     self._done()
                     return
             h.c_set(b"content-type", content_type)
-            h.c_set(b"content-length", _dec(<size_t>len(body)))
-            self._declared_length = len(body)
+            h.c_set(b"content-length", _dec(<size_t>nbytes))
+            self._declared_length = nbytes
             self._bytes_written = 0
+            # Headers + body in one flush (one-shot respond).
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:
                 self._out_buf = bytearray(256)
             h.c_write_wire_ba(self._out_buf, &self._out_len)
             self._buf_bytes(CRLF)
-            self._buf_bytes(body)
+            self._buf_body(body)
             self._flush()
         self._status_code = status
         self._bytes_written = self._declared_length if self._declared_length > 0 else 0
@@ -603,6 +706,7 @@ cdef class RequestExchange:
 
     def write(self, data):
         cdef Py_ssize_t n
+        cdef object part
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
         if self._transport.is_closing():
@@ -630,19 +734,35 @@ cdef class RequestExchange:
                     "204/304 and 1xx responses must not include a message body."
                 ),
             )
+        n = self._body_nbytes(data)
+        if n == 0:
+            return self
         if self._declared_length >= 0:
-            self._bytes_written += len(data)
-            self._buf_bytes(data)
-            self._flush()
+            # Known Content-Length: write parts directly (no _out_buf copy).
+            self._bytes_written += n
+            self._write_body_raw(data)
             return self
         if self._brotli != NULL or self._gzip != NULL:
-            self._block(data, &native_out, &native_len)
-            self._write_native_chunk(native_out, native_len)
+            # Chunked + compressed: feed each part to the streaming compressor.
+            if isinstance(data, (list, tuple)):
+                for part in data:
+                    if not isinstance(part, (bytes, bytearray, memoryview)):
+                        raise TypeError(
+                            "body parts must be bytes-like, got "
+                            + type(part).__name__
+                        )
+                    if not part:
+                        continue
+                    self._block(part, &native_out, &native_len)
+                    self._write_native_chunk(native_out, native_len)
+            else:
+                self._block(data, &native_out, &native_len)
+                self._write_native_chunk(native_out, native_len)
             return self
-        n = len(data)
+        # Chunked identity: one chunk framed around all parts (no join).
         self._buf_uint(<size_t>n, 16)
         self._buf_bytes(CRLF)
-        self._buf_bytes(data)
+        self._buf_body(data)
         self._buf_bytes(CRLF)
         self._flush()
         return self
@@ -659,7 +779,11 @@ cdef class RequestExchange:
             self._done()
             return
         if self._status_code < 0:
-            cl = _dec(<size_t>(len(data) if data is not None else 0))
+            cl = _dec(
+                <size_t>(
+                    self._body_nbytes(data) if data is not None else 0
+                )
+            )
             self.headers.c_set(b"content-length", cl)
             self.write_headers(200 if data is not None else 204)
         if data:
