@@ -8,4 +8,3 @@ cdef class App(Router):
     cdef object _loop
     cdef object _task_discard
     cdef bint _eager_start
-    cdef bint _eager_via_create_task
