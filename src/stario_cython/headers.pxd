@@ -29,7 +29,6 @@ cdef class Headers:
     cdef int _request_wildcard_q
     cdef int _request_identity_q
 
-    cdef void start_raw_header(self)
     cdef void append_raw_name(self, const char* data, size_t length)
     cdef void append_raw_value(self, const char* data, size_t length)
     cdef void finish_raw_header(self)
@@ -55,11 +54,4 @@ cdef class Headers:
     cdef void c_remove(self, object name)
     cdef void c_clear(self)
     cdef bint c_empty(self)
-    cdef void c_merge_vary(self, object token)
-    cdef int _add_ba(self, object buf, Py_ssize_t* length, const char* src, Py_ssize_t n) except -1
     cdef int c_write_wire_ba(self, object buf, Py_ssize_t* length) except -1
-    cdef int c_write_response_wire_ba(
-        self,
-        object buf,
-        Py_ssize_t* length,
-    ) except -1

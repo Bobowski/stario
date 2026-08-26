@@ -50,6 +50,28 @@ DEFAULT_MAX_HEADER_BYTES = 64 * 1024  # 64 KiB
 DEFAULT_BODY_TIMEOUT = 30.0  # seconds
 
 
+def host_without_port(host_str: str) -> str:
+    """Host header without port, lowercased; IPv6 hosts keep brackets."""
+    host_str = host_str.strip()
+    if not host_str:
+        return ""
+    if host_str.startswith("["):
+        bracket_end = host_str.find("]")
+        if bracket_end == -1:
+            return host_str.lower()
+        host = host_str[: bracket_end + 1].lower()
+        rest = host_str[bracket_end + 1 :]
+        if rest and (not rest.startswith(":") or not rest[1:].isdigit()):
+            return host_str.lower()
+        return host
+    if ":" in host_str:
+        host_part, _, port_part = host_str.rpartition(":")
+        if port_part.isdigit() and host_part:
+            return host_part.lower()
+        return host_str.lower()
+    return host_str.lower()
+
+
 class BodyReader:
     """Protocol-owned buffer bridged to `async` readers: safe size limits, slow-read timeouts, and read pausing.
 
@@ -340,31 +362,7 @@ class Request:
     def host(self) -> str:
         """`Host` header value without port, lowercased; IPv6 hosts keep brackets. Empty string if missing."""
         if self._host is None:
-            host_str = (self.headers.get("host") or "").strip()
-            if not host_str:
-                self._host = ""
-            elif host_str.startswith("["):
-                # Bracketed IPv6 literal, optional :port suffix.
-                bracket_end = host_str.find("]")
-                if bracket_end == -1:
-                    self._host = host_str.lower()
-                else:
-                    host = host_str[: bracket_end + 1].lower()
-                    rest = host_str[bracket_end + 1 :]
-                    if rest and (not rest.startswith(":") or not rest[1:].isdigit()):
-                        self._host = host_str.lower()
-                    else:
-                        self._host = host
-            elif ":" in host_str:
-                host_part, _, port_part = host_str.rpartition(":")
-                # Only strip a numeric port; bare colons stay in IPv6 literals.
-                self._host = (
-                    host_part.lower()
-                    if port_part.isdigit() and host_part
-                    else host_str.lower()
-                )
-            else:
-                self._host = host_str.lower()
+            self._host = host_without_port(self.headers.get("host") or "")
         return self._host
 
     # =========================================================================

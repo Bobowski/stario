@@ -24,6 +24,7 @@ from stario.http.compression import (
     DEFAULT_GZIP_LEVEL,
     DEFAULT_MIN_SIZE,
     content_type_is_compressible,
+    merge_vary,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
 from stario.http.request import DEFAULT_BODY_TIMEOUT
@@ -78,7 +79,6 @@ cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
 cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
 cdef bytes ZERO_CL = b"content-length: 0\r\n\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
-cdef bytes CL_HEADER = b"content-length: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
@@ -91,7 +91,6 @@ cdef object STARTED_ERROR = (
 )
 
 cdef list _POOL = []
-cdef object _UNBOUND = object()
 
 
 cdef inline bint _is_bytes_like(object obj) noexcept:
@@ -253,7 +252,6 @@ cdef class RequestExchange:
         self._cached = None
         self._data_ready = None
         self._stall_handle = None
-        self._compression = _UNBOUND
         self._brotli_enabled = False
         self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
@@ -557,9 +555,7 @@ cdef class RequestExchange:
             self._date_box = date_box
             self._max_size = max_body_size
             self._timeout = DEFAULT_BODY_TIMEOUT
-            if self._compression is not compression:
-                self._compression = compression
-                self._apply_compression(compression)
+            self._apply_compression(compression)
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
@@ -686,8 +682,6 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
-        # Empty headers + no compression: writelines of existing buffers (no join,
-        # no _out_buf churn — keeps tiny plaintext/json competitive).
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
@@ -728,7 +722,7 @@ cdef class RequestExchange:
                     try:
                         self._frame(flat, encoding, &native_out, &native_len)
                         h.c_set(b"content-encoding", encoding)
-                        h.c_merge_vary(b"accept-encoding")
+                        merge_vary(h, b"accept-encoding")
                         h.c_set(b"content-type", content_type)
                         h.c_set(b"content-length", _dec(native_len))
                         self._declared_length = <Py_ssize_t>native_len
@@ -750,17 +744,14 @@ cdef class RequestExchange:
                     return
             self._declared_length = nbytes
             self._bytes_written = 0
+            h.c_set(b"content-type", content_type)
+            h.c_set(b"content-length", _dec(<size_t>nbytes))
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:
                 self._out_buf = bytearray(256)
-            h.c_write_response_wire_ba(self._out_buf, &self._out_len)
-            self._buf_bytes(CT_PREFIX)
-            self._buf_bytes(content_type)
+            h.c_write_wire_ba(self._out_buf, &self._out_len)
             self._buf_bytes(CRLF)
-            self._buf_bytes(CL_HEADER)
-            self._buf_uint(<size_t>nbytes, 10)
-            self._buf_bytes(CRLF2)
             self._flush()
             self._status_code = status
             if nbytes:
@@ -829,7 +820,7 @@ cdef class RequestExchange:
                     else:
                         self._ensure_gzip()
                     headers.c_set(b"content-encoding", encoding)
-                    headers.c_merge_vary(b"accept-encoding")
+                    merge_vary(headers, b"accept-encoding")
         self._buf_bytes(_status_line(status_code))
         self._buf_bytes(self._date_box[0])
         if self._out_buf is None:
@@ -1116,18 +1107,8 @@ cdef class RequestExchange:
         if not self._body_active:
             self.reset_body(False, -1)
         new_total = self._total_read + <Py_ssize_t>length
-        if new_total > self._max_size:
-            self._abort_reason = ABORT_TOO_LARGE
-            self._cancel_stall_timer()
-            self._clear_body_storage()
-            self._connection.set_body_paused(self, False)
-            self._wake()
-            if self._discard_body and not self._transport.is_closing():
-                self._transport.close()
-            return
-        if (
-            self._read_max_size >= 0
-            and new_total > self._read_max_size
+        if new_total > self._max_size or (
+            self._read_max_size >= 0 and new_total > self._read_max_size
         ):
             self._abort_reason = ABORT_TOO_LARGE
             self._cancel_stall_timer()
@@ -1166,7 +1147,6 @@ cdef class RequestExchange:
                 self._reset_stall_timer()
             self._maybe_pause()
             return
-        # body(): refresh stall on progress; wake only on complete/abort.
         if self._waiting:
             self._reset_stall_timer()
 
@@ -1175,24 +1155,14 @@ cdef class RequestExchange:
             return
         self._body_complete = True
         self._cancel_stall_timer()
-        if self._discard_body:
+        if self._discard_body or self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
-            self._maybe_recycle()
-            return
-        self._seal_body_tail()
-        if self._consumed_as == CONSUMED_STREAM:
-            self._wake()
-            self._maybe_recycle()
-            return
-        if self._abort_reason != ABORT_NONE:
-            self._clear_body_storage()
-            self._wake()
-            self._maybe_recycle()
-            return
-        if self._consumed_as == CONSUMED_BODY:
-            if self._cached is None:
+        else:
+            self._seal_body_tail()
+            if self._consumed_as == CONSUMED_BODY and self._cached is None:
                 self._cached = self._body_to_bytes()
-        self._wake()
+        if not self._discard_body:
+            self._wake()
         self._maybe_recycle()
 
     cdef void c_abort(self):

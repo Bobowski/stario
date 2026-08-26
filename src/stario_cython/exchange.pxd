@@ -5,7 +5,6 @@ from stario_cython.request cimport Request
 cdef class RequestExchange:
     cdef object _transport
     cdef list _date_box
-    cdef object _compression
     cdef int _req_encoding
     cdef bint _req_expect_continue
     cdef bint _req_connection_close

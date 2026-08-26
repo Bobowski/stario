@@ -11,7 +11,6 @@ from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport RequestExchange, acquire_exchange
 from stario_cython.llhttp cimport *
-from stario_cython.request cimport Request
 
 cdef int F_CONTENT_LENGTH = 0x20
 cdef int PAUSE_WRITE = 1
@@ -19,8 +18,6 @@ cdef int PAUSE_PIPELINE = 2
 cdef int PAUSE_BODY = 4
 cdef int PARSER_QUANTUM = 512 * 1024
 cdef int MAX_PENDING_EXCHANGES = 64
-# Handlers always start at headers-complete. Body bytes accumulate on the exchange;
-# body() awaits one completion Event, stream() drains with backpressure.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"
@@ -449,31 +446,28 @@ cdef class HttpProtocol:
         self.request_keep_alive = True
         self.url = b""
 
-    cdef void _on_url(self, const char* at, size_t length):
+    cdef bint _header_too_large(self, size_t length):
         if self.rejected:
-            return
+            return True
         self.head_bytes += <int>length
         if self.head_bytes > self.max_header_bytes:
             self._close_error(431, "Request header fields too large")
+            return True
+        return False
+
+    cdef void _on_url(self, const char* at, size_t length):
+        if self._header_too_large(length):
             return
         if self._append(&self.url_buf, &self.url_len, &self.url_cap, at, length) != 0:
             self._close_error(431, "Request header fields too large")
 
     cdef void _on_header_field(self, const char* at, size_t length):
-        if self.rejected or self.reading_exchange is None:
-            return
-        self.head_bytes += <int>length
-        if self.head_bytes > self.max_header_bytes:
-            self._close_error(431, "Request header fields too large")
+        if self.reading_exchange is None or self._header_too_large(length):
             return
         self.reading_exchange.request_headers.append_raw_name(at, length)
 
     cdef void _on_header_value(self, const char* at, size_t length):
-        if self.rejected or self.reading_exchange is None:
-            return
-        self.head_bytes += <int>length
-        if self.head_bytes > self.max_header_bytes:
-            self._close_error(431, "Request header fields too large")
+        if self.reading_exchange is None or self._header_too_large(length):
             return
         self.reading_exchange.request_headers.append_raw_value(at, length)
 
@@ -501,7 +495,6 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
-        # Snapshot keep-alive / expect / accept-encoding into exchange slots.
         exchange.cache_hot_request_headers()
         self.request_keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
@@ -511,10 +504,14 @@ cdef class HttpProtocol:
                 and not exchange._req_connection_close
             )
         )
-        self.complete_headers(
+        if self.request_dispatched or self.transport is None or self.transport.is_closing():
+            return
+        self._build_request(exchange)
+        exchange.reset_body(
             exchange._req_expect_continue,
             <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
         )
+        self._dispatch(exchange)
 
     cdef void _on_body(self, const char* at, size_t length):
         if not self.rejected and self.reading_exchange is not None:
@@ -529,51 +526,29 @@ cdef class HttpProtocol:
             exchange.c_complete()
         self.reading_exchange = None
 
-    cdef Request _build_request(self, RequestExchange exchange, object body):
+    cdef void _build_request(self, RequestExchange exchange):
         cdef object path_bytes
         cdef object query
-        cdef object method
-        cdef object version
-        cdef Request request = exchange.req
         cdef object url = self.url
         cdef Py_ssize_t q = url.find(b"?")
         if q == -1:
             path_bytes, query = url, b""
         else:
             path_bytes, query = url[:q], url[q + 1 :]
-        method = _method_str(<int>llhttp_get_method(self.parser))
-        version = _version_str(
-            <int>llhttp_get_http_major(self.parser),
-            <int>llhttp_get_http_minor(self.parser),
-        )
-        request.reset(
-            method,
+        exchange.req.reset(
+            _method_str(<int>llhttp_get_method(self.parser)),
             decode_path(path_bytes),
             query,
-            version,
+            _version_str(
+                <int>llhttp_get_http_major(self.parser),
+                <int>llhttp_get_http_minor(self.parser),
+            ),
             self.request_keep_alive,
             exchange.request_headers,
-            body,
+            exchange,
         )
-        return request
 
-    cdef void complete_headers(
-        self,
-        bint expect_continue,
-        Py_ssize_t expected_body,
-    ):
-        cdef RequestExchange exchange
-        cdef Request request
-        if self.request_dispatched or self.rejected:
-            return
-        if self.transport is None or self.transport.is_closing():
-            return
-        exchange = self.reading_exchange
-        request = self._build_request(exchange, exchange)
-        exchange.reset_body(expect_continue, expected_body)
-        self._dispatch(exchange, request)
-
-    cdef void _dispatch(self, RequestExchange exchange, Request request):
+    cdef void _dispatch(self, RequestExchange exchange):
         cdef object span
         self.request_dispatched = True
         if self.noop_span is not None:
@@ -612,13 +587,7 @@ cdef class HttpProtocol:
         self.pending_exchanges.clear()
 
     def response_completed(self, RequestExchange exchange):
-        """Advance the connection after the response is fully sent.
-
-        Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
-        the handler coroutine returns. The handler (or ``app.create_task`` work)
-        may still run after this; the connection is free to start the next
-        pipelined/keep-alive exchange immediately.
-        """
+        """Start the next pipelined exchange after this response is fully sent."""
         cdef object transport = self.transport
         cdef object conn
         cdef RequestExchange next_exchange
