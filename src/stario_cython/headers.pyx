@@ -284,7 +284,6 @@ cdef class Headers:
     def __init__(self, raw_header_data=None):
         self._data = raw_header_data if raw_header_data is not None else {}
         self._materialized = raw_header_data is not None
-        self._request_connection_close = False
         self._request_expect_continue = False
         self._request_accept_present = False
         self._request_br_q = -1
@@ -389,9 +388,6 @@ cdef class Headers:
         if _token_equals(name, 0, nlen, "host", 4):
             if self._request_host_index < 0:
                 self._request_host_index = self._raw_count
-        elif _token_equals(name, 0, nlen, "connection", 10):
-            if _contains_token(value, vlen, "close", 5):
-                self._request_connection_close = True
         elif _token_equals(name, 0, nlen, "expect", 6):
             if _contains_token(value, vlen, "100-continue", 12):
                 self._request_expect_continue = True
@@ -517,9 +513,6 @@ cdef class Headers:
                 self._request_identity_q = q
             start = segment_end + 1
 
-    cdef bint c_request_connection_close(self) noexcept:
-        return self._request_connection_close
-
     cdef bint c_request_expect_continue(self) noexcept:
         return self._request_expect_continue
 
@@ -604,7 +597,6 @@ cdef class Headers:
         self._pending_header = False
         self._request_host_index = -1
         self._materialized = False
-        self._request_connection_close = False
         self._request_expect_continue = False
         self._request_accept_present = False
 

@@ -125,11 +125,4 @@ cdef class RequestExchange:
     cdef void _done(self)
     cdef void _maybe_pause(self)
 
-cdef RequestExchange acquire_exchange(
-    object connection,
-    object app,
-    object transport,
-    list date_box,
-    object compression,
-    int max_body_size,
-)
+cdef RequestExchange acquire_exchange()

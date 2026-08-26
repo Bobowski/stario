@@ -21,7 +21,6 @@ cdef class Headers:
     cdef bint _pending_header
     cdef Py_ssize_t _request_host_index
     cdef bint _materialized
-    cdef bint _request_connection_close
     cdef bint _request_expect_continue
     cdef bint _request_accept_present
     cdef int _request_br_q
@@ -42,7 +41,6 @@ cdef class Headers:
         const char* value,
         size_t length,
     ) noexcept
-    cdef bint c_request_connection_close(self) noexcept
     cdef bint c_request_expect_continue(self) noexcept
     cdef int c_select_request_encoding(
         self,

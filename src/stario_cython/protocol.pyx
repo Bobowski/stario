@@ -188,8 +188,6 @@ cdef class HttpProtocol:
     cdef int max_header_bytes
     cdef int max_body_bytes
     cdef bint rejected
-    cdef bint request_dispatched
-    cdef bint request_keep_alive
     cdef int pause_reasons
     cdef object body_pause_owner
     cdef object held_data
@@ -251,8 +249,6 @@ cdef class HttpProtocol:
         self.max_header_bytes = max_header_bytes
         self.max_body_bytes = max_body_bytes
         self.rejected = False
-        self.request_dispatched = False
-        self.request_keep_alive = True
 
     def connection_made(self, transport):
         self.transport = transport
@@ -416,32 +412,25 @@ cdef class HttpProtocol:
         return 0
 
     cdef void _on_message_begin(self):
+        cdef RequestExchange exchange
         if self.rejected:
             return
         self.url_len = 0
-        if self.idle_exchange is not None:
-            self.reading_exchange = self.idle_exchange
+        exchange = self.idle_exchange
+        if exchange is not None:
             self.idle_exchange = None
-            self.reading_exchange.reset(
-                self,
-                self.app,
-                self.transport,
-                self.date_box,
-                self.compression,
-                self.max_body_bytes,
-            )
         else:
-            self.reading_exchange = acquire_exchange(
-                self,
-                self.app,
-                self.transport,
-                self.date_box,
-                self.compression,
-                self.max_body_bytes,
-            )
+            exchange = acquire_exchange()
+        exchange.reset(
+            self,
+            self.app,
+            self.transport,
+            self.date_box,
+            self.compression,
+            self.max_body_bytes,
+        )
+        self.reading_exchange = exchange
         self.head_bytes = 40
-        self.request_dispatched = False
-        self.request_keep_alive = True
 
     cdef bint _header_too_large(self, size_t length):
         if self.rejected:
@@ -488,8 +477,7 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
-        self.request_keep_alive = llhttp_should_keep_alive(self.parser) != 0
-        if self.request_dispatched or self.transport is None or self.transport.is_closing():
+        if self.transport is None or self.transport.is_closing():
             return
         self._build_request(exchange)
         exchange.reset_body(
@@ -533,14 +521,13 @@ cdef class HttpProtocol:
                 <int>llhttp_get_http_major(self.parser),
                 <int>llhttp_get_http_minor(self.parser),
             ),
-            self.request_keep_alive,
+            llhttp_should_keep_alive(self.parser) != 0,
             exchange.request_headers,
             exchange,
         )
 
     cdef void _dispatch(self, RequestExchange exchange):
         cdef object span
-        self.request_dispatched = True
         if self.noop_span is not None:
             span = self.noop_span
         else:

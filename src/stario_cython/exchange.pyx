@@ -701,9 +701,7 @@ cdef class RequestExchange:
         ):
             self._writelines_plain(status, content_type, body, nbytes)
         else:
-            if not has_body:
-                body = b""
-            elif h.c_get(b"content-encoding") is None:
+            if has_body and h.c_get(b"content-encoding") is None:
                 encoding = self._select(body, content_type, False, nbytes)
                 if encoding is not None:
                     flat = self._body_as_bytes(body)
@@ -1280,25 +1278,7 @@ cdef class RequestExchange:
         return self._cached
 
 
-cdef RequestExchange acquire_exchange(
-    object connection,
-    object app,
-    object transport,
-    list date_box,
-    object compression,
-    int max_body_size,
-):
-    cdef RequestExchange exchange
+cdef RequestExchange acquire_exchange():
     if _POOL:
-        exchange = _POOL.pop()
-    else:
-        exchange = RequestExchange()
-    exchange.reset(
-        connection,
-        app,
-        transport,
-        date_box,
-        compression,
-        max_body_size,
-    )
-    return exchange
+        return _POOL.pop()
+    return RequestExchange()
