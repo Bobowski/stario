@@ -71,12 +71,6 @@ cdef int ABORT_TIMEOUT = 3
 cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
 cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
 cdef bytes STATUS_304 = b"HTTP/1.1 304 Not Modified\r\n"
-cdef bytes STATUS_400 = b"HTTP/1.1 400 Bad Request\r\n"
-cdef bytes STATUS_404 = b"HTTP/1.1 404 Not Found\r\n"
-cdef bytes STATUS_405 = b"HTTP/1.1 405 Method Not Allowed\r\n"
-cdef bytes STATUS_413 = b"HTTP/1.1 413 Payload Too Large\r\n"
-cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
-cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
 cdef bytes ZERO_CL = b"content-length: 0\r\n\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
@@ -203,18 +197,6 @@ cdef object _status_line(int status):
         return STATUS_204
     if status == 304:
         return STATUS_304
-    if status == 400:
-        return STATUS_400
-    if status == 404:
-        return STATUS_404
-    if status == 405:
-        return STATUS_405
-    if status == 413:
-        return STATUS_413
-    if status == 431:
-        return STATUS_431
-    if status == 500:
-        return STATUS_500
     return get_status_line(status)
 
 
@@ -426,6 +408,49 @@ cdef class RequestExchange:
         self._out_len = 0
         self._transport.write(view)
 
+    cdef void _write_header_block(self, int status, Headers headers):
+        self._buf_bytes(_status_line(status))
+        self._buf_bytes(self._date_box[0])
+        if self._out_buf is None:
+            self._out_buf = bytearray(256)
+        headers.c_write_wire_ba(self._out_buf, &self._out_len)
+        self._buf_bytes(CRLF)
+
+    cdef void _writelines_plain(
+        self,
+        int status,
+        object content_type,
+        object body,
+        Py_ssize_t nbytes,
+    ):
+        if not _may_have_body(status):
+            self._transport.writelines(
+                (_status_line(status), self._date_box[0], ZERO_CL)
+            )
+            return
+        if isinstance(body, (list, tuple)):
+            self._transport.writelines((
+                _status_line(status),
+                self._date_box[0],
+                CT_PREFIX,
+                content_type,
+                CL_PREFIX,
+                _dec(<size_t>nbytes),
+                CRLF2,
+            ))
+            self._transport.writelines(body)
+            return
+        self._transport.writelines((
+            _status_line(status),
+            self._date_box[0],
+            CT_PREFIX,
+            content_type,
+            CL_PREFIX,
+            _dec(<size_t>nbytes),
+            CRLF2,
+            body,
+        ))
+
     @property
     def status_code(self):
         if self._status_code < 0:
@@ -554,37 +579,24 @@ cdef class RequestExchange:
             self._transport = transport
             self._date_box = date_box
             self._max_size = max_body_size
-            self._timeout = DEFAULT_BODY_TIMEOUT
             self._apply_compression(compression)
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
         self.request_headers.c_clear()
-        self._clear_hot_request_headers()
+        self._req_encoding = ENCODING_NONE
         self.handler_done = False
         self.handler_started = False
 
-    cdef void _clear_hot_request_headers(self):
-        self._req_encoding = ENCODING_NONE
-        self._req_expect_continue = False
-        self._req_connection_close = False
-
-    cdef void cache_hot_request_headers(self):
-        """Snapshot keep-alive / expect / accept-encoding (Headers API unchanged)."""
-        cdef Headers h = self.request_headers
+    cdef void start_response(self):
+        cdef int encoding = ENCODING_NONE
+        self.handler_started = True
         if self._brotli_enabled or self._gzip_enabled:
-            self._req_encoding = h.c_select_request_encoding(
+            encoding = self.request_headers.c_select_request_encoding(
                 self._brotli_enabled,
                 self._gzip_enabled,
             )
-        else:
-            self._req_encoding = ENCODING_NONE
-        self._req_connection_close = h.c_request_connection_close()
-        self._req_expect_continue = h.c_request_expect_continue()
-
-    cdef void start_response(self):
-        self.handler_started = True
-        self.reset_response(self._req_encoding)
+        self.reset_response(encoding)
 
     cdef void handler_finished(self):
         self.handler_done = True
@@ -623,7 +635,7 @@ cdef class RequestExchange:
         self._clear_body_storage()
         self._body_active = False
         self._read_max_size = -1
-        self._clear_hot_request_headers()
+        self._req_encoding = ENCODING_NONE
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
         if (
             self._out_buf is not None
@@ -644,7 +656,7 @@ cdef class RequestExchange:
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
-        self._clear_hot_request_headers()
+        self._req_encoding = ENCODING_NONE
         self.app = None
         self._connection = None
         self._transport = None
@@ -662,6 +674,7 @@ cdef class RequestExchange:
         cdef Py_ssize_t nbytes
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
+        cdef bint has_body
         if self._transport.is_closing():
             if not self._completed:
                 self._completed = True
@@ -675,7 +688,8 @@ cdef class RequestExchange:
                     "then write()/end()."
                 ),
             )
-        if not _may_have_body(status):
+        has_body = _may_have_body(status)
+        if not has_body:
             body = b""
             nbytes = 0
         else:
@@ -683,37 +697,11 @@ cdef class RequestExchange:
         self._declared_length = nbytes
         self._bytes_written = 0
         if h.c_empty() and (
-            not _may_have_body(status)
-            or not self._may_compress(body, content_type, False, nbytes)
+            not has_body or not self._may_compress(body, content_type, False, nbytes)
         ):
-            if not _may_have_body(status):
-                self._transport.writelines(
-                    (_status_line(status), self._date_box[0], ZERO_CL)
-                )
-            elif isinstance(body, (list, tuple)):
-                self._transport.writelines((
-                    _status_line(status),
-                    self._date_box[0],
-                    CT_PREFIX,
-                    content_type,
-                    CL_PREFIX,
-                    _dec(<size_t>nbytes),
-                    CRLF2,
-                ))
-                self._transport.writelines(body)
-            else:
-                self._transport.writelines((
-                    _status_line(status),
-                    self._date_box[0],
-                    CT_PREFIX,
-                    content_type,
-                    CL_PREFIX,
-                    _dec(<size_t>nbytes),
-                    CRLF2,
-                    body,
-                ))
+            self._writelines_plain(status, content_type, body, nbytes)
         else:
-            if not _may_have_body(status):
+            if not has_body:
                 body = b""
             elif h.c_get(b"content-encoding") is None:
                 encoding = self._select(body, content_type, False, nbytes)
@@ -726,13 +714,7 @@ cdef class RequestExchange:
                         h.c_set(b"content-type", content_type)
                         h.c_set(b"content-length", _dec(native_len))
                         self._declared_length = <Py_ssize_t>native_len
-                        self._bytes_written = 0
-                        self._buf_bytes(_status_line(status))
-                        self._buf_bytes(self._date_box[0])
-                        if self._out_buf is None:
-                            self._out_buf = bytearray(256)
-                        h.c_write_wire_ba(self._out_buf, &self._out_len)
-                        self._buf_bytes(CRLF)
+                        self._write_header_block(status, h)
                         self._buf_add(<const char*>native_out, <Py_ssize_t>native_len)
                         self._flush()
                     finally:
@@ -746,12 +728,7 @@ cdef class RequestExchange:
             self._bytes_written = 0
             h.c_set(b"content-type", content_type)
             h.c_set(b"content-length", _dec(<size_t>nbytes))
-            self._buf_bytes(_status_line(status))
-            self._buf_bytes(self._date_box[0])
-            if self._out_buf is None:
-                self._out_buf = bytearray(256)
-            h.c_write_wire_ba(self._out_buf, &self._out_len)
-            self._buf_bytes(CRLF)
+            self._write_header_block(status, h)
             self._flush()
             self._status_code = status
             if nbytes:
@@ -821,12 +798,7 @@ cdef class RequestExchange:
                         self._ensure_gzip()
                     headers.c_set(b"content-encoding", encoding)
                     merge_vary(headers, b"accept-encoding")
-        self._buf_bytes(_status_line(status_code))
-        self._buf_bytes(self._date_box[0])
-        if self._out_buf is None:
-            self._out_buf = bytearray(256)
-        headers.c_write_wire_ba(self._out_buf, &self._out_len)
-        self._buf_bytes(CRLF)
+        self._write_header_block(status_code, headers)
         self._flush()
         self._status_code = status_code
         return self
@@ -1069,13 +1041,13 @@ cdef class RequestExchange:
         """Arm/refresh slowloris stall timeout while a body consumer is waiting."""
         cdef object loop
         self._cancel_stall_timer()
-        if not self._waiting or self._body_complete or self._timeout <= 0:
+        if not self._waiting or self._body_complete:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._stall_handle = loop.call_later(self._timeout, self._on_stall_timeout)
+        self._stall_handle = loop.call_later(DEFAULT_BODY_TIMEOUT, self._on_stall_timeout)
 
     def _on_stall_timeout(self):
         self._stall_handle = None

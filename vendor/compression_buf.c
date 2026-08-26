@@ -44,6 +44,11 @@ static void trim_output(unsigned char** out, size_t* cap) {
     }
 }
 
+static StarioBrotli* stario_brotli_new(int level, int window_log);
+static void stario_brotli_free(StarioBrotli* brotli);
+static StarioGzip* stario_gzip_new(int level, int window_bits);
+static void stario_gzip_free(StarioGzip* gzip);
+
 static int grow_buffer(unsigned char** buf, size_t* cap, size_t used) {
     size_t next_cap;
     unsigned char* next;
@@ -178,7 +183,7 @@ static int brotli_start(StarioBrotli* brotli, int level, int window_log) {
     return 0;
 }
 
-StarioBrotli* stario_brotli_new(int level, int window_log) {
+static StarioBrotli* stario_brotli_new(int level, int window_log) {
     StarioBrotli* brotli = (StarioBrotli*)calloc(1, sizeof(StarioBrotli));
     if (brotli == NULL || brotli_start(brotli, level, window_log) != 0) {
         free(brotli);
@@ -241,7 +246,7 @@ int stario_brotli_finish_borrowed(
     );
 }
 
-void stario_brotli_free(StarioBrotli* brotli) {
+static void stario_brotli_free(StarioBrotli* brotli) {
     if (brotli == NULL) {
         return;
     }
@@ -318,7 +323,7 @@ static int gzip_deflate(
     return 0;
 }
 
-StarioGzip* stario_gzip_new(int level, int window_bits) {
+static StarioGzip* stario_gzip_new(int level, int window_bits) {
     StarioGzip* gzip = (StarioGzip*)malloc(sizeof(StarioGzip));
 
     if (gzip == NULL) {
@@ -377,7 +382,7 @@ int stario_gzip_finish_borrowed(
     return gzip_deflate(gzip, Z_FINISH, in, in_len, out, out_len);
 }
 
-void stario_gzip_free(StarioGzip* gzip) {
+static void stario_gzip_free(StarioGzip* gzip) {
     if (gzip == NULL) {
         return;
     }

@@ -6,8 +6,6 @@ cdef class RequestExchange:
     cdef object _transport
     cdef list _date_box
     cdef int _req_encoding
-    cdef bint _req_expect_continue
-    cdef bint _req_connection_close
     cdef public Headers headers
     cdef StarioBrotli* _brotli
     cdef StarioGzip* _gzip
@@ -45,7 +43,6 @@ cdef class RequestExchange:
     cdef int _total_read
     cdef int _max_size
     cdef Py_ssize_t _read_max_size
-    cdef double _timeout
     cdef int _consumed_as
     cdef int _abort_reason
     cdef bint _body_active
@@ -75,8 +72,6 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size)
-    cdef void _clear_hot_request_headers(self)
-    cdef void cache_hot_request_headers(self)
     cdef void c_feed(self, const char* at, size_t length)
     cdef void c_complete(self)
     cdef void c_abort(self)
@@ -91,6 +86,14 @@ cdef class RequestExchange:
     cdef int _buf_body(self, object body) except -1
     cdef int _buf_uint(self, size_t n, int base) except -1
     cdef void _flush(self)
+    cdef void _write_header_block(self, int status, Headers headers)
+    cdef void _writelines_plain(
+        self,
+        int status,
+        object content_type,
+        object body,
+        Py_ssize_t nbytes,
+    )
     cdef Py_ssize_t _body_nbytes(self, object body) except -2
     cdef object _body_as_bytes(self, object body)
     cdef bint _may_compress(

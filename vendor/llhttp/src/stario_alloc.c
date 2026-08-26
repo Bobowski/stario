@@ -19,10 +19,6 @@ llhttp_settings_t* stario_settings_new(void) {
   return settings;
 }
 
-void stario_settings_del(llhttp_settings_t* settings) {
-  free(settings);
-}
-
 void stario_parser_set_data(llhttp_t* parser, void* data) {
   parser->data = data;
 }

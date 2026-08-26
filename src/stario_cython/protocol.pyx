@@ -181,7 +181,6 @@ cdef class HttpProtocol:
     cdef RequestExchange active_exchange
     cdef RequestExchange idle_exchange
     cdef object pending_exchanges
-    cdef bytes url
     cdef char* url_buf
     cdef Py_ssize_t url_len
     cdef Py_ssize_t url_cap
@@ -248,7 +247,6 @@ cdef class HttpProtocol:
         self.connections = connections
         self.transport = None
         self.pending_exchanges = []
-        self.url = b""
         self.head_bytes = 0
         self.max_header_bytes = max_header_bytes
         self.max_body_bytes = max_body_bytes
@@ -444,7 +442,6 @@ cdef class HttpProtocol:
         self.head_bytes = 40
         self.request_dispatched = False
         self.request_keep_alive = True
-        self.url = b""
 
     cdef bint _header_too_large(self, size_t length):
         if self.rejected:
@@ -479,10 +476,6 @@ cdef class HttpProtocol:
         cdef RequestExchange exchange
         cdef uint16_t flags
         cdef uint64_t content_length
-        if self.url_buf != NULL and self.url_len > 0:
-            self.url = PyBytes_FromStringAndSize(self.url_buf, self.url_len)
-        else:
-            self.url = b""
         if self.rejected or self.reading_exchange is None:
             return
         exchange = self.reading_exchange
@@ -495,20 +488,12 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
-        exchange.cache_hot_request_headers()
-        self.request_keep_alive = (
-            llhttp_should_keep_alive(self.parser) != 0
-            or (
-                llhttp_get_http_major(self.parser) == 1
-                and llhttp_get_http_minor(self.parser) == 1
-                and not exchange._req_connection_close
-            )
-        )
+        self.request_keep_alive = llhttp_should_keep_alive(self.parser) != 0
         if self.request_dispatched or self.transport is None or self.transport.is_closing():
             return
         self._build_request(exchange)
         exchange.reset_body(
-            exchange._req_expect_continue,
+            exchange.request_headers.c_request_expect_continue(),
             <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
         )
         self._dispatch(exchange)
@@ -529,8 +514,13 @@ cdef class HttpProtocol:
     cdef void _build_request(self, RequestExchange exchange):
         cdef object path_bytes
         cdef object query
-        cdef object url = self.url
-        cdef Py_ssize_t q = url.find(b"?")
+        cdef object url
+        cdef Py_ssize_t q
+        if self.url_buf != NULL and self.url_len > 0:
+            url = PyBytes_FromStringAndSize(self.url_buf, self.url_len)
+        else:
+            url = b""
+        q = url.find(b"?")
         if q == -1:
             path_bytes, query = url, b""
         else:
