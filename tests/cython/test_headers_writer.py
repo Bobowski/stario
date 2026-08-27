@@ -95,6 +95,59 @@ async def test_exchange_respond_native_compression_round_trip(
             await writer.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_one_shot_compression_writes_generated_headers_without_dict_roundtrip() -> None:
+    app = App()
+    state = {}
+    body = b"direct generated response headers " * 32
+
+    async def compressed(_c, w):
+        w.headers.set("vary", "origin")
+        w.headers.set("x-custom", "present")
+        w.respond(body, b"text/plain; charset=utf-8")
+        state["content-encoding"] = w.headers.get("content-encoding")
+        state["content-type"] = w.headers.get("content-type")
+        state["content-length"] = w.headers.get("content-length")
+        state["vary"] = w.headers.get("vary")
+
+    app.get("/", compressed)
+    async with running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            min_size=0,
+            brotli_level=-1,
+            zstd_level=-1,
+            gzip_level=6,
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: gzip\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await read_response(reader)
+            header, compressed_body = payload.split(b"\r\n\r\n", 1)
+            assert b"x-custom: present\r\n" in header + b"\r\n"
+            assert b"content-encoding: gzip\r\n" in header + b"\r\n"
+            assert b"vary: origin, accept-encoding\r\n" in header + b"\r\n"
+            assert b"content-type: text/plain; charset=utf-8\r\n" in header + b"\r\n"
+            assert gzip.decompress(compressed_body) == body
+            assert state == {
+                "content-encoding": None,
+                "content-type": None,
+                "content-length": None,
+                "vary": "origin",
+            }
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 @pytest.mark.parametrize(
     ("accept_encoding", "expected"),
     [

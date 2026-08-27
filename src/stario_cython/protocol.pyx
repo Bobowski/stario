@@ -483,18 +483,18 @@ cdef class HttpProtocol:
             return
         if self._header_too_large(length):
             return
-        self.reading_exchange.request_headers.append_raw_name(at, length)
+        self.reading_exchange.append_request_header_name(at, length)
 
     cdef void _on_header_value(self, const char* at, size_t length):
         if self.rejected or self.reading_exchange is None:
             return
         if self._header_too_large(length):
             return
-        self.reading_exchange.request_headers.append_raw_value(at, length)
+        self.reading_exchange.append_request_header_value(at, length)
 
     cdef void _on_header_value_complete(self):
         if self.reading_exchange is not None:
-            self.reading_exchange.request_headers.finish_raw_header()
+            self.reading_exchange.finish_request_header()
 
     cdef void _on_headers_complete(self):
         cdef RequestExchange exchange
@@ -508,7 +508,7 @@ cdef class HttpProtocol:
         if self.rejected or self.reading_exchange is None:
             return
         exchange = self.reading_exchange
-        exchange.request_headers.finish_raw_header()
+        exchange.finish_request_header()
         if llhttp_get_upgrade(self.parser):
             self._close_error(400, "Upgrade not supported")
             return
@@ -517,7 +517,7 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             self._close_error(413, "Request body too large")
             return
-        # Snapshot keep-alive / expect / accept-encoding into exchange slots.
+        # Select response encoding from exchange-local request header state.
         exchange.cache_hot_request_headers()
         self.request_keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0

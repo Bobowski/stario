@@ -130,6 +130,116 @@ async def test_fragmented_headers_materialize_correctly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_request_headers_scan_arena_until_copy_on_write() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    seen = []
+
+    async def inspect(c, w):
+        headers = c.req.headers
+        assert headers.materialized is False
+        assert headers.get("authorization") == "Bearer token"
+        assert headers.get("x-missing") is None
+        assert headers.getlist("cookie") == ["a=1", "b=2"]
+        assert "X-Request-ID" in headers
+        assert headers.materialized is False
+        headers.set("X-Local", "yes")
+        assert headers.materialized is True
+        assert headers.getlist("cookie") == ["a=1", "b=2"]
+        seen.append(headers.items())
+        responses.text(w, "ok")
+
+    app.get("/", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: Example.COM:80\r\n"
+            b"Authorization: Bearer token\r\n"
+            b"Cookie: a=1\r\n"
+            b"cookie: b=2\r\n"
+            b"X-Request-ID: request-1\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        assert (b"cookie", b"a=1") in [
+            (name.encode("latin-1"), value.encode("latin-1"))
+            for name, value in seen[0]
+        ]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_request_header_view_resets_when_exchange_is_reused() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    materialized_states = []
+    seen_local = []
+
+    async def inspect(c, w):
+        headers = c.req.headers
+        materialized_states.append(headers.materialized)
+        seen_local.append(headers.get("x-local"))
+        if len(materialized_states) == 1:
+            headers.set("X-Local", "first")
+        responses.text(w, "ok")
+
+    app.get("/", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: first\r\n\r\n")
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        writer.write(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: second\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        assert materialized_states == [False, False]
+        assert seen_local == [None, None]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_stream_large_and_chunked_upload() -> None:
     loop = asyncio.get_running_loop()
     app = App()

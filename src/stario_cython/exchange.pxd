@@ -1,5 +1,13 @@
+from libc.stdint cimport uint32_t
+
 from stario_cython.compression_buf cimport StarioBrotli, StarioGzip
 from stario_cython.headers cimport Headers
+
+ctypedef struct RawHeader:
+    uint32_t name_offset
+    uint32_t name_length
+    uint32_t value_offset
+    uint32_t value_length
 
 cdef class Request:
     cdef public object method
@@ -31,6 +39,23 @@ cdef class RequestExchange:
     cdef int _req_encoding
     cdef bint _req_expect_continue
     cdef bint _req_connection_close
+    cdef char* _req_arena
+    cdef Py_ssize_t _req_arena_len
+    cdef Py_ssize_t _req_arena_cap
+    cdef RawHeader* _req_raw_headers
+    cdef Py_ssize_t _req_raw_count
+    cdef Py_ssize_t _req_raw_headers_cap
+    cdef Py_ssize_t _req_pending_name_offset
+    cdef Py_ssize_t _req_pending_name_length
+    cdef Py_ssize_t _req_pending_value_offset
+    cdef Py_ssize_t _req_pending_value_length
+    cdef bint _req_pending_header
+    cdef Py_ssize_t _req_host_index
+    cdef bint _req_accept_present
+    cdef int _req_br_q
+    cdef int _req_gzip_q
+    cdef int _req_wildcard_q
+    cdef int _req_identity_q
     cdef public Headers headers
     cdef StarioBrotli* _brotli
     cdef StarioGzip* _gzip
@@ -54,7 +79,7 @@ cdef class RequestExchange:
     cdef public object route
     cdef object _connection
     cdef object _state
-    cdef public Headers request_headers
+    cdef public object request_headers
     cdef public Request req
     cdef bint handler_done
     cdef bint handler_started
@@ -98,6 +123,17 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size)
+    cdef int _reserve_request_arena(self, Py_ssize_t bytes_needed) except -1
+    cdef int _reserve_request_headers(self) except -1
+    cdef void append_request_header_name(self, const char* data, size_t length)
+    cdef void append_request_header_value(self, const char* data, size_t length)
+    cdef void finish_request_header(self)
+    cdef void _scan_request_accept_encoding(
+        self,
+        const char* value,
+        size_t length,
+    ) noexcept
+    cdef void _clear_request_headers(self)
     cdef void _clear_hot_request_headers(self)
     cdef void cache_hot_request_headers(self)
     cdef void c_feed(self, const char* at, size_t length)
@@ -137,6 +173,16 @@ cdef class RequestExchange:
     cdef void _maybe_continue(self)
     cdef void _done(self)
     cdef void _maybe_pause(self)
+
+cdef class RequestHeaders(Headers):
+    cdef object _owner
+    cdef bint _request_materialized
+
+    cdef void _materialize(self)
+    cdef object c_get(self, object name)
+    cdef void c_clear(self)
+    cdef void c_reset(self)
+    cdef object c_request_host(self)
 
 cdef RequestExchange acquire_exchange(
     object connection,

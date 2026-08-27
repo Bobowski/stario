@@ -5,8 +5,9 @@ import asyncio
 from types import MappingProxyType
 
 from libc.stddef cimport size_t
+from libc.stdlib cimport free, realloc
 from libc.stdio cimport sprintf
-from libc.string cimport memcpy
+from libc.string cimport memcmp, memcpy
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_GET_SIZE,
@@ -42,7 +43,7 @@ from stario_cython.compression_buf cimport (
     stario_gzip_finish_borrowed,
     stario_gzip_release,
 )
-from stario_cython.headers cimport Headers
+from stario_cython.headers cimport Headers, _encode_name, _intern_name
 
 # Stream batching limit and independent transport backpressure window.
 cdef int LOW_WATER = 128 * 1024
@@ -51,6 +52,9 @@ cdef int STREAM_CHUNK_LIMIT = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
+cdef int REQUEST_NAME_MAX = 256
+cdef int REQUEST_ARENA_RETAIN_MAX = 8 * 1024
+cdef int REQUEST_HEADERS_RETAIN_MAX = 64
 
 cdef object BODY_TYPE_ERROR = (
     "body must be bytes-like or a list/tuple of bytes-like objects"
@@ -80,6 +84,8 @@ cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
 cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
 cdef bytes ZERO_CL = b"content-length: 0\r\n\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
+cdef bytes CE_PREFIX = b"content-encoding: "
+cdef bytes VARY_PREFIX = b"vary: "
 cdef bytes CL_HEADER = b"content-length: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
@@ -105,6 +111,121 @@ cdef inline void _require_bytes_like(object part):
         raise TypeError(
             "body parts must be bytes-like, got " + type(part).__name__
         )
+
+
+cdef inline void _lower_copy(
+    char* dst,
+    const char* src,
+    size_t length,
+) noexcept:
+    cdef size_t i
+    cdef unsigned char ch
+    for i in range(length):
+        ch = <unsigned char>src[i]
+        if 65 <= ch <= 90:
+            ch += 32
+        dst[i] = <char>ch
+
+
+cdef inline bint _token_equals(
+    const char* value,
+    size_t start,
+    size_t end,
+    const char* token,
+    size_t token_length,
+) noexcept:
+    cdef size_t i
+    cdef unsigned char ch
+    if end - start != token_length:
+        return False
+    for i in range(token_length):
+        ch = <unsigned char>value[start + i]
+        if 65 <= ch <= 90:
+            ch += 32
+        if ch != <unsigned char>token[i]:
+            return False
+    return True
+
+
+cdef bint _contains_token(
+    const char* value,
+    size_t length,
+    const char* token,
+    size_t token_length,
+) noexcept:
+    cdef size_t start = 0
+    cdef size_t end
+    while start < length:
+        while start < length and (
+            value[start] == <char>32
+            or value[start] == <char>9
+            or value[start] == <char>44
+        ):
+            start += 1
+        end = start
+        while end < length and value[end] != <char>44:
+            end += 1
+        while end > start and (
+            value[end - 1] == <char>32 or value[end - 1] == <char>9
+        ):
+            end -= 1
+        if _token_equals(value, start, end, token, token_length):
+            return True
+        start = end + 1
+    return False
+
+
+cdef int _parse_qvalue(
+    const char* value,
+    size_t start,
+    size_t end,
+) noexcept:
+    cdef int q = 0
+    cdef int digits = 0
+    cdef unsigned char ch
+    while start < end and (
+        value[start] == <char>32 or value[start] == <char>9
+    ):
+        start += 1
+    while end > start and (
+        value[end - 1] == <char>32 or value[end - 1] == <char>9
+    ):
+        end -= 1
+    if start >= end:
+        return 0
+    if value[start] == <char>49:
+        start += 1
+        if start == end:
+            return 1000
+        if value[start] != <char>46:
+            return 0
+        start += 1
+        while start < end:
+            if value[start] != <char>48:
+                return 0
+            start += 1
+        return 1000
+    if value[start] != <char>48:
+        return 0
+    start += 1
+    if start == end:
+        return 0
+    if value[start] != <char>46:
+        return 0
+    start += 1
+    while start < end and digits < 3:
+        ch = <unsigned char>value[start]
+        if ch < 48 or ch > 57:
+            return 0
+        q = q * 10 + ch - 48
+        digits += 1
+        start += 1
+    if start != end:
+        return 0
+    while digits < 3:
+        q *= 10
+        digits += 1
+    return q
 
 
 cdef inline bint _range_equals_ci(
@@ -230,6 +351,31 @@ cdef object _dec(size_t n):
     return PyBytes_FromStringAndSize(buf, i)
 
 
+cdef object _merge_vary_value(object existing, object token):
+    cdef object stripped
+    cdef object part
+    cdef object token_lower
+    cdef bint has_value = False
+    if existing is None:
+        return token
+    stripped = existing.strip()
+    if not stripped:
+        return token
+    if stripped == b"*":
+        return existing
+    token_lower = token.lower()
+    for raw_part in existing.split(b","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        has_value = True
+        if part == b"*" or part.lower() == token_lower:
+            return existing
+    if has_value:
+        return existing.rstrip() + b", " + token
+    return token
+
+
 cdef class Request:
     """Request view. Same handler API as stario.http.request.Request."""
 
@@ -275,8 +421,13 @@ cdef class Request:
         cdef object host_wire
         if self._host is not None:
             return self._host
-        if isinstance(self.headers, Headers):
-            host_wire = (<Headers>self.headers).c_request_host()
+        if isinstance(self.headers, RequestHeaders):
+            host_wire = (<RequestHeaders>self.headers).c_request_host()
+            host_str = (
+                host_wire.decode("latin-1") if host_wire is not None else ""
+            )
+        elif isinstance(self.headers, Headers):
+            host_wire = (<Headers>self.headers).c_get(b"host")
             host_str = (
                 host_wire.decode("latin-1") if host_wire is not None else ""
             )
@@ -322,6 +473,8 @@ cdef class Request:
 
 cdef class RequestExchange:
     def __cinit__(self):
+        self._req_arena = NULL
+        self._req_raw_headers = NULL
         self._brotli = NULL
         self._gzip = NULL
         self._out_buf = None
@@ -339,7 +492,7 @@ cdef class RequestExchange:
 
     def __init__(self):
         self.headers = Headers()
-        self.request_headers = Headers()
+        self.request_headers = RequestHeaders(self)
         self.req = Request()
         self._chunks = None
         self._cached = None
@@ -358,6 +511,12 @@ cdef class RequestExchange:
 
     def __dealloc__(self):
         self._free_compressors()
+        if self._req_arena != NULL:
+            free(self._req_arena)
+            self._req_arena = NULL
+        if self._req_raw_headers != NULL:
+            free(self._req_raw_headers)
+            self._req_raw_headers = NULL
 
     cdef void reset_response(self, int encoding):
         self._free_compressors()
@@ -619,6 +778,222 @@ cdef class RequestExchange:
         self._flush()
         return 0
 
+    cdef int _reserve_request_arena(
+        self,
+        Py_ssize_t bytes_needed,
+    ) except -1:
+        cdef Py_ssize_t needed = self._req_arena_len + bytes_needed
+        cdef Py_ssize_t cap
+        cdef char* arena
+        if needed <= self._req_arena_cap:
+            return 0
+        cap = 256 if self._req_arena_cap == 0 else self._req_arena_cap * 2
+        if cap < needed:
+            cap = needed
+        arena = <char*>realloc(self._req_arena, <size_t>cap)
+        if arena == NULL:
+            raise MemoryError()
+        self._req_arena = arena
+        self._req_arena_cap = cap
+        return 0
+
+    cdef int _reserve_request_headers(self) except -1:
+        cdef Py_ssize_t cap
+        cdef RawHeader* headers
+        if self._req_raw_count < self._req_raw_headers_cap:
+            return 0
+        cap = (
+            16
+            if self._req_raw_headers_cap == 0
+            else self._req_raw_headers_cap * 2
+        )
+        headers = <RawHeader*>realloc(
+            self._req_raw_headers,
+            <size_t>cap * sizeof(RawHeader),
+        )
+        if headers == NULL:
+            raise MemoryError()
+        self._req_raw_headers = headers
+        self._req_raw_headers_cap = cap
+        return 0
+
+    cdef void append_request_header_name(
+        self,
+        const char* data,
+        size_t length,
+    ):
+        if not self._req_pending_header:
+            self._req_pending_header = True
+            self._req_pending_name_offset = self._req_arena_len
+            self._req_pending_name_length = 0
+            self._req_pending_value_offset = -1
+            self._req_pending_value_length = 0
+        if self._req_pending_value_offset >= 0:
+            raise ValueError("Invalid fragmented header field")
+        if self._req_pending_name_length + <Py_ssize_t>length >= REQUEST_NAME_MAX:
+            raise ValueError("Invalid header name: too long")
+        self._reserve_request_arena(<Py_ssize_t>length)
+        _lower_copy(self._req_arena + self._req_arena_len, data, length)
+        self._req_arena_len += <Py_ssize_t>length
+        self._req_pending_name_length += <Py_ssize_t>length
+
+    cdef void append_request_header_value(
+        self,
+        const char* data,
+        size_t length,
+    ):
+        if not self._req_pending_header:
+            raise ValueError("Invalid header value without field")
+        if self._req_pending_value_offset < 0:
+            self._req_pending_value_offset = self._req_arena_len
+        self._reserve_request_arena(<Py_ssize_t>length)
+        if length:
+            memcpy(self._req_arena + self._req_arena_len, data, length)
+        self._req_arena_len += <Py_ssize_t>length
+        self._req_pending_value_length += <Py_ssize_t>length
+
+    cdef void finish_request_header(self):
+        cdef RawHeader* header
+        cdef const char* name
+        cdef const char* value
+        cdef size_t name_length
+        cdef size_t value_length
+        if not self._req_pending_header:
+            return
+        if self._req_pending_name_length == 0:
+            raise ValueError("Invalid header name: empty")
+        if self._req_pending_value_offset < 0:
+            self._req_pending_value_offset = self._req_arena_len
+        name = self._req_arena + self._req_pending_name_offset
+        value = self._req_arena + self._req_pending_value_offset
+        name_length = <size_t>self._req_pending_name_length
+        value_length = <size_t>self._req_pending_value_length
+        self._reserve_request_headers()
+        header = &self._req_raw_headers[self._req_raw_count]
+        header.name_offset = <uint32_t>self._req_pending_name_offset
+        header.name_length = <uint32_t>name_length
+        header.value_offset = <uint32_t>self._req_pending_value_offset
+        header.value_length = <uint32_t>value_length
+        if name_length == 4 and memcmp(name, "host", 4) == 0:
+            if self._req_host_index < 0:
+                self._req_host_index = self._req_raw_count
+        elif name_length == 10 and memcmp(name, "connection", 10) == 0:
+            if _contains_token(value, value_length, "close", 5):
+                self._req_connection_close = True
+        elif name_length == 6 and memcmp(name, "expect", 6) == 0:
+            if _contains_token(value, value_length, "100-continue", 12):
+                self._req_expect_continue = True
+        elif name_length == 15 and memcmp(name, "accept-encoding", 15) == 0:
+            self._scan_request_accept_encoding(value, value_length)
+        self._req_raw_count += 1
+        self._req_pending_header = False
+
+    cdef void _scan_request_accept_encoding(
+        self,
+        const char* value,
+        size_t length,
+    ) noexcept:
+        cdef size_t start = 0
+        cdef size_t segment_end
+        cdef size_t separator
+        cdef size_t token_end
+        cdef size_t param_start
+        cdef size_t param_end
+        cdef size_t equals
+        cdef size_t key_start
+        cdef size_t key_end
+        cdef int q
+        if not self._req_accept_present:
+            self._req_accept_present = True
+            self._req_br_q = -1
+            self._req_gzip_q = -1
+            self._req_wildcard_q = -1
+            self._req_identity_q = -1
+        while start < length:
+            segment_end = start
+            while segment_end < length and value[segment_end] != <char>44:
+                segment_end += 1
+            while start < segment_end and (
+                value[start] == <char>32 or value[start] == <char>9
+            ):
+                start += 1
+            separator = start
+            while separator < segment_end and value[separator] != <char>59:
+                separator += 1
+            token_end = separator
+            while token_end > start and (
+                value[token_end - 1] == <char>32
+                or value[token_end - 1] == <char>9
+            ):
+                token_end -= 1
+            q = 1000
+            param_start = separator
+            while param_start < segment_end:
+                param_start += 1
+                param_end = param_start
+                while (
+                    param_end < segment_end
+                    and value[param_end] != <char>59
+                ):
+                    param_end += 1
+                equals = param_start
+                while equals < param_end and value[equals] != <char>61:
+                    equals += 1
+                key_start = param_start
+                while key_start < equals and (
+                    value[key_start] == <char>32
+                    or value[key_start] == <char>9
+                ):
+                    key_start += 1
+                key_end = equals
+                while key_end > key_start and (
+                    value[key_end - 1] == <char>32
+                    or value[key_end - 1] == <char>9
+                ):
+                    key_end -= 1
+                if (
+                    equals < param_end
+                    and key_end - key_start == 1
+                    and (
+                        value[key_start] == <char>113
+                        or value[key_start] == <char>81
+                    )
+                ):
+                    q = _parse_qvalue(value, equals + 1, param_end)
+                    break
+                param_start = param_end
+            if _token_equals(value, start, token_end, "br", 2):
+                self._req_br_q = q
+            elif _token_equals(value, start, token_end, "gzip", 4):
+                self._req_gzip_q = q
+            elif _token_equals(value, start, token_end, "*", 1):
+                self._req_wildcard_q = q
+            elif _token_equals(value, start, token_end, "identity", 8):
+                self._req_identity_q = q
+            start = segment_end + 1
+
+    cdef void _clear_request_headers(self):
+        (<RequestHeaders>self.request_headers).c_reset()
+        if (
+            self._req_arena != NULL
+            and self._req_arena_cap > REQUEST_ARENA_RETAIN_MAX
+        ):
+            free(self._req_arena)
+            self._req_arena = NULL
+            self._req_arena_cap = 0
+        if (
+            self._req_raw_headers != NULL
+            and self._req_raw_headers_cap > REQUEST_HEADERS_RETAIN_MAX
+        ):
+            free(self._req_raw_headers)
+            self._req_raw_headers = NULL
+            self._req_raw_headers_cap = 0
+        self._req_arena_len = 0
+        self._req_raw_count = 0
+        self._req_pending_header = False
+        self._req_host_index = -1
+        self._clear_hot_request_headers()
+
     cdef void reset(
         self,
         object connection,
@@ -642,8 +1017,7 @@ cdef class RequestExchange:
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
-        self.request_headers.c_clear()
-        self._clear_hot_request_headers()
+        self._clear_request_headers()
         self.handler_done = False
         self.handler_started = False
 
@@ -651,19 +1025,44 @@ cdef class RequestExchange:
         self._req_encoding = ENCODING_NONE
         self._req_expect_continue = False
         self._req_connection_close = False
+        self._req_accept_present = False
+        self._req_br_q = -1
+        self._req_gzip_q = -1
+        self._req_wildcard_q = -1
+        self._req_identity_q = -1
 
     cdef void cache_hot_request_headers(self):
-        """Snapshot keep-alive / expect / accept-encoding (Headers API unchanged)."""
-        cdef Headers h = self.request_headers
-        if self._brotli_enabled or self._gzip_enabled:
-            self._req_encoding = h.c_select_request_encoding(
-                self._brotli_enabled,
-                self._gzip_enabled,
-            )
-        else:
+        """Select response encoding from exchange-local request-header state."""
+        cdef int wildcard
+        cdef int brotli_q
+        cdef int gzip_q
+        cdef int best_q = 0
+        if (
+            not self._req_accept_present
+            or not (self._brotli_enabled or self._gzip_enabled)
+        ):
             self._req_encoding = ENCODING_NONE
-        self._req_connection_close = h.c_request_connection_close()
-        self._req_expect_continue = h.c_request_expect_continue()
+            return
+        wildcard = (
+            self._req_wildcard_q
+            if self._req_wildcard_q >= 0
+            else 0
+        )
+        brotli_q = self._req_br_q if self._req_br_q >= 0 else wildcard
+        gzip_q = (
+            self._req_gzip_q
+            if self._req_gzip_q >= 0
+            else wildcard
+        )
+        self._req_encoding = ENCODING_NONE
+        if self._brotli_enabled and brotli_q > best_q:
+            best_q = brotli_q
+            self._req_encoding = ENCODING_BR
+        if self._gzip_enabled and gzip_q > best_q:
+            best_q = gzip_q
+            self._req_encoding = ENCODING_GZIP
+        if self._req_identity_q >= best_q:
+            self._req_encoding = ENCODING_NONE
 
     cdef void start_response(self):
         self.handler_started = True
@@ -722,12 +1121,11 @@ cdef class RequestExchange:
     cdef void release_global(self):
         self._free_compressors()
         self.headers.c_clear()
-        self.request_headers.c_clear()
+        self._clear_request_headers()
         self.req.reset("GET", "/", b"", "1.1", True, None, None)
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
-        self._clear_hot_request_headers()
         self.app = None
         self._connection = None
         self._transport = None
@@ -742,6 +1140,7 @@ cdef class RequestExchange:
         cdef Headers h = self.headers
         cdef object encoding
         cdef object flat
+        cdef object vary
         cdef Py_ssize_t nbytes
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
@@ -810,18 +1209,32 @@ cdef class RequestExchange:
                     flat = self._body_as_bytes(body)
                     try:
                         self._frame(flat, encoding, &native_out, &native_len)
-                        h.c_set(b"content-encoding", encoding)
-                        h.c_merge_vary(b"accept-encoding")
-                        h.c_set(b"content-type", content_type)
-                        h.c_set(b"content-length", _dec(native_len))
                         self._declared_length = <Py_ssize_t>native_len
                         self._bytes_written = 0
                         self._buf_bytes(_status_line(status))
                         self._buf_bytes(self._date_box[0])
                         if self._out_buf is None:
                             self._out_buf = bytearray(256)
-                        h.c_write_wire_ba(self._out_buf, &self._out_len)
+                        vary = _merge_vary_value(
+                            h.c_get(b"vary"),
+                            b"accept-encoding",
+                        )
+                        h.c_write_compressed_response_wire_ba(
+                            self._out_buf,
+                            &self._out_len,
+                        )
+                        self._buf_bytes(CE_PREFIX)
+                        self._buf_bytes(encoding)
                         self._buf_bytes(CRLF)
+                        self._buf_bytes(VARY_PREFIX)
+                        self._buf_bytes(vary)
+                        self._buf_bytes(CRLF)
+                        self._buf_bytes(CT_PREFIX)
+                        self._buf_bytes(content_type)
+                        self._buf_bytes(CRLF)
+                        self._buf_bytes(CL_HEADER)
+                        self._buf_uint(native_len, 10)
+                        self._buf_bytes(CRLF2)
                         self._buf_add(<const char*>native_out, <Py_ssize_t>native_len)
                         self._flush()
                     finally:
@@ -1413,6 +1826,157 @@ cdef class RequestExchange:
         if max_size is not None and len(self._cached) > max_size:
             raise HttpException(413, "Request body too large")
         return self._cached
+
+
+cdef class RequestHeaders(Headers):
+    """Read-mostly request headers backed by the owning exchange arena."""
+
+    def __init__(self, RequestExchange owner):
+        Headers.__init__(self)
+        self._owner = owner
+        self._request_materialized = False
+
+    cdef void _materialize(self):
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef Py_ssize_t index
+        cdef object key
+        cdef object value
+        cdef object existing
+        if self._request_materialized:
+            return
+        owner = <RequestExchange>self._owner
+        for index in range(owner._req_raw_count):
+            header = &owner._req_raw_headers[index]
+            key = _intern_name(
+                owner._req_arena + header.name_offset,
+                header.name_length,
+            )
+            value = PyBytes_FromStringAndSize(
+                owner._req_arena + header.value_offset,
+                header.value_length,
+            )
+            existing = self._data.get(key)
+            if existing is None:
+                self._data[key] = value
+            elif type(existing) is list:
+                existing.append(value)
+            else:
+                self._data[key] = [existing, value]
+        self._request_materialized = True
+
+    cdef object c_get(self, object name):
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef bytes key
+        cdef const char* query
+        cdef Py_ssize_t query_length
+        cdef Py_ssize_t index
+        cdef object value
+        if self._request_materialized:
+            value = self._data.get(name)
+            if value is None:
+                return None
+            if type(value) is bytes:
+                return value
+            return value[0]
+        key = name
+        query = key
+        query_length = len(key)
+        owner = <RequestExchange>self._owner
+        for index in range(owner._req_raw_count):
+            header = &owner._req_raw_headers[index]
+            if (
+                header.name_length == <uint32_t>query_length
+                and memcmp(
+                    owner._req_arena + header.name_offset,
+                    query,
+                    <size_t>query_length,
+                ) == 0
+            ):
+                return PyBytes_FromStringAndSize(
+                    owner._req_arena + header.value_offset,
+                    header.value_length,
+                )
+        return None
+
+    cdef void c_clear(self):
+        self._materialize()
+        self._data.clear()
+
+    cdef void c_reset(self):
+        self._data.clear()
+        self._request_materialized = False
+
+    cdef object c_request_host(self):
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        if self._request_materialized:
+            return self.c_get(b"host")
+        owner = <RequestExchange>self._owner
+        if owner._req_host_index < 0:
+            return None
+        header = &owner._req_raw_headers[owner._req_host_index]
+        return PyBytes_FromStringAndSize(
+            owner._req_arena + header.value_offset,
+            header.value_length,
+        )
+
+    def getlist(self, str name):
+        return [
+            value.decode("latin-1")
+            for value in self.unsafe_getlist(_encode_name(name))
+        ]
+
+    def unsafe_getlist(self, name):
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef bytes key
+        cdef const char* query
+        cdef Py_ssize_t query_length
+        cdef Py_ssize_t index
+        cdef object value
+        cdef list result
+        if self._request_materialized:
+            value = self._data.get(name)
+            if value is None:
+                return []
+            if type(value) is bytes:
+                return [value]
+            return list(value)
+        key = name
+        query = key
+        query_length = len(key)
+        owner = <RequestExchange>self._owner
+        result = []
+        for index in range(owner._req_raw_count):
+            header = &owner._req_raw_headers[index]
+            if (
+                header.name_length == <uint32_t>query_length
+                and memcmp(
+                    owner._req_arena + header.name_offset,
+                    query,
+                    <size_t>query_length,
+                ) == 0
+            ):
+                result.append(
+                    PyBytes_FromStringAndSize(
+                        owner._req_arena + header.value_offset,
+                        header.value_length,
+                    )
+                )
+        return result
+
+    def __contains__(self, name):
+        try:
+            return self.c_get(_encode_name(name)) is not None
+        except ValueError:
+            return False
+
+    @property
+    def materialized(self):
+        """Whether a mutating/full-map operation copied the request arena."""
+        return self._request_materialized
 
 
 cdef RequestExchange acquire_exchange(
