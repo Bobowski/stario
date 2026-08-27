@@ -45,9 +45,18 @@ async def cookie_list(c, w):
     w.respond(BODY, CONTENT_TYPE)
 
 
+async def response_headers(_c, w):
+    w.headers.set("cache-control", "no-store")
+    w.headers.set("x-request-id", "request-1")
+    w.headers.add("vary", "origin")
+    w.headers.add("vary", "accept-language")
+    w.respond(BODY, CONTENT_TYPE)
+
+
 async def bootstrap(app: App, _span: Span) -> None:
     app.get("/headers/none", no_reads)
     app.get("/headers/one", one_read)
     app.get("/headers/three", three_reads)
     app.get("/headers/cookies", cookie_list)
+    app.get("/headers/response", response_headers)
     yield
