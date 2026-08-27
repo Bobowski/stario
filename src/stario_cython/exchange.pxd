@@ -147,6 +147,7 @@ cdef class RequestExchange:
     cdef void c_abort(self)
     cdef void _clear_body_storage(self) noexcept
     cdef int _ensure_body_tail(self, Py_ssize_t received_before) noexcept
+    cdef int _adopt_expected_body_buffer(self) noexcept
     cdef int _seal_body_tail(self) noexcept
     cdef object _body_to_bytes(self)
     cdef void reset_response(self, int encoding)

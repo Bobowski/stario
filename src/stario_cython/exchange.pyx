@@ -1489,8 +1489,13 @@ cdef class RequestExchange:
         if self._body_tail is not None:
             return 0
         cap = self._stream_max_chunk
+        # Buffered body() wants one Content-Length-sized object so complete
+        # does not b"".join ~32x64KiB tails. Do not wait for CONSUMED_BODY:
+        # the first body bytes often win that race (same llhttp_execute as
+        # headers-complete, or a pipelined request still queued). stream()
+        # sets CONSUMED_STREAM before feeding so it keeps 64KiB tails.
         if (
-            self._consumed_as == CONSUMED_BODY
+            self._consumed_as != CONSUMED_STREAM
             and self._expected_size > 0
             and received_before == 0
         ):
@@ -1508,6 +1513,58 @@ cdef class RequestExchange:
         self._body_tail = tail
         self._tail_used = 0
         self._tail_cap = cap
+        return 0
+
+    cdef int _adopt_expected_body_buffer(self) noexcept:
+        """Compact already-fed 64KiB tails into one Content-Length buffer.
+
+        Used when body() starts after some bytes already landed in stream-sized
+        pieces. Later c_feed memcpy's into this tail; complete skips join.
+        """
+        cdef Py_ssize_t have
+        cdef Py_ssize_t offset
+        cdef object dest
+        cdef object chunk
+        cdef object chunks
+        if self._expected_size <= 0 or self._consumed_as == CONSUMED_STREAM:
+            return 0
+        if self._body_complete:
+            return 0
+        have = self._buffered + self._tail_used
+        if have > self._expected_size:
+            return 0
+        if (
+            self._body_tail is not None
+            and self._tail_cap == self._expected_size
+            and (self._chunks is None or not self._chunks)
+        ):
+            return 0
+        dest = PyBytes_FromStringAndSize(NULL, self._expected_size)
+        if dest is None:
+            PyErr_Clear()
+            return -1
+        offset = 0
+        chunks = self._chunks
+        if chunks is not None:
+            for chunk in chunks:
+                memcpy(
+                    PyBytes_AS_STRING(dest) + offset,
+                    PyBytes_AS_STRING(chunk),
+                    <size_t>len(chunk),
+                )
+                offset += len(chunk)
+            chunks.clear()
+        if self._body_tail is not None and self._tail_used > 0:
+            memcpy(
+                PyBytes_AS_STRING(dest) + offset,
+                PyBytes_AS_STRING(self._body_tail),
+                <size_t>self._tail_used,
+            )
+            offset += self._tail_used
+        self._body_tail = dest
+        self._tail_used = offset
+        self._tail_cap = self._expected_size
+        self._buffered = 0
         return 0
 
     cdef int _seal_body_tail(self) noexcept:
@@ -1682,21 +1739,20 @@ cdef class RequestExchange:
             self._wake()
             self._maybe_recycle()
             return 0
-        if self._consumed_as == CONSUMED_BODY:
-            if self._cached is None:
-                if self._chunks is None or not self._chunks:
-                    self._cached = b""
-                elif len(self._chunks) == 1:
-                    self._cached = self._chunks[0]
-                    self._chunks.clear()
-                    self._buffered = 0
-                else:
-                    self._cached = b"".join(self._chunks)
-                    if PyErr_Occurred() or self._cached is None:
-                        PyErr_Clear()
-                        return -1
-                    self._chunks.clear()
-                    self._buffered = 0
+        if self._consumed_as != CONSUMED_STREAM and self._cached is None:
+            if self._chunks is None or not self._chunks:
+                self._cached = b""
+            elif len(self._chunks) == 1:
+                self._cached = self._chunks[0]
+                self._chunks.clear()
+                self._buffered = 0
+            else:
+                self._cached = b"".join(self._chunks)
+                if PyErr_Occurred() or self._cached is None:
+                    PyErr_Clear()
+                    return -1
+                self._chunks.clear()
+                self._buffered = 0
         self._wake()
         self._maybe_recycle()
         return 0
@@ -1774,6 +1830,12 @@ cdef class RequestExchange:
                 )
         self._stream_max_chunk = chunk_size
         self._consumed_as = CONSUMED_STREAM
+        if (
+            self._body_tail is not None
+            and self._tail_cap != chunk_size
+            and self._seal_body_tail() != 0
+        ):
+            raise MemoryError()
         if self._cached is not None:
             yield self._cached
             return
@@ -1825,6 +1887,8 @@ cdef class RequestExchange:
             return self._cached
         self._consumed_as = CONSUMED_BODY
         self._read_max_size = -1 if max_size is None else <Py_ssize_t>max_size
+        if self._adopt_expected_body_buffer() != 0:
+            raise MemoryError()
         self._maybe_continue()
         while not self._body_complete:
             if self._abort_reason != ABORT_NONE:

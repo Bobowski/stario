@@ -811,6 +811,101 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_content_length_body_survives_many_64k_segments() -> None:
+    """Known Content-Length body() must not join a tail per 64KiB feed."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    started = asyncio.Event()
+    payload = bytes(range(256)) * 1024  # 256 KiB, not a multiple of one pattern
+
+    async def echo(c, w):
+        started.set()
+        body = await c.req.body()
+        w.respond(body, b"application/octet-stream")
+
+    app.post("/echo", echo)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+        )
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        for i in range(0, len(payload), 4096):
+            writer.write(payload[i : i + 4096])
+            await writer.drain()
+            await asyncio.sleep(0)
+        assert payload in await read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_content_length_body_in_same_packet_as_headers() -> None:
+    """First body bytes in the headers-complete execute still materialize correctly."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    payload = b"y" * (128 * 1024)
+
+    async def echo(c, w):
+        w.respond(await c.req.body(), b"application/octet-stream")
+
+    app.post("/echo", echo)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+        )
+        await writer.drain()
+        assert payload in await read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_next_request_starts_after_respond_before_handler_returns() -> None:
     """Connection advances on response send, not when the handler coroutine ends."""
     loop = asyncio.get_running_loop()
