@@ -16,7 +16,7 @@ from stario.routing import UrlPath
 from tests.helpers import run_with_app
 
 
-def test_eager_create_task_falls_back_for_uvloop() -> None:
+def test_eager_create_task_uses_direct_task_with_uvloop() -> None:
     uvloop = pytest.importorskip("uvloop")
 
     async def run() -> None:

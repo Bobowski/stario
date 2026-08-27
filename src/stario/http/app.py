@@ -146,27 +146,12 @@ class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        if eager_start:
-            try:
-                task = loop.create_task(
-                    coro,
-                    name=name,
-                    eager_start=True,
-                )
-            except TypeError as exc:
-                # uvloop 0.21 exposes create_task() without Python 3.14's
-                # eager_start keyword. Constructing the stdlib Task directly
-                # preserves eager execution while retaining uvloop as owner.
-                if "eager_start" not in str(exc):
-                    raise
-                task = asyncio.Task(
-                    coro,
-                    loop=loop,
-                    name=name,
-                    eager_start=True,
-                )
-        else:
-            task = loop.create_task(coro, name=name)
+        task = asyncio.Task(
+            coro,
+            loop=loop,
+            name=name,
+            eager_start=eager_start,
+        )
         if not task.done():
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
