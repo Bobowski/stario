@@ -55,6 +55,7 @@ from stario_cython.headers cimport Headers, _encode_name, _intern_name, _lower_c
 
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
+cdef int BODY_HIGH_WATER = 64 * 1024
 cdef int STREAM_CHUNK_LIMIT = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
@@ -1658,9 +1659,14 @@ cdef class RequestExchange:
                 self._transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
 
     cdef void _maybe_pause(self):
-        if self._consumed_as != CONSUMED_STREAM:
+        if self._consumed_as == CONSUMED_STREAM:
+            if self._buffered + self._tail_used > HIGH_WATER:
+                self._connection.set_body_paused(self, True)
             return
-        if self._buffered + self._tail_used > HIGH_WATER:
+        if (
+            self._consumed_as == CONSUMED_BODY
+            and self._buffered + self._tail_used > BODY_HIGH_WATER
+        ):
             self._connection.set_body_paused(self, True)
 
     cdef int c_feed(self, const char* at, size_t length) noexcept:
@@ -1714,9 +1720,19 @@ cdef class RequestExchange:
                 self._reset_stall_timer()
             self._maybe_pause()
             return 0
-        # body(): refresh stall on progress; wake only on complete/abort.
+        # body(): refresh stall on progress; wake on complete/abort, and also
+        # when over the high-water mark so the waiter can unpause the transport.
+        # Without that, _pump_data keeps ingesting parser quantums and wrk's
+        # 32 connections dump full 2MB bodies without yielding.
         if self._waiting:
             self._reset_stall_timer()
+        self._maybe_pause()
+        if (
+            self._consumed_as == CONSUMED_BODY
+            and self._waiting
+            and self._buffered + self._tail_used > BODY_HIGH_WATER
+        ):
+            self._wake()
         return 0
 
     cdef int c_complete(self) noexcept:
@@ -1724,6 +1740,8 @@ cdef class RequestExchange:
             return 0
         self._body_complete = True
         self._cancel_stall_timer()
+        if self._connection is not None:
+            self._connection.set_body_paused(self, False)
         if self._discard_body:
             self._clear_body_storage()
             self._maybe_recycle()
@@ -1898,7 +1916,13 @@ cdef class RequestExchange:
                 and self._total_read > self._read_max_size
             ):
                 raise HttpException(413, "Request body too large")
+            if self._connection is not None:
+                self._connection.set_body_paused(self, False)
+            if self._body_complete:
+                break
             await self._wait_for_body_data()
+        if self._connection is not None:
+            self._connection.set_body_paused(self, False)
         if self._abort_reason != ABORT_NONE:
             self._raise_abort()
         if self._cached is None:
