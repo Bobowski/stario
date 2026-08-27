@@ -256,9 +256,10 @@ Each run writes a timestamped directory under `benchmarks/server/results/`:
 - `summary.md` — grouped markdown tables.
 - `config.txt` — run settings.
 
-A committed reference baseline (hardware, methodology, tables) lives at
-`benchmarks/server/baseline-20260824.md`. Timestamped `results/` dirs remain
-gitignored.
+A committed reference baseline (hardware, methodology, Python vs Cython tables)
+lives at `benchmarks/server/baseline-20260827.md`. The previous capture with
+native/ASGI competitor rows is `benchmarks/server/baseline-20260824.md`.
+Timestamped `results/` dirs remain gitignored.
 
 Successful runs keep only `summary.md` and `config.txt` by default. Use
 `KEEP_RAW=1` to keep the per-endpoint `wrk` output and server logs. Failed
