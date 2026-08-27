@@ -1,5 +1,5 @@
-"""Compatibility shim: Request lives in the exchange extension."""
+"""Compatibility shim: Request lives in the compiled core."""
 
-from stario_cython.exchange import Request
+from stario_cython.core import Request
 
 __all__ = ["Request"]

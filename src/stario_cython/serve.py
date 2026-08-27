@@ -9,6 +9,10 @@ timeouts, the 8-request pipeline cap) stay unwired.
 
 from __future__ import annotations
 
+import argparse
+import sys
+
+from stario.cli.imports import load_symbol
 from stario.http.bootstrap import Bootstrap
 from stario.http.config import RequestPolicy, ServerConfig, server_config_from_env
 from stario.http.server import Server
@@ -88,3 +92,19 @@ async def serve(
 def run(bootstrap: Bootstrap) -> None:
     """CLI / ``python -m stario_cython`` entry."""
     _server(bootstrap, _uvloop_config()).run()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse ``MODULE:bootstrap`` and run the Cython server."""
+    parser = argparse.ArgumentParser(prog="stario-cython")
+    parser.add_argument(
+        "app",
+        metavar="MODULE:CALLABLE",
+        help="Import path to bootstrap (async def bootstrap(app, span): ...; yield)",
+    )
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    bootstrap = load_symbol(args.app, label="app")
+    if not callable(bootstrap):
+        parser.error("app must be callable")
+    run(bootstrap)  # type: ignore[arg-type]
+    return 0
