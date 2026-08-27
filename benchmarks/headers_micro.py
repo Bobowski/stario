@@ -42,6 +42,7 @@ pyximport.install(
 
 from _headers_micro import (  # type: ignore[import-not-found]  # noqa: E402
     MODE_ADAPTIVE,
+    MODE_ARENA_LINEAR,
     MODE_ARENA_SCAN,
     MODE_EAGER_DICT,
     MODE_LAZY_DICT,
@@ -55,7 +56,8 @@ JSON_PATH = os.environ.get("HEADERS_BENCH_JSON")
 STRATEGIES = {
     "eager-dict": MODE_EAGER_DICT,
     "lazy-dict": MODE_LAZY_DICT,
-    "arena-scan": MODE_ARENA_SCAN,
+    "arena-hash": MODE_ARENA_SCAN,
+    "arena-linear": MODE_ARENA_LINEAR,
     "adaptive-3": MODE_ADAPTIVE,
 }
 
@@ -235,19 +237,20 @@ def main() -> int:
             )
 
     print(
-        "| fields | workload | eager dict | lazy dict | arena scan | "
-        "adaptive-3 | arena vs lazy |"
+        "| fields | workload | eager dict | lazy dict | arena hash | "
+        "arena linear | adaptive-3 | linear vs lazy |"
     )
-    print("|---:|---|---:|---:|---:|---:|---:|")
+    print("|---:|---|---:|---:|---:|---:|---:|---:|")
     for row in rows:
         timings = row["nanoseconds_per_request"]
         assert isinstance(timings, dict)
         lazy = timings["lazy-dict"]
-        arena = timings["arena-scan"]
+        arena = timings["arena-linear"]
         print(
             f"| {row['headers']} | {row['workload']} | "
             f"{timings['eager-dict']:.0f} ns | "
             f"{lazy:.0f} ns | "
+            f"{timings['arena-hash']:.0f} ns | "
             f"{arena:.0f} ns | "
             f"{timings['adaptive-3']:.0f} ns | "
             f"{(arena / lazy - 1) * 100:+.1f}% |"

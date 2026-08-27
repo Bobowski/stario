@@ -20,6 +20,7 @@ cdef enum:
     LAZY_DICT = 1
     ARENA_SCAN = 2
     ADAPTIVE = 3
+    ARENA_LINEAR = 4
     INTERN_TABLE_SIZE = 64
     INTERN_MAX = 32
 
@@ -176,7 +177,7 @@ cdef class HeaderStore:
         self._headers = NULL
 
     def __init__(self, int mode, int promote_after=3):
-        if mode < EAGER_DICT or mode > ADAPTIVE:
+        if mode < EAGER_DICT or mode > ARENA_LINEAR:
             raise ValueError("unknown header strategy")
         if promote_after < 1:
             raise ValueError("promote_after must be positive")
@@ -333,14 +334,19 @@ cdef class HeaderStore:
     cdef object _scan_get(self, bytes name):
         cdef const char* query = name
         cdef Py_ssize_t query_len = len(name)
-        cdef uint32_t query_hash = _hash_bytes(query, query_len)
+        cdef uint32_t query_hash = 0
         cdef Py_ssize_t i
         cdef RawHeader* header
+        if self._mode != ARENA_LINEAR:
+            query_hash = _hash_bytes(query, query_len)
         for i in range(self._count):
             header = &self._headers[i]
             if (
-                header.name_hash == query_hash
-                and header.name_length == <uint32_t>query_len
+                header.name_length == <uint32_t>query_len
+                and (
+                    header.name_hash == 0
+                    or header.name_hash == query_hash
+                )
                 and memcmp(
                     self._arena + header.name_offset,
                     query,
@@ -356,15 +362,20 @@ cdef class HeaderStore:
     cdef list _scan_getlist(self, bytes name):
         cdef const char* query = name
         cdef Py_ssize_t query_len = len(name)
-        cdef uint32_t query_hash = _hash_bytes(query, query_len)
+        cdef uint32_t query_hash = 0
         cdef Py_ssize_t i
         cdef RawHeader* header
         cdef list result = []
+        if self._mode != ARENA_LINEAR:
+            query_hash = _hash_bytes(query, query_len)
         for i in range(self._count):
             header = &self._headers[i]
             if (
-                header.name_hash == query_hash
-                and header.name_length == <uint32_t>query_len
+                header.name_length == <uint32_t>query_len
+                and (
+                    header.name_hash == 0
+                    or header.name_hash == query_hash
+                )
                 and memcmp(
                     self._arena + header.name_offset,
                     query,
@@ -448,3 +459,4 @@ MODE_EAGER_DICT = EAGER_DICT
 MODE_LAZY_DICT = LAZY_DICT
 MODE_ARENA_SCAN = ARENA_SCAN
 MODE_ADAPTIVE = ADAPTIVE
+MODE_ARENA_LINEAR = ARENA_LINEAR
