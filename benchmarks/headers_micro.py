@@ -98,11 +98,14 @@ class Workload:
 WORKLOADS = (
     Workload("no application reads"),
     Workload("one arbitrary read", gets=(b"authorization",)),
+    Workload("one missing optional read", gets=(b"x-optional-feature",)),
     Workload(
         "three distinct reads",
         gets=(b"authorization", b"user-agent", b"x-request-id"),
     ),
     Workload("same header 8x", gets=(b"authorization",) * 8),
+    Workload("same missing header 8x", gets=(b"x-optional-feature",) * 8),
+    Workload("same header 64x", gets=(b"authorization",) * 64),
     Workload("single Cookie getlist", getlists=(b"cookie",)),
     Workload(
         "three Cookie lines getlist",

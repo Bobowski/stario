@@ -141,6 +141,20 @@ cdef inline uint32_t _lower_copy_hash(
     return value
 
 
+cdef inline void _lower_copy(
+    char* dst,
+    const char* src,
+    Py_ssize_t length,
+) noexcept:
+    cdef Py_ssize_t i
+    cdef uint8_t ch
+    for i in range(length):
+        ch = <uint8_t>src[i]
+        if 65 <= ch <= 90:
+            ch += 32
+        dst[i] = <char>ch
+
+
 cdef class HeaderStore:
     """One pooled request-header store with a selectable lookup strategy."""
 
@@ -235,11 +249,17 @@ cdef class HeaderStore:
         self._reserve_headers(self._count + 1)
         name_offset = self._arena_len
         header = &self._headers[self._count]
-        header.name_hash = _lower_copy_hash(
-            self._arena + name_offset,
-            name_src,
-            name_len,
-        )
+        if self._mode == ARENA_SCAN or self._mode == ADAPTIVE:
+            header.name_hash = _lower_copy_hash(
+                self._arena + name_offset,
+                name_src,
+                name_len,
+            )
+        else:
+            # Current lazy storage lowercases while parsing but does not need
+            # a request-time lookup hash until it materializes.
+            _lower_copy(self._arena + name_offset, name_src, name_len)
+            header.name_hash = 0
         self._arena_len += name_len
         value_offset = self._arena_len
         if value_len:
@@ -269,14 +289,21 @@ cdef class HeaderStore:
         cdef object key
         cdef object value
         cdef object existing
+        cdef uint32_t name_hash
         if self._materialized:
             return
         for i in range(self._count):
             header = &self._headers[i]
+            name_hash = header.name_hash
+            if name_hash == 0:
+                name_hash = _hash_bytes(
+                    self._arena + header.name_offset,
+                    header.name_length,
+                )
             key = _intern_name(
                 self._arena + header.name_offset,
                 header.name_length,
-                header.name_hash,
+                name_hash,
             )
             value = PyBytes_FromStringAndSize(
                 self._arena + header.value_offset,
