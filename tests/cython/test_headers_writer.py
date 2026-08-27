@@ -103,6 +103,7 @@ async def test_one_shot_compression_writes_generated_headers_without_dict_roundt
 
     async def compressed(_c, w):
         w.headers.set("vary", "origin")
+        w.headers.add("vary", "accept-language")
         w.headers.set("x-custom", "present")
         w.respond(body, b"text/plain; charset=utf-8")
         state["content-encoding"] = w.headers.get("content-encoding")
@@ -134,7 +135,9 @@ async def test_one_shot_compression_writes_generated_headers_without_dict_roundt
             header, compressed_body = payload.split(b"\r\n\r\n", 1)
             assert b"x-custom: present\r\n" in header + b"\r\n"
             assert b"content-encoding: gzip\r\n" in header + b"\r\n"
-            assert b"vary: origin, accept-encoding\r\n" in header + b"\r\n"
+            assert b"vary: origin\r\n" in header + b"\r\n"
+            assert b"vary: accept-language\r\n" in header + b"\r\n"
+            assert b"vary: accept-encoding\r\n" in header + b"\r\n"
             assert b"content-type: text/plain; charset=utf-8\r\n" in header + b"\r\n"
             assert gzip.decompress(compressed_body) == body
             assert state == {

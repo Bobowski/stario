@@ -351,31 +351,6 @@ cdef object _dec(size_t n):
     return PyBytes_FromStringAndSize(buf, i)
 
 
-cdef object _merge_vary_value(object existing, object token):
-    cdef object stripped
-    cdef object part
-    cdef object token_lower
-    cdef bint has_value = False
-    if existing is None:
-        return token
-    stripped = existing.strip()
-    if not stripped:
-        return token
-    if stripped == b"*":
-        return existing
-    token_lower = token.lower()
-    for raw_part in existing.split(b","):
-        part = raw_part.strip()
-        if not part:
-            continue
-        has_value = True
-        if part == b"*" or part.lower() == token_lower:
-            return existing
-    if has_value:
-        return existing.rstrip() + b", " + token
-    return token
-
-
 cdef class Request:
     """Request view. Same handler API as stario.http.request.Request."""
 
@@ -1140,7 +1115,6 @@ cdef class RequestExchange:
         cdef Headers h = self.headers
         cdef object encoding
         cdef object flat
-        cdef object vary
         cdef Py_ssize_t nbytes
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
@@ -1215,10 +1189,6 @@ cdef class RequestExchange:
                         self._buf_bytes(self._date_box[0])
                         if self._out_buf is None:
                             self._out_buf = bytearray(256)
-                        vary = _merge_vary_value(
-                            h.c_get(b"vary"),
-                            b"accept-encoding",
-                        )
                         h.c_write_compressed_response_wire_ba(
                             self._out_buf,
                             &self._out_len,
@@ -1226,9 +1196,10 @@ cdef class RequestExchange:
                         self._buf_bytes(CE_PREFIX)
                         self._buf_bytes(encoding)
                         self._buf_bytes(CRLF)
-                        self._buf_bytes(VARY_PREFIX)
-                        self._buf_bytes(vary)
-                        self._buf_bytes(CRLF)
+                        if not h.c_vary_contains(b"accept-encoding"):
+                            self._buf_bytes(VARY_PREFIX)
+                            self._buf_bytes(b"accept-encoding")
+                            self._buf_bytes(CRLF)
                         self._buf_bytes(CT_PREFIX)
                         self._buf_bytes(content_type)
                         self._buf_bytes(CRLF)

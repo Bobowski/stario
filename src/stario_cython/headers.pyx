@@ -210,6 +210,21 @@ cdef class Headers:
     cdef bint c_empty(self):
         return not self._data
 
+    cdef bint c_vary_contains(self, object token):
+        cdef object existing = self._data.get(b"vary")
+        cdef object value
+        cdef object part
+        cdef object token_lower = token.lower()
+        if existing is None:
+            return False
+        values = (existing,) if type(existing) is bytes else existing
+        for value in values:
+            for raw_part in value.split(b","):
+                part = raw_part.strip()
+                if part == b"*" or part.lower() == token_lower:
+                    return True
+        return False
+
     cdef void c_merge_vary(self, object token):
         cdef object existing = self.c_get(b"vary")
         cdef object stripped
@@ -277,9 +292,7 @@ cdef class Headers:
                 name == b"content-type" or name == b"content-length"
             ):
                 continue
-            if skip_mode == 2 and (
-                name == b"content-encoding" or name == b"vary"
-            ):
+            if skip_mode == 2 and name == b"content-encoding":
                 continue
             if type(value) is bytes:
                 pointer = name
