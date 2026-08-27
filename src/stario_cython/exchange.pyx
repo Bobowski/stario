@@ -1922,6 +1922,18 @@ cdef class RequestHeaders(Headers):
             header.value_length,
         )
 
+    def get(self, str name, default=None):
+        cdef object wire = self.c_get(_encode_name(name))
+        if wire is None:
+            return default
+        return wire.decode("latin-1")
+
+    def unsafe_get(self, name, default=None):
+        cdef object value = self.c_get(name)
+        if value is None:
+            return default
+        return value
+
     def getlist(self, str name):
         return [
             value.decode("latin-1")
