@@ -180,6 +180,9 @@ cdef class RequestHeaders(Headers):
 
     cdef void _materialize(self)
     cdef object c_get(self, object name)
+    cdef void c_set(self, object name, object value)
+    cdef void c_add(self, object name, object value)
+    cdef void c_remove(self, object name)
     cdef void c_clear(self)
     cdef void c_reset(self)
     cdef object c_request_host(self)

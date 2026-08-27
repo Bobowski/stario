@@ -1,7 +1,6 @@
 cdef class Headers:
     cdef dict _data
 
-    cdef void _materialize(self)
     cdef object c_get(self, object name)
     cdef void c_set(self, object name, object value)
     cdef void c_add(self, object name, object value)

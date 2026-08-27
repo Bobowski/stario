@@ -178,12 +178,8 @@ cdef class Headers:
     def __init__(self, raw_header_data=None):
         self._data = raw_header_data if raw_header_data is not None else {}
 
-    cdef void _materialize(self):
-        """Overridden by exchange-backed request headers."""
-
     cdef object c_get(self, object name):
         cdef object value
-        self._materialize()
         value = self._data.get(name)
         if value is None:
             return None
@@ -192,12 +188,10 @@ cdef class Headers:
         return value[0]
 
     cdef void c_set(self, object name, object value):
-        self._materialize()
         self._data[name] = value
 
     cdef void c_add(self, object name, object value):
         cdef object existing
-        self._materialize()
         if name not in self._data:
             self._data[name] = value
             return
@@ -208,15 +202,12 @@ cdef class Headers:
             self._data[name] = [existing, value]
 
     cdef void c_remove(self, object name):
-        self._materialize()
         self._data.pop(name, None)
 
     cdef void c_clear(self):
-        self._materialize()
         self._data.clear()
 
     cdef bint c_empty(self):
-        self._materialize()
         return not self._data
 
     cdef void c_merge_vary(self, object token):
@@ -281,7 +272,6 @@ cdef class Headers:
         cdef object value
         cdef object header_value
         cdef const char* pointer
-        self._materialize()
         for name, value in self._data.items():
             if skip_mode and (
                 name == b"content-type" or name == b"content-length"
@@ -376,7 +366,6 @@ cdef class Headers:
 
     def unsafe_getlist(self, name):
         cdef object value
-        self._materialize()
         value = self._data.get(name)
         if value is None:
             return []
@@ -401,7 +390,6 @@ cdef class Headers:
         cdef object name
         cdef object value
         cdef object item
-        self._materialize()
         for name, value in self._data.items():
             if type(value) is list:
                 for item in value:
@@ -412,15 +400,12 @@ cdef class Headers:
 
     def __contains__(self, name):
         try:
-            self._materialize()
             return _encode_name(name) in self._data
         except ValueError:
             return False
 
     def __len__(self):
-        self._materialize()
         return len(self._data)
 
     def __repr__(self):
-        self._materialize()
         return f"Headers({self._data!r})"

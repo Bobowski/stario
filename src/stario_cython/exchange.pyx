@@ -1900,6 +1900,25 @@ cdef class RequestHeaders(Headers):
                 )
         return None
 
+    cdef void c_set(self, object name, object value):
+        self._materialize()
+        self._data[name] = value
+
+    cdef void c_add(self, object name, object value):
+        cdef object existing
+        self._materialize()
+        existing = self._data.get(name)
+        if existing is None:
+            self._data[name] = value
+        elif type(existing) is list:
+            existing.append(value)
+        else:
+            self._data[name] = [existing, value]
+
+    cdef void c_remove(self, object name):
+        self._materialize()
+        self._data.pop(name, None)
+
     cdef void c_clear(self):
         self._materialize()
         self._data.clear()
@@ -1979,11 +1998,39 @@ cdef class RequestHeaders(Headers):
                 )
         return result
 
+    def items(self):
+        return [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in self.unsafe_items()
+        ]
+
+    def unsafe_items(self):
+        cdef list result = []
+        cdef object name
+        cdef object value
+        cdef object item
+        self._materialize()
+        for name, value in self._data.items():
+            if type(value) is list:
+                for item in value:
+                    result.append((name, item))
+            else:
+                result.append((name, value))
+        return result
+
     def __contains__(self, name):
         try:
             return self.c_get(_encode_name(name)) is not None
         except ValueError:
             return False
+
+    def __len__(self):
+        self._materialize()
+        return len(self._data)
+
+    def __repr__(self):
+        self._materialize()
+        return f"RequestHeaders({self._data!r})"
 
     @property
     def materialized(self):
