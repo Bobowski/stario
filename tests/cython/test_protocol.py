@@ -1,8 +1,6 @@
 import asyncio
-import socket
 
 import pytest
-import uvloop
 
 import stario.responses as responses
 from stario import App
@@ -10,6 +8,7 @@ from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.protocol import HttpProtocol
+from tests.cython.http import free_port, read_response
 
 
 class TrackingApp(App):
@@ -20,24 +19,6 @@ class TrackingApp(App):
     def create_task(self, coro, **kwargs):
         self.eager_starts.append(kwargs.get("eager_start", False))
         return super().create_task(coro, **kwargs)
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-async def _read_response(reader: asyncio.StreamReader) -> bytes:
-    async with asyncio.timeout(2):
-        header = await reader.readuntil(b"\r\n\r\n")
-        if b"content-length:" in header.lower():
-            for line in header.split(b"\r\n"):
-                if line.lower().startswith(b"content-length:"):
-                    length = int(line.split(b":", 1)[1])
-                    body = await reader.readexactly(length) if length else b""
-                    return header + body
-    return header
 
 
 @pytest.mark.asyncio
@@ -73,13 +54,13 @@ async def test_plaintext_and_post_and_keepalive() -> None:
             connections,
         )
 
-    port = _free_port()
+    port = free_port()
     server = await loop.create_server(factory, "127.0.0.1", port)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"GET /plaintext HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         await writer.drain()
-        first = await _read_response(reader)
+        first = await read_response(reader)
         assert b"Hello, World!" in first
         assert all(proto.disconnect is None for proto in connections)
 
@@ -91,7 +72,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
             b"abcde"
         )
         await writer.drain()
-        second = await _read_response(reader)
+        second = await read_response(reader)
         assert b"abcde" in second
         assert app.eager_starts == [True, True]
         assert writers[0] is writers[1]
@@ -124,7 +105,7 @@ async def test_fragmented_headers_materialize_correctly() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     request = (
@@ -140,7 +121,7 @@ async def test_fragmented_headers_materialize_correctly() -> None:
             writer.write(bytes((byte,)))
             await writer.drain()
             await asyncio.sleep(0)
-        assert b"ok" in await _read_response(reader)
+        assert b"ok" in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -174,7 +155,7 @@ async def test_stream_large_and_chunked_upload() -> None:
             connections,
         )
 
-    port = _free_port()
+    port = free_port()
     server = await loop.create_server(factory, "127.0.0.1", port)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -188,7 +169,7 @@ async def test_stream_large_and_chunked_upload() -> None:
             + payload
         )
         await writer.drain()
-        first = await _read_response(reader)
+        first = await read_response(reader)
         assert b"71680" in first
 
         chunk = b"y" * 4096
@@ -204,7 +185,7 @@ async def test_stream_large_and_chunked_upload() -> None:
             + b"".join(parts)
         )
         await writer.drain()
-        second = await _read_response(reader)
+        second = await read_response(reader)
         assert b"32768" in second
         writer.close()
         await writer.wait_closed()
@@ -240,7 +221,7 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -252,14 +233,14 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
             b"4\r\nslow\r\n"
         )
         await writer.drain()
-        assert b"ignored" in await _read_response(reader)
+        assert b"ignored" in await read_response(reader)
 
         writer.write(
             b"0\r\n\r\n"
             b"GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
-        assert b"/next" in await _read_response(reader)
+        assert b"/next" in await read_response(reader)
         assert len(seen) == 2
         assert seen[0] is seen[1]
         writer.close()
@@ -295,7 +276,7 @@ async def test_abandoned_stream_discards_remainder_and_advances_pipeline() -> No
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     payload = b"x" * (2 * 1024 * 1024)
@@ -313,8 +294,8 @@ async def test_abandoned_stream_discards_remainder_and_advances_pipeline() -> No
             b"Connection: close\r\n\r\n"
         )
         await writer.drain()
-        assert b"partial" in await _read_response(reader)
-        assert b"next" in await _read_response(reader)
+        assert b"partial" in await read_response(reader)
+        assert b"next" in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -344,7 +325,7 @@ async def test_small_expect_continue_is_sent_before_body() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     writer = None
@@ -365,7 +346,7 @@ async def test_small_expect_continue_is_sent_before_body() -> None:
 
         writer.write(b"hello")
         await writer.drain()
-        assert b"hello" in await _read_response(reader)
+        assert b"hello" in await read_response(reader)
     finally:
         if writer is not None:
             writer.close()
@@ -399,13 +380,13 @@ async def test_disconnect_future_is_lazy() -> None:
             connections,
         )
 
-    port = _free_port()
+    port = free_port()
     server = await loop.create_server(factory, "127.0.0.1", port)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"GET /watch HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         await writer.drain()
-        payload = await _read_response(reader)
+        payload = await read_response(reader)
         assert b"ok" in payload
         assert all(proto.disconnect is not None for proto in connections)
         writer.close()
@@ -451,7 +432,7 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -461,8 +442,8 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
             b"GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
-        assert b"first" in await _read_response(reader)
-        assert b"second" in await _read_response(reader)
+        assert b"first" in await read_response(reader)
+        assert b"second" in await read_response(reader)
         assert events == [("second-start", "/second"), ("first-done", "/first")]
         assert exchanges["first"].completed
         assert exchanges["second"].completed
@@ -500,7 +481,7 @@ async def test_large_single_read_pipeline_is_bounded() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     request_count = 128
@@ -516,7 +497,7 @@ async def test_large_single_read_pipeline_is_bounded() -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"".join(requests))
         await writer.drain()
-        response = await _read_response(reader)
+        response = await read_response(reader)
         assert response.startswith(b"HTTP/1.1 429")
         release.set()
         assert handled == [0]
@@ -552,7 +533,7 @@ async def test_pipelined_streaming_bodies_are_request_owned() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     first = b"a" * (66 * 1024)
@@ -570,8 +551,8 @@ async def test_pipelined_streaming_bodies_are_request_owned() -> None:
             + second
         )
         await writer.drain()
-        assert str(len(first)).encode() in await _read_response(reader)
-        assert str(len(second)).encode() in await _read_response(reader)
+        assert str(len(first)).encode() in await read_response(reader)
+        assert str(len(second)).encode() in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -602,7 +583,7 @@ async def test_exchange_pool_reuses_across_connections() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -612,7 +593,7 @@ async def test_exchange_pool_reuses_across_connections() -> None:
                 b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
             )
             await writer.drain()
-            assert b"ok" in await _read_response(reader)
+            assert b"ok" in await read_response(reader)
             assert await reader.read() == b""
             writer.close()
             await writer.wait_closed()
@@ -646,7 +627,7 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -660,7 +641,7 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
         await asyncio.wait_for(started.wait(), timeout=1.0)
         writer.write(b"hello")
         await writer.drain()
-        assert b"hello" in await _read_response(reader)
+        assert b"hello" in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -692,7 +673,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -712,7 +693,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
             writer.write(payload[i : i + 512])
             await writer.drain()
             await asyncio.sleep(0)
-        assert payload in await _read_response(reader)
+        assert payload in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -755,7 +736,7 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -765,13 +746,13 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
             b"GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
-        assert b"one" in await _read_response(reader)
+        assert b"one" in await read_response(reader)
         await asyncio.wait_for(first_responded.wait(), timeout=1.0)
         await asyncio.wait_for(second_started.wait(), timeout=1.0)
         assert "second-enter" in order
         assert "first-exit" not in order
         release_first.set()
-        assert b"two" in await _read_response(reader)
+        assert b"two" in await read_response(reader)
         await asyncio.sleep(0)
         assert order == ["first-enter", "second-enter", "first-exit"]
         writer.close()
@@ -808,7 +789,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     try:
@@ -820,7 +801,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
             b"x"
         )
         await writer.drain()
-        response = await _read_response(reader)
+        response = await read_response(reader)
         assert b"500" in response.split(b"\r\n", 1)[0]
         assert errors
         assert "stream chunk limit" in str(errors[0])
@@ -854,7 +835,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
             connections,
         ),
         "127.0.0.1",
-        _free_port(),
+        free_port(),
     )
     port = server.sockets[0].getsockname()[1]
     payload = b"z" * (2 * 1024 * 1024)
@@ -869,7 +850,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
             + payload
         )
         await writer.drain()
-        assert b"2097152" in await _read_response(reader)
+        assert b"2097152" in await read_response(reader)
         assert sizes
         assert all(size <= 8 * 1024 for size in sizes)
         assert any(size == 8 * 1024 for size in sizes[:-1] or sizes)

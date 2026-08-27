@@ -1,0 +1,511 @@
+"""Cython protocol edge cases. Header/idle timeouts are not implemented."""
+
+from __future__ import annotations
+
+import asyncio
+import random
+
+import pytest
+
+import stario.responses as responses
+from stario import App, Relay
+from stario.datastar import SSE
+from stario_cython.request import Request
+
+from tests.cython.http import (
+    RecordingTransport,
+    make_protocol,
+    response_status,
+    response_statuses,
+)
+
+
+def _attach(app: App | None = None, **kwargs):
+    loop = asyncio.get_running_loop()
+    if app is None:
+        app = App()
+    proto = make_protocol(loop, app, **kwargs)
+    transport = RecordingTransport(proto)
+    proto.connection_made(transport)
+    return proto, app, transport
+
+
+async def _drain(app: App) -> None:
+    await asyncio.sleep(0)
+    await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_garbage_bytes_yield_400() -> None:
+    proto, app, transport = _attach()
+    try:
+        proto.data_received(b"\x00\xff\xfe not http \r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_upgrade_request_yields_400() -> None:
+    proto, app, transport = _attach()
+    try:
+        proto.data_received(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: t\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Upgrade: websocket\r\n"
+            b"\r\n"
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_invalid_incoming_header_names_return_400() -> None:
+    proto, app, transport = _attach()
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nBad Name: v\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_invalid_incoming_header_values_return_400() -> None:
+    proto, app, transport = _attach()
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nX-Test: ok\x00bad\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_header_total_over_limit_returns_431() -> None:
+    limit = 512
+    app = App()
+    hits = 0
+
+    async def handler(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "should not run")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(app=app, max_header_bytes=limit)
+    try:
+        pad = b"x" * (limit + 32)
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\nX-Pad: " + pad + b"\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 431
+        assert hits == 0
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_body_over_limit_returns_413() -> None:
+    app = App()
+
+    async def read_body(c, w) -> None:
+        await c.req.body()
+        responses.text(w, "ok")
+
+    app.post("/", read_body)
+    proto, app, transport = _attach(app=app, max_body_bytes=20)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n" + (b"y" * 100)
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_declared_body_over_limit_fails_before_handler_runs() -> None:
+    app = App()
+    hits = 0
+
+    async def ignore_body(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "ok")
+
+    app.post("/", ignore_body)
+    proto, app, transport = _attach(app=app, max_body_bytes=20)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n"
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
+        assert hits == 0
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_random_inputs_do_not_raise() -> None:
+    rng = random.Random(42)
+    for _ in range(15):
+        proto, app, transport = _attach()
+        try:
+            proto.data_received(rng.randbytes(rng.randint(0, 512)))
+            await _drain(app)
+            status = response_status(transport.writes)
+            assert status in (None, 400, 404, 413, 431, 414, 505)
+        finally:
+            if not transport.is_closing():
+                transport.close()
+            await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_percent_encoded_path_reaches_handler() -> None:
+    app = App()
+    seen: list[str] = []
+
+    async def handler(c, w) -> None:
+        seen.append(c.req.path)
+        responses.text(w, "ok")
+
+    app.get("/hello world", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET /hello%20world HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert seen == ["/hello world"]
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
+    app = App()
+    seen: list[str] = []
+
+    async def wildcard(c, w) -> None:
+        seen.append(c.route.params["name"])
+        responses.text(w, "wildcard")
+
+    async def nested(_c, w) -> None:
+        seen.append("nested")
+        responses.text(w, "nested")
+
+    app.get("/files/{name}", wildcard)
+    app.get("/files/a/b", nested)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET /files/a%2Fb HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert seen == ["a%2Fb"]
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"GET /caf% HTTP/1.1\r\nHost: t\r\n\r\n",
+        b"GET /%C3 HTTP/1.1\r\nHost: t\r\n\r\n",
+        b"GET /caf\xc3 HTTP/1.1\r\nHost: t\r\n\r\n",
+    ],
+    ids=["truncated_percent", "invalid_utf8_percent", "invalid_utf8_path"],
+)
+async def test_invalid_path_encoding_returns_400(payload: bytes) -> None:
+    proto, app, transport = _attach()
+    try:
+        proto.data_received(payload)
+        await _drain(app)
+        assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_chunked_request_body_reaches_handler() -> None:
+    app = App()
+    bodies: list[bytes] = []
+
+    async def echo(c, w) -> None:
+        bodies.append(await c.req.body())
+        responses.text(w, "ok")
+
+    app.post("/", echo)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\n"
+            b"Host: t\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"5\r\nhello\r\n"
+            b"6\r\n world\r\n"
+            b"0\r\n\r\n"
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert bodies == [b"hello world"]
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_expect_100_continue_sends_interim_response() -> None:
+    app = App()
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        responses.text(w, body.decode())
+
+    app.post("/", echo)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\n"
+            b"Host: t\r\n"
+            b"Content-Length: 5\r\n"
+            b"Expect: 100-continue\r\n"
+            b"\r\n"
+        )
+        await asyncio.sleep(0)
+        raw = b"".join(transport.writes)
+        assert raw.startswith(b"HTTP/1.1 100 Continue\r\n\r\n")
+
+        proto.data_received(b"hello")
+        await _drain(app)
+        assert response_statuses(transport.writes) == [100, 200]
+        assert b"".join(transport.writes).endswith(b"hello")
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_connection_close_header_closes_socket_after_response() -> None:
+    app = App()
+
+    async def handler(_c, w) -> None:
+        responses.text(w, "bye")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_serves_second_request_on_same_connection() -> None:
+    app = App()
+    hits: list[str] = []
+
+    async def a(_c, w) -> None:
+        hits.append("a")
+        responses.text(w, "a")
+
+    async def b(_c, w) -> None:
+        hits.append("b")
+        responses.text(w, "b")
+
+    app.get("/a", a)
+    app.get("/b", b)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert hits == ["a"]
+
+        proto.data_received(b"GET /b HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert hits == ["a", "b"]
+        assert not transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_pipelined_requests_are_served_in_order() -> None:
+    app = App()
+    order: list[str] = []
+
+    async def slow(_c, w) -> None:
+        order.append("slow.start")
+        await asyncio.sleep(0.01)
+        order.append("slow.end")
+        responses.text(w, "slow")
+
+    async def fast(_c, w) -> None:
+        order.append("fast")
+        responses.text(w, "fast")
+
+    app.get("/slow", slow)
+    app.get("/fast", fast)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(
+            b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n"
+            b"GET /fast HTTP/1.1\r\nHost: t\r\n\r\n"
+        )
+        await _drain(app)
+        await app.drain_tasks()
+        await _drain(app)
+        assert order == ["slow.start", "slow.end", "fast"]
+        assert response_statuses(transport.writes) == [200, 200]
+        raw = b"".join(transport.writes)
+        assert raw.index(b"slow") < raw.index(b"fast")
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_connection_lost_signals_disconnect_without_cancelling_handler() -> None:
+    app = App()
+    started = asyncio.Event()
+    hang = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def handler(c, _w) -> None:
+        started.set()
+        async with c.alive():
+            await hang.wait()
+        finished.set()
+
+    app.get("/", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await started.wait()
+        transport.close()
+        await asyncio.sleep(0)
+        await _drain(app)
+        assert finished.is_set()
+    finally:
+        hang.set()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_connection_lost_lets_sse_handler_run_post_alive_cleanup() -> None:
+    app = App()
+    relay = Relay[str]()
+    cleanup_events: list[str] = []
+
+    async def subscribe(c, w) -> None:
+        async with relay.subscribe("*") as live:
+            SSE(w).open()
+            c.span.event("connected", {})
+            async for _subject, _ in c.alive(live):
+                pass
+        cleanup_events.append("disconnected")
+        c.span.event("disconnected", {})
+
+    app.get("/subscribe", subscribe)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET /subscribe HTTP/1.1\r\nHost: t\r\n\r\n")
+        await asyncio.sleep(0)
+        transport.close()
+        await _drain(app)
+        assert cleanup_events == ["disconnected"]
+    finally:
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_close_if_idle_closes_keep_alive_socket() -> None:
+    app = App()
+
+    async def handler(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert not transport.is_closing()
+        assert proto.close_if_idle() is True
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_close_if_idle_skips_in_flight_handler() -> None:
+    app = App()
+    started = asyncio.Event()
+    hang = asyncio.Event()
+
+    async def handler(_c, _w) -> None:
+        started.set()
+        await hang.wait()
+
+    app.get("/", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await started.wait()
+        assert proto.close_if_idle() is False
+        assert not transport.is_closing()
+    finally:
+        hang.set()
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+def test_request_shim_reexports_exchange_type() -> None:
+    from stario_cython.exchange import Request as ExchangeRequest
+
+    assert Request is ExchangeRequest
+    req = Request(method="GET", path="/x", headers={"host": "Example.COM:80"})
+    assert req.host == "example.com"

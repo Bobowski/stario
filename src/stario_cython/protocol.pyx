@@ -9,9 +9,8 @@ from stario.http.wire import decode_path
 from stario.http.writer import get_status_line
 from stario.telemetry.noop import NoOpTracer
 
-from stario_cython.exchange cimport RequestExchange, acquire_exchange
+from stario_cython.exchange cimport Request, RequestExchange, acquire_exchange
 from stario_cython.llhttp cimport *
-from stario_cython.request cimport Request
 
 cdef int F_CONTENT_LENGTH = 0x20
 cdef int PAUSE_WRITE = 1
@@ -147,24 +146,6 @@ cdef int _cb_message_complete(llhttp_t* parser) noexcept:
         _proto(parser)._on_message_complete()
     except Exception:
         return -1
-    return 0
-
-
-cdef int _grow(char** buf, Py_ssize_t* cap, Py_ssize_t need):
-    cdef char* p
-    cdef Py_ssize_t next_cap
-    if need <= cap[0]:
-        return 0
-    next_cap = 64
-    if cap[0] > 0:
-        next_cap = cap[0] * 2
-    if next_cap < need:
-        next_cap = need
-    p = <char*>realloc(buf[0], <size_t>next_cap)
-    if p == NULL:
-        return -1
-    buf[0] = p
-    cap[0] = next_cap
     return 0
 
 
@@ -407,6 +388,27 @@ cdef class HttpProtocol:
             self.body_pause_owner = None
             self._set_pause_reason(PAUSE_BODY, False)
 
+    def close_if_idle(self) -> bool:
+        """Close the connection if it is waiting for a new request.
+
+        Matches ``stario.http.protocol.HttpProtocol.close_if_idle`` so the
+        shared ``Server`` drain path can reuse Cython connections.
+        """
+        cdef object transport
+        if (
+            self.active_exchange is not None
+            or self.reading_exchange is not None
+            or self.pending_exchanges
+            or self.held_data is not None
+            or self.rejected
+        ):
+            return False
+        transport = self.transport
+        if transport is None or transport.is_closing():
+            return False
+        transport.close()
+        return True
+
     def pause_writing(self):
         self._set_pause_reason(PAUSE_WRITE, True)
 
@@ -414,11 +416,30 @@ cdef class HttpProtocol:
         self._set_pause_reason(PAUSE_WRITE, False)
 
     cdef int _append(self, char** buf, Py_ssize_t* length, Py_ssize_t* cap, const char* at, size_t n):
-        if _grow(buf, cap, length[0] + <Py_ssize_t>n) != 0:
-            return -1
+        cdef char* p
+        cdef Py_ssize_t need = length[0] + <Py_ssize_t>n
+        cdef Py_ssize_t next_cap
+        if need > cap[0]:
+            next_cap = 64
+            if cap[0] > 0:
+                next_cap = cap[0] * 2
+            if next_cap < need:
+                next_cap = need
+            p = <char*>realloc(buf[0], <size_t>next_cap)
+            if p == NULL:
+                return -1
+            buf[0] = p
+            cap[0] = next_cap
         memcpy(buf[0] + length[0], at, n)
         length[0] += <Py_ssize_t>n
         return 0
+
+    cdef bint _header_too_large(self, size_t length):
+        self.head_bytes += <int>length
+        if self.head_bytes > self.max_header_bytes:
+            self._close_error(431, "Request header fields too large")
+            return True
+        return False
 
     cdef void _on_message_begin(self):
         if self.rejected:
@@ -452,9 +473,7 @@ cdef class HttpProtocol:
     cdef void _on_url(self, const char* at, size_t length):
         if self.rejected:
             return
-        self.head_bytes += <int>length
-        if self.head_bytes > self.max_header_bytes:
-            self._close_error(431, "Request header fields too large")
+        if self._header_too_large(length):
             return
         if self._append(&self.url_buf, &self.url_len, &self.url_cap, at, length) != 0:
             self._close_error(431, "Request header fields too large")
@@ -462,18 +481,14 @@ cdef class HttpProtocol:
     cdef void _on_header_field(self, const char* at, size_t length):
         if self.rejected or self.reading_exchange is None:
             return
-        self.head_bytes += <int>length
-        if self.head_bytes > self.max_header_bytes:
-            self._close_error(431, "Request header fields too large")
+        if self._header_too_large(length):
             return
         self.reading_exchange.request_headers.append_raw_name(at, length)
 
     cdef void _on_header_value(self, const char* at, size_t length):
         if self.rejected or self.reading_exchange is None:
             return
-        self.head_bytes += <int>length
-        if self.head_bytes > self.max_header_bytes:
-            self._close_error(431, "Request header fields too large")
+        if self._header_too_large(length):
             return
         self.reading_exchange.request_headers.append_raw_value(at, length)
 
@@ -483,6 +498,7 @@ cdef class HttpProtocol:
 
     cdef void _on_headers_complete(self):
         cdef RequestExchange exchange
+        cdef Request request
         cdef uint16_t flags
         cdef uint64_t content_length
         if self.url_buf != NULL and self.url_len > 0:
@@ -511,10 +527,16 @@ cdef class HttpProtocol:
                 and not exchange._req_connection_close
             )
         )
-        self.complete_headers(
+        if self.request_dispatched or self.rejected:
+            return
+        if self.transport is None or self.transport.is_closing():
+            return
+        request = self._build_request(exchange, exchange)
+        exchange.reset_body(
             exchange._req_expect_continue,
             <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
         )
+        self._dispatch(exchange, request)
 
     cdef void _on_body(self, const char* at, size_t length):
         if not self.rejected and self.reading_exchange is not None:
@@ -556,22 +578,6 @@ cdef class HttpProtocol:
             body,
         )
         return request
-
-    cdef void complete_headers(
-        self,
-        bint expect_continue,
-        Py_ssize_t expected_body,
-    ):
-        cdef RequestExchange exchange
-        cdef Request request
-        if self.request_dispatched or self.rejected:
-            return
-        if self.transport is None or self.transport.is_closing():
-            return
-        exchange = self.reading_exchange
-        request = self._build_request(exchange, exchange)
-        exchange.reset_body(expect_continue, expected_body)
-        self._dispatch(exchange, request)
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
         cdef object span

@@ -1,6 +1,28 @@
 from stario_cython.compression_buf cimport StarioBrotli, StarioGzip
 from stario_cython.headers cimport Headers
-from stario_cython.request cimport Request
+
+cdef class Request:
+    cdef public object method
+    cdef public object path
+    cdef public object headers
+    cdef public object protocol_version
+    cdef public bint keep_alive
+    cdef public object query_bytes
+    cdef public object _body
+    cdef object _query
+    cdef object _cookies
+    cdef object _host
+
+    cdef void reset(
+        self,
+        object method,
+        object path,
+        object query_bytes,
+        object protocol_version,
+        bint keep_alive,
+        object headers,
+        object body,
+    )
 
 cdef class RequestExchange:
     cdef object _transport
@@ -108,13 +130,6 @@ cdef class RequestExchange:
     cdef int _ensure_brotli(self) except -1
     cdef int _ensure_gzip(self) except -1
     cdef void _free_compressors(self)
-    cdef object _select(
-        self,
-        object data,
-        object content_type,
-        bint streaming,
-        Py_ssize_t nbytes,
-    )
     cdef void _raise_abort(self)
     cdef void _wake(self)
     cdef void _cancel_stall_timer(self)

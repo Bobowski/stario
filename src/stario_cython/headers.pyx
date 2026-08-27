@@ -657,14 +657,15 @@ cdef class Headers:
         length[0] = need
         return 0
 
-    cdef int c_write_wire_ba(self, object buf, Py_ssize_t* length) except -1:
+    cdef int _write_pairs(self, object buf, Py_ssize_t* length, bint skip_content) except -1:
         cdef object name
         cdef object value
         cdef object header_value
         cdef const char* p
-        cdef Py_ssize_t n
         self._materialize()
         for name, value in self._data.items():
+            if skip_content and (name == b"content-type" or name == b"content-length"):
+                continue
             if type(value) is bytes:
                 p = name
                 self._add_ba(buf, length, p, <Py_ssize_t>len(name))
@@ -682,35 +683,15 @@ cdef class Headers:
                 self._add_ba(buf, length, <const char*>b"\r\n", 2)
         return 0
 
+    cdef int c_write_wire_ba(self, object buf, Py_ssize_t* length) except -1:
+        return self._write_pairs(buf, length, False)
+
     cdef int c_write_response_wire_ba(
         self,
         object buf,
         Py_ssize_t* length,
     ) except -1:
-        cdef object name
-        cdef object value
-        cdef object header_value
-        cdef const char* p
-        self._materialize()
-        for name, value in self._data.items():
-            if name == b"content-type" or name == b"content-length":
-                continue
-            if type(value) is bytes:
-                p = name
-                self._add_ba(buf, length, p, <Py_ssize_t>len(name))
-                self._add_ba(buf, length, <const char*>b": ", 2)
-                p = value
-                self._add_ba(buf, length, p, <Py_ssize_t>len(value))
-                self._add_ba(buf, length, <const char*>b"\r\n", 2)
-                continue
-            for header_value in value:
-                p = name
-                self._add_ba(buf, length, p, <Py_ssize_t>len(name))
-                self._add_ba(buf, length, <const char*>b": ", 2)
-                p = header_value
-                self._add_ba(buf, length, p, <Py_ssize_t>len(header_value))
-                self._add_ba(buf, length, <const char*>b"\r\n", 2)
-        return 0
+        return self._write_pairs(buf, length, True)
 
     def add(self, str name, str value):
         self.c_add(_encode_name(name), _encode_value(value))

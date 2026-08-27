@@ -50,11 +50,6 @@ extensions = [
         extra_compile_args=["-O3"],
     ),
     Extension(
-        "stario_cython.request",
-        sources=["src/stario_cython/request.pyx"],
-        extra_compile_args=["-O3"],
-    ),
-    Extension(
         "stario_cython.exchange",
         sources=[
             "src/stario_cython/exchange.pyx",

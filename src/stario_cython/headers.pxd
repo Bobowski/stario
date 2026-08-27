@@ -57,6 +57,7 @@ cdef class Headers:
     cdef bint c_empty(self)
     cdef void c_merge_vary(self, object token)
     cdef int _add_ba(self, object buf, Py_ssize_t* length, const char* src, Py_ssize_t n) except -1
+    cdef int _write_pairs(self, object buf, Py_ssize_t* length, bint skip_content) except -1
     cdef int c_write_wire_ba(self, object buf, Py_ssize_t* length) except -1
     cdef int c_write_response_wire_ba(
         self,

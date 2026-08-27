@@ -2,6 +2,7 @@
 """Globally pooled state for one live request handler and its response."""
 
 import asyncio
+from types import MappingProxyType
 
 from libc.stddef cimport size_t
 from libc.stdio cimport sprintf
@@ -13,6 +14,7 @@ from cpython.bytearray cimport (
 )
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
 
+from stario import cookies as cookie_helpers
 from stario.exceptions import (
     ClientDisconnected,
     HttpException,
@@ -26,7 +28,8 @@ from stario.http.compression import (
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
-from stario.http.request import DEFAULT_BODY_TIMEOUT
+from stario.http.query import ParsedQuery
+from stario.http.request import DEFAULT_BODY_TIMEOUT, host_without_port
 from stario.http.writer import get_status_line
 
 from stario_cython.compression_buf cimport (
@@ -40,7 +43,6 @@ from stario_cython.compression_buf cimport (
     stario_gzip_release,
 )
 from stario_cython.headers cimport Headers
-from stario_cython.request cimport Request
 
 # Stream batching limit and independent transport backpressure window.
 cdef int LOW_WATER = 128 * 1024
@@ -226,6 +228,96 @@ cdef object _dec(size_t n):
         return _DEC_SMALL[n]
     i = sprintf(buf, "%zu", n)
     return PyBytes_FromStringAndSize(buf, i)
+
+
+cdef class Request:
+    """Request view. Same handler API as stario.http.request.Request."""
+
+    def __init__(
+        self,
+        *,
+        method="GET",
+        path="/",
+        query_bytes=b"",
+        protocol_version="1.1",
+        keep_alive=True,
+        headers=None,
+        body=None,
+    ):
+        self.reset(
+            method, path, query_bytes, protocol_version, keep_alive, headers, body
+        )
+
+    cdef void reset(
+        self,
+        object method,
+        object path,
+        object query_bytes,
+        object protocol_version,
+        bint keep_alive,
+        object headers,
+        object body,
+    ):
+        self.method = method
+        self.path = path
+        self.headers = headers
+        self.protocol_version = protocol_version
+        self.keep_alive = keep_alive
+        self.query_bytes = query_bytes
+        self._body = body
+        self._query = None
+        self._cookies = None
+        self._host = None
+
+    @property
+    def host(self):
+        cdef object host_str
+        cdef object host_wire
+        if self._host is not None:
+            return self._host
+        if isinstance(self.headers, Headers):
+            host_wire = (<Headers>self.headers).c_request_host()
+            host_str = (
+                host_wire.decode("latin-1") if host_wire is not None else ""
+            )
+        else:
+            host_str = self.headers.get("host") or ""
+        self._host = host_without_port(host_str)
+        return self._host
+
+    @property
+    def query(self):
+        if self._query is None:
+            self._query = ParsedQuery(self.query_bytes)
+        return self._query
+
+    @property
+    def cookies(self):
+        if self._cookies is None:
+            self._cookies = cookie_helpers.parse_cookie_headers(
+                self.headers.getlist("cookie")
+            )
+        return MappingProxyType(self._cookies)
+
+    async def body(self, max_size=None):
+        if max_size is not None and max_size < 0:
+            raise ValueError("max_size must be non-negative.")
+        if self._body is None:
+            return b""
+        if type(self._body) is bytes:
+            if max_size is not None and len(self._body) > max_size:
+                raise HttpException(413, "Request body too large")
+            return self._body
+        return await self._body.read(max_size=max_size)
+
+    async def stream(self, max_chunk=None):
+        if self._body is None:
+            return
+        if type(self._body) is bytes:
+            yield self._body
+            return
+        async for chunk in self._body.stream(max_chunk=max_chunk):
+            yield chunk
 
 
 cdef class RequestExchange:
@@ -527,19 +619,6 @@ cdef class RequestExchange:
         self._flush()
         return 0
 
-    cdef object _select(
-        self,
-        object data,
-        object content_type,
-        bint streaming,
-        Py_ssize_t nbytes,
-    ):
-        if not self._may_compress(data, content_type, streaming, nbytes):
-            return None
-        if self._req_encoding == ENCODING_BR:
-            return b"br"
-        return b"gzip"
-
     cdef void reset(
         self,
         object connection,
@@ -722,7 +801,11 @@ cdef class RequestExchange:
             if not _may_have_body(status):
                 body = b""
             elif h.c_get(b"content-encoding") is None:
-                encoding = self._select(body, content_type, False, nbytes)
+                encoding = None
+                if self._may_compress(body, content_type, False, nbytes):
+                    encoding = (
+                        b"br" if self._req_encoding == ENCODING_BR else b"gzip"
+                    )
                 if encoding is not None:
                     flat = self._body_as_bytes(body)
                     try:
@@ -820,9 +903,13 @@ cdef class RequestExchange:
         else:
             headers.c_set(b"transfer-encoding", b"chunked")
             if headers.c_get(b"content-encoding") is None:
-                encoding = self._select(
+                encoding = None
+                if self._may_compress(
                     None, headers.c_get(b"content-type"), True, -1
-                )
+                ):
+                    encoding = (
+                        b"br" if self._req_encoding == ENCODING_BR else b"gzip"
+                    )
                 if encoding is not None:
                     if encoding == b"br":
                         self._ensure_brotli()
@@ -1116,18 +1203,8 @@ cdef class RequestExchange:
         if not self._body_active:
             self.reset_body(False, -1)
         new_total = self._total_read + <Py_ssize_t>length
-        if new_total > self._max_size:
-            self._abort_reason = ABORT_TOO_LARGE
-            self._cancel_stall_timer()
-            self._clear_body_storage()
-            self._connection.set_body_paused(self, False)
-            self._wake()
-            if self._discard_body and not self._transport.is_closing():
-                self._transport.close()
-            return
-        if (
-            self._read_max_size >= 0
-            and new_total > self._read_max_size
+        if new_total > self._max_size or (
+            self._read_max_size >= 0 and new_total > self._read_max_size
         ):
             self._abort_reason = ABORT_TOO_LARGE
             self._cancel_stall_timer()
