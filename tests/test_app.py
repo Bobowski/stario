@@ -1,7 +1,5 @@
 """Tests for app-level routing and host dispatch."""
 
-import asyncio
-
 import pytest
 
 from stario.exceptions import (
