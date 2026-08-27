@@ -54,6 +54,8 @@ cdef class RequestExchange:
     cdef Py_ssize_t _req_pending_value_length
     cdef bint _req_pending_header
     cdef Py_ssize_t _req_host_index
+    cdef Py_ssize_t _req_cookie_index
+    cdef Py_ssize_t _req_authorization_index
     cdef Py_ssize_t _req_url_offset
     cdef Py_ssize_t _req_url_length
     cdef bint _req_accept_present
@@ -185,7 +187,6 @@ cdef class RequestHeaders(Headers):
     cdef object _owner
     cdef bint _request_materialized
 
-    cdef void _materialize(self)
     cdef object c_get(self, object name)
     cdef object c_get_n(self, const char* query, Py_ssize_t query_length)
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length)
@@ -195,6 +196,8 @@ cdef class RequestHeaders(Headers):
     cdef void c_clear(self)
     cdef void c_reset(self) noexcept
     cdef object c_request_host(self)
+    cdef object c_request_indexed(self, Py_ssize_t index)
+    cdef void c_parse_cookies(self, dict out) except *
 
 cdef RequestExchange acquire_exchange(
     object connection,

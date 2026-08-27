@@ -5,6 +5,7 @@ from stario_cython.protocol import HttpProtocol
 
 import stario.responses as responses
 from stario import App
+from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
 from tests.cython.http import free_port, read_response
@@ -129,7 +130,7 @@ async def test_fragmented_headers_materialize_correctly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_headers_scan_arena_until_copy_on_write() -> None:
+async def test_request_headers_scan_arena_without_copy() -> None:
     loop = asyncio.get_running_loop()
     app = App()
     seen = []
@@ -144,10 +145,8 @@ async def test_request_headers_scan_arena_until_copy_on_write() -> None:
         assert "X-Request-ID" in headers
         assert "authorization" in headers
         assert headers.materialized is False
-        headers.set("X-Local", "yes")
-        assert headers.materialized is True
-        assert headers.getlist("cookie") == ["a=1", "b=2"]
         seen.append(headers.items())
+        assert headers.materialized is False
         responses.text(w, "ok")
 
     app.get("/", inspect)
@@ -200,8 +199,6 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
         headers = c.req.headers
         materialized_states.append(headers.materialized)
         seen_local.append(headers.get("x-local"))
-        if len(materialized_states) == 1:
-            headers.set("X-Local", "first")
         responses.text(w, "ok")
 
     app.get("/", inspect)
@@ -221,7 +218,7 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"GET / HTTP/1.1\r\nHost: first\r\n\r\n")
+        writer.write(b"GET / HTTP/1.1\r\nHost: first\r\nX-Local: one\r\n\r\n")
         await writer.drain()
         assert b"ok" in await read_response(reader)
         writer.write(
@@ -232,7 +229,7 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
         await writer.drain()
         assert b"ok" in await read_response(reader)
         assert materialized_states == [False, False]
-        assert seen_local == [None, None]
+        assert seen_local == ["one", None]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -1060,6 +1057,151 @@ async def test_stream_respects_max_chunk_batches() -> None:
         assert sizes
         assert all(size <= 8 * 1024 for size in sizes)
         assert any(size == 8 * 1024 for size in sizes[:-1] or sizes)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_request_headers_are_read_only() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    errors: list[str] = []
+
+    async def inspect(c, w):
+        with pytest.raises(StarioRuntime, match="read-only"):
+            c.req.headers.set("X-Local", "yes")
+        with pytest.raises(StarioRuntime, match="read-only"):
+            c.req.headers.add("X-Local", "yes")
+        with pytest.raises(StarioRuntime, match="read-only"):
+            c.req.headers.remove("host")
+        errors.append("raised")
+        responses.text(w, "ok")
+
+    app.get("/", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: stario.test\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        assert errors == ["raised"]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_lazy_cookies_and_query_from_arena() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    seen: dict[str, object] = {}
+
+    async def inspect(c, w):
+        assert c.req.headers.materialized is False
+        assert dict(c.req.cookies) == {"a": "2", "b": "3", "x": "a;b"}
+        assert c.req.query.get("q") == "hello world"
+        assert c.req.query.getlist("tag") == ["a", "b"]
+        assert c.req.query.get("accent") == "é"
+        assert c.req.query.get("bad") == "�"
+        assert c.req.query.get("eq") == "1=2"
+        assert c.req.headers.get("authorization") == "Bearer abc"
+        assert c.req.headers.materialized is False
+        seen["ok"] = True
+        responses.text(w, "ok")
+
+    app.get("/search", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /search?q=hello+world&tag=a&tag=b&accent=%C3%A9&bad=%A9&eq=1=2"
+            b" HTTP/1.1\r\n"
+            b"Host: stario.test\r\n"
+            b"Authorization: Bearer abc\r\n"
+            b"Cookie: a=1; x=\"a;b\"\r\n"
+            b"Cookie: a=2; b=3\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        assert seen.get("ok") is True
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_cookies_do_not_leak_across_keepalive() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    seen: list[dict[str, str]] = []
+
+    async def inspect(c, w):
+        seen.append(dict(c.req.cookies))
+        responses.text(w, "ok")
+
+    app.get("/", inspect)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: first\r\nCookie: sid=one\r\n\r\n")
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        writer.write(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: second\r\n"
+            b"Cookie: sid=two\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"ok" in await read_response(reader)
+        assert seen == [{"sid": "one"}, {"sid": "two"}]
         writer.close()
         await writer.wait_closed()
     finally:
