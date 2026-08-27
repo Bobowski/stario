@@ -39,10 +39,11 @@ Official `benchmarks/server` suite, same machine, one worker, `10s` × 5 measure
 | Validate JSON | 56,663 ± 1,621 | 69,992 ± 838 | 1.24× |
 | Form POST | 60,476 ± 1,105 | 73,163 ± 361 | 1.21× |
 | JSON 1KB | 56,451 ± 276 | 66,933 ± 104 | 1.19× |
-| Octet 64KB | 21,233 ± 146 | 21,289 ± 179 | 1.00× |
-| Octet 2MB (buffer) | 2,111 ± 16 | 1,223 ± 14 | 0.58× |
-| Octet 2MB (stream) | 2,885 ± 18 | 3,029 ± 18 | 1.05× |
-| Multipart 2MB | 2,118 ± 41 | 1,670 ± 20 | 0.79× |
+| Octet 64KB | 25,228 ± 219 | 24,229 ± 244 | 0.96× |
+| Octet 2MB (buffer) | 2,062 ± 292 | 2,947 ± 35 | 1.43× |
+| Octet 2MB (stream) | 2,863 ± 15 | 3,208 ± 8 | 1.12× |
+| Multipart 2MB | 2,047 ± 173 | 2,905 ± 60 | 1.42× |
 
-Read paths ~1.7×. Small POST ~1.2×. 64KB ingest even. Streaming 2MB slightly
-ahead. Large buffered ingest and multipart still trail Python.
+Read paths ~1.7×. Small POST ~1.2×. 64KB ingest even. Buffered 2MB, streaming 2MB,
+and multipart are ahead of Python after pre-sizing Content-Length bodies and
+pausing `body()` at 64KiB between parser quantums.
