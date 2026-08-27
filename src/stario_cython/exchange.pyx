@@ -19,6 +19,7 @@ from cpython.bytearray cimport (
     PyByteArray_Resize,
 )
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from cpython.exc cimport PyErr_Clear, PyErr_Occurred
 
 from stario import cookies as cookie_helpers
 from stario.exceptions import (
@@ -959,7 +960,7 @@ cdef class RequestExchange:
                 self._req_identity_q = q
             start = segment_end + 1
 
-    cdef void _clear_request_headers(self):
+    cdef void _clear_request_headers(self) noexcept:
         (<RequestHeaders>self.request_headers).c_reset()
         if (
             self._req_arena != NULL
@@ -991,7 +992,7 @@ cdef class RequestExchange:
         list date_box,
         object compression,
         int max_body_size,
-    ):
+    ) noexcept:
         self.in_pool = False
         if self._connection is not connection:
             self._connection = connection
@@ -1010,7 +1011,7 @@ cdef class RequestExchange:
         self.handler_done = False
         self.handler_started = False
 
-    cdef void _clear_hot_request_headers(self):
+    cdef void _clear_hot_request_headers(self) noexcept:
         self._req_encoding = ENCODING_NONE
         self._req_expect_continue = False
         self._req_connection_close = False
@@ -1020,7 +1021,7 @@ cdef class RequestExchange:
         self._req_wildcard_q = -1
         self._req_identity_q = -1
 
-    cdef void cache_hot_request_headers(self):
+    cdef void cache_hot_request_headers(self) noexcept:
         """Select response encoding from exchange-local request-header state."""
         cdef int wildcard
         cdef int brotli_q
@@ -1456,7 +1457,7 @@ cdef class RequestExchange:
     def alive(self, source=None):
         return _Alive(self, source)
 
-    cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size):
+    cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size) noexcept:
         self._body_active = True
         self._clear_body_storage()
         self._cached = None
@@ -1473,7 +1474,7 @@ cdef class RequestExchange:
         self._expected_size = expected_size
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
-    cdef void _clear_body_storage(self):
+    cdef void _clear_body_storage(self) noexcept:
         if self._chunks is not None:
             self._chunks.clear()
         self._body_tail = None
@@ -1481,9 +1482,10 @@ cdef class RequestExchange:
         self._tail_cap = 0
         self._buffered = 0
 
-    cdef int _ensure_body_tail(self, Py_ssize_t received_before) except -1:
+    cdef int _ensure_body_tail(self, Py_ssize_t received_before) noexcept:
         cdef Py_ssize_t cap
         cdef Py_ssize_t remaining
+        cdef object tail
         if self._body_tail is not None:
             return 0
         cap = self._stream_max_chunk
@@ -1499,13 +1501,18 @@ cdef class RequestExchange:
             remaining = self._expected_size - received_before
             if 0 < remaining < cap:
                 cap = remaining
-        self._body_tail = PyBytes_FromStringAndSize(NULL, cap)
+        tail = PyBytes_FromStringAndSize(NULL, cap)
+        if tail is None:
+            PyErr_Clear()
+            return -1
+        self._body_tail = tail
         self._tail_used = 0
         self._tail_cap = cap
         return 0
 
-    cdef int _seal_body_tail(self) except -1:
+    cdef int _seal_body_tail(self) noexcept:
         cdef object chunk
+        cdef object chunks
         if self._body_tail is None or self._tail_used == 0:
             return 0
         if self._tail_used == self._tail_cap:
@@ -1515,9 +1522,14 @@ cdef class RequestExchange:
                 PyBytes_AS_STRING(self._body_tail),
                 self._tail_used,
             )
-        if self._chunks is None:
-            self._chunks = []
-        self._chunks.append(chunk)
+            if chunk is None:
+                PyErr_Clear()
+                return -1
+        chunks = self._chunks
+        if chunks is None:
+            chunks = []
+            self._chunks = chunks
+        chunks.append(chunk)
         self._buffered += self._tail_used
         self._body_tail = None
         self._tail_used = 0
@@ -1526,7 +1538,8 @@ cdef class RequestExchange:
 
     cdef object _body_to_bytes(self):
         cdef object out
-        self._seal_body_tail()
+        if self._seal_body_tail() != 0:
+            raise MemoryError()
         if self._chunks is None or not self._chunks:
             return b""
         if len(self._chunks) == 1:
@@ -1553,22 +1566,23 @@ cdef class RequestExchange:
         if self._data_ready is not None:
             self._data_ready.set()
 
-    cdef void _cancel_stall_timer(self):
+    cdef void _cancel_stall_timer(self) noexcept:
         cdef object handle = self._stall_handle
         if handle is not None:
             handle.cancel()
             self._stall_handle = None
 
-    cdef void _reset_stall_timer(self):
+    cdef void _reset_stall_timer(self) noexcept:
         """Arm/refresh slowloris stall timeout while a body consumer is waiting."""
         cdef object loop
+        cdef object connection
         self._cancel_stall_timer()
         if not self._waiting or self._body_complete or self._timeout <= 0:
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        connection = self._connection
+        if connection is None:
             return
+        loop = connection.loop
         self._stall_handle = loop.call_later(self._timeout, self._on_stall_timeout)
 
     def _on_stall_timeout(self):
@@ -1592,7 +1606,7 @@ cdef class RequestExchange:
         if self._buffered + self._tail_used > HIGH_WATER:
             self._connection.set_body_paused(self, True)
 
-    cdef void c_feed(self, const char* at, size_t length):
+    cdef int c_feed(self, const char* at, size_t length) noexcept:
         cdef Py_ssize_t new_total
         cdef Py_ssize_t offset
         cdef Py_ssize_t available
@@ -1611,14 +1625,15 @@ cdef class RequestExchange:
             self._wake()
             if self._discard_body and not self._transport.is_closing():
                 self._transport.close()
-            return
+            return 0
         if self._discard_body:
             self._total_read = new_total
-            return
+            return 0
         emitted = False
         offset = 0
         while offset < <Py_ssize_t>length:
-            self._ensure_body_tail(self._total_read + offset)
+            if self._ensure_body_tail(self._total_read + offset) != 0:
+                return -1
             available = self._tail_cap - self._tail_used
             take = <Py_ssize_t>length - offset
             if take > available:
@@ -1631,7 +1646,8 @@ cdef class RequestExchange:
             self._tail_used += take
             offset += take
             if self._tail_used == self._tail_cap:
-                self._seal_body_tail()
+                if self._seal_body_tail() != 0:
+                    return -1
                 emitted = True
         self._total_read = new_total
         if self._consumed_as == CONSUMED_STREAM:
@@ -1640,35 +1656,50 @@ cdef class RequestExchange:
             if self._waiting:
                 self._reset_stall_timer()
             self._maybe_pause()
-            return
+            return 0
         # body(): refresh stall on progress; wake only on complete/abort.
         if self._waiting:
             self._reset_stall_timer()
+        return 0
 
-    cdef void c_complete(self):
+    cdef int c_complete(self) noexcept:
         if not self._body_active:
-            return
+            return 0
         self._body_complete = True
         self._cancel_stall_timer()
         if self._discard_body:
             self._clear_body_storage()
             self._maybe_recycle()
-            return
-        self._seal_body_tail()
+            return 0
+        if self._seal_body_tail() != 0:
+            return -1
         if self._consumed_as == CONSUMED_STREAM:
             self._wake()
             self._maybe_recycle()
-            return
+            return 0
         if self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
             self._wake()
             self._maybe_recycle()
-            return
+            return 0
         if self._consumed_as == CONSUMED_BODY:
             if self._cached is None:
-                self._cached = self._body_to_bytes()
+                if self._chunks is None or not self._chunks:
+                    self._cached = b""
+                elif len(self._chunks) == 1:
+                    self._cached = self._chunks[0]
+                    self._chunks.clear()
+                    self._buffered = 0
+                else:
+                    self._cached = b"".join(self._chunks)
+                    if PyErr_Occurred() or self._cached is None:
+                        PyErr_Clear()
+                        return -1
+                    self._chunks.clear()
+                    self._buffered = 0
         self._wake()
         self._maybe_recycle()
+        return 0
 
     cdef void c_abort(self):
         if self._abort_reason != ABORT_NONE:
@@ -1908,7 +1939,7 @@ cdef class RequestHeaders(Headers):
         self._materialize()
         self._data.clear()
 
-    cdef void c_reset(self):
+    cdef void c_reset(self) noexcept:
         self._data.clear()
         self._request_materialized = False
 

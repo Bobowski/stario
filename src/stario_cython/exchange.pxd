@@ -120,14 +120,14 @@ cdef class RequestExchange:
         list date_box,
         object compression,
         int max_body_size,
-    )
+    ) noexcept
     cdef void start_response(self)
     cdef void handler_finished(self)
     cdef void cancel_before_start(self)
     cdef void _maybe_recycle(self)
     cdef void park(self)
     cdef void release_global(self)
-    cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size)
+    cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size) noexcept
     cdef int _reserve_request_arena(self, Py_ssize_t bytes_needed) noexcept
     cdef int _reserve_request_headers(self) noexcept
     cdef int append_request_url(self, const char* data, size_t length) noexcept
@@ -139,15 +139,15 @@ cdef class RequestExchange:
         const char* value,
         size_t length,
     ) noexcept
-    cdef void _clear_request_headers(self)
-    cdef void _clear_hot_request_headers(self)
-    cdef void cache_hot_request_headers(self)
-    cdef void c_feed(self, const char* at, size_t length)
-    cdef void c_complete(self)
+    cdef void _clear_request_headers(self) noexcept
+    cdef void _clear_hot_request_headers(self) noexcept
+    cdef void cache_hot_request_headers(self) noexcept
+    cdef int c_feed(self, const char* at, size_t length) noexcept
+    cdef int c_complete(self) noexcept
     cdef void c_abort(self)
-    cdef void _clear_body_storage(self)
-    cdef int _ensure_body_tail(self, Py_ssize_t received_before) except -1
-    cdef int _seal_body_tail(self) except -1
+    cdef void _clear_body_storage(self) noexcept
+    cdef int _ensure_body_tail(self, Py_ssize_t received_before) noexcept
+    cdef int _seal_body_tail(self) noexcept
     cdef object _body_to_bytes(self)
     cdef void reset_response(self, int encoding)
     cdef void _apply_compression(self, object compression)
@@ -174,8 +174,8 @@ cdef class RequestExchange:
     cdef void _free_compressors(self)
     cdef void _raise_abort(self)
     cdef void _wake(self)
-    cdef void _cancel_stall_timer(self)
-    cdef void _reset_stall_timer(self)
+    cdef void _cancel_stall_timer(self) noexcept
+    cdef void _reset_stall_timer(self) noexcept
     cdef void _maybe_continue(self)
     cdef void _done(self)
     cdef void _maybe_pause(self)
@@ -190,7 +190,7 @@ cdef class RequestHeaders(Headers):
     cdef void c_add(self, object name, object value)
     cdef void c_remove(self, object name)
     cdef void c_clear(self)
-    cdef void c_reset(self)
+    cdef void c_reset(self) noexcept
     cdef object c_request_host(self)
 
 cdef RequestExchange acquire_exchange(

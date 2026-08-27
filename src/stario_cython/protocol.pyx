@@ -160,7 +160,7 @@ cdef int _cb_message_complete(llhttp_t* parser) noexcept:
 
 cdef class HttpProtocol:
     cdef llhttp_t* parser
-    cdef object loop
+    cdef public object loop
     cdef object app
     cdef object tracer
     cdef object noop_span
@@ -307,7 +307,7 @@ cdef class HttpProtocol:
             return
         self._pump_data(data, 0)
 
-    cdef void _pump_data(self, object data, Py_ssize_t offset):
+    cdef void _pump_data(self, object data, Py_ssize_t offset) noexcept:
         cdef const char* ptr
         cdef Py_ssize_t n
         cdef Py_ssize_t end
@@ -421,21 +421,25 @@ cdef class HttpProtocol:
         return False
 
     cdef void _on_message_begin(self) noexcept:
+        cdef RequestExchange exchange
         if self.rejected:
             return
-        try:
-            if self.idle_exchange is not None:
-                self.reading_exchange = self.idle_exchange
-                self.idle_exchange = None
-                self.reading_exchange.reset(
-                    self,
-                    self.app,
-                    self.transport,
-                    self.date_box,
-                    self.compression,
-                    self.max_body_bytes,
-                )
-            else:
+        exchange = self.idle_exchange
+        if exchange is not None:
+            self.idle_exchange = None
+            self.reading_exchange = exchange
+            exchange.reset(
+                self,
+                self.app,
+                self.transport,
+                self.date_box,
+                self.compression,
+                self.max_body_bytes,
+            )
+        else:
+            # Pool miss: constructing an exchange can raise. Keepalive reuse
+            # above is noexcept.
+            try:
                 self.reading_exchange = acquire_exchange(
                     self,
                     self.app,
@@ -444,11 +448,12 @@ cdef class HttpProtocol:
                     self.compression,
                     self.max_body_bytes,
                 )
-            self.head_bytes = 40
-            self.request_dispatched = False
-            self.request_keep_alive = True
-        except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            except Exception:
+                self._close_error(400, "Invalid HTTP request")
+                return
+        self.head_bytes = 40
+        self.request_dispatched = False
+        self.request_keep_alive = True
 
     cdef void _on_url(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
@@ -524,9 +529,7 @@ cdef class HttpProtocol:
     cdef void _on_body(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
-        try:
-            self.reading_exchange.c_feed(at, length)
-        except Exception:
+        if self.reading_exchange.c_feed(at, length) != 0:
             self._close_error(400, "Invalid HTTP request")
 
     cdef void _on_message_complete(self) noexcept:
@@ -534,11 +537,9 @@ cdef class HttpProtocol:
         if self.rejected:
             return
         exchange = self.reading_exchange
-        try:
-            if exchange is not None and exchange._body_active:
-                exchange.c_complete()
-        except Exception:
-            self._close_error(400, "Invalid HTTP request")
+        if exchange is not None and exchange._body_active:
+            if exchange.c_complete() != 0:
+                self._close_error(400, "Invalid HTTP request")
         self.reading_exchange = None
 
     cdef Request _build_request(self, RequestExchange exchange, object body):
