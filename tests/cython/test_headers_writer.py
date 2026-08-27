@@ -3,11 +3,11 @@ import gzip
 
 import brotli
 import pytest
+from stario_cython.headers import Headers
 
 from stario import App
 from stario.exceptions import StarioError
 from stario.http.compression import CompressionConfig
-from stario_cython.headers import Headers
 from tests.cython.http import read_chunk, read_response, running_server
 
 

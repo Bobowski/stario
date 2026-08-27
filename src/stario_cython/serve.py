@@ -13,7 +13,6 @@ from stario.http.bootstrap import Bootstrap
 from stario.http.config import RequestPolicy, ServerConfig, server_config_from_env
 from stario.http.server import Server
 from stario.telemetry.noop import NoOpTracer
-
 from stario_cython.protocol import HttpProtocol
 
 

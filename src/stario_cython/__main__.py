@@ -6,7 +6,6 @@ import argparse
 import sys
 
 from stario.cli.imports import load_symbol
-
 from stario_cython.serve import run
 
 

@@ -11,7 +11,6 @@ import stario.responses as responses
 from stario import App, Relay
 from stario.datastar import SSE
 from stario_cython.request import Request
-
 from tests.cython.http import (
     RecordingTransport,
     make_protocol,

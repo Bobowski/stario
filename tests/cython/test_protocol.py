@@ -1,13 +1,12 @@
 import asyncio
 
 import pytest
+from stario_cython.protocol import HttpProtocol
 
 import stario.responses as responses
 from stario import App
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
-
-from stario_cython.protocol import HttpProtocol
 from tests.cython.http import free_port, read_response
 
 

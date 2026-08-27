@@ -8,9 +8,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+from stario_cython.protocol import HttpProtocol
+
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
-from stario_cython.protocol import HttpProtocol
 
 DATE = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
