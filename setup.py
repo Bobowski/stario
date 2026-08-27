@@ -45,20 +45,33 @@ codec_link_args = _pkg_config(_CODEC_PACKAGES, "--libs-only-other")
 
 extensions = [
     Extension(
-        "stario_cython.core",
+        "stario_cython.headers",
+        sources=["src/stario_cython/headers.pyx"],
+        extra_compile_args=["-O3"],
+    ),
+    Extension(
+        "stario_cython.exchange",
         sources=[
-            "src/stario_cython/core.pyx",
+            "src/stario_cython/exchange.pyx",
             "vendor/compression_buf.c",
+        ],
+        include_dirs=["vendor", "src", *codec_include_dirs],
+        library_dirs=codec_library_dirs,
+        libraries=codec_libraries,
+        extra_compile_args=["-O3", *codec_compile_args],
+        extra_link_args=codec_link_args,
+    ),
+    Extension(
+        "stario_cython.protocol",
+        sources=[
+            "src/stario_cython/protocol.pyx",
             "vendor/llhttp/src/llhttp.c",
             "vendor/llhttp/src/http.c",
             "vendor/llhttp/src/api.c",
             "vendor/llhttp/src/stario_alloc.c",
         ],
-        include_dirs=["vendor", "vendor/llhttp/include", "src", *codec_include_dirs],
-        library_dirs=codec_library_dirs,
-        libraries=codec_libraries,
-        extra_compile_args=["-O3", *codec_compile_args],
-        extra_link_args=codec_link_args,
+        include_dirs=["vendor/llhttp/include", "vendor", "src"],
+        extra_compile_args=["-O3"],
     ),
 ]
 
