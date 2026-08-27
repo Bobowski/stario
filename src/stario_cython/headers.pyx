@@ -18,9 +18,6 @@ from cpython.bytearray cimport (
 )
 from cpython.bytes cimport PyBytes_FromStringAndSize
 
-cdef bytes _VALID_NAME = (
-    b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-)
 cdef bytes _VALID_VALUE = bytes(
     b for b in range(256) if b == 0x09 or (b >= 0x20 and b != 0x7F)
 )
@@ -29,6 +26,86 @@ cdef enum:
     INTERN_MAX = 36
     INTERN_TABLE_SIZE = 64
     NAME_STACK = 256
+
+cdef extern from *:
+    """
+    #include <Python.h>
+    #include <stdint.h>
+
+    static uint8_t stario_hdr_lower[256];
+    static int stario_hdr_lower_ready;
+
+    static void stario_hdr_lower_init(void) {
+        static const char valid[] =
+            "!#$%&'*+-.^_`|~0123456789"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz";
+        const unsigned char* p;
+        int i;
+        if (stario_hdr_lower_ready) {
+            return;
+        }
+        for (i = 0; i < 256; i++) {
+            stario_hdr_lower[i] = 0;
+        }
+        for (p = (const unsigned char*)valid; *p; p++) {
+            unsigned char c = *p;
+            stario_hdr_lower[c] = (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
+        }
+        stario_hdr_lower_ready = 1;
+    }
+
+    static int stario_fold_header_name(
+        PyObject* name,
+        char* buf,
+        Py_ssize_t cap,
+        Py_ssize_t* out_n
+    ) {
+        Py_ssize_t i;
+        Py_ssize_t n;
+        int kind;
+        void* data;
+        stario_hdr_lower_init();
+        if (!PyUnicode_Check(name)) {
+            PyErr_SetString(PyExc_TypeError, "header name must be str");
+            return -1;
+        }
+        n = PyUnicode_GET_LENGTH(name);
+        if (n == 0) {
+            PyErr_SetString(PyExc_ValueError, "Invalid header name: empty");
+            return -1;
+        }
+        if (n >= cap) {
+            PyErr_SetString(PyExc_ValueError, "Invalid header name: too long");
+            return -1;
+        }
+        kind = PyUnicode_KIND(name);
+        data = PyUnicode_DATA(name);
+        for (i = 0; i < n; i++) {
+            Py_UCS4 ch = PyUnicode_READ(kind, data, i);
+            uint8_t mapped;
+            if (ch > 255) {
+                PyErr_Format(PyExc_ValueError, "Invalid header name: %R", name);
+                return -1;
+            }
+            mapped = stario_hdr_lower[(uint8_t)ch];
+            if (mapped == 0) {
+                PyErr_Format(PyExc_ValueError, "Invalid header name: %R", name);
+                return -1;
+            }
+            buf[i] = (char)mapped;
+        }
+        *out_n = n;
+        return 0;
+    }
+    """
+    int stario_fold_header_name(
+        object name,
+        char* buf,
+        Py_ssize_t cap,
+        Py_ssize_t* out_n,
+    ) except -1
+
 
 cdef const char* _INTERN_C[INTERN_MAX]
 cdef Py_ssize_t _INTERN_N[INTERN_MAX]
@@ -107,6 +184,10 @@ cdef void _init_intern() noexcept:
 _init_intern()
 
 
+cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1:
+    return stario_fold_header_name(name, buf, <Py_ssize_t>NAME_STACK, out_n)
+
+
 cdef object _intern_name(const char* src, size_t n):
     cdef char buf[NAME_STACK]
     cdef const char* normalized
@@ -140,16 +221,10 @@ cdef object _intern_name(const char* src, size_t n):
 
 
 cdef object _encode_name(str name):
-    cdef bytes raw
-    try:
-        raw = name.encode("latin-1")
-    except UnicodeEncodeError:
-        raise ValueError(f"Invalid header name: {name}")
-    if not raw:
-        raise ValueError("Invalid header name: empty")
-    if raw.translate(None, _VALID_NAME):
-        raise ValueError(f"Invalid header name: {name}")
-    return _intern_name(<const char*>raw, <size_t>len(raw))
+    cdef char buf[NAME_STACK]
+    cdef Py_ssize_t n
+    stario_fold_header_name(name, buf, <Py_ssize_t>NAME_STACK, &n)
+    return _intern_name(buf, <size_t>n)
 
 
 cdef object _encode_value(str value):

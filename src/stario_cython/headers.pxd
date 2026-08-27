@@ -14,6 +14,13 @@ cdef inline void _lower_copy(
             ch += 32
         dst[i] = <char>ch
 
+cdef enum:
+    HEADER_NAME_STACK = 256
+
+cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
+cdef object _intern_name(const char* src, size_t n)
+cdef object _encode_name(str name)
+
 cdef class Headers:
     cdef dict _data
 
@@ -38,6 +45,3 @@ cdef class Headers:
         object buf,
         Py_ssize_t* length,
     ) except -1
-
-cdef object _intern_name(const char* src, size_t n)
-cdef object _encode_name(str name)

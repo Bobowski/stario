@@ -138,9 +138,11 @@ async def test_request_headers_scan_arena_until_copy_on_write() -> None:
         headers = c.req.headers
         assert headers.materialized is False
         assert headers.get("authorization") == "Bearer token"
+        assert headers.get("Authorization") == "Bearer token"
         assert headers.get("x-missing") is None
         assert headers.getlist("cookie") == ["a=1", "b=2"]
         assert "X-Request-ID" in headers
+        assert "authorization" in headers
         assert headers.materialized is False
         headers.set("X-Local", "yes")
         assert headers.materialized is True

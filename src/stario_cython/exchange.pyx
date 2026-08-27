@@ -51,7 +51,14 @@ from stario_cython.compression_buf cimport (
     stario_gzip_finish_borrowed,
     stario_gzip_release,
 )
-from stario_cython.headers cimport Headers, _encode_name, _intern_name, _lower_copy
+from stario_cython.headers cimport (
+    Headers,
+    HEADER_NAME_STACK,
+    _encode_name,
+    _fold_header_name,
+    _intern_name,
+    _lower_copy,
+)
 
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
@@ -1970,23 +1977,23 @@ cdef class RequestHeaders(Headers):
         self._request_materialized = True
 
     cdef object c_get(self, object name):
+        cdef bytes key = name
+        return self.c_get_n(<const char*>key, <Py_ssize_t>len(key))
+
+    cdef object c_get_n(self, const char* query, Py_ssize_t query_length):
         cdef RequestExchange owner
         cdef RawHeader* header
-        cdef bytes key
-        cdef const char* query
-        cdef Py_ssize_t query_length
         cdef Py_ssize_t index
         cdef object value
+        cdef object key
         if self._request_materialized:
-            value = self._data.get(name)
+            key = _intern_name(query, <size_t>query_length)
+            value = self._data.get(key)
             if value is None:
                 return None
             if type(value) is bytes:
                 return value
             return value[0]
-        key = name
-        query = key
-        query_length = len(key)
         owner = <RequestExchange>self._owner
         for index in range(owner._req_raw_count):
             header = &owner._req_raw_headers[index]
@@ -2003,6 +2010,41 @@ cdef class RequestHeaders(Headers):
                     header.value_length,
                 )
         return None
+
+    cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length):
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef Py_ssize_t index
+        cdef object value
+        cdef object key
+        cdef list result
+        if self._request_materialized:
+            key = _intern_name(query, <size_t>query_length)
+            value = self._data.get(key)
+            if value is None:
+                return []
+            if type(value) is bytes:
+                return [value]
+            return list(value)
+        owner = <RequestExchange>self._owner
+        result = []
+        for index in range(owner._req_raw_count):
+            header = &owner._req_raw_headers[index]
+            if (
+                header.name_length == <uint32_t>query_length
+                and memcmp(
+                    owner._req_arena + header.name_offset,
+                    query,
+                    <size_t>query_length,
+                ) == 0
+            ):
+                result.append(
+                    PyBytes_FromStringAndSize(
+                        owner._req_arena + header.value_offset,
+                        header.value_length,
+                    )
+                )
+        return result
 
     cdef void c_set(self, object name, object value):
         self._materialize()
@@ -2046,7 +2088,11 @@ cdef class RequestHeaders(Headers):
         )
 
     def get(self, str name, default=None):
-        cdef object wire = self.c_get(_encode_name(name))
+        cdef char buf[HEADER_NAME_STACK]
+        cdef Py_ssize_t n
+        cdef object wire
+        _fold_header_name(name, buf, &n)
+        wire = self.c_get_n(buf, n)
         if wire is None:
             return default
         return wire.decode("latin-1")
@@ -2058,49 +2104,16 @@ cdef class RequestHeaders(Headers):
         return value
 
     def getlist(self, str name):
-        return [
-            value.decode("latin-1")
-            for value in self.unsafe_getlist(_encode_name(name))
-        ]
+        cdef char buf[HEADER_NAME_STACK]
+        cdef Py_ssize_t n
+        cdef list values
+        _fold_header_name(name, buf, &n)
+        values = <list>self.c_getlist_n(buf, n)
+        return [value.decode("latin-1") for value in values]
 
     def unsafe_getlist(self, name):
-        cdef RequestExchange owner
-        cdef RawHeader* header
-        cdef bytes key
-        cdef const char* query
-        cdef Py_ssize_t query_length
-        cdef Py_ssize_t index
-        cdef object value
-        cdef list result
-        if self._request_materialized:
-            value = self._data.get(name)
-            if value is None:
-                return []
-            if type(value) is bytes:
-                return [value]
-            return list(value)
-        key = name
-        query = key
-        query_length = len(key)
-        owner = <RequestExchange>self._owner
-        result = []
-        for index in range(owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
-            if (
-                header.name_length == <uint32_t>query_length
-                and memcmp(
-                    owner._req_arena + header.name_offset,
-                    query,
-                    <size_t>query_length,
-                ) == 0
-            ):
-                result.append(
-                    PyBytes_FromStringAndSize(
-                        owner._req_arena + header.value_offset,
-                        header.value_length,
-                    )
-                )
-        return result
+        cdef bytes key = name
+        return self.c_getlist_n(<const char*>key, <Py_ssize_t>len(key))
 
     def items(self):
         return [
@@ -2123,10 +2136,13 @@ cdef class RequestHeaders(Headers):
         return result
 
     def __contains__(self, name):
+        cdef char buf[HEADER_NAME_STACK]
+        cdef Py_ssize_t n
         try:
-            return self.c_get(_encode_name(name)) is not None
+            _fold_header_name(name, buf, &n)
         except ValueError:
             return False
+        return self.c_get_n(buf, n) is not None
 
     def __len__(self):
         self._materialize()
