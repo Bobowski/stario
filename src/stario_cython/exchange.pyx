@@ -119,6 +119,55 @@ cdef object STARTED_ERROR = (
     "Set headers via w.headers.set() before the first write or one-shot respond()."
 )
 
+cdef object RESPOND_DATE_ERROR = (
+    "Date is emitted by respond(); do not set it on w.headers."
+)
+cdef object RESPOND_TE_ERROR = (
+    "respond() always sends Content-Length; do not set Transfer-Encoding."
+)
+
+
+cdef void _check_respond_owned(
+    Headers h,
+    object content_type,
+) except *:
+    cdef object existing
+    existing = h.c_get(b"date")
+    if existing is not None:
+        raise StarioRuntime(
+            RESPOND_DATE_ERROR,
+            help_text="The writer supplies Date on every response.",
+        )
+    existing = h.c_get(b"transfer-encoding")
+    if existing is not None:
+        raise StarioRuntime(
+            RESPOND_TE_ERROR,
+            help_text="Use write_headers() when you need chunked encoding.",
+        )
+    existing = h.c_get(b"content-type")
+    if existing is not None and existing != content_type:
+        raise StarioRuntime(
+            "Content-Type on w.headers does not match respond()",
+            context={"headers": existing, "respond": content_type},
+            help_text=(
+                "Omit Content-Type on w.headers and pass it as respond()'s "
+                "content_type argument. If you set it, it must match."
+            ),
+        )
+
+
+cdef void _check_respond_length(Headers h, object content_length) except *:
+    cdef object existing = h.c_get(b"content-length")
+    if existing is not None and existing != content_length:
+        raise StarioRuntime(
+            "Content-Length on w.headers does not match respond()",
+            context={"headers": existing, "respond": content_length},
+            help_text=(
+                "Omit Content-Length on w.headers; respond() derives it from "
+                "the on-wire body (after compression). If you set it, it must match."
+            ),
+        )
+
 cdef list _POOL = []
 cdef object _UNBOUND = object()
 
@@ -1545,6 +1594,7 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
+        _check_respond_owned(h, content_type)
         # Empty headers + no compression: writelines of existing buffers (no join,
         # no _out_buf churn — keeps tiny plaintext/json competitive).
         if h.c_empty() and (
@@ -1592,6 +1642,7 @@ cdef class RequestExchange:
                         self._frame(flat, encoding, &native_out, &native_len)
                         self._declared_length = <Py_ssize_t>native_len
                         self._bytes_written = 0
+                        _check_respond_length(h, _dec(native_len))
                         self._buf_bytes(_status_line(status))
                         self._buf_bytes(self._date_box[0])
                         if self._out_buf is None:
@@ -1624,6 +1675,7 @@ cdef class RequestExchange:
                     return
             self._declared_length = nbytes
             self._bytes_written = 0
+            _check_respond_length(h, _dec(<size_t>nbytes))
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:
@@ -2422,7 +2474,6 @@ cdef class RequestHeaders(Headers):
         _raise_readonly_request_headers()
 
     cdef void c_reset(self) noexcept:
-        self._data.clear()
         self._request_materialized = False
 
     cdef object c_request_host(self):

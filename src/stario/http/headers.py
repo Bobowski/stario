@@ -64,6 +64,10 @@ class Headers:
     multiple values (`list[bytes]`). The single-value shape keeps common headers
     cheap; the list shape preserves duplicates such as `Set-Cookie`.
 
+    The Cython writer stores the same pairs as a linear list with wire-ready
+    `name: ` / `value\\r\\n` suffixes instead of this dict; the public get/set
+    API is the same.
+
     `_data` is a stable internal layout for protocol/writer hot paths.
     """
 

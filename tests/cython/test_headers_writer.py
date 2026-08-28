@@ -6,7 +6,7 @@ import pytest
 from stario_cython.headers import Headers
 
 from stario import App
-from stario.exceptions import StarioError
+from stario.exceptions import StarioError, StarioRuntime
 from stario.http.compression import CompressionConfig
 from tests.cython.http import read_chunk, read_response, running_server
 
@@ -22,6 +22,32 @@ def test_headers_public_api():
     assert len(headers) == 2
     headers.remove("accept")
     assert headers.get("accept") is None
+
+
+def test_headers_pair_list_keeps_order_and_repeats() -> None:
+    headers = Headers()
+    headers.set("X-A", "1")
+    headers.add("Set-Cookie", "a=1")
+    headers.add("Set-Cookie", "b=2")
+    headers.set("X-B", "2")
+    headers.set("X-A", "replaced")
+    assert headers.items() == [
+        ("set-cookie", "a=1"),
+        ("set-cookie", "b=2"),
+        ("x-b", "2"),
+        ("x-a", "replaced"),
+    ]
+    assert headers.getlist("set-cookie") == ["a=1", "b=2"]
+    assert headers.unsafe_items() == [
+        (b"set-cookie", b"a=1"),
+        (b"set-cookie", b"b=2"),
+        (b"x-b", b"2"),
+        (b"x-a", b"replaced"),
+    ]
+    assert len(headers) == 3
+    headers.remove("set-cookie")
+    assert headers.get("set-cookie") is None
+    assert headers.items() == [("x-b", "2"), ("x-a", "replaced")]
 
 
 def test_headers_unsafe_bytes():
@@ -586,6 +612,120 @@ async def test_respond_rejects_non_bytes_parts() -> None:
                 exc = await caught
             assert "bytes-like" in str(exc)
             await read_response(reader)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_respond_writes_extra_headers_before_derived_type_and_length() -> None:
+    app = App()
+
+    async def extra(_c, w):
+        w.headers.set("X-Custom", "present")
+        w.headers.add("Set-Cookie", "a=1")
+        w.headers.add("Set-Cookie", "b=2")
+        w.respond(b"hello", b"text/plain; charset=utf-8")
+
+    app.get("/", extra)
+    async with running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await read_response(reader)
+            header, body = payload.split(b"\r\n\r\n", 1)
+            block = header + b"\r\n"
+            assert body == b"hello"
+            assert b"x-custom: present\r\n" in block
+            assert b"set-cookie: a=1\r\n" in block
+            assert b"set-cookie: b=2\r\n" in block
+            assert b"content-type: text/plain; charset=utf-8\r\n" in block
+            assert b"content-length: 5\r\n" in block
+            extra_at = block.find(b"x-custom: present\r\n")
+            type_at = block.find(b"content-type: text/plain; charset=utf-8\r\n")
+            assert extra_at != -1 and extra_at < type_at
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_respond_accepts_matching_owned_headers() -> None:
+    app = App()
+
+    async def matching(_c, w):
+        w.headers.set("content-type", "text/plain; charset=utf-8")
+        w.headers.set("content-length", "2")
+        w.respond(b"ok", b"text/plain; charset=utf-8")
+
+    app.get("/", matching)
+    async with running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await read_response(reader)
+            header, body = payload.split(b"\r\n\r\n", 1)
+            block = header + b"\r\n"
+            assert body == b"ok"
+            assert block.count(b"content-type: text/plain; charset=utf-8\r\n") == 1
+            assert block.count(b"content-length: 2\r\n") == 1
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prepare", "match"),
+    [
+        (
+            lambda w: w.headers.set("content-type", "text/html"),
+            "Content-Type",
+        ),
+        (
+            lambda w: w.headers.set("content-length", "99"),
+            "Content-Length",
+        ),
+        (
+            lambda w: w.headers.set("date", "Tue, 01 Jan 2030 00:00:00 GMT"),
+            "Date is emitted",
+        ),
+        (
+            lambda w: w.headers.set("transfer-encoding", "chunked"),
+            "Transfer-Encoding",
+        ),
+    ],
+)
+async def test_respond_errors_when_owned_headers_conflict(
+    prepare,
+    match: str,
+) -> None:
+    app = App()
+    caught = asyncio.get_running_loop().create_future()
+
+    async def bad(_c, w):
+        prepare(w)
+        try:
+            w.respond(b"ok", b"text/plain; charset=utf-8")
+        except StarioRuntime as exc:
+            caught.set_result(exc)
+            w.abort()
+
+    app.get("/", bad)
+    async with running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            async with asyncio.timeout(2):
+                exc = await caught
+            assert match in str(exc)
         finally:
             writer.close()
             await writer.wait_closed()

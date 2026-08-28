@@ -22,8 +22,12 @@ cdef object _intern_name(const char* src, size_t n)
 cdef object _encode_name(str name)
 
 cdef class Headers:
-    cdef dict _data
+    cdef list _names
+    cdef list _values
+    cdef Py_ssize_t _n
 
+    cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept
+    cdef void _store_at(self, Py_ssize_t index, object wire, object line)
     cdef object c_get(self, object name)
     cdef void c_set(self, object name, object value)
     cdef void c_add(self, object name, object value)

@@ -33,6 +33,42 @@ def _append_wire_headers(parts: list[bytes], headers: Headers) -> None:
     headers.unsafe_append_wire_lines(parts)
 
 
+def _check_respond_owned(headers: Headers, content_type: bytes) -> None:
+    if headers.unsafe_get(b"date") is not None:
+        raise StarioRuntime(
+            "Date is emitted by respond(); do not set it on w.headers.",
+            help_text="The writer supplies Date on every response.",
+        )
+    if headers.unsafe_get(b"transfer-encoding") is not None:
+        raise StarioRuntime(
+            "respond() always sends Content-Length; do not set Transfer-Encoding.",
+            help_text="Use write_headers() when you need chunked encoding.",
+        )
+    existing = headers.unsafe_get(b"content-type")
+    if existing is not None and existing != content_type:
+        raise StarioRuntime(
+            "Content-Type on w.headers does not match respond()",
+            context={"headers": existing, "respond": content_type},
+            help_text=(
+                "Omit Content-Type on w.headers and pass it as respond()'s "
+                "content_type argument. If you set it, it must match."
+            ),
+        )
+
+
+def _check_respond_length(headers: Headers, content_length: bytes) -> None:
+    existing = headers.unsafe_get(b"content-length")
+    if existing is not None and existing != content_length:
+        raise StarioRuntime(
+            "Content-Length on w.headers does not match respond()",
+            context={"headers": existing, "respond": content_length},
+            help_text=(
+                "Omit Content-Length on w.headers; respond() derives it from "
+                "the on-wire body (after compression). If you set it, it must match."
+            ),
+        )
+
+
 @lru_cache(maxsize=128)
 def get_status_line(status_code: int) -> bytes:
     """Build HTTP/1.1 status line."""
@@ -134,6 +170,15 @@ class Writer:
 
         Skips negotiation if `Content-Encoding` is already set on `headers`.
         Uses the whole-body compression path, not per-chunk.
+
+        `respond()` always emits `Date`, `Content-Type` (from `content_type`),
+        and `Content-Length` (from the on-wire body, after compression). Extra
+        headers already on `w.headers` are written as-is.
+
+        If those owned names are already set, they must match what `respond()`
+        would emit (`StarioRuntime` on mismatch). Do not set `Date` or
+        `Transfer-Encoding`. `Content-Encoding` already on the map disables
+        auto-compression and is sent unchanged.
         """
         if self._transport.is_closing():
             if not self._completed:
@@ -159,6 +204,7 @@ class Writer:
         self._bind_declared_length(
             0 if not _response_may_have_body(status) else len(body)
         )
+        _check_respond_owned(h, content_type)
 
         # Minimal fast path: no custom headers and no compression work.
         if not h and (
@@ -192,7 +238,6 @@ class Writer:
             # Content-Length is set.
             if not _response_may_have_body(status):
                 body = b""
-                h.unsafe_set(b"content-length", b"0")
             elif h.unsafe_get(b"content-encoding") is None:
                 compressor = self._compression.select(
                     self._accept_encoding,
@@ -204,8 +249,10 @@ class Writer:
                     h.unsafe_set(b"content-encoding", compressor.encoding)
                     merge_vary(h, b"accept-encoding")
 
+            final_length = b"%d" % len(body) if _response_may_have_body(status) else b"0"
+            _check_respond_length(h, final_length)
             h.unsafe_set(b"content-type", content_type)
-            h.unsafe_set(b"content-length", b"%d" % len(body))
+            h.unsafe_set(b"content-length", final_length)
             self._bind_declared_length(len(body))
 
             parts = [get_status_line(status), self._get_date_header()]

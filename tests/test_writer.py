@@ -522,3 +522,47 @@ class TestWriterRaw:
             assert completed == ["done"]
         finally:
             loop.close()
+
+    def test_respond_errors_on_content_type_mismatch(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.headers.set("content-type", "text/html")
+            with pytest.raises(StarioRuntime, match="Content-Type"):
+                w.respond(b"ok", b"text/plain")
+        finally:
+            loop.close()
+
+    def test_respond_errors_on_content_length_mismatch(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.headers.set("content-length", "99")
+            with pytest.raises(StarioRuntime, match="Content-Length"):
+                w.respond(b"ok", b"text/plain")
+        finally:
+            loop.close()
+
+    def test_respond_accepts_matching_content_type(self):
+        w, sink, loop = _make_writer()
+        try:
+            w.headers.set("content-type", "text/plain")
+            w.headers.set("x-custom", "yes")
+            w.respond(b"ok", b"text/plain")
+            payload = bytes(sink)
+            assert b"x-custom: yes\r\n" in payload
+            assert payload.count(b"content-type: text/plain\r\n") == 1
+            assert payload.endswith(b"ok")
+        finally:
+            loop.close()
+
+    def test_respond_errors_on_date_or_transfer_encoding(self):
+        w, _sink, loop = _make_writer()
+        try:
+            w.headers.set("date", "Tue, 01 Jan 2030 00:00:00 GMT")
+            with pytest.raises(StarioRuntime, match="Date is emitted"):
+                w.respond(b"ok", b"text/plain")
+            w.headers.remove("date")
+            w.headers.set("transfer-encoding", "chunked")
+            with pytest.raises(StarioRuntime, match="Transfer-Encoding"):
+                w.respond(b"ok", b"text/plain")
+        finally:
+            loop.close()
