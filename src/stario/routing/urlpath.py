@@ -145,7 +145,9 @@ def _append_formatted_segments(
         if segment.kind == "exact":
             parts.append(segment.name)
         else:
-            parts.append(formatter(pattern, segment.name, segment.kind, values[segment.name]))
+            parts.append(
+                formatter(pattern, segment.name, segment.kind, values[segment.name])
+            )
 
 
 class UrlPath:
@@ -198,7 +200,9 @@ class UrlPath:
             self.host_text = None
 
         self._path_text = path_text
-        self.text = (self.host_text + path_text) if self.host_text is not None else path_text
+        self.text = (
+            (self.host_text + path_text) if self.host_text is not None else path_text
+        )
         self.placeholders = _collect_placeholders(
             self.host,
             self.path,

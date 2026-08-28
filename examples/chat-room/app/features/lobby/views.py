@@ -40,13 +40,8 @@ def lobby_live_view(
         ),
         h.Ul(
             {"class": "room-list"},
-            [
-                _room_card(room, online=online_counts.get(room.id, 0))
-                for room in rooms
-            ]
-            or h.Li(
-                h.P({"class": "lobby-empty"}, "No rooms yet — create one above.")
-            ),
+            [_room_card(room, online=online_counts.get(room.id, 0)) for room in rooms]
+            or h.Li(h.P({"class": "lobby-empty"}, "No rooms yet — create one above.")),
         ),
         _create_room_dialog(),
     )
@@ -77,7 +72,9 @@ def lobby_view(
                     },
                     if_missing=True,
                 ),
-                data.init(f"{VISITOR_SESSION_INIT}\n{at.get(subscribe_url, retry='always')}"),
+                data.init(
+                    f"{VISITOR_SESSION_INIT}\n{at.get(subscribe_url, retry='always')}"
+                ),
                 lobby_live_view(rooms=rooms, online_counts=online_counts),
             ),
         ]

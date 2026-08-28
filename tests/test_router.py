@@ -110,12 +110,6 @@ class TestFindHandler:
         assert feed.pattern == "/feed"
         assert search.pattern == "/search"
 
-    def test_add_rejects_non_route(self):
-        router = Router()
-
-        with pytest.raises(StarioError, match="takes a Route"):
-            router.add("/health", noop_handler)  # type: ignore[arg-type]
-
     def test_hostless_method_wins_over_host_405(self):
         router = Router()
         router.get(UrlPath("/api", host="api.example.com"), noop_handler)

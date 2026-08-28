@@ -384,15 +384,6 @@ class DatastarActions:
         h.Button(data.on("click", at.fetch(SEND, {"room_id": room.id})), "Send")
         ```
         """
-        if not isinstance(route, Route):
-            raise StarioError(
-                "at.fetch() takes a Route",
-                context={"got": type(route).__name__},
-                help_text=(
-                    "Declare the endpoint with Route.get/post/... and pass that object. "
-                    "Use at.get(url) or at.post(url) for a raw URL."
-                ),
-            )
         if route.method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise StarioError(
                 "at.fetch() has no Datastar action for this method",

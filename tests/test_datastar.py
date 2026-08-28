@@ -389,6 +389,18 @@ class TestDatastarAttributeMatrix:
             ),
             (data.signals({"count": 0}), {"data-signals": '{"count":0}'}),
             (data.bind("email"), {"data-bind": "email"}),
+            (
+                data.bind("is_checked", prop="checked"),
+                {"data-bind:is-checked__case.snake__prop.checked": True},
+            ),
+            (
+                data.bind("query", event="input.change"),
+                {"data-bind:query__case.snake__event.input.change": True},
+            ),
+            (
+                data.bind("is_checked", prop="checked", event="change"),
+                {"data-bind:is-checked__case.snake__prop.checked__event.change": True},
+            ),
             (data.show("$visible"), {"data-show": "$visible"}),
             (
                 data.on("submit", "go()", prevent=True, stop=True),
@@ -407,8 +419,17 @@ class TestDatastarAttributeMatrix:
                 {"data-on-intersect__half": "seen()"},
             ),
             (
+                data.on_intersect("seen()", view_transition=True),
+                {"data-on-intersect__viewtransition": "seen()"},
+            ),
+            (
                 data.persist(include=["draft", "settings"]),
                 {"data-persist": "{'include':'draft|settings'}"},
+            ),
+            (data.persist(session=True), {"data-persist__session": True}),
+            (
+                data.persist(storage_key="prefs", session=True),
+                {"data-persist:prefs__session": True},
             ),
             (
                 DatastarAttributes("data-star-").text("$title"),
@@ -567,9 +588,7 @@ class TestDatastarActions:
             == "@post('/rooms/7/send?src=btn#latest')"
         )
 
-    def test_fetch_rejects_non_route_and_unknown_methods(self):
-        with pytest.raises(StarioError, match="takes a Route"):
-            at.fetch("/save")  # type: ignore[arg-type]
+    def test_fetch_rejects_unknown_methods(self):
         with pytest.raises(StarioError, match="no Datastar action"):
             at.fetch(Route.head("/page"))
         with pytest.raises(StarioError, match="no Datastar action"):

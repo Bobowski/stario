@@ -71,7 +71,9 @@ def subscribe(db: Database, relay: Relay[str]):
 
             async for subject, _ in c.alive(live):
                 c.span.event("relay", {"subject": subject})
-                if subject.startswith("lobby.") or any(subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES):
+                if subject.startswith("lobby.") or any(
+                    subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES
+                ):
                     patch_lobby(sse, db, identity)
 
     return handler

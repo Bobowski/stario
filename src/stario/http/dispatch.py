@@ -525,16 +525,6 @@ class Router:
         middleware: Sequence[Middleware] = (),
     ) -> None:
         """Register a `Route`. Path + method stay on `handle()`."""
-        if not isinstance(route, Route):
-            raise StarioError(
-                "add() takes a Route",
-                context={"got": type(route).__name__},
-                help_text=(
-                    "Declare the endpoint with Route.get/post/... and pass that object. "
-                    "Use app.handle(method, path, handler) or app.get(path, handler) "
-                    "for a path without a Route."
-                ),
-            )
         self.handle(route.method, route.path, handler, middleware=middleware)
 
     def get(

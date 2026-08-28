@@ -22,9 +22,7 @@ UNSAFE_REDIRECT_TARGETS = [
     "ftp://example.com/file",
 ]
 
-UNSAFE_REDIRECT_MATCH = (
-    "control characters|backslashes|app-relative path or absolute"
-)
+UNSAFE_REDIRECT_MATCH = "control characters|backslashes|app-relative path or absolute"
 
 
 def _redirect_from_exception(w: Writer, exc: RedirectException) -> None:

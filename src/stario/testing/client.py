@@ -259,9 +259,7 @@ class TestClient:
         disconnect = wired.disconnect
         timeout_secs = self.request_timeout if timeout is None else timeout
         loop = asyncio.get_running_loop()
-        exchange_deadline = (
-            None if timeout_secs is None else loop.time() + timeout_secs
-        )
+        exchange_deadline = None if timeout_secs is None else loop.time() + timeout_secs
 
         async def run_stream() -> None:
             await run_dispatch(

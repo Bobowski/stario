@@ -41,11 +41,14 @@ class TestAppendQueryFragment:
         )
 
     def test_appends_query_and_fragment(self):
-        assert append_query_fragment(
-            "/docs",
-            query={"q": "routes"},
-            fragment="section/one?tab=api",
-        ) == "/docs?q=routes#section/one?tab=api"
+        assert (
+            append_query_fragment(
+                "/docs",
+                query={"q": "routes"},
+                fragment="section/one?tab=api",
+            )
+            == "/docs?q=routes#section/one?tab=api"
+        )
 
     def test_empty_fragment(self):
         assert append_query_fragment("/docs", fragment="") == "/docs#"

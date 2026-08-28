@@ -240,11 +240,7 @@ class Server:
             max(self.config.graceful_shutdown_timeout, 0.0), _FORCE_CLOSE_CAP
         )
         close_deadline = loop.time() + force_close_budget
-        while (
-            connections
-            and not self._urgent_drain
-            and loop.time() < close_deadline
-        ):
+        while connections and not self._urgent_drain and loop.time() < close_deadline:
             force_closed += await self._force_close_open_transports(connections)
             await asyncio.sleep(0)
 

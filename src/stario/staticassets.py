@@ -298,9 +298,7 @@ class AssetManifest:
                 continue
             logical_path = relative_path.as_posix()
             before = resolved.stat()
-            hashed_name = (
-                f"{resolved.stem}.{fingerprint(resolved, chunk_size=hash_chunk_size)}{resolved.suffix}"
-            )
+            hashed_name = f"{resolved.stem}.{fingerprint(resolved, chunk_size=hash_chunk_size)}{resolved.suffix}"
             after = resolved.stat()
             if (
                 before.st_size != after.st_size

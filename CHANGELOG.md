@@ -6,6 +6,15 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Fixed
+
+- `data.bind()` with `prop` or `event` — emit a key-only attribute. Datastar bind is exclusive (signal in the key or the value, not both); the previous form also set the value and Datastar raised `KeyAndValueProvided`.
+- `data.persist(session=True)` — emit `data-persist__session` when `storage_key` is omitted.
+
+### Added
+
+- `data.on_intersect(..., view_transition=True)` — Datastar `__viewtransition` modifier.
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

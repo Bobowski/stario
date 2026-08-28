@@ -107,7 +107,7 @@ class DatastarAttributes:
         # Attrs(' data-bind="email"')
 
         data.bind("is_checked", prop="checked", event="change")
-        # Attrs(' data-bind:is-checked__case.snake__prop.checked__event.change="is_checked"')
+        # Attrs(' data-bind:is-checked__case.snake__prop.checked__event.change')
         ```
         """
         validate_signal_path(signal_name)
@@ -116,19 +116,10 @@ class DatastarAttributes:
 
         key_suffix = signal_path_key(signal_name)
         if prop is None:
-            return Attrs(
-                f' {self.prefix}bind:{key_suffix}__event.{event}="'
-                f'{escape_attr(signal_name)}"'
-            )
+            return Attrs(f" {self.prefix}bind:{key_suffix}__event.{event}")
         if event is None:
-            return Attrs(
-                f' {self.prefix}bind:{key_suffix}__prop.{prop}="'
-                f'{escape_attr(signal_name)}"'
-            )
-        return Attrs(
-            f' {self.prefix}bind:{key_suffix}__prop.{prop}__event.{event}="'
-            f'{escape_attr(signal_name)}"'
-        )
+            return Attrs(f" {self.prefix}bind:{key_suffix}__prop.{prop}")
+        return Attrs(f" {self.prefix}bind:{key_suffix}__prop.{prop}__event.{event}")
 
     def class_(self, name: str, expression: str) -> Attrs:
         """Toggle one CSS class from a reactive expression.
@@ -377,12 +368,13 @@ class DatastarAttributes:
         delay: TimeValue | None = None,
         debounce: Debounce | None = None,
         throttle: Throttle | None = None,
+        view_transition: bool = False,
     ) -> Attrs:
         """React to viewport intersection.
 
         ```python
-        data.on_intersect("load()", threshold=0.25, once=True)
-        # Attrs(' data-on-intersect__threshold.25__once="load()"')
+        data.on_intersect("load()", threshold=0.25, once=True, view_transition=True)
+        # Attrs(' data-on-intersect__threshold.25__once__viewtransition="load()"')
         ```
         """
         modifiers: list[str] = []
@@ -417,6 +409,8 @@ class DatastarAttributes:
             modifiers.append(debounce_to_string(debounce))
         if throttle is not None:
             modifiers.append(throttle_to_string(throttle))
+        if view_transition:
+            modifiers.append("viewtransition")
 
         if modifiers:
             return Attrs(
@@ -705,12 +699,13 @@ class DatastarAttributes:
         """
         filters = filter_js(include, exclude)
         value: str | bool = filters if filters is not None else True
-        if storage_key is None:
-            key = self.prefix + "persist"
-        elif session:
-            key = f"{self.prefix}persist:{storage_key}__session"
-        else:
-            key = f"{self.prefix}persist:{storage_key}"
+        key = (
+            self.prefix + "persist"
+            if storage_key is None
+            else f"{self.prefix}persist:{storage_key}"
+        )
+        if session:
+            key += "__session"
         if value is True:
             return Attrs(f" {key}")
         return Attrs(f' {key}="{escape_attr(value)}"')

@@ -79,7 +79,9 @@ class TestParseHostSegments:
             parse_host_segments("api..example.com")
 
     def test_rejects_catchall_after_first_label(self):
-        with pytest.raises(StarioError, match="Catchall host param in invalid position"):
+        with pytest.raises(
+            StarioError, match="Catchall host param in invalid position"
+        ):
             parse_host_segments("example.{tenant...}.com")
 
 
@@ -99,5 +101,7 @@ class TestParsePathSegments:
             parse_path_segments("/users//profile")
 
     def test_rejects_catchall_before_last_segment(self):
-        with pytest.raises(StarioError, match="Catchall path param in invalid position"):
+        with pytest.raises(
+            StarioError, match="Catchall path param in invalid position"
+        ):
             parse_path_segments("/files/{path...}/download")

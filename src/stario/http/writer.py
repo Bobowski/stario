@@ -387,7 +387,10 @@ class Writer:
             self.write(data)
 
         # Content-Length responses must match bytes actually written.
-        if self._declared_length is not None and self._bytes_written != self._declared_length:
+        if (
+            self._declared_length is not None
+            and self._bytes_written != self._declared_length
+        ):
             raise StarioRuntime(
                 "Response body length mismatch: wrote "
                 f"{self._bytes_written} bytes, Content-Length is {self._declared_length}",
