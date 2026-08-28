@@ -48,27 +48,35 @@ Read paths ~1.7×. Small POST ~1.2×. 64KB ingest even. Buffered 2MB, streaming 
 and multipart are ahead of Python after pre-sizing Content-Length bodies and
 pausing `body()` at 64KiB between parser quantums.
 
-## Hot path vs `cython-core` (2026-08-28)
+## Hot path + timeouts vs `cython-core` (2026-08-28)
 
 Same machine, official suite, unmodified `cython-core` (`f80d6f0`, run
-`20260828T110114Z`) vs this hot-path work (`174cef7`, run
-`20260828T112246Z`). Full table: `benchmarks/server/baseline-20260828.md`.
+`20260828T153450Z`) vs this branch (`460114d`, run `20260828T154518Z`).
+Full table: `benchmarks/server/baseline-20260828.md`.
 Do not mix these Cython rows with the 2026-08-27 Python column (different
-host class).
+host class), or with the earlier same-day PR #33-only capture
+(`20260828T110114Z`) from a prior VM.
 
-| Endpoint | Unmodified `cython-core` | Hot path | Hot / core |
+| Endpoint | Unmodified `cython-core` | This branch | Ratio |
 | --- | ---: | ---: | ---: |
-| Plaintext | 129,230 ± 2,877 | 132,083 ± 4,307 | 1.02× |
-| JSON | 123,825 ± 3,502 | 131,544 ± 825 | 1.06× |
-| Params | 111,894 ± 1,687 | 126,443 ± 252 | 1.13× |
-| Validate JSON | 66,359 ± 234 | 108,084 ± 1,902 | **1.63×** |
-| Form POST | 77,785 ± 1,875 | 131,462 ± 1,629 | **1.69×** |
-| JSON 1KB | 67,892 ± 1,636 | 112,493 ± 3,605 | **1.66×** |
-| Octet 64KB | 24,091 ± 164 | 37,735 ± 131 | **1.57×** |
-| Octet 2MB (buffer) | 3,117 ± 78 | 3,190 ± 31 | 1.02× |
-| Octet 2MB (stream) | 3,480 ± 3 | 3,485 ± 12 | 1.00× |
-| Multipart 2MB | 3,179 ± 151 | 3,350 ± 37 | 1.05× |
+| Plaintext | 125,495 ± 879 | 130,032 ± 602 | **1.04×** |
+| JSON | 121,997 ± 2,671 | 119,338 ± 4,601 | 0.98× |
+| Params | 117,005 ± 211 | 122,350 ± 1,991 | **1.05×** |
+| Validate JSON | 67,425 ± 512 | 106,918 ± 1,108 | **1.59×** |
+| Form POST | 75,089 ± 1,124 | 126,328 ± 3,486 | **1.68×** |
+| JSON 1KB | 68,866 ± 93 | 108,776 ± 781 | **1.58×** |
+| Octet 64KB | 22,013 ± 390 | 37,948 ± 406 | **1.72×** |
+| Octet 2MB (buffer) | 3,004 ± 14 | 3,172 ± 71 | **1.06×** |
+| Octet 2MB (stream) | 3,435 ± 48 | 3,391 ± 120 | 0.99× |
+| Multipart 2MB | 2,998 ± 59 | 3,178 ± 18 | **1.06×** |
 
 Small POST and the 64KiB octet fixture (exactly the deferral cap) jump because
-`body()` no longer waits on an Event during `llhttp_execute`. 2MB paths stay
-header-dispatch and did not regress. Plaintext is within sample noise.
+`body()` no longer waits on an Event during `llhttp_execute`. Header/idle
+timeouts reuse one timer handle per connection; plaintext is **+3.6%** (not
+killed). JSON and 2MB stream sit inside sample noise. 2MB buffer did not
+regress.
+
+Header timeout is armed only while headers (or a deferred small body) are
+still arriving. Idle timeout is armed only when the connection is idle.
+`RequestPolicy.max_pipelined_requests` (default 8) caps the pipeline queue.
+Body stall timeout takes `RequestPolicy.body_timeout`.
