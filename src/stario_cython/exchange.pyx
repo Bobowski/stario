@@ -125,7 +125,6 @@ cdef object RESPOND_DATE_ERROR = (
 cdef object RESPOND_TE_ERROR = (
     "respond() always sends Content-Length; do not set Transfer-Encoding."
 )
-cdef object _dec(size_t n)
 
 
 cdef void _check_respond_owned(
