@@ -83,8 +83,8 @@ the header deadline. `RequestPolicy.max_pipelined_requests` (default 8) caps
 the pipeline queue. Body stall is a generation counter — chunks do not
 `call_later`.
 
-Same-machine callback vs 10ms-sweep vs timeouts-off vs 50ms-sweep:
-`benchmarks/server/baseline-20260828.md`. Sweep ≈ callback on plaintext;
-timeouts-off is ~+5% plaintext (not worth dropping timeouts);
-10ms sweep was −7% on 2MB stream; 50ms recovered 2MB. Production now uses
-the 1s Date tick (5s/30s timeouts do not need 50ms).
+Same-machine callback vs 10ms-sweep vs timeouts-off vs 50ms-sweep vs
+1s Date tick: `benchmarks/server/baseline-20260828.md`. Sweep ≈ callback
+on plaintext; timeouts-off is ~+5% plaintext (not worth dropping timeouts);
+10ms sweep was −7% on 2MB stream; 50ms recovered 2MB. **1s Date tick vs
+50ms vs callbacks is a wash on plaintext** (129.3k / 130.8k / 128.0k).
