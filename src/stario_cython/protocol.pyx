@@ -5,9 +5,10 @@
 URL bytes and header fragments are written into the current exchange arena.
 Path/query decoding is cached here because it is connection-parse work.
 
-Header, idle, and body-stall timeouts share one cleanup path. Default is a
-sweeper over the connection set: each wake calls ``loop.time()`` once, then
-compares stored deadlines. See ``stario_cython.timeouts``.
+Header, idle, and body-stall timeouts share one cleanup path. Under Server
+that path is the Date-header tick (once a second): one ``loop.time()``, then
+compare stored deadlines. Tests and raw ``create_server`` use a fallback
+sweeper at the same period. See ``stario_cython.timeouts``.
 """
 
 import asyncio
@@ -31,6 +32,7 @@ from stario.telemetry.noop import NoOpTracer
 from stario_cython.exchange cimport Request, RequestExchange, acquire_exchange, _status_line
 from stario_cython.llhttp cimport *
 from stario_cython.timeouts import (
+    DATE_TICK_SWEEP_ATTR as _PY_DATE_TICK_SWEEP_ATTR,
     TIMEOUT_MODE as _PY_TIMEOUT_MODE,
     sweep_interval as _py_sweep_interval,
 )
@@ -191,7 +193,7 @@ cdef int TIMEOUT_IDLE = 2
 cdef int CLEANUP_OFF = 0
 cdef int CLEANUP_SWEEP = 1
 cdef int TIMEOUT_MODE = 1
-cdef double TIMEOUT_SWEEP_INTERVAL = 0.05
+cdef double TIMEOUT_SWEEP_INTERVAL = 1.0
 cdef object _SWEEPS_ATTR = "_stario_timeout_sweeps"
 # GET and large/chunked bodies dispatch at headers-complete. Small
 # Content-Length bodies dispatch at message-complete so body() is cached.
@@ -336,6 +338,9 @@ async def _timeout_sweep_loop(loop, connections, key):
 
 def _ensure_timeout_sweeper(loop, connections):
     if TIMEOUT_MODE != CLEANUP_SWEEP:
+        return
+    # Server Date tick already walks this loop's connections once a second.
+    if getattr(loop, _PY_DATE_TICK_SWEEP_ATTR, False):
         return
     sweeps = getattr(loop, _SWEEPS_ATTR, None)
     if sweeps is None:

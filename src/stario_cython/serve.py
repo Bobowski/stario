@@ -13,8 +13,9 @@ the exchange — chunks do not ``call_later``. ``RequestPolicy.max_pipelined_req
 (default 8) caps the pipeline queue.
 
 ``STARIO_CYTHON_TIMEOUTS=off`` disables header/idle/body-stall cleanup
-(profiling hatch). ``STARIO_CYTHON_TIMEOUT_SWEEP`` sets the sweeper period
-(default 50ms).
+(profiling hatch). Under Server the sweep rides the Date-header tick (1s).
+``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback sweeper period used
+without Server (default 1s).
 """
 
 from __future__ import annotations

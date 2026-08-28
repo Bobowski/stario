@@ -18,8 +18,8 @@ from tests.cython.http import (
     response_statuses,
 )
 
-# Default sweeper period is 50ms. Timeouts here must exceed two periods;
-# waits must exceed timeout + one period.
+# Production sweeps with the Date tick (1s). Tests force 50ms via conftest.
+# Timeouts here must exceed two periods; waits must exceed timeout + one period.
 _TIMEOUT = 0.15
 _WAIT = 0.40
 _TRICKLE_PAUSE = 0.08
@@ -694,6 +694,28 @@ async def test_timeout_sweeper_is_one_task_per_connection_set() -> None:
         if not transport.is_closing():
             transport.close()
         await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_server_date_tick_skips_fallback_sweeper() -> None:
+    from stario_cython.timeouts import DATE_TICK_SWEEP_ATTR, timeout_cleanup_mode
+
+    if timeout_cleanup_mode() != "sweep":
+        pytest.skip("default cleanup is the connection sweeper")
+    loop = asyncio.get_running_loop()
+    setattr(loop, DATE_TICK_SWEEP_ATTR, True)
+    proto = app = transport = None
+    try:
+        proto, app, transport = _attach(header_timeout=5.0)
+        sweeps = getattr(loop, "_stario_timeout_sweeps", None) or {}
+        live = [task for task in sweeps.values() if task is not None and not task.done()]
+        assert live == []
+    finally:
+        setattr(loop, DATE_TICK_SWEEP_ATTR, False)
+        if transport is not None and not transport.is_closing():
+            transport.close()
+        if app is not None:
+            await _drain(app)
 
 
 @pytest.mark.asyncio

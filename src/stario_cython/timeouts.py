@@ -1,17 +1,22 @@
 """Timeout cleanup for the Cython HTTP protocol.
 
-Header, idle, and body-stall timeouts share **one** mechanism: a sweeper
-over the connection set. Each wake calls ``loop.time()`` once, then
-compares deadlines stored on the protocol / exchange.
+Header, idle, and body-stall timeouts share **one** mechanism: compare
+deadlines stored on the connection to ``loop.time()`` computed once per
+wake.
+
+Under ``stario.http.server.Server`` that wake is the Date-header tick
+(once a second). Header/idle/body-stall defaults are 5s/5s/30s, so 1s
+granularity is enough and adds no extra timer. Protocols constructed
+without Server (tests, raw ``create_server``) start a fallback sweeper
+with the same period.
 
 ``STARIO_CYTHON_TIMEOUTS`` (process env, read at import):
 
-- ``sweep`` (default) — one sweeper task per ``connections`` set
+- ``sweep`` (default)
 - ``off`` / ``0`` — no header, idle, or body-stall cleanup (profiling hatch)
 
-``STARIO_CYTHON_TIMEOUT_SWEEP`` is the sweeper period in seconds (default
-``0.05``). Expiry is that period at worst. 10ms was measurable on 2MB
-streaming wrk; 50ms is still tight for the 5s/30s production timeouts.
+``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback sweeper period
+(default ``1``). Tests set ``0.05`` so slowloris cases finish quickly.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ MODE_OFF = 0
 MODE_SWEEP = 1
 
 _SWEEP_ATTR = "_stario_timeout_sweeps"
+# Keep in sync with ``stario.http.server._DATE_TICK_SWEEPS_TIMEOUTS``.
+DATE_TICK_SWEEP_ATTR = "_stario_date_tick_sweeps_timeouts"
 
 
 def parse_timeout_mode(raw: str | None = None) -> int:
@@ -43,11 +50,11 @@ def timeout_cleanup_mode() -> str:
 
 
 def sweep_interval() -> float:
-    raw = os.environ.get("STARIO_CYTHON_TIMEOUT_SWEEP", "0.05")
+    raw = os.environ.get("STARIO_CYTHON_TIMEOUT_SWEEP", "1")
     try:
         value = float(raw)
     except ValueError:
-        value = 0.05
+        value = 1.0
     if value < 0.001:
         return 0.001
     if value > 1.0:

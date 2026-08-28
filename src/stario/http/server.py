@@ -56,6 +56,10 @@ type LoopRun[T] = Callable[[Coroutine[Any, Any, T]], T]
 # Upper bound on the force-close loop after the graceful wait (see _drain_listener).
 _FORCE_CLOSE_CAP = 1.0
 
+# Keep in sync with ``stario_cython.protocol``: Cython skips its own sweeper
+# task when the Date tick already walks connections once a second.
+_DATE_TICK_SWEEPS_TIMEOUTS = "_stario_date_tick_sweeps_timeouts"
+
 # Yield to the event loop this many times while waiting for connection_made to register.
 _ACCEPT_REGISTER_YIELDS = 10
 
@@ -122,6 +126,7 @@ class Server:
         self._used = False
         self._date_box = [b""]
         self._urgent_drain = False
+        self._live_connections: set[Connection] | None = None
 
     def run(self) -> None:
         """Block until shutdown; picks the event loop from `config.event_loop`.
@@ -450,6 +455,7 @@ class Server:
     ) -> AsyncGenerator[asyncio.Server]:
         """Bind on enter; drain in-flight work on exit."""
         connections: set[Connection] = set()
+        self._live_connections = connections
         listener = await self._create_listener(listen_sock, app, connections)
 
         # Startup span ends once we are listening; shutdown span opens on exit.
@@ -464,10 +470,30 @@ class Server:
             self._open_shutdown_span(span, "expected_stop")  # signal or app.shutdown
         finally:
             await self._drain_listener(listener, app, connections, span)
+            self._live_connections = None
+
+    def _sweep_connection_timeouts(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Compare stored deadlines to one ``loop.time()`` (Date-tick cadence)."""
+        connections = self._live_connections
+        if not connections:
+            return
+        now = loop.time()
+        for proto in tuple(connections):
+            check = getattr(proto, "check_timeouts", None)
+            if check is None:
+                continue
+            try:
+                check(now)
+            except Exception:
+                continue
 
     @asynccontextmanager
     async def _date_tick(self) -> AsyncGenerator[None]:
-        """Refresh the shared Date header now, then once per second until exit."""
+        """Refresh Date, then once per second also sweep connection timeouts.
+
+        Header/idle/body-stall defaults are 5s/5s/30s. One-second granularity
+        matches Date and avoids a second timer on the event loop.
+        """
 
         def refresh() -> None:
             now = datetime.now(UTC)
@@ -476,16 +502,21 @@ class Server:
                 now, usegmt=True
             ).encode("ascii")
 
+        loop = asyncio.get_running_loop()
+        setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, True)
+
         async def tick() -> None:
             while True:
                 await asyncio.sleep(1)
                 refresh()
+                self._sweep_connection_timeouts(loop)
 
         refresh()  # first value before any connection can read it
         task = asyncio.create_task(tick())
         try:
             yield
         finally:
+            setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, False)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task

@@ -76,14 +76,15 @@ timeouts reuse one timer handle per connection; plaintext is **+3.6%** (not
 killed). JSON and 2MB stream sit inside sample noise. 2MB buffer did not
 regress.
 
-Header, idle, and body-stall timeouts share one connection-set sweeper
-(`loop.time()` once per wake, default 50ms). Idle is armed only when the
-connection is idle; trickle bytes do not reset the header deadline.
-`RequestPolicy.max_pipelined_requests` (default 8) caps the pipeline queue.
-Body stall is a generation counter — chunks do not `call_later`.
+Header, idle, and body-stall timeouts share one cleanup: under Server they
+ride the Date-header tick (once a second, one `loop.time()` then compare).
+Idle is armed only when the connection is idle; trickle bytes do not reset
+the header deadline. `RequestPolicy.max_pipelined_requests` (default 8) caps
+the pipeline queue. Body stall is a generation counter — chunks do not
+`call_later`.
 
 Same-machine callback vs 10ms-sweep vs timeouts-off vs 50ms-sweep:
 `benchmarks/server/baseline-20260828.md`. Sweep ≈ callback on plaintext;
 timeouts-off is ~+5% plaintext (not worth dropping timeouts);
-10ms sweep was −7% on 2MB stream; 50ms sweep recovered 2MB (3,734 stream /
-3,471 buffer) and kept plaintext at 130.8k.
+10ms sweep was −7% on 2MB stream; 50ms recovered 2MB. Production now uses
+the 1s Date tick (5s/30s timeouts do not need 50ms).
