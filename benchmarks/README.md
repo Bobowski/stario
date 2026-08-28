@@ -1,14 +1,42 @@
 # Stario benchmarks
 
-Two suites, one per layer we care about:
+Three suites, one per layer we care about:
 
 - `html/` — HTML generation speed: stario against other Python renderers, plus
   microbenchmarks for stario's own hot paths.
 - `server/` — end-to-end HTTP throughput: Stario against native Python HTTP
   servers and ASGI framework stacks under `wrk`.
+- `headers_micro.py` — Cython request-header storage tradeoffs: eager dict,
+  current-style lazy dict, direct arena scans, and adaptive promotion.
 
 The goal is repeatable local signal, not lab-grade numbers. Run on a quiet
 machine and compare repeated runs before drawing conclusions.
+
+## Request-header storage (`headers_micro.py`)
+
+This benchmark informs the Cython protocol's request-header representation. It
+models pooled exchange state and compares complete parse-plus-handler-access
+cycles for 8, 16, and 32 fields. Workloads include no application reads, one
+or several arbitrary reads, repeated reads, and single/repeated Cookie fields.
+
+The Cython backend verifies that every representation returns identical values
+before measuring it. Header names are normalized and hashed while entering the
+arena; lookup queries use normalized bytes, matching the protocol's internal
+header path.
+
+```bash
+PYTHONPATH=src:. .venv/bin/python benchmarks/headers_micro.py
+```
+
+Defaults are 100,000 logical requests and seven repeats per case. Override
+them or retain machine-readable results with:
+
+```bash
+HEADERS_BENCH_ITERATIONS=200000 \
+HEADERS_BENCH_REPEATS=9 \
+HEADERS_BENCH_JSON=/tmp/headers-micro.json \
+PYTHONPATH=src:. .venv/bin/python benchmarks/headers_micro.py
+```
 
 ## HTML generation (`html/`)
 
@@ -228,9 +256,10 @@ Each run writes a timestamped directory under `benchmarks/server/results/`:
 - `summary.md` — grouped markdown tables.
 - `config.txt` — run settings.
 
-A committed reference baseline (hardware, methodology, tables) lives at
-`benchmarks/server/baseline-20260824.md`. Timestamped `results/` dirs remain
-gitignored.
+A committed reference baseline (hardware, methodology, Python vs Cython tables)
+lives at `benchmarks/server/baseline-20260827.md`. The previous capture with
+native/ASGI competitor rows is `benchmarks/server/baseline-20260824.md`.
+Timestamped `results/` dirs remain gitignored.
 
 Successful runs keep only `summary.md` and `config.txt` by default. Use
 `KEEP_RAW=1` to keep the per-endpoint `wrk` output and server logs. Failed
