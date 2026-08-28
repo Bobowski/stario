@@ -25,39 +25,18 @@ only. Python Stario still negotiates zstd.
 `PYTHONPATH=src` is required so `stario_cython` resolves after the inplace
 build.
 
-## Python vs Cython (2026-08-27)
+## Merge snapshot (2026-08-28)
 
-Official `benchmarks/server` suite, same machine, one worker, `10s` × 5 measured
-+ 1 warmup, IQR trimming. Full tables and reproduce steps:
-`benchmarks/server/baseline-20260827.md`.
+Official `benchmarks/server` suite, one worker, `10s` × 5 measured + 1
+warmup, IQR trimming. Full lab log:
+[`benchmarks/server/baseline-20260828.md`](benchmarks/server/baseline-20260828.md).
 
-| Endpoint | Python httptools | Cython llhttp | Cython / Python |
-| --- | ---: | ---: | ---: |
-| Plaintext | 72,734 ± 647 | 125,160 ± 298 | 1.72× |
-| JSON | 71,042 ± 582 | 123,017 ± 3,211 | 1.73× |
-| Params | 71,033 ± 1,669 | 117,136 ± 2,590 | 1.65× |
-| Validate JSON | 56,663 ± 1,621 | 69,992 ± 838 | 1.24× |
-| Form POST | 60,476 ± 1,105 | 73,163 ± 361 | 1.21× |
-| JSON 1KB | 56,451 ± 276 | 66,933 ± 104 | 1.19× |
-| Octet 64KB | 25,228 ± 219 | 24,229 ± 244 | 0.96× |
-| Octet 2MB (buffer) | 2,062 ± 292 | 2,947 ± 35 | 1.43× |
-| Octet 2MB (stream) | 2,863 ± 15 | 3,208 ± 8 | 1.12× |
-| Multipart 2MB | 2,047 ± 173 | 2,905 ± 60 | 1.42× |
+### vs unmodified `cython-core` (current Cython)
 
-Read paths ~1.7×. Small POST ~1.2×. 64KB ingest even. Buffered 2MB, streaming 2MB,
-and multipart are ahead of Python after pre-sizing Content-Length bodies and
-pausing `body()` at 64KiB between parser quantums.
+`f80d6f0` (`20260828T153450Z`) → this branch `460114d`
+(`20260828T154518Z`). Same host, sequential.
 
-## Hot path + timeouts vs `cython-core` (2026-08-28)
-
-Same machine, official suite, unmodified `cython-core` (`f80d6f0`, run
-`20260828T153450Z`) vs this branch (`460114d`, run `20260828T154518Z`).
-Full table: `benchmarks/server/baseline-20260828.md`.
-Do not mix these Cython rows with the 2026-08-27 Python column (different
-host class), or with the earlier same-day PR #33-only capture
-(`20260828T110114Z`) from a prior VM.
-
-| Endpoint | Unmodified `cython-core` | This branch | Ratio |
+| Endpoint | Current (`cython-core`) | This branch | Ratio |
 | --- | ---: | ---: | ---: |
 | Plaintext | 125,495 ± 879 | 130,032 ± 602 | **1.04×** |
 | JSON | 121,997 ± 2,671 | 119,338 ± 4,601 | 0.98× |
@@ -70,21 +49,49 @@ host class), or with the earlier same-day PR #33-only capture
 | Octet 2MB (stream) | 3,435 ± 48 | 3,391 ± 120 | 0.99× |
 | Multipart 2MB | 2,998 ± 59 | 3,178 ± 18 | **1.06×** |
 
-Small POST and the 64KiB octet fixture (exactly the deferral cap) jump because
-`body()` no longer waits on an Event during `llhttp_execute`. Header/idle
-timeouts reuse one timer handle per connection; plaintext is **+3.6%** (not
-killed). JSON and 2MB stream sit inside sample noise. 2MB buffer did not
-regress.
+Small POST and the 64KiB fixture jump because deferred Content-Length ≤64KiB
+bodies complete before the handler’s `body()` wait. GET / 2MB stream are
+noise. Timeouts did not kill plaintext (+3.6%).
 
-Header, idle, and body-stall timeouts share one cleanup: under Server they
-ride the Date-header tick (once a second, one `loop.time()` then compare).
-Idle is armed only when the connection is idle; trickle bytes do not reset
-the header deadline. `RequestPolicy.max_pipelined_requests` (default 8) caps
-the pipeline queue. Body stall is a generation counter — chunks do not
-`call_later`.
+### vs Python httptools (current Python Stario)
 
-Same-machine callback vs 10ms-sweep vs timeouts-off vs 50ms-sweep vs
-1s Date tick: `benchmarks/server/baseline-20260828.md`. Sweep ≈ callback
-on plaintext; timeouts-off is ~+5% plaintext (not worth dropping timeouts);
-10ms sweep was −7% on 2MB stream; 50ms recovered 2MB. **1s Date tick vs
-50ms vs callbacks is a wash on plaintext** (129.3k / 130.8k / 128.0k).
+Same suite `20260828T193136Z`. Python: `stario.cli serve`. Cython:
+`python -m stario_cython`.
+
+| Endpoint | Current Python | This Cython | Cython / Python |
+| --- | ---: | ---: | ---: |
+| Plaintext | 74,752 ± 274 | 132,903 ± 3,484 | **1.78×** |
+| JSON | 72,983 ± 1,742 | 133,817 ± 7,033 | **1.83×** |
+| Params | 70,804 ± 95 | 126,707 ± 5,128 | **1.79×** |
+| Validate JSON | 56,566 ± 619 | 112,068 ± 4,145 | **1.98×** |
+| Form POST | 60,305 ± 106 | 123,813 ± 1,677 | **2.05×** |
+| JSON 1KB | 55,945 ± 431 | 110,946 ± 4,462 | **1.98×** |
+| Octet 64KB | 20,065 ± 202 | 37,772 ± 487 | **1.88×** |
+| Octet 2MB (buffer) | 1,981 ± 33 | 3,441 ± 20 | **1.74×** |
+| Octet 2MB (stream) | 2,969 ± 7 | 3,652 ± 16 | **1.23×** |
+| Multipart 2MB | 2,007 ± 80 | 3,563 ± 99 | **1.77×** |
+
+GET ~1.8×. Small POST ~2.0× (was ~1.2× on 27 Aug). 2MB stream 1.23×.
+
+### Timeouts that land
+
+Header, idle, and body-stall share **one** cleanup: the Date-header tick
+(1s) calls `check_timeouts(now)` on live connections. One `loop.time()`
+per wake. No extra sweeper, no per-request `TimerHandle`, no stall
+`call_later` per chunk.
+
+| | |
+| --- | --- |
+| Header | 5s, while headers or a deferred small body are still arriving |
+| Idle | 5s, only when the connection is idle |
+| Body stall | 30s, generation counter on the exchange |
+| Pipeline cap | 8 |
+| Tests | fallback sweeper at 50ms (`STARIO_CYTHON_TIMEOUT_SWEEP`) |
+| Hatch | `STARIO_CYTHON_TIMEOUTS=off` |
+
+wrk: sweep ≈ callbacks on plaintext; timeouts-off ~+5% plaintext (keep
+timeouts); 10ms sweep −7% on 2MB stream; 50ms and 1s Date tick are a wash
+(129.3k / 130.8k / 128.0k). Callbacks were deleted.
+
+App/Router stay Python. Do not revive dual Cython App/Router, a contiguous
+serializer, pooled `asyncio.Event`, or static/pre-serialized handlers.
