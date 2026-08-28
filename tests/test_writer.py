@@ -554,6 +554,23 @@ class TestWriterRaw:
         finally:
             loop.close()
 
+    def test_respond_writes_set_cookie_and_custom_headers(self):
+        w, sink, loop = _make_writer()
+        try:
+            cookies.set_cookie(w, "session", "abc123")
+            cookies.set_cookie(w, "theme", "dark")
+            w.headers.set("X-Request-ID", "in-1")
+            w.respond(b"ok", b"text/plain")
+            payload = bytes(sink)
+            assert b"x-request-id: in-1\r\n" in payload
+            assert b"session=abc123" in payload
+            assert b"theme=dark" in payload
+            assert payload.lower().count(b"set-cookie:") == 2
+            assert payload.count(b"content-type: text/plain\r\n") == 1
+            assert payload.endswith(b"ok")
+        finally:
+            loop.close()
+
     def test_respond_errors_on_date_or_transfer_encoding(self):
         w, _sink, loop = _make_writer()
         try:

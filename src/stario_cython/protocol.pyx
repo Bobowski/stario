@@ -627,7 +627,7 @@ cdef class HttpProtocol:
         if transport is None or transport.is_closing():
             self._drop_pending()
             return
-        # User may have set Connection: close on the response Headers dict.
+        # User may have set Connection: close on the response Headers.
         conn = exchange.headers.c_get(b"connection")
         if conn is not None and (
             conn == b"close" or conn.lower() == b"close"

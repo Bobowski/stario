@@ -28,49 +28,6 @@ def _response_may_have_body(status_code: int) -> bool:
     return status_code not in _NO_BODY_STATUSES and not 100 <= status_code < 200
 
 
-def _append_wire_headers(parts: list[bytes], headers: Headers) -> None:
-    """Append header lines to `parts` for the writer hot path."""
-    headers.unsafe_append_wire_lines(parts)
-
-
-def _check_respond_owned(headers: Headers, content_type: bytes) -> None:
-    if headers.unsafe_get(b"date") is not None:
-        raise StarioRuntime(
-            "Date is emitted by respond(); do not set it on w.headers.",
-            help_text="The writer supplies Date on every response.",
-        )
-    if headers.unsafe_get(b"transfer-encoding") is not None:
-        raise StarioRuntime(
-            "respond() always sends Content-Length; do not set Transfer-Encoding.",
-            help_text="Use write_headers() when you need chunked encoding.",
-        )
-    existing = headers.unsafe_get(b"content-type")
-    if existing is not None and existing != content_type:
-        raise StarioRuntime(
-            "Content-Type on w.headers does not match respond()",
-            context={"headers": existing, "respond": content_type},
-            help_text=(
-                "Omit Content-Type on w.headers and pass it as respond()'s "
-                "content_type argument. If you set it, it must match."
-            ),
-        )
-
-
-def _check_respond_length(headers: Headers, content_length: bytes) -> None:
-    existing = headers.unsafe_get(b"content-length")
-    if existing is None:
-        return
-    if existing != content_length:
-        raise StarioRuntime(
-            "Content-Length on w.headers does not match respond()",
-            context={"headers": existing, "respond": content_length},
-            help_text=(
-                "Omit Content-Length on w.headers; respond() derives it from "
-                "the on-wire body (after compression). If you set it, it must match."
-            ),
-        )
-
-
 @lru_cache(maxsize=128)
 def get_status_line(status_code: int) -> bytes:
     """Build HTTP/1.1 status line."""
@@ -206,9 +163,10 @@ class Writer:
         self._bind_declared_length(
             0 if not _response_may_have_body(status) else len(body)
         )
-        # Empty maps cannot conflict with Date/Content-Type/Content-Length.
+        existing_ce = None
+        existing_cl = None
         if h:
-            _check_respond_owned(h, content_type)
+            existing_ce, existing_cl = h.respond_scan(content_type)
 
         # Minimal fast path: no custom headers and no compression work.
         if not h and (
@@ -242,7 +200,7 @@ class Writer:
             # Content-Length is set.
             if not _response_may_have_body(status):
                 body = b""
-            elif h.unsafe_get(b"content-encoding") is None:
+            elif existing_ce is None:
                 compressor = self._compression.select(
                     self._accept_encoding,
                     data=body,
@@ -254,13 +212,14 @@ class Writer:
                     merge_vary(h, b"accept-encoding")
 
             final_length = b"%d" % len(body)
-            _check_respond_length(h, final_length)
+            if existing_cl is not None:
+                h.require_respond_length(existing_cl, final_length)
             h.unsafe_set(b"content-type", content_type)
             h.unsafe_set(b"content-length", final_length)
             self._bind_declared_length(len(body))
 
             parts = [get_status_line(status), self._get_date_header()]
-            _append_wire_headers(parts, h)
+            h.unsafe_append_wire_lines(parts)
             parts.append(b"\r\n")
             parts.append(body)
             content = b"".join(parts)
@@ -346,10 +305,7 @@ class Writer:
                 merge_vary(headers, b"accept-encoding")
 
         parts = [get_status_line(status_code), self._get_date_header()]
-        # Hot path: read headers._data directly and append wire chunks separately.
-        # iter_items() / unsafe_items() add generator or list overhead here; name+value
-        # concat allocates an intermediate bytes per line. Four appends + join is fastest.
-        _append_wire_headers(parts, headers)
+        headers.unsafe_append_wire_lines(parts)
         parts.append(b"\r\n")
         self._transport.write(b"".join(parts))
         self._status_code = status_code

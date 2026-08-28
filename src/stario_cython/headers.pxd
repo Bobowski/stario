@@ -16,9 +16,6 @@ cdef inline void _lower_copy(
 
 cdef enum:
     HEADER_NAME_STACK = 256
-    SKIP_NONE = 0
-    SKIP_TYPE_LENGTH = 1
-    SKIP_TYPE_LENGTH_ENCODING = 2
 
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
 cdef object _intern_name(const char* src, size_t n)
@@ -41,15 +38,13 @@ cdef class Headers:
     cdef bint c_vary_contains(self, object token)
     cdef void c_merge_vary(self, object token)
     cdef int _add_ba(self, object buf, Py_ssize_t* length, const char* src, Py_ssize_t n) except -1
-    cdef int _write_pairs(self, object buf, Py_ssize_t* length, int skip_mode) except -1
+    cdef int _write_pair_at(self, object buf, Py_ssize_t* length, Py_ssize_t index) except -1
     cdef int c_write_wire_ba(self, object buf, Py_ssize_t* length) except -1
-    cdef int c_write_response_wire_ba(
+    cdef object c_scan_respond(self, object content_type)
+    cdef void c_require_respond_length(self, object existing_cl, object expected) except *
+    cdef int c_write_respond_pairs(
         self,
         object buf,
         Py_ssize_t* length,
-    ) except -1
-    cdef int c_write_compressed_response_wire_ba(
-        self,
-        object buf,
-        Py_ssize_t* length,
+        bint skip_ce,
     ) except -1

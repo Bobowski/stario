@@ -1,12 +1,13 @@
 # cython: language_level=3
-"""Response headers as a retained pair list, plus the intern table.
+"""One Headers type: a retained pair list plus the intern table.
 
 Application ``get``/``set`` still see clean names and values. Internally each
 pair is stored already shaped for the writer: ``name: `` and ``value\\r\\n``.
-Lookup is a linear scan (typical response maps are a handful of fields).
-``Set-Cookie`` stays repeated pairs instead of a Python dict-of-lists.
+Lookup is a linear scan (typical maps are a handful of fields). ``Set-Cookie``
+stays repeated pairs. ``respond()`` walks the arrays once to validate owned
+names, then dumps them with two ``memcpy``s per pair.
 
-Request wire storage belongs to ``RequestExchange``.
+Request wire storage belongs to ``RequestExchange`` (arena + ``RequestHeaders``).
 """
 
 from libc.stdint cimport uint8_t, uint32_t
@@ -21,6 +22,8 @@ from cpython.bytes cimport (
     PyBytes_FromStringAndSize,
     PyBytes_GET_SIZE,
 )
+
+from stario.exceptions import StarioRuntime
 
 cdef bytes _VALID_VALUE = bytes(
     b for b in range(256) if b == 0x09 or (b >= 0x20 and b != 0x7F)
@@ -117,6 +120,18 @@ cdef uint8_t _INTERN_SLOT[INTERN_TABLE_SIZE]
 cdef list _INTERN_PY = []
 cdef list _INTERN_WIRE = []
 cdef int _INTERN_COUNT = 0
+cdef object WIRE_DATE
+cdef object WIRE_CONTENT_TYPE
+cdef object WIRE_CONTENT_LENGTH
+cdef object WIRE_CONTENT_ENCODING
+cdef object WIRE_TRANSFER_ENCODING
+cdef object WIRE_SET_COOKIE
+cdef object RESPOND_DATE_ERROR = (
+    "Date is emitted by respond(); do not set it on w.headers."
+)
+cdef object RESPOND_TE_ERROR = (
+    "respond() always sends Content-Length; do not set Transfer-Encoding."
+)
 
 
 cdef inline uint32_t _hash_bytes(const char* src, size_t n) noexcept:
@@ -195,6 +210,7 @@ cdef void _init_intern() noexcept:
     _intern_add("allow")
     _intern_add("last-event-id")
     _intern_add("date")
+    _intern_add("set-cookie")
 
 
 _init_intern()
@@ -250,6 +266,14 @@ cdef object _intern_wire_name(const char* src, size_t n):
     if index < 0:
         return _make_wire_name(src, n)
     return _INTERN_WIRE[index]
+
+
+WIRE_DATE = _intern_wire_name("date", 4)
+WIRE_CONTENT_TYPE = _intern_wire_name("content-type", 12)
+WIRE_CONTENT_LENGTH = _intern_wire_name("content-length", 14)
+WIRE_CONTENT_ENCODING = _intern_wire_name("content-encoding", 16)
+WIRE_TRANSFER_ENCODING = _intern_wire_name("transfer-encoding", 17)
+WIRE_SET_COOKIE = _intern_wire_name("set-cookie", 10)
 
 
 cdef object _value_line(object value):
@@ -308,6 +332,11 @@ cdef object _encode_value(str value):
     if raw.translate(None, _VALID_VALUE):
         raise ValueError(f"Invalid header value: {value}")
     return raw
+
+
+def encode_header_value(str value):
+    """Validate and return wire bytes for a header value."""
+    return _encode_value(value)
 
 
 cdef class Headers:
@@ -463,40 +492,26 @@ cdef class Headers:
         length[0] = need
         return 0
 
-    cdef int _write_pairs(
+    cdef int _write_pair_at(
         self,
         object buf,
         Py_ssize_t* length,
-        int skip_mode,
+        Py_ssize_t index,
     ) except -1:
-        cdef Py_ssize_t i
-        cdef bytes name
-        cdef bytes value
-        cdef const char* ns
-        cdef Py_ssize_t nn
-        for i in range(self._n):
-            name = <bytes>self._names[i]
-            nn = PyBytes_GET_SIZE(name)
-            ns = PyBytes_AS_STRING(name)
-            if skip_mode != SKIP_NONE:
-                if (
-                    _wire_is(name, "content-type", 12)
-                    or _wire_is(name, "content-length", 14)
-                ):
-                    continue
-                if (
-                    skip_mode == SKIP_TYPE_LENGTH_ENCODING
-                    and _wire_is(name, "content-encoding", 16)
-                ):
-                    continue
-            self._add_ba(buf, length, ns, nn)
-            value = <bytes>self._values[i]
-            self._add_ba(
-                buf,
-                length,
-                PyBytes_AS_STRING(value),
-                PyBytes_GET_SIZE(value),
-            )
+        cdef bytes name = <bytes>self._names[index]
+        cdef bytes value = <bytes>self._values[index]
+        self._add_ba(
+            buf,
+            length,
+            PyBytes_AS_STRING(name),
+            PyBytes_GET_SIZE(name),
+        )
+        self._add_ba(
+            buf,
+            length,
+            PyBytes_AS_STRING(value),
+            PyBytes_GET_SIZE(value),
+        )
         return 0
 
     cdef int c_write_wire_ba(
@@ -504,21 +519,84 @@ cdef class Headers:
         object buf,
         Py_ssize_t* length,
     ) except -1:
-        return self._write_pairs(buf, length, SKIP_NONE)
+        cdef Py_ssize_t i
+        for i in range(self._n):
+            self._write_pair_at(buf, length, i)
+        return 0
 
-    cdef int c_write_response_wire_ba(
+    cdef object c_scan_respond(self, object content_type):
+        cdef Py_ssize_t i
+        cdef object name
+        cdef object value
+        cdef object existing_ce = None
+        cdef object existing_cl = None
+        for i in range(self._n):
+            name = self._names[i]
+            if name is WIRE_DATE:
+                raise StarioRuntime(
+                    RESPOND_DATE_ERROR,
+                    help_text="The writer supplies Date on every response.",
+                )
+            if name is WIRE_TRANSFER_ENCODING:
+                raise StarioRuntime(
+                    RESPOND_TE_ERROR,
+                    help_text="Use write_headers() when you need chunked encoding.",
+                )
+            if name is WIRE_CONTENT_TYPE:
+                value = _bare_bytes(self._values[i], 2)
+                if value != content_type:
+                    raise StarioRuntime(
+                        "Content-Type on w.headers does not match respond()",
+                        context={"headers": value, "respond": content_type},
+                        help_text=(
+                            "Omit Content-Type on w.headers and pass it as "
+                            "respond()'s content_type argument. If you set it, "
+                            "it must match."
+                        ),
+                    )
+                continue
+            if name is WIRE_CONTENT_LENGTH:
+                existing_cl = _bare_bytes(self._values[i], 2)
+                continue
+            if name is WIRE_CONTENT_ENCODING:
+                existing_ce = _bare_bytes(self._values[i], 2)
+        return existing_ce, existing_cl
+
+    cdef void c_require_respond_length(
+        self,
+        object existing_cl,
+        object expected,
+    ) except *:
+        if existing_cl is None:
+            return
+        if existing_cl != expected:
+            raise StarioRuntime(
+                "Content-Length on w.headers does not match respond()",
+                context={"headers": existing_cl, "respond": expected},
+                help_text=(
+                    "Omit Content-Length on w.headers; respond() derives it from "
+                    "the on-wire body (after compression). If you set it, it must match."
+                ),
+            )
+
+    cdef int c_write_respond_pairs(
         self,
         object buf,
         Py_ssize_t* length,
+        bint skip_ce,
     ) except -1:
-        return self._write_pairs(buf, length, SKIP_TYPE_LENGTH)
-
-    cdef int c_write_compressed_response_wire_ba(
-        self,
-        object buf,
-        Py_ssize_t* length,
-    ) except -1:
-        return self._write_pairs(buf, length, SKIP_TYPE_LENGTH_ENCODING)
+        cdef Py_ssize_t i
+        cdef object name
+        for i in range(self._n):
+            name = self._names[i]
+            if (
+                name is WIRE_CONTENT_TYPE
+                or name is WIRE_CONTENT_LENGTH
+                or (skip_ce and name is WIRE_CONTENT_ENCODING)
+            ):
+                continue
+            self._write_pair_at(buf, length, i)
+        return 0
 
     def add(self, str name, str value):
         self.c_add(_encode_name(name), _encode_value(value))
@@ -593,6 +671,35 @@ cdef class Headers:
             ))
         return result
 
+    def respond_scan(self, content_type):
+        """One walk: Date/TE errors, Content-Type match, capture CE and CL."""
+        return self.c_scan_respond(content_type)
+
+    def require_respond_length(self, existing_cl, expected):
+        self.c_require_respond_length(existing_cl, expected)
+
+    def unsafe_append_wire_lines(self, list parts):
+        """Append pre-baked ``name: `` / ``value\\r\\n`` pairs for the writer."""
+        cdef Py_ssize_t i
+        for i in range(self._n):
+            parts.append(self._names[i])
+            parts.append(self._values[i])
+
+    def unsafe_append_respond_lines(self, list parts, bint skip_ce=False):
+        """Append extra respond() headers, skipping owned Content-Type/Length."""
+        cdef Py_ssize_t i
+        cdef object name
+        for i in range(self._n):
+            name = self._names[i]
+            if (
+                name is WIRE_CONTENT_TYPE
+                or name is WIRE_CONTENT_LENGTH
+                or (skip_ce and name is WIRE_CONTENT_ENCODING)
+            ):
+                continue
+            parts.append(name)
+            parts.append(self._values[i])
+
     def __contains__(self, name):
         cdef char buf[NAME_STACK]
         cdef Py_ssize_t n
@@ -601,6 +708,9 @@ cdef class Headers:
         except (TypeError, ValueError):
             return False
         return self._find_n(buf, n) >= 0
+
+    def __bool__(self):
+        return self._n != 0
 
     def __len__(self):
         cdef set seen = set()

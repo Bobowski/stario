@@ -6,12 +6,12 @@ import pytest
 from stario_cython.headers import Headers
 
 from stario import App
+import stario.cookies as cookies
 from stario.exceptions import StarioError, StarioRuntime
-from stario.http.compression import CompressionConfig
-from tests.cython.http import read_chunk, read_response, running_server
 
 
 def test_headers_public_api():
+    assert PublicHeaders is Headers
     headers = Headers()
     headers.set("Host", "example.com")
     headers.add("Accept", "text/html")
@@ -647,6 +647,50 @@ async def test_respond_writes_extra_headers_before_derived_type_and_length() -> 
             extra_at = block.find(b"x-custom: present\r\n")
             type_at = block.find(b"content-type: text/plain; charset=utf-8\r\n")
             assert extra_at != -1 and extra_at < type_at
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_respond_reads_input_headers_and_writes_cookies() -> None:
+    app = App()
+
+    async def echo(_c, w):
+        assert _c.req.cookies.get("session") == "abc123"
+        assert _c.req.headers.get("authorization") == "Bearer tok"
+        assert _c.req.headers.get("x-request-id") == "in-1"
+        w.headers.set("X-Request-ID", _c.req.headers.get("x-request-id") or "")
+        cookies.set_cookie(w, "session", "abc123")
+        cookies.set_cookie(w, "theme", "dark")
+        w.respond(b"hello", b"text/plain; charset=utf-8")
+
+    app.get("/", echo)
+    async with running_server(app, date=b"date: now\r\n") as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Authorization: Bearer tok\r\n"
+                b"Cookie: session=abc123\r\n"
+                b"X-Request-ID: in-1\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await read_response(reader)
+            header, body = payload.split(b"\r\n\r\n", 1)
+            block = header + b"\r\n"
+            assert body == b"hello"
+            assert b"x-request-id: in-1\r\n" in block
+            assert b"session=abc123" in block
+            assert b"theme=dark" in block
+            assert block.lower().count(b"set-cookie:") == 2
+            assert b"content-type: text/plain; charset=utf-8\r\n" in block
+            assert b"content-length: 5\r\n" in block
+            cookies_at = block.lower().find(b"set-cookie:")
+            type_at = block.find(b"content-type: text/plain; charset=utf-8\r\n")
+            assert cookies_at != -1 and cookies_at < type_at
         finally:
             writer.close()
             await writer.wait_closed()
