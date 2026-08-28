@@ -62,6 +62,8 @@ Targets:
 - `blacksheep-uvicorn` — BlackSheep on one Uvicorn worker
 - `blacksheep-granian` — BlackSheep on one Granian worker
 - `sanic` — Sanic in one process
+- `falcon` — Falcon ASGI on one Uvicorn worker
+- `robyn` — Robyn on one process and one worker thread
 
 ### Benchmark shape
 
@@ -72,11 +74,17 @@ Targets:
 - JSON response bodies use `ujson` for Stario and FastAPI to match Sanic's
   `ujson` dependency more closely.
 - Stario runs with `STARIO_TRACER=noop`; FastAPI, BlackSheep/Uvicorn,
-  BlackSheep/Granian, and Sanic run with access logging disabled.
+  BlackSheep/Granian, Falcon, and Sanic run with access logging disabled.
+- Robyn runs with `--processes 1 --workers 1 --log-level WARN
+  --disable-openapi` (no per-request access log middleware; OpenAPI routes off).
+  Handlers are sync, static GET routes use `const=True`, and handlers return bare
+  `str`/`dict` so Robyn's Rust executor can serve them (manual `Response` objects
+  force a slower Python path). JSON on the fast path uses Robyn's native orjson
+  serialization; validate still parses with `ujson` for parity with other targets.
 
 FastAPI uses Pydantic validation, matching the referenced benchmark. Stario,
-BlackSheep, and Sanic validate the JSON body manually because they do not
-bundle a Pydantic-style request validation layer.
+BlackSheep, Falcon, Robyn, and Sanic validate the JSON body manually because
+they do not bundle a Pydantic-style request validation layer.
 
 ### Requirements
 

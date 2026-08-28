@@ -13,7 +13,7 @@ THREADS="${THREADS:-2}"
 CONNECTIONS="${CONNECTIONS:-${CONCURRENCY:-128}}"
 PYTHON="${PYTHON:-3.14}"
 KEEP_RAW="${KEEP_RAW:-0}"
-TARGETS=(stario fastapi blacksheep-uvicorn blacksheep-granian sanic)
+TARGETS=(stario fastapi blacksheep-uvicorn blacksheep-granian sanic falcon robyn)
 ENDPOINTS=(plaintext json params validate)
 
 RUN_DIR=""
@@ -23,12 +23,13 @@ SERVER_CMD=()
 
 usage() {
   cat <<'EOF'
-Usage: benchmarks/server/run.sh [stario|fastapi|blacksheep-uvicorn|blacksheep-granian|sanic ...]
+Usage: benchmarks/server/run.sh [stario|fastapi|blacksheep-uvicorn|blacksheep-granian|sanic|falcon|robyn ...]
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 HOST=127.0.0.1 PORT=3000 PYTHON=3.14 REFRESH_ENVS=1 KEEP_RAW=1
 
 PORT is the base port. Targets use fixed offsets: stario=PORT, fastapi=PORT+1,
-blacksheep-uvicorn=PORT+2, blacksheep-granian=PORT+3, sanic=PORT+4.
+blacksheep-uvicorn=PORT+2, blacksheep-granian=PORT+3, sanic=PORT+4, falcon=PORT+5,
+robyn=PORT+6.
 EOF
 }
 
@@ -126,6 +127,8 @@ ensure_target() {
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
     sanic) ensure_env sanic sanic uvloop ujson ;;
+    falcon) ensure_env falcon falcon 'uvicorn[standard]' ujson ;;
+    robyn) ensure_env robyn robyn ujson ;;
   esac
 }
 
@@ -180,12 +183,32 @@ command_for() {
         --host "$HOST" --port "$SERVER_PORT"
       )
       ;;
+    falcon)
+      uvicorn_cmd falcon apps.falcon_app:app
+      ;;
+    robyn)
+      SERVER_CMD=(
+        "$(python_for robyn)" "$BENCHMARK_DIR/apps/robyn_app.py"
+        --host "$HOST" --port "$SERVER_PORT"
+        --processes 1
+        --workers 1
+        --log-level WARN
+        --disable-openapi
+      )
+      ;;
   esac
 }
 
 stop_server() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
+    local deadline=$((SECONDS + 3))
+    while kill -0 "$SERVER_PID" >/dev/null 2>&1 && ((SECONDS < deadline)); do
+      sleep 0.1
+    done
+    if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+      kill -9 "$SERVER_PID" >/dev/null 2>&1 || true
+    fi
     wait "$SERVER_PID" >/dev/null 2>&1 || true
   fi
   SERVER_PID=""
