@@ -47,3 +47,28 @@ Official `benchmarks/server` suite, same machine, one worker, `10s` × 5 measure
 Read paths ~1.7×. Small POST ~1.2×. 64KB ingest even. Buffered 2MB, streaming 2MB,
 and multipart are ahead of Python after pre-sizing Content-Length bodies and
 pausing `body()` at 64KiB between parser quantums.
+
+## Hot path vs `cython-core` (2026-08-28)
+
+Same machine, official suite, unmodified `cython-core` (`f80d6f0`, run
+`20260828T110114Z`) vs this hot-path work (`174cef7`, run
+`20260828T112246Z`). Full table: `benchmarks/server/baseline-20260828.md`.
+Do not mix these Cython rows with the 2026-08-27 Python column (different
+host class).
+
+| Endpoint | Unmodified `cython-core` | Hot path | Hot / core |
+| --- | ---: | ---: | ---: |
+| Plaintext | 129,230 ± 2,877 | 132,083 ± 4,307 | 1.02× |
+| JSON | 123,825 ± 3,502 | 131,544 ± 825 | 1.06× |
+| Params | 111,894 ± 1,687 | 126,443 ± 252 | 1.13× |
+| Validate JSON | 66,359 ± 234 | 108,084 ± 1,902 | **1.63×** |
+| Form POST | 77,785 ± 1,875 | 131,462 ± 1,629 | **1.69×** |
+| JSON 1KB | 67,892 ± 1,636 | 112,493 ± 3,605 | **1.66×** |
+| Octet 64KB | 24,091 ± 164 | 37,735 ± 131 | **1.57×** |
+| Octet 2MB (buffer) | 3,117 ± 78 | 3,190 ± 31 | 1.02× |
+| Octet 2MB (stream) | 3,480 ± 3 | 3,485 ± 12 | 1.00× |
+| Multipart 2MB | 3,179 ± 151 | 3,350 ± 37 | 1.05× |
+
+Small POST and the 64KiB octet fixture (exactly the deferral cap) jump because
+`body()` no longer waits on an Event during `llhttp_execute`. 2MB paths stay
+header-dispatch and did not regress. Plaintext is within sample noise.
