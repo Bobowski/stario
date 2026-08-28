@@ -73,6 +73,24 @@ Same suite `20260828T193136Z`. Python: `stario.cli serve`. Cython:
 
 GET ~1.8×. Small POST ~2.0× (was ~1.2× on 27 Aug). 2MB stream 1.23×.
 
+### All servers (this host)
+
+Median req/s. Same knobs, one worker. Stario: `20260828T193136Z`. Granian /
+Socketify / Robyn / Django-Bolt: `20260828T183308Z`. BlackSheep+Granian:
+`20260828T180757Z`. Bold is best in that column. Granian is RSGI, no
+framework. Full ± and lab log:
+[`benchmarks/server/baseline-20260828.md`](benchmarks/server/baseline-20260828.md).
+
+| Server | Plaintext | JSON | Params | Validate | Form | JSON 1KB | 64KB | 2MB buf | 2MB stream | Multipart |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Granian RSGI | **146,875** | **144,111** | **146,201** | 106,610 | 118,928 | **114,517** | 31,212 | 1,429 | 3,108 | 3,138 |
+| Stario Cython | 132,903 | 133,817 | 126,707 | **112,068** | **123,813** | 110,946 | **37,772** | **3,441** | 3,652 | **3,563** |
+| Socketify | 122,497 | 103,563 | 79,977 | 13,267 | 19,556 | 13,293 | 12,365 | 674 | **4,062** | 663 |
+| BlackSheep+Granian | 113,487 | 102,801 | 105,259 | 42,628 | 46,420 | 42,622 | 21,029 | 1,214 | 3,155 | 1,228 |
+| Stario Python | 74,752 | 72,983 | 70,804 | 56,566 | 60,305 | 55,945 | 20,065 | 1,981 | 2,969 | 2,007 |
+| Django-Bolt | 30,071 | 31,946 | 30,310 | 25,585 | 26,272 | 26,252 | 20,037 | 1,499 | 1,478 | 1,488 |
+| Robyn | 25,780 | 25,206 | 19,351 | 18,382 | 4,721 | 18,270 | 15,629 | 735 | 751 | 498 |
+
 ### Timeouts that land
 
 Header, idle, and body-stall share **one** cleanup: the Date-header tick
