@@ -84,6 +84,51 @@ async def test_plaintext_and_post_and_keepalive() -> None:
 
 
 @pytest.mark.asyncio
+async def test_small_content_length_body_is_complete_when_handler_runs() -> None:
+    """Content-Length bodies <= 64KiB dispatch after llhttp finishes the message."""
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def echo(c, w):
+        # Deferred dispatch: body() is already complete (no Event wait).
+        payload = await c.req.body()
+        assert payload == b"x" * 1024
+        w.respond(payload, b"text/plain; charset=utf-8")
+
+    app.post("/echo", echo)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"x" * 1024
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 1024\r\n\r\n" + payload
+        )
+        await writer.drain()
+        response = await read_response(reader)
+        assert payload in response
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_fragmented_headers_materialize_correctly() -> None:
     loop = asyncio.get_running_loop()
     app = App()
@@ -714,9 +759,11 @@ async def test_exchange_pool_reuses_across_connections() -> None:
 
 @pytest.mark.asyncio
 async def test_handler_starts_before_content_length_body_arrives() -> None:
+    """Bodies larger than 64KiB still dispatch at headers-complete."""
     loop = asyncio.get_running_loop()
     app = App()
     started = asyncio.Event()
+    payload = b"x" * (65 * 1024)
 
     async def echo(c, w):
         started.set()
@@ -743,13 +790,15 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"
-            b"Content-Length: 5\r\n\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
         )
         await writer.drain()
         await asyncio.wait_for(started.wait(), timeout=1.0)
-        writer.write(b"hello")
+        writer.write(payload)
         await writer.drain()
-        assert b"hello" in await read_response(reader)
+        assert payload in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:
@@ -786,7 +835,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        payload = b"abcdefghij" * 1000  # 10 KiB
+        payload = b"abcdefghij" * 7000  # 70 KiB: above the small-body deferral cap
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"

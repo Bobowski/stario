@@ -1,4 +1,4 @@
-# cython: language_level=3
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """One Headers type: a retained pair list plus the intern table.
 
 Application ``get``/``set`` still see clean names and values. Internally each

@@ -63,6 +63,10 @@ def make_protocol(
     compression: CompressionConfig | None = None,
     max_header_bytes: int = 64 * 1024,
     max_body_bytes: int = 10 * 1024 * 1024,
+    header_timeout: float = 5.0,
+    keep_alive_timeout: float = 5.0,
+    body_timeout: float = 30.0,
+    max_pipelined_requests: int = 8,
 ) -> HttpProtocol:
     if connections is None:
         connections = set()
@@ -75,6 +79,10 @@ def make_protocol(
         connections,
         max_header_bytes=max_header_bytes,
         max_body_bytes=max_body_bytes,
+        header_timeout=header_timeout,
+        keep_alive_timeout=keep_alive_timeout,
+        body_timeout=body_timeout,
+        max_pipelined_requests=max_pipelined_requests,
     )
 
 
@@ -86,6 +94,10 @@ async def running_server(
     compression: CompressionConfig | None = None,
     max_header_bytes: int = 64 * 1024,
     max_body_bytes: int = 10 * 1024 * 1024,
+    header_timeout: float = 5.0,
+    keep_alive_timeout: float = 5.0,
+    body_timeout: float = 30.0,
+    max_pipelined_requests: int = 8,
 ) -> AsyncIterator[int]:
     loop = asyncio.get_running_loop()
     connections: set[HttpProtocol] = set()
@@ -98,6 +110,10 @@ async def running_server(
             compression=compression,
             max_header_bytes=max_header_bytes,
             max_body_bytes=max_body_bytes,
+            header_timeout=header_timeout,
+            keep_alive_timeout=keep_alive_timeout,
+            body_timeout=body_timeout,
+            max_pipelined_requests=max_pipelined_requests,
         ),
         "127.0.0.1",
         free_port(),

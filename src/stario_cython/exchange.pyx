@@ -43,7 +43,7 @@ from stario.http.compression import (
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
-from stario.http.request import DEFAULT_BODY_TIMEOUT, host_without_port
+from stario.http.request import host_without_port
 from stario.http.writer import get_status_line
 
 from stario_cython.compression_buf cimport (
@@ -65,6 +65,7 @@ from stario_cython.headers cimport (
     _intern_name,
     _lower_copy,
 )
+from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
 
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
@@ -93,6 +94,17 @@ cdef int ABORT_NONE = 0
 cdef int ABORT_TOO_LARGE = 1
 cdef int ABORT_DISCONNECTED = 2
 cdef int ABORT_TIMEOUT = 3
+cdef int _TIMEOUT_MODE = 1
+cdef int _TIMEOUT_OFF = 0
+cdef int _TIMEOUT_SWEEP = 1
+
+
+def _bind_timeout_mode():
+    global _TIMEOUT_MODE
+    _TIMEOUT_MODE = <int>_PY_TIMEOUT_MODE
+
+
+_bind_timeout_mode()
 
 cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
 cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
@@ -516,8 +528,15 @@ cdef class ParsedQuery:
         return [(k, v) for k, vals in self._data.items() for v in vals]
 
     def as_dict(self, *, last=False):
-        cdef int i = -1 if last else 0
-        return {k: vals[i] for k, vals in self._data.items()}
+        cdef dict out = {}
+        cdef list vals
+        cdef Py_ssize_t idx
+        for k, vals in self._data.items():
+            if not vals:
+                continue
+            idx = len(vals) - 1 if last else 0
+            out[k] = vals[idx]
+        return out
 
     def as_lists(self):
         return {k: list(v) for k, v in self._data.items()}
@@ -850,7 +869,9 @@ cdef class RequestExchange:
         self._chunks = None
         self._cached = None
         self._data_ready = None
-        self._stall_handle = None
+        self._stall_deadline = 0.0
+        self._stall_touch = 0
+        self._stall_seen = 0
         self._compression = _UNBOUND
         self._brotli_enabled = False
         self._gzip_enabled = False
@@ -1384,6 +1405,7 @@ cdef class RequestExchange:
         list date_box,
         object compression,
         int max_body_size,
+        double body_timeout,
     ) noexcept:
         self.in_pool = False
         if self._connection is not connection:
@@ -1391,11 +1413,11 @@ cdef class RequestExchange:
             self.app = app
             self._transport = transport
             self._date_box = date_box
-            self._max_size = max_body_size
-            self._timeout = DEFAULT_BODY_TIMEOUT
             if self._compression is not compression:
                 self._compression = compression
                 self._apply_compression(compression)
+        self._max_size = max_body_size
+        self._timeout = body_timeout
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
@@ -1449,6 +1471,10 @@ cdef class RequestExchange:
     cdef void start_response(self):
         self.handler_started = True
         self.reset_response(self._req_encoding)
+
+    def on_handler_done(self, task):
+        """``Task.add_done_callback`` entry; recycles after ``App.__call__``."""
+        self.handler_finished()
 
     cdef void handler_finished(self):
         self.handler_done = True
@@ -2032,31 +2058,33 @@ cdef class RequestExchange:
             self._data_ready.set()
 
     cdef void _cancel_stall_timer(self) noexcept:
-        cdef object handle = self._stall_handle
-        if handle is not None:
-            handle.cancel()
-            self._stall_handle = None
+        self._stall_deadline = 0.0
+        self._stall_seen = self._stall_touch
 
     cdef void _reset_stall_timer(self) noexcept:
-        """Arm/refresh slowloris stall timeout while a body consumer is waiting."""
-        cdef object loop
-        cdef object connection
-        self._cancel_stall_timer()
-        if not self._waiting or self._body_complete or self._timeout <= 0:
-            return
-        connection = self._connection
-        if connection is None:
-            return
-        loop = connection.loop
-        self._stall_handle = loop.call_later(self._timeout, self._on_stall_timeout)
+        """Arm/refresh slowloris stall timeout while a body consumer is waiting.
 
-    def _on_stall_timeout(self):
-        self._stall_handle = None
+        Sweep mode only bumps a generation counter. The connection sweeper
+        stores ``now + timeout`` once per wake — body chunks do not call
+        ``loop.time()`` or ``call_later``.
+        """
+        if not self._waiting or self._body_complete or self._timeout <= 0:
+            self._cancel_stall_timer()
+            return
+        if _TIMEOUT_MODE == _TIMEOUT_OFF:
+            self._cancel_stall_timer()
+            return
+        self._stall_touch += 1
+
+    cdef void fire_body_stall(self):
+        self._stall_deadline = 0.0
+        self._stall_seen = self._stall_touch
         if self._abort_reason != ABORT_NONE or self._body_complete:
             return
         self._abort_reason = ABORT_TIMEOUT
         self._clear_body_storage()
-        self._connection.set_body_paused(self, False)
+        if self._connection is not None:
+            self._connection.set_body_paused(self, False)
         self._wake()
 
     cdef void _maybe_continue(self):
@@ -2561,6 +2589,7 @@ cdef RequestExchange acquire_exchange(
     list date_box,
     object compression,
     int max_body_size,
+    double body_timeout,
 ):
     cdef RequestExchange exchange
     if _POOL:
@@ -2574,5 +2603,6 @@ cdef RequestExchange acquire_exchange(
         date_box,
         compression,
         max_body_size,
+        body_timeout,
     )
     return exchange

@@ -47,7 +47,7 @@ extensions = [
     Extension(
         "stario_cython.headers",
         sources=["src/stario_cython/headers.pyx"],
-        extra_compile_args=["-O3"],
+        extra_compile_args=["-O3", "-fno-strict-aliasing"],
     ),
     Extension(
         "stario_cython.exchange",
@@ -58,7 +58,7 @@ extensions = [
         include_dirs=["vendor", "src", *codec_include_dirs],
         library_dirs=codec_library_dirs,
         libraries=codec_libraries,
-        extra_compile_args=["-O3", *codec_compile_args],
+        extra_compile_args=["-O3", "-fno-strict-aliasing", *codec_compile_args],
         extra_link_args=codec_link_args,
     ),
     Extension(
@@ -71,7 +71,7 @@ extensions = [
             "vendor/llhttp/src/stario_alloc.c",
         ],
         include_dirs=["vendor/llhttp/include", "vendor", "src"],
-        extra_compile_args=["-O3"],
+        extra_compile_args=["-O3", "-fno-strict-aliasing"],
     ),
 ]
 

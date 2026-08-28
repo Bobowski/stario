@@ -5,8 +5,8 @@ import brotli
 import pytest
 from stario_cython.headers import Headers
 
-from stario import App
 import stario.cookies as cookies
+from stario import App
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.http.headers import Headers as PublicHeaders
