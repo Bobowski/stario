@@ -342,7 +342,9 @@ command_for() {
           "$(python_for stario-cython)" -m stario_cython apps.stario_app:bootstrap
         )
       else
+        # This branch's Headers live in stario_cython; load inplace .so via src.
         SERVER_CMD=(
+          env PYTHONPATH="$ROOT/src:$BENCHMARK_DIR"
           "$(python_for stario)" -m stario.cli serve apps.stario_app:bootstrap
         )
       fi
