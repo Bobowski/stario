@@ -1,4 +1,4 @@
-"""Cython protocol edge cases. Header/idle timeouts are not implemented."""
+"""Cython protocol edge cases, including header/idle timeouts and pipeline cap."""
 
 from __future__ import annotations
 
@@ -497,6 +497,178 @@ async def test_close_if_idle_skips_in_flight_handler() -> None:
         assert not transport.is_closing()
     finally:
         hang.set()
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_connection_with_no_data_times_out_headers() -> None:
+    proto, app, transport = _attach(header_timeout=0.01)
+    try:
+        await asyncio.sleep(0.03)
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_partial_headers_time_out() -> None:
+    proto, app, transport = _attach(header_timeout=0.01)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\n")
+        await asyncio.sleep(0.03)
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_trickle_headers_do_not_reset_header_timeout() -> None:
+    proto, app, transport = _attach(header_timeout=0.04)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\n")
+        await asyncio.sleep(0.025)
+        proto.data_received(b"Host: t\r\n")
+        await asyncio.sleep(0.025)
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_stalled_deferred_small_body_times_out() -> None:
+    """Small Content-Length bodies dispatch at message-complete. Incomplete
+    bodies must not hang: the header timer stays armed until dispatch."""
+    app = App()
+    hits = 0
+
+    async def handler(c, w) -> None:
+        nonlocal hits
+        hits += 1
+        await c.req.body()
+        responses.text(w, "ok")
+
+    app.post("/", handler)
+    proto, app, transport = _attach(app=app, header_timeout=0.01)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\n"
+        )
+        await asyncio.sleep(0.03)
+        assert transport.is_closing()
+        assert hits == 0
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_complete_request_does_not_keep_header_timer() -> None:
+    app = App()
+
+    async def handler(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(
+        app=app, header_timeout=0.01, keep_alive_timeout=5.0
+    )
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        await asyncio.sleep(0.03)
+        assert not transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_idle_keep_alive_times_out() -> None:
+    app = App()
+
+    async def handler(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(
+        app=app, header_timeout=5.0, keep_alive_timeout=0.01
+    )
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert not transport.is_closing()
+        await asyncio.sleep(0.03)
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_handler_is_not_header_timed_out() -> None:
+    app = App()
+    started = asyncio.Event()
+    hang = asyncio.Event()
+
+    async def handler(_c, w) -> None:
+        started.set()
+        await hang.wait()
+        responses.text(w, "ok")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(app=app, header_timeout=0.01)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await started.wait()
+        await asyncio.sleep(0.03)
+        assert not transport.is_closing()
+    finally:
+        hang.set()
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cap_rejects_ninth_queued_request() -> None:
+    app = App()
+    release = asyncio.Event()
+    handled: list[int] = []
+
+    async def endpoint(c, w) -> None:
+        index = int(c.req.query_bytes)
+        handled.append(index)
+        if index == 0:
+            await release.wait()
+        responses.text(w, str(index))
+
+    app.get("/", endpoint)
+    proto, app, transport = _attach(app=app, max_pipelined_requests=8)
+    try:
+        chunks = [
+            b"GET /?" + str(i).encode("ascii") + b" HTTP/1.1\r\nHost: t\r\n\r\n"
+            for i in range(10)
+        ]
+        proto.data_received(b"".join(chunks))
+        await asyncio.sleep(0)
+        assert response_status(transport.writes) == 429
+        release.set()
+        await _drain(app)
+        assert handled == [0]
+    finally:
         if not transport.is_closing():
             transport.close()
         await _drain(app)

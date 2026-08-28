@@ -43,7 +43,7 @@ from stario.http.compression import (
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
-from stario.http.request import DEFAULT_BODY_TIMEOUT, host_without_port
+from stario.http.request import host_without_port
 from stario.http.writer import get_status_line
 
 from stario_cython.compression_buf cimport (
@@ -1391,6 +1391,7 @@ cdef class RequestExchange:
         list date_box,
         object compression,
         int max_body_size,
+        double body_timeout,
     ) noexcept:
         self.in_pool = False
         if self._connection is not connection:
@@ -1398,11 +1399,11 @@ cdef class RequestExchange:
             self.app = app
             self._transport = transport
             self._date_box = date_box
-            self._max_size = max_body_size
-            self._timeout = DEFAULT_BODY_TIMEOUT
             if self._compression is not compression:
                 self._compression = compression
                 self._apply_compression(compression)
+        self._max_size = max_body_size
+        self._timeout = body_timeout
         self.span = None
         self.route = EMPTY_ROUTE_MATCH
         self._state = None
@@ -2572,6 +2573,7 @@ cdef RequestExchange acquire_exchange(
     list date_box,
     object compression,
     int max_body_size,
+    double body_timeout,
 ):
     cdef RequestExchange exchange
     if _POOL:
@@ -2585,5 +2587,6 @@ cdef RequestExchange acquire_exchange(
         date_box,
         compression,
         max_body_size,
+        body_timeout,
     )
     return exchange

@@ -14,6 +14,12 @@ from libc.string cimport memcmp, memcpy
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from cpython.unicode cimport PyUnicode_DecodeASCII
 
+from stario.http.config import (
+    DEFAULT_HEADER_TIMEOUT,
+    DEFAULT_KEEP_ALIVE_TIMEOUT,
+    DEFAULT_MAX_PIPELINED_REQUESTS,
+)
+from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
 
@@ -170,7 +176,9 @@ cdef int PAUSE_WRITE = 1
 cdef int PAUSE_PIPELINE = 2
 cdef int PAUSE_BODY = 4
 cdef int PARSER_QUANTUM = 512 * 1024
-cdef int MAX_PENDING_EXCHANGES = 64
+cdef int TIMEOUT_NONE = 0
+cdef int TIMEOUT_HEADER = 1
+cdef int TIMEOUT_IDLE = 2
 # GET and large/chunked bodies dispatch at headers-complete. Small
 # Content-Length bodies dispatch at message-complete so body() is cached.
 
@@ -303,6 +311,15 @@ cdef class HttpProtocol:
     cdef int head_bytes
     cdef int max_header_bytes
     cdef int max_body_bytes
+    cdef int max_pipelined_requests
+    cdef double header_timeout
+    cdef double keep_alive_timeout
+    cdef double body_timeout
+    cdef int timeout_kind
+    cdef double timeout_deadline
+    cdef double timeout_handle_when
+    cdef object timeout_handle
+    cdef bint header_timeout_reset
     cdef bint rejected
     cdef bint request_dispatched
     cdef bint request_keep_alive
@@ -330,6 +347,11 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.timeout_kind = TIMEOUT_NONE
+        self.timeout_deadline = 0.0
+        self.timeout_handle_when = 0.0
+        self.timeout_handle = None
+        self.header_timeout_reset = False
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -346,6 +368,10 @@ cdef class HttpProtocol:
         connections,
         max_header_bytes=64 * 1024,
         max_body_bytes=10 * 1024 * 1024,
+        header_timeout=DEFAULT_HEADER_TIMEOUT,
+        keep_alive_timeout=DEFAULT_KEEP_ALIVE_TIMEOUT,
+        body_timeout=DEFAULT_BODY_TIMEOUT,
+        max_pipelined_requests=DEFAULT_MAX_PIPELINED_REQUESTS,
     ):
         self.loop = loop
         self.app = app
@@ -362,9 +388,18 @@ cdef class HttpProtocol:
         self.head_bytes = 0
         self.max_header_bytes = max_header_bytes
         self.max_body_bytes = max_body_bytes
+        self.max_pipelined_requests = max_pipelined_requests
+        self.header_timeout = header_timeout
+        self.keep_alive_timeout = keep_alive_timeout
+        self.body_timeout = body_timeout
         self.rejected = False
         self.request_dispatched = False
         self.request_keep_alive = True
+        self.timeout_kind = TIMEOUT_NONE
+        self.timeout_deadline = 0.0
+        self.timeout_handle_when = 0.0
+        self.timeout_handle = None
+        self.header_timeout_reset = False
 
     def connection_made(self, transport):
         self.transport = transport
@@ -375,7 +410,13 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.rejected = False
+        self.timeout_kind = TIMEOUT_NONE
+        self.timeout_deadline = 0.0
         self.connections.add(self)
+        # First request: header timer only. wrk keep-alive must not re-arm
+        # a TimerHandle per request (see _arm_timeout).
+        self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
 
     def ensure_disconnect(self):
         if self.disconnect is None:
@@ -387,6 +428,7 @@ cdef class HttpProtocol:
     def connection_lost(self, exc):
         cdef RequestExchange exchange
         self.closed = True
+        self._cancel_timeout()
         self.connections.discard(self)
         if self.idle_exchange is not None:
             self.idle_exchange.release_global()
@@ -425,6 +467,11 @@ cdef class HttpProtocol:
     def data_received(self, data):
         if self.rejected or self.parser == NULL or not data:
             return
+        if self.timeout_kind == TIMEOUT_IDLE:
+            # Keep-alive traffic: drop the idle deadline without cancelling
+            # the TimerHandle. The watchdog reschedules or stops when it fires.
+            self.timeout_kind = TIMEOUT_NONE
+            self.timeout_deadline = 0.0
         if self.held_data is not None:
             self.held_data = self.held_data[self.held_offset :] + data
             self.held_offset = 0
@@ -434,6 +481,85 @@ cdef class HttpProtocol:
             self.held_offset = 0
             return
         self._pump_data(data, 0)
+        self._after_pump()
+
+    cdef void _arm_timeout(self, int kind, double seconds):
+        """Arm header or idle deadline. Reuses one TimerHandle per connection.
+
+        wrk keep-alive would die if we ``call_later`` per request. Store a
+        deadline (cheap) and only allocate a handle when none exists, or when
+        the new deadline is *sooner* than the current fire time (slowloris
+        tests with 10ms headers after a 5s idle handle).
+        """
+        cdef object loop
+        cdef object transport
+        cdef double now
+        cdef double deadline
+        transport = self.transport
+        if transport is None or transport.is_closing() or seconds <= 0:
+            return
+        loop = self.loop
+        now = loop.time()
+        deadline = now + seconds
+        self.timeout_kind = kind
+        self.timeout_deadline = deadline
+        if self.timeout_handle is None:
+            self.timeout_handle = loop.call_later(seconds, self._on_timeout)
+            self.timeout_handle_when = deadline
+        elif deadline < self.timeout_handle_when:
+            self.timeout_handle.cancel()
+            self.timeout_handle = loop.call_later(seconds, self._on_timeout)
+            self.timeout_handle_when = deadline
+
+    cdef void _cancel_timeout(self):
+        cdef object handle
+        self.timeout_kind = TIMEOUT_NONE
+        self.timeout_deadline = 0.0
+        self.timeout_handle_when = 0.0
+        handle = self.timeout_handle
+        if handle is not None:
+            handle.cancel()
+            self.timeout_handle = None
+
+    def _on_timeout(self):
+        cdef object transport
+        cdef object loop
+        cdef double now
+        cdef double deadline
+        self.timeout_handle = None
+        self.timeout_handle_when = 0.0
+        if self.rejected:
+            return
+        transport = self.transport
+        if transport is None or transport.is_closing():
+            return
+        deadline = self.timeout_deadline
+        if self.timeout_kind == TIMEOUT_NONE or deadline <= 0:
+            return
+        loop = self.loop
+        now = loop.time()
+        if now < deadline:
+            self.timeout_handle = loop.call_later(deadline - now, self._on_timeout)
+            self.timeout_handle_when = deadline
+            return
+        self.timeout_kind = TIMEOUT_NONE
+        self.timeout_deadline = 0.0
+        transport.close()
+
+    cdef void _after_pump(self):
+        """Arm a header timer only if this read left headers (or a deferred
+        small body) unfinished. Full wrk requests dispatch inside the pump,
+        so this is a no-op on the keep-alive hot path.
+        """
+        if not self.header_timeout_reset:
+            return
+        self.header_timeout_reset = False
+        if (
+            not self.rejected
+            and self.reading_exchange is not None
+            and not self.request_dispatched
+        ):
+            self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
 
     cdef void _pump_data(self, object data, Py_ssize_t offset) noexcept:
         cdef const char* ptr
@@ -501,6 +627,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self._pump_data(data, offset)
+        self._after_pump()
         if self.pause_reasons == 0 and self.held_data is None:
             transport = self.transport
             if transport is not None and not transport.is_closing():
@@ -533,6 +660,7 @@ cdef class HttpProtocol:
         if transport is None or transport.is_closing():
             return False
         transport.close()
+        self._cancel_timeout()
         return True
 
     def pause_writing(self):
@@ -563,6 +691,7 @@ cdef class HttpProtocol:
                 self.date_box,
                 self.compression,
                 self.max_body_bytes,
+                self.body_timeout,
             )
         else:
             # Pool miss: constructing an exchange can raise. Keepalive reuse
@@ -575,6 +704,7 @@ cdef class HttpProtocol:
                     self.date_box,
                     self.compression,
                     self.max_body_bytes,
+                    self.body_timeout,
                 )
             except Exception:
                 self._close_error(400, "Invalid HTTP request")
@@ -582,6 +712,7 @@ cdef class HttpProtocol:
         self.head_bytes = 40
         self.request_dispatched = False
         self.request_keep_alive = True
+        self.header_timeout_reset = True
 
     cdef void _on_url(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
@@ -728,6 +859,9 @@ cdef class HttpProtocol:
     cdef void _dispatch(self, RequestExchange exchange, Request request):
         cdef object span
         self.request_dispatched = True
+        if self.timeout_kind == TIMEOUT_HEADER:
+            self.timeout_kind = TIMEOUT_NONE
+            self.timeout_deadline = 0.0
         if self.noop_span is not None:
             span = self.noop_span
         else:
@@ -736,7 +870,7 @@ cdef class HttpProtocol:
         if self.active_exchange is None:
             self._start_exchange(exchange, True)
         else:
-            if len(self.pending_exchanges) >= MAX_PENDING_EXCHANGES:
+            if len(self.pending_exchanges) >= self.max_pipelined_requests:
                 self._close_error(429, "Too many pipelined requests")
                 return
             self.pending_exchanges.append(exchange)
@@ -798,6 +932,7 @@ cdef class HttpProtocol:
                 self._set_pause_reason(PAUSE_PIPELINE, False)
             return
         self._set_pause_reason(PAUSE_PIPELINE, False)
+        self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
     cdef void _close_error(self, int status, object message) noexcept:
         cdef object transport
@@ -806,6 +941,7 @@ cdef class HttpProtocol:
         if self.rejected:
             return
         self.rejected = True
+        self._cancel_timeout()
         transport = self.transport
         try:
             if transport is None or transport.is_closing():

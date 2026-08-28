@@ -3,8 +3,13 @@
 Lifecycle (signal handling, graceful drain, date-header refresh) is the
 standard ``stario.http.server.Server``. This module injects the compiled
 protocol factory and keeps the Cython defaults (uvloop + NoOpTracer).
-Request-policy knobs the compiled parser does not implement (header/idle
-timeouts, the 8-request pipeline cap) stay unwired.
+
+Header timeout is armed only while headers (or a deferred small body) are
+still arriving. Idle/keep-alive timeout is armed only when the connection
+has no in-flight request. One TimerHandle is reused per connection so wrk
+keep-alive does not ``call_later`` per request. Body stall timeout lives on
+the exchange. ``RequestPolicy.max_pipelined_requests`` (default 8) caps the
+pipeline queue.
 """
 
 from __future__ import annotations
@@ -38,6 +43,10 @@ def _make_cython_protocol(
         connections,
         max_header_bytes=requests.max_header_bytes,
         max_body_bytes=requests.max_body_bytes,
+        header_timeout=requests.header_timeout,
+        keep_alive_timeout=requests.keep_alive_timeout,
+        body_timeout=requests.body_timeout,
+        max_pipelined_requests=requests.max_pipelined_requests,
     )
 
 

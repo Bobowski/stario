@@ -122,6 +122,7 @@ cdef class RequestExchange:
         list date_box,
         object compression,
         int max_body_size,
+        double body_timeout,
     ) noexcept
     cdef void start_response(self)
     cdef void handler_finished(self)
@@ -206,4 +207,5 @@ cdef RequestExchange acquire_exchange(
     list date_box,
     object compression,
     int max_body_size,
+    double body_timeout,
 )
