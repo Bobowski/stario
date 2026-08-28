@@ -93,7 +93,8 @@ server cannot be reused by accident.
 | Target | Server |
 | --- | --- |
 | `stario` | Python httptools protocol |
-| `stario-cython` | Cython llhttp protocol (`cython-core`) |
+| `stario-cython` | Cython llhttp protocol + Cython App/Router (`cython-core`) |
+| `stario-cython-pyapp` | Cython llhttp + Python App (`STARIO_CYTHON_PYTHON_APP=1`) |
 
 **Native HTTP servers**
 
@@ -257,8 +258,10 @@ Each run writes a timestamped directory under `benchmarks/server/results/`:
 - `config.txt` — run settings.
 
 A committed reference baseline (hardware, methodology, Python vs Cython tables)
-lives at `benchmarks/server/baseline-20260827.md`. The previous capture with
-native/ASGI competitor rows is `benchmarks/server/baseline-20260824.md`.
+lives at `benchmarks/server/baseline-20260827.md`. Cython App/Router vs Python
+App vs Granian RSGI is `benchmarks/server/baseline-20260828-app-router.md`.
+The previous capture with native/ASGI competitor rows is
+`benchmarks/server/baseline-20260824.md`.
 Timestamped `results/` dirs remain gitignored.
 
 Successful runs keep only `summary.md` and `config.txt` by default. Use
