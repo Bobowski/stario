@@ -50,6 +50,17 @@ extensions = [
         extra_compile_args=["-O3", "-fno-strict-aliasing"],
     ),
     Extension(
+        "stario_cython.router",
+        sources=["src/stario_cython/router.pyx"],
+        extra_compile_args=["-O3", "-fno-strict-aliasing"],
+    ),
+    Extension(
+        "stario_cython.app",
+        sources=["src/stario_cython/app.pyx"],
+        include_dirs=["vendor", "src"],
+        extra_compile_args=["-O3", "-fno-strict-aliasing"],
+    ),
+    Extension(
         "stario_cython.exchange",
         sources=[
             "src/stario_cython/exchange.pyx",

@@ -6,6 +6,10 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- **PoC:** Cython `Router` + `App` (`stario_cython.router` / `stario_cython.app`) used by `python -m stario_cython`. Hostless exact routes use a static method map; parameterized routes keep a nested match cache and walk path/host in place. Set `STARIO_CYTHON_PYTHON_APP=1` to keep the Python App on the Cython protocol (benchmark baseline). `benchmarks/server/run.sh` target `stario-cython-pyapp` does that.
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

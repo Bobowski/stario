@@ -107,6 +107,7 @@ class Server:
         *,
         config: ServerConfig | None = None,
         make_protocol: ProtocolMaker | None = None,
+        app_factory: Callable[[], Any] | None = None,
     ) -> None:
         """Configure listening, bootstrap, telemetry, and per-connection compression.
 
@@ -116,12 +117,15 @@ class Server:
         - `make_protocol`: Optional factory for a non-default HTTP protocol
           (used by the Cython core). Receives the shared date box so the
           writer can read `date_box[0]` without a per-response call.
+        - `app_factory`: Constructs the `App` (or Cython App drop-in) for this
+          serve. Defaults to `stario.http.app.App`.
         """
 
         self.bootstrap = bootstrap
         self.config = config if config is not None else ServerConfig()
         self.tracer = tracer
         self.make_protocol = make_protocol
+        self.app_factory = app_factory or App
 
         self._used = False
         self._date_box = [b""]
@@ -147,7 +151,7 @@ class Server:
             )
         self._used = True
 
-        app = App()
+        app = self.app_factory()
         span = self._open_startup_span()  # ProxySpan: startup → shutdown via replace()
 
         # Signal handlers stay active through span.end(); see _signal_handlers.
@@ -275,11 +279,7 @@ class Server:
             max(self.config.graceful_shutdown_timeout, 0.0), _FORCE_CLOSE_CAP
         )
         close_deadline = loop.time() + force_close_budget
-        while (
-            connections
-            and not self._urgent_drain
-            and loop.time() < close_deadline
-        ):
+        while connections and not self._urgent_drain and loop.time() < close_deadline:
             force_closed += await self._force_close_open_transports(connections)
             await asyncio.sleep(0)
 

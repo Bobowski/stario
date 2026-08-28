@@ -18,13 +18,14 @@ KEEP_RAW="${KEEP_RAW:-0}"
 WRK="${WRK:-wrk}"
 BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
 TARGETS=(
-  stario stario-cython
+  stario stario-cython stario-cython-pyapp
   socketify robyn granian-rsgi sanic django-bolt
   blacksheep-granian blacksheep-uvicorn fastapi
 )
 TARGET_LABELS=(
   "stario|Stario (Python httptools)"
-  "stario-cython|Stario (Cython llhttp)"
+  "stario-cython|Stario (Cython llhttp, Cython App)"
+  "stario-cython-pyapp|Stario (Cython llhttp, Python App)"
   "socketify|Socketify (uWebSockets/libuv)"
   "robyn|Robyn (Rust/Actix)"
   "granian-rsgi|Granian RSGI (Rust, no framework)"
@@ -35,7 +36,7 @@ TARGET_LABELS=(
   "fastapi|FastAPI + Uvicorn ASGI"
 )
 SUMMARY_GROUPS=(
-  "Stario (this checkout)|stario stario-cython"
+  "Stario (this checkout)|stario stario-cython stario-cython-pyapp"
   "Native HTTP servers|socketify robyn granian-rsgi sanic django-bolt"
   "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
 )
@@ -73,7 +74,7 @@ usage() {
 Usage: benchmarks/server/run.sh [target ...]
 
 Targets (default: all):
-  Stario:              stario, stario-cython
+  Stario:              stario, stario-cython, stario-cython-pyapp
   Native HTTP servers: socketify, robyn, granian-rsgi, sanic, django-bolt
   ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
 
@@ -226,7 +227,12 @@ format_int() {
   printf '%s%s' "$value" "$out"
 }
 
-python_for() { echo "$ENVS_DIR/$1/bin/python"; }
+python_for() {
+  case "$1" in
+    stario-cython-pyapp) echo "$ENVS_DIR/stario-cython/bin/python" ;;
+    *) echo "$ENVS_DIR/$1/bin/python" ;;
+  esac
+}
 
 require_port_free() {
   local python="$1" target="$2" port="$3"
@@ -302,6 +308,9 @@ ensure_target() {
       ensure_env stario-cython "stario @ file://$ROOT" uvloop ujson cython setuptools wheel
       build_stario_cython "$(python_for stario-cython)"
       ;;
+    stario-cython-pyapp)
+      ensure_target stario-cython
+      ;;
     socketify) ensure_env socketify socketify ujson ;;
     robyn) ensure_env robyn robyn ujson ;;
     granian-rsgi) ensure_env granian-rsgi granian uvloop ujson ;;
@@ -328,7 +337,7 @@ uvicorn_cmd() {
 
 command_for() {
   case "$1" in
-    stario|stario-cython)
+    stario|stario-cython|stario-cython-pyapp)
       export STARIO_HOST="$HOST"
       export STARIO_PORT="$SERVER_PORT"
       export STARIO_LOOP=uvloop
@@ -336,10 +345,14 @@ command_for() {
       export STARIO_COMPRESS_ZSTD_LEVEL=-1
       export STARIO_COMPRESS_BROTLI_LEVEL=-1
       export STARIO_COMPRESS_GZIP_LEVEL=-1
-      if [[ "$1" == stario-cython ]]; then
+      if [[ "$1" == stario-cython || "$1" == stario-cython-pyapp ]]; then
+        local app_env=()
+        if [[ "$1" == stario-cython-pyapp ]]; then
+          app_env=(STARIO_CYTHON_PYTHON_APP=1)
+        fi
         SERVER_CMD=(
-          env PYTHONPATH="$ROOT/src:$BENCHMARK_DIR"
-          "$(python_for stario-cython)" -m stario_cython apps.stario_app:bootstrap
+          env PYTHONPATH="$ROOT/src:$BENCHMARK_DIR" "${app_env[@]}"
+          "$(python_for "$1")" -m stario_cython apps.stario_app:bootstrap
         )
       else
         # This branch's Headers live in stario_cython; load inplace .so via src.

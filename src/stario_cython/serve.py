@@ -16,11 +16,15 @@ the exchange — chunks do not ``call_later``. ``RequestPolicy.max_pipelined_req
 (profiling hatch). Under Server the sweep rides the Date-header tick (1s).
 ``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback sweeper period used
 without Server (default 1s).
+
+``STARIO_CYTHON_PYTHON_APP=1`` keeps the Python ``App`` / ``Router`` on this
+protocol so Cython vs Python dispatch can be compared on the same build.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from stario.cli.imports import load_symbol
@@ -29,6 +33,17 @@ from stario.http.config import RequestPolicy, ServerConfig, server_config_from_e
 from stario.http.server import Server
 from stario.telemetry.noop import NoOpTracer
 from stario_cython.protocol import HttpProtocol
+
+
+def _resolve_app_class():
+    """Cython App unless ``STARIO_CYTHON_PYTHON_APP=1`` (Python App baseline)."""
+    if os.environ.get("STARIO_CYTHON_PYTHON_APP") == "1":
+        from stario.http.app import App
+
+        return App
+    from stario_cython.app import App
+
+    return App
 
 
 def _make_cython_protocol(
@@ -83,6 +98,7 @@ def _server(bootstrap: Bootstrap, config: ServerConfig) -> Server:
         NoOpTracer(),
         config=config,
         make_protocol=_make_cython_protocol,
+        app_factory=_resolve_app_class(),
     )
 
 
