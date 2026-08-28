@@ -1,4 +1,4 @@
-# cython: language_level=3
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """asyncio Protocol + llhttp: one TCP connection, pipelining, and dispatch.
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
@@ -6,8 +6,13 @@ URL bytes and header fragments are written into the current exchange arena.
 Path/query decoding is cached here because it is connection-parse work.
 """
 
-from libc.stdint cimport uint16_t, uint64_t
+from collections import deque
+
+from libc.stdint cimport uint16_t, uint32_t, uint64_t
+from libc.stdlib cimport free, malloc
+from libc.string cimport memcmp, memcpy
 from cpython.bytes cimport PyBytes_FromStringAndSize
+from cpython.unicode cimport PyUnicode_DecodeASCII
 
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -15,30 +20,150 @@ from stario.telemetry.noop import NoOpTracer
 from stario_cython.exchange cimport Request, RequestExchange, acquire_exchange, _status_line
 from stario_cython.llhttp cimport *
 
-cdef dict _URL_CACHE = {}
-cdef int _URL_CACHE_MAX = 256
+cdef enum:
+    URL_CACHE_CAP = 256
+    URL_CACHE_MAX_KEY = 512
+    SMALL_BODY_COMPLETE_DISPATCH = 64 * 1024
+
+cdef char* _UC_KEY[256]
+cdef Py_ssize_t _UC_LEN[256]
+cdef uint32_t _UC_HASH[256]
+cdef list _UC_PATH = None
+cdef list _UC_QUERY = None
+cdef object Q_EMPTY = b""
+cdef object PATH_EMPTY = ""
 
 
-cdef tuple _split_request_target(object url):
-    cdef object cached
-    cdef Py_ssize_t question
-    cdef object path_bytes
+cdef uint32_t _url_hash(const char* s, Py_ssize_t n) noexcept:
+    cdef uint32_t value = <uint32_t>2166136261
+    cdef Py_ssize_t i
+    for i in range(n):
+        value = (value ^ <unsigned char>s[i]) * <uint32_t>16777619
+    return value
+
+
+cdef void _url_cache_init():
+    global _UC_PATH, _UC_QUERY
+    cdef int i
+    if _UC_PATH is not None:
+        return
+    _UC_PATH = [None] * URL_CACHE_CAP
+    _UC_QUERY = [None] * URL_CACHE_CAP
+    for i in range(URL_CACHE_CAP):
+        _UC_KEY[i] = NULL
+        _UC_LEN[i] = 0
+        _UC_HASH[i] = 0
+
+
+cdef void _url_cache_clear():
+    cdef int i
+    for i in range(URL_CACHE_CAP):
+        if _UC_KEY[i] != NULL:
+            free(_UC_KEY[i])
+            _UC_KEY[i] = NULL
+        _UC_LEN[i] = 0
+        _UC_HASH[i] = 0
+        _UC_PATH[i] = None
+        _UC_QUERY[i] = None
+
+
+cdef int _url_find(const char* url, Py_ssize_t n, uint32_t h) noexcept:
+    cdef int slot = <int>(h & (URL_CACHE_CAP - 1))
+    cdef int i
+    for i in range(URL_CACHE_CAP):
+        if _UC_KEY[slot] == NULL:
+            return -1
+        if (
+            _UC_HASH[slot] == h
+            and _UC_LEN[slot] == n
+            and memcmp(_UC_KEY[slot], url, <size_t>n) == 0
+        ):
+            return slot
+        slot = (slot + 1) & (URL_CACHE_CAP - 1)
+    return -1
+
+
+cdef void _url_store(
+    const char* url,
+    Py_ssize_t n,
+    uint32_t h,
+    object path,
+    object query,
+):
+    cdef int slot
+    cdef int i
+    cdef char* copy
+    slot = <int>(h & (URL_CACHE_CAP - 1))
+    for i in range(URL_CACHE_CAP):
+        if _UC_KEY[slot] == NULL:
+            copy = <char*>malloc(<size_t>n if n > 0 else 1)
+            if copy == NULL:
+                return
+            if n:
+                memcpy(copy, url, <size_t>n)
+            _UC_KEY[slot] = copy
+            _UC_LEN[slot] = n
+            _UC_HASH[slot] = h
+            _UC_PATH[slot] = path
+            _UC_QUERY[slot] = query
+            return
+        slot = (slot + 1) & (URL_CACHE_CAP - 1)
+    _url_cache_clear()
+    slot = <int>(h & (URL_CACHE_CAP - 1))
+    copy = <char*>malloc(<size_t>n if n > 0 else 1)
+    if copy == NULL:
+        return
+    if n:
+        memcpy(copy, url, <size_t>n)
+    _UC_KEY[slot] = copy
+    _UC_LEN[slot] = n
+    _UC_HASH[slot] = h
+    _UC_PATH[slot] = path
+    _UC_QUERY[slot] = query
+
+
+cdef object _decode_path_n(const char* s, Py_ssize_t n):
+    cdef Py_ssize_t i
+    cdef unsigned char c
+    if n <= 0:
+        return PATH_EMPTY
+    for i in range(n):
+        c = <unsigned char>s[i]
+        if c == 37 or c >= 128:
+            return decode_path(PyBytes_FromStringAndSize(s, n))
+    return PyUnicode_DecodeASCII(s, n, NULL)
+
+
+cdef tuple _split_request_target_n(const char* url, Py_ssize_t n):
+    cdef Py_ssize_t question = -1
+    cdef Py_ssize_t i
+    cdef uint32_t h = 0
+    cdef int slot
+    cdef object path
     cdef object query
-    cdef tuple result
-    cached = _URL_CACHE.get(url)
-    if cached is not None:
-        return <tuple>cached
-    question = url.find(b"?")
-    if question == -1:
-        path_bytes, query = url, b""
+    if n <= 0:
+        return (PATH_EMPTY, Q_EMPTY)
+    if n <= URL_CACHE_MAX_KEY:
+        h = _url_hash(url, n)
+        slot = _url_find(url, n, h)
+        if slot >= 0:
+            return (_UC_PATH[slot], _UC_QUERY[slot])
+    for i in range(n):
+        if url[i] == 63:
+            question = i
+            break
+    if question < 0:
+        path = _decode_path_n(url, n)
+        query = Q_EMPTY
     else:
-        path_bytes, query = url[:question], url[question + 1 :]
-    result = (decode_path(path_bytes), query)
-    if len(_URL_CACHE) >= _URL_CACHE_MAX:
-        _URL_CACHE.clear()
-    if <Py_ssize_t>len(url) <= 512:
-        _URL_CACHE[url] = result
-    return result
+        path = _decode_path_n(url, question)
+        if question + 1 < n:
+            query = PyBytes_FromStringAndSize(url + question + 1, n - question - 1)
+        else:
+            query = Q_EMPTY
+    if n <= URL_CACHE_MAX_KEY:
+        _url_store(url, n, h, path, query)
+    return (path, query)
 
 cdef int F_CONTENT_LENGTH = 0x20
 cdef int PAUSE_WRITE = 1
@@ -46,8 +171,8 @@ cdef int PAUSE_PIPELINE = 2
 cdef int PAUSE_BODY = 4
 cdef int PARSER_QUANTUM = 512 * 1024
 cdef int MAX_PENDING_EXCHANGES = 64
-# Handlers always start at headers-complete. Body bytes accumulate on the exchange;
-# body() awaits one completion Event, stream() drains with backpressure.
+# GET and large/chunked bodies dispatch at headers-complete. Small
+# Content-Length bodies dispatch at message-complete so body() is cached.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"
@@ -95,10 +220,11 @@ cdef object _version_str(int major, int minor):
 
 
 
-cdef void _bind_settings() noexcept:
+cdef void _bind_settings():
     global _SETTINGS
     if _SETTINGS != NULL:
         return
+    _url_cache_init()
     _SETTINGS = stario_settings_new()
     _SETTINGS.on_message_begin = _cb_message_begin
     _SETTINGS.on_url = _cb_url
@@ -185,6 +311,7 @@ cdef class HttpProtocol:
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
+    cdef object _create_task
 
     def __cinit__(self):
         _bind_settings()
@@ -229,8 +356,9 @@ cdef class HttpProtocol:
         self.date_box = date_box
         self.compression = compression
         self.connections = connections
+        self._create_task = app.create_task
         self.transport = None
-        self.pending_exchanges = []
+        self.pending_exchanges = deque()
         self.head_bytes = 0
         self.max_header_bytes = max_header_bytes
         self.max_body_bytes = max_body_bytes
@@ -486,7 +614,6 @@ cdef class HttpProtocol:
 
     cdef void _on_headers_complete(self) noexcept:
         cdef RequestExchange exchange
-        cdef Request request
         cdef uint16_t flags
         cdef uint64_t content_length
         if self.rejected or self.reading_exchange is None:
@@ -517,12 +644,21 @@ cdef class HttpProtocol:
         if self.transport is None or self.transport.is_closing():
             return
         try:
-            request = self._build_request(exchange, exchange)
             exchange.reset_body(
                 exchange._req_expect_continue,
                 <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
             )
-            self._dispatch(exchange, request)
+            # Small Content-Length bodies that fit in the current read complete
+            # before the handler runs, so body() hits the cached bytes instead
+            # of waiting on an Event during llhttp_execute. Expect: 100-continue
+            # and large/chunked bodies still dispatch at headers-complete.
+            if (
+                not exchange._req_expect_continue
+                and (flags & F_CONTENT_LENGTH)
+                and 0 < content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+            ):
+                return
+            self._dispatch(exchange, self._build_request(exchange, exchange))
         except Exception:
             self._close_error(400, "Invalid HTTP request")
 
@@ -540,22 +676,39 @@ cdef class HttpProtocol:
         if exchange is not None and exchange._body_active:
             if exchange.c_complete() != 0:
                 self._close_error(400, "Invalid HTTP request")
+                self.reading_exchange = None
+                return
+        if (
+            not self.request_dispatched
+            and exchange is not None
+            and not self.rejected
+        ):
+            try:
+                if self.transport is None or self.transport.is_closing():
+                    self.reading_exchange = None
+                    return
+                self._dispatch(
+                    exchange,
+                    self._build_request(exchange, exchange),
+                )
+            except Exception:
+                self._close_error(400, "Invalid HTTP request")
+                self.reading_exchange = None
+                return
         self.reading_exchange = None
 
     cdef Request _build_request(self, RequestExchange exchange, object body):
         cdef object method
         cdef object version
-        cdef object url
         cdef tuple split
         cdef Request request = exchange.req
         if exchange._req_url_length > 0:
-            url = PyBytes_FromStringAndSize(
+            split = _split_request_target_n(
                 exchange._req_arena + exchange._req_url_offset,
                 exchange._req_url_length,
             )
         else:
-            url = b""
-        split = _split_request_target(url)
+            split = (PATH_EMPTY, Q_EMPTY)
         method = _method_str(<int>llhttp_get_method(self.parser))
         version = _version_str(
             <int>llhttp_get_http_major(self.parser),
@@ -590,19 +743,18 @@ cdef class HttpProtocol:
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
+        cdef object task
         self.active_exchange = exchange
         exchange.start_response()
-        self.app.create_task(
-            self._run(exchange),
+        task = self._create_task(
+            self.app(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
         )
-
-    async def _run(self, RequestExchange exchange):
-        try:
-            await self.app(exchange, exchange)
-        finally:
+        if task.done():
             exchange.handler_finished()
+        else:
+            task.add_done_callback(exchange.on_handler_done)
 
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
@@ -640,7 +792,7 @@ cdef class HttpProtocol:
             self._drop_pending()
             return
         if self.pending_exchanges:
-            next_exchange = self.pending_exchanges.pop(0)
+            next_exchange = self.pending_exchanges.popleft()
             self._start_exchange(next_exchange, False)
             if not self.pending_exchanges:
                 self._set_pause_reason(PAUSE_PIPELINE, False)

@@ -660,11 +660,10 @@ main() {
   for target in "${selected[@]}"; do known_target "$target" || { echo "Unknown target: $target" >&2; usage >&2; exit 1; }; done
   for endpoint in "${ENDPOINTS[@]}"; do path_for "$endpoint" >/dev/null || exit 1; done
 
-  ensure_fixtures "$(python_for "${selected[0]}")"
   if [[ ! -x "$(python_for "${selected[0]}")" ]]; then
     ensure_target "${selected[0]}"
-    ensure_fixtures "$(python_for "${selected[0]}")"
   fi
+  ensure_fixtures "$(python_for "${selected[0]}")"
 
   RUN_DIR="$RESULTS_DIR/$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$RUN_DIR"

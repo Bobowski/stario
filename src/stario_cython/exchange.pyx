@@ -516,8 +516,15 @@ cdef class ParsedQuery:
         return [(k, v) for k, vals in self._data.items() for v in vals]
 
     def as_dict(self, *, last=False):
-        cdef int i = -1 if last else 0
-        return {k: vals[i] for k, vals in self._data.items()}
+        cdef dict out = {}
+        cdef list vals
+        cdef Py_ssize_t idx
+        for k, vals in self._data.items():
+            if not vals:
+                continue
+            idx = len(vals) - 1 if last else 0
+            out[k] = vals[idx]
+        return out
 
     def as_lists(self):
         return {k: list(v) for k, v in self._data.items()}
@@ -1449,6 +1456,10 @@ cdef class RequestExchange:
     cdef void start_response(self):
         self.handler_started = True
         self.reset_response(self._req_encoding)
+
+    def on_handler_done(self, task):
+        """``Task.add_done_callback`` entry; recycles after ``App.__call__``."""
+        self.handler_finished()
 
     cdef void handler_finished(self):
         self.handler_done = True

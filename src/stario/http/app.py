@@ -20,6 +20,7 @@ from stario.exceptions import (
 )
 from stario.http.context import Context
 from stario.routing.locations import normalize_path
+from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
 from .writer import Writer
@@ -189,8 +190,12 @@ class App(Router):
         send a response on the success path.
         """
         span = c.span
-        span.start()
-        span.attrs({"request.method": c.req.method, "request.path": c.req.path})
+        # Cython (and benchmark) servers use NoOpTracer. Skip method calls and
+        # the attrs dict on that path; RecordingSpan and others still record.
+        record = type(span) is not NoOpSpan
+        if record:
+            span.start()
+            span.attrs({"request.method": c.req.method, "request.path": c.req.path})
         failed_after_start = False
 
         try:
@@ -236,14 +241,15 @@ class App(Router):
                         exc = handler_exc
                 if not handler_responded:
                     responses.text(w, "Internal Server Error", 500)
-            if not handler_responded:
+            if not handler_responded and record:
                 span.fail(str(exc))
                 span.exception(exc)
         finally:
             # After headers: abort the transport on failure; otherwise finish the message.
             if failed_after_start and not w.completed:
                 w.abort()
-            else:
+            elif not w.completed:
                 w.end()
-            span.attr("response.status_code", w.status_code)
-            span.end()
+            if record:
+                span.attr("response.status_code", w.status_code)
+                span.end()
