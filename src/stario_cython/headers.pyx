@@ -125,7 +125,6 @@ cdef object WIRE_CONTENT_TYPE
 cdef object WIRE_CONTENT_LENGTH
 cdef object WIRE_CONTENT_ENCODING
 cdef object WIRE_TRANSFER_ENCODING
-cdef object WIRE_SET_COOKIE
 cdef object RESPOND_DATE_ERROR = (
     "Date is emitted by respond(); do not set it on w.headers."
 )
@@ -273,7 +272,6 @@ WIRE_CONTENT_TYPE = _intern_wire_name("content-type", 12)
 WIRE_CONTENT_LENGTH = _intern_wire_name("content-length", 14)
 WIRE_CONTENT_ENCODING = _intern_wire_name("content-encoding", 16)
 WIRE_TRANSFER_ENCODING = _intern_wire_name("transfer-encoding", 17)
-WIRE_SET_COOKIE = _intern_wire_name("set-cookie", 10)
 
 
 cdef object _value_line(object value):
@@ -683,21 +681,6 @@ cdef class Headers:
         cdef Py_ssize_t i
         for i in range(self._n):
             parts.append(self._names[i])
-            parts.append(self._values[i])
-
-    def unsafe_append_respond_lines(self, list parts, bint skip_ce=False):
-        """Append extra respond() headers, skipping owned Content-Type/Length."""
-        cdef Py_ssize_t i
-        cdef object name
-        for i in range(self._n):
-            name = self._names[i]
-            if (
-                name is WIRE_CONTENT_TYPE
-                or name is WIRE_CONTENT_LENGTH
-                or (skip_ce and name is WIRE_CONTENT_ENCODING)
-            ):
-                continue
-            parts.append(name)
             parts.append(self._values[i])
 
     def __contains__(self, name):
