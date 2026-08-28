@@ -8,6 +8,9 @@ from stario_cython.headers import Headers
 from stario import App
 import stario.cookies as cookies
 from stario.exceptions import StarioError, StarioRuntime
+from stario.http.compression import CompressionConfig
+from stario.http.headers import Headers as PublicHeaders
+from tests.cython.http import read_chunk, read_response, running_server
 
 
 def test_headers_public_api():
