@@ -12,9 +12,9 @@ connection has no in-flight request. Body stall is a generation counter on
 the exchange — chunks do not ``call_later``. ``RequestPolicy.max_pipelined_requests``
 (default 8) caps the pipeline queue.
 
-``STARIO_CYTHON_TIMEOUTS=callback`` restores per-connection TimerHandles for
-wrk A/B. ``STARIO_CYTHON_TIMEOUTS=off`` disables header/idle/body-stall
-cleanup (profiling).
+``STARIO_CYTHON_TIMEOUTS=off`` disables header/idle/body-stall cleanup
+(profiling hatch). ``STARIO_CYTHON_TIMEOUT_SWEEP`` sets the sweeper period
+(default 50ms).
 """
 
 from __future__ import annotations

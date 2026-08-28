@@ -94,10 +94,9 @@ cdef int ABORT_NONE = 0
 cdef int ABORT_TOO_LARGE = 1
 cdef int ABORT_DISCONNECTED = 2
 cdef int ABORT_TIMEOUT = 3
-cdef int _TIMEOUT_MODE = 2
+cdef int _TIMEOUT_MODE = 1
 cdef int _TIMEOUT_OFF = 0
-cdef int _TIMEOUT_CALLBACK = 1
-cdef int _TIMEOUT_SWEEP = 2
+cdef int _TIMEOUT_SWEEP = 1
 
 
 def _bind_timeout_mode():
@@ -870,7 +869,6 @@ cdef class RequestExchange:
         self._chunks = None
         self._cached = None
         self._data_ready = None
-        self._stall_handle = None
         self._stall_deadline = 0.0
         self._stall_touch = 0
         self._stall_seen = 0
@@ -2060,10 +2058,6 @@ cdef class RequestExchange:
             self._data_ready.set()
 
     cdef void _cancel_stall_timer(self) noexcept:
-        cdef object handle = self._stall_handle
-        if handle is not None:
-            handle.cancel()
-            self._stall_handle = None
         self._stall_deadline = 0.0
         self._stall_seen = self._stall_touch
 
@@ -2074,31 +2068,15 @@ cdef class RequestExchange:
         stores ``now + timeout`` once per wake — body chunks do not call
         ``loop.time()`` or ``call_later``.
         """
-        cdef object loop
-        cdef object connection
-        cdef object handle
         if not self._waiting or self._body_complete or self._timeout <= 0:
             self._cancel_stall_timer()
             return
         if _TIMEOUT_MODE == _TIMEOUT_OFF:
             self._cancel_stall_timer()
             return
-        if _TIMEOUT_MODE == _TIMEOUT_SWEEP:
-            handle = self._stall_handle
-            if handle is not None:
-                handle.cancel()
-                self._stall_handle = None
-            self._stall_touch += 1
-            return
-        self._cancel_stall_timer()
-        connection = self._connection
-        if connection is None:
-            return
-        loop = connection.loop
-        self._stall_handle = loop.call_later(self._timeout, self._on_stall_timeout)
+        self._stall_touch += 1
 
     cdef void fire_body_stall(self):
-        self._stall_handle = None
         self._stall_deadline = 0.0
         self._stall_seen = self._stall_touch
         if self._abort_reason != ABORT_NONE or self._body_complete:
@@ -2108,9 +2086,6 @@ cdef class RequestExchange:
         if self._connection is not None:
             self._connection.set_body_paused(self, False)
         self._wake()
-
-    def _on_stall_timeout(self):
-        self.fire_body_stall()
 
     cdef void _maybe_continue(self):
         if self._expect_continue:

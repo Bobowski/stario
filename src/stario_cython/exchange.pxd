@@ -95,7 +95,6 @@ cdef class RequestExchange:
     cdef object _chunks
     cdef object _cached
     cdef object _data_ready
-    cdef object _stall_handle
     cdef double _stall_deadline
     cdef uint64_t _stall_touch
     cdef uint64_t _stall_seen

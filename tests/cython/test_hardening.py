@@ -18,6 +18,12 @@ from tests.cython.http import (
     response_statuses,
 )
 
+# Default sweeper period is 50ms. Timeouts here must exceed two periods;
+# waits must exceed timeout + one period.
+_TIMEOUT = 0.15
+_WAIT = 0.40
+_TRICKLE_PAUSE = 0.08
+
 
 def _attach(app: App | None = None, **kwargs):
     loop = asyncio.get_running_loop()
@@ -504,9 +510,9 @@ async def test_close_if_idle_skips_in_flight_handler() -> None:
 
 @pytest.mark.asyncio
 async def test_connection_with_no_data_times_out_headers() -> None:
-    proto, app, transport = _attach(header_timeout=0.01)
+    proto, app, transport = _attach(header_timeout=_TIMEOUT)
     try:
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(_WAIT)
         assert transport.is_closing()
     finally:
         if not transport.is_closing():
@@ -516,10 +522,10 @@ async def test_connection_with_no_data_times_out_headers() -> None:
 
 @pytest.mark.asyncio
 async def test_partial_headers_time_out() -> None:
-    proto, app, transport = _attach(header_timeout=0.01)
+    proto, app, transport = _attach(header_timeout=_TIMEOUT)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\n")
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(_WAIT)
         assert transport.is_closing()
     finally:
         if not transport.is_closing():
@@ -529,12 +535,12 @@ async def test_partial_headers_time_out() -> None:
 
 @pytest.mark.asyncio
 async def test_trickle_headers_do_not_reset_header_timeout() -> None:
-    proto, app, transport = _attach(header_timeout=0.04)
+    proto, app, transport = _attach(header_timeout=_TIMEOUT)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\n")
-        await asyncio.sleep(0.025)
+        await asyncio.sleep(_TRICKLE_PAUSE)
         proto.data_received(b"Host: t\r\n")
-        await asyncio.sleep(0.025)
+        await asyncio.sleep(_WAIT)
         assert transport.is_closing()
     finally:
         if not transport.is_closing():
@@ -545,7 +551,7 @@ async def test_trickle_headers_do_not_reset_header_timeout() -> None:
 @pytest.mark.asyncio
 async def test_stalled_deferred_small_body_times_out() -> None:
     """Small Content-Length bodies dispatch at message-complete. Incomplete
-    bodies must not hang: the header timer stays armed until dispatch."""
+    bodies must not hang: the header deadline stays armed until dispatch."""
     app = App()
     hits = 0
 
@@ -556,12 +562,12 @@ async def test_stalled_deferred_small_body_times_out() -> None:
         responses.text(w, "ok")
 
     app.post("/", handler)
-    proto, app, transport = _attach(app=app, header_timeout=0.01)
+    proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
     try:
         proto.data_received(
             b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\n"
         )
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(_WAIT)
         assert transport.is_closing()
         assert hits == 0
     finally:
@@ -579,13 +585,13 @@ async def test_complete_request_does_not_keep_header_timer() -> None:
 
     app.get("/", handler)
     proto, app, transport = _attach(
-        app=app, header_timeout=0.01, keep_alive_timeout=5.0
+        app=app, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
     )
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await _drain(app)
         assert response_status(transport.writes) == 200
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(_WAIT)
         assert not transport.is_closing()
     finally:
         if not transport.is_closing():
@@ -602,14 +608,14 @@ async def test_idle_keep_alive_times_out() -> None:
 
     app.get("/", handler)
     proto, app, transport = _attach(
-        app=app, header_timeout=5.0, keep_alive_timeout=0.01
+        app=app, header_timeout=5.0, keep_alive_timeout=_TIMEOUT
     )
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await _drain(app)
         assert response_status(transport.writes) == 200
         assert not transport.is_closing()
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(_WAIT)
         assert transport.is_closing()
     finally:
         if not transport.is_closing():
@@ -629,11 +635,11 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
         responses.text(w, "ok")
 
     app.get("/", handler)
-    proto, app, transport = _attach(app=app, header_timeout=0.01)
+    proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await started.wait()
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(_WAIT)
         assert not transport.is_closing()
     finally:
         hang.set()
@@ -645,8 +651,7 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
 @pytest.mark.asyncio
 async def test_stalled_chunked_body_returns_408() -> None:
     """Chunked / large bodies dispatch at headers-complete. A stalled
-    ``body()`` wait must 408 via the shared connection sweeper (or the
-    callback stall handle), not hang the handler.
+    ``body()`` wait must 408 via the shared connection sweeper, not hang.
     """
     app = App()
 
@@ -656,14 +661,14 @@ async def test_stalled_chunked_body_returns_408() -> None:
 
     app.post("/", handler)
     proto, app, transport = _attach(
-        app=app, body_timeout=0.02, header_timeout=5.0
+        app=app, body_timeout=_TIMEOUT, header_timeout=5.0
     )
     try:
         proto.data_received(
             b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
             b"5\r\nhello"
         )
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(_WAIT)
         await _drain(app)
         assert response_status(transport.writes) == 408
     finally:

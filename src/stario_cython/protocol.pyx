@@ -189,10 +189,9 @@ cdef int TIMEOUT_NONE = 0
 cdef int TIMEOUT_HEADER = 1
 cdef int TIMEOUT_IDLE = 2
 cdef int CLEANUP_OFF = 0
-cdef int CLEANUP_CALLBACK = 1
-cdef int CLEANUP_SWEEP = 2
-cdef int TIMEOUT_MODE = 2
-cdef double TIMEOUT_SWEEP_INTERVAL = 0.01
+cdef int CLEANUP_SWEEP = 1
+cdef int TIMEOUT_MODE = 1
+cdef double TIMEOUT_SWEEP_INTERVAL = 0.05
 cdef object _SWEEPS_ATTR = "_stario_timeout_sweeps"
 # GET and large/chunked bodies dispatch at headers-complete. Small
 # Content-Length bodies dispatch at message-complete so body() is cached.
@@ -390,8 +389,6 @@ cdef class HttpProtocol:
     cdef double body_timeout
     cdef int timeout_kind
     cdef double timeout_deadline
-    cdef double timeout_handle_when
-    cdef object timeout_handle
     cdef bint header_timeout_reset
     cdef bint rejected
     cdef bint request_dispatched
@@ -422,8 +419,6 @@ cdef class HttpProtocol:
         self.pump_scheduled = False
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
-        self.timeout_handle_when = 0.0
-        self.timeout_handle = None
         self.header_timeout_reset = False
 
     def __dealloc__(self):
@@ -470,8 +465,6 @@ cdef class HttpProtocol:
         self.request_keep_alive = True
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
-        self.timeout_handle_when = 0.0
-        self.timeout_handle = None
         self.header_timeout_reset = False
 
     def connection_made(self, transport):
@@ -487,8 +480,8 @@ cdef class HttpProtocol:
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
         self.connections.add(self)
-        # First request: header deadline only. wrk keep-alive must not
-        # allocate a TimerHandle per request (see _arm_timeout).
+        # First request: header deadline only. Keep-alive stores a
+        # deadline; the sweeper compares it. No TimerHandle per request.
         self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
         _ensure_timeout_sweeper(self.loop, self.connections)
 
@@ -543,9 +536,8 @@ cdef class HttpProtocol:
         if self.rejected or self.parser == NULL or not data:
             return
         if self.timeout_kind == TIMEOUT_IDLE:
-            # Keep-alive traffic: drop the idle deadline. Sweep mode has
-            # nothing else to cancel; callback mode leaves the handle to
-            # no-op or reschedule when it fires.
+            # Keep-alive traffic: drop the idle deadline. The sweeper
+            # sees TIMEOUT_NONE on the next wake.
             self.timeout_kind = TIMEOUT_NONE
             self.timeout_deadline = 0.0
         if self.held_data is not None:
@@ -560,51 +552,23 @@ cdef class HttpProtocol:
         self._after_pump()
 
     cdef void _arm_timeout(self, int kind, double seconds):
-        """Arm header or idle deadline.
+        """Store a header or idle deadline on the connection.
 
-        Sweep mode (default): store ``loop.time() + seconds`` on the
-        connection. The sweeper compares that deadline to one ``now`` per
-        wake — no ``call_later`` on the keep-alive path.
-
-        Callback mode: reuse one TimerHandle per connection. wrk keep-alive
-        would die if we ``call_later`` per request. Store a deadline and only
-        allocate a handle when none exists, or when the new deadline is
-        *sooner* than the current fire time (slowloris tests with 10ms
-        headers after a 5s idle handle).
+        The sweeper compares ``timeout_deadline`` to one ``loop.time()``
+        per wake. wrk keep-alive is a double store, not ``call_later``.
         """
-        cdef object loop
         cdef object transport
-        cdef double now
-        cdef double deadline
         if TIMEOUT_MODE == CLEANUP_OFF:
             return
         transport = self.transport
         if transport is None or transport.is_closing() or seconds <= 0:
             return
         self.timeout_kind = kind
-        loop = self.loop
-        now = loop.time()
-        deadline = now + seconds
-        self.timeout_deadline = deadline
-        if TIMEOUT_MODE == CLEANUP_SWEEP:
-            return
-        if self.timeout_handle is None:
-            self.timeout_handle = loop.call_later(seconds, self._on_timeout)
-            self.timeout_handle_when = deadline
-        elif deadline < self.timeout_handle_when:
-            self.timeout_handle.cancel()
-            self.timeout_handle = loop.call_later(seconds, self._on_timeout)
-            self.timeout_handle_when = deadline
+        self.timeout_deadline = self.loop.time() + seconds
 
     cdef void _cancel_timeout(self):
-        cdef object handle
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
-        self.timeout_handle_when = 0.0
-        handle = self.timeout_handle
-        if handle is not None:
-            handle.cancel()
-            self.timeout_handle = None
 
     cdef void _check_body_stall(self, RequestExchange exchange, double now):
         if exchange is None or exchange._timeout <= 0 or not exchange._waiting:
@@ -647,31 +611,6 @@ cdef class HttpProtocol:
         self._check_body_stall(reading, now)
         if active is not None and active is not reading:
             self._check_body_stall(active, now)
-
-    def _on_timeout(self):
-        cdef object transport
-        cdef object loop
-        cdef double now
-        cdef double deadline
-        self.timeout_handle = None
-        self.timeout_handle_when = 0.0
-        if self.rejected:
-            return
-        transport = self.transport
-        if transport is None or transport.is_closing():
-            return
-        deadline = self.timeout_deadline
-        if self.timeout_kind == TIMEOUT_NONE or deadline <= 0:
-            return
-        loop = self.loop
-        now = loop.time()
-        if now < deadline:
-            self.timeout_handle = loop.call_later(deadline - now, self._on_timeout)
-            self.timeout_handle_when = deadline
-            return
-        self.timeout_kind = TIMEOUT_NONE
-        self.timeout_deadline = 0.0
-        transport.close()
 
     cdef void _after_pump(self):
         """Arm a header deadline only if this read left headers (or a deferred
