@@ -82,7 +82,8 @@ connection is idle; trickle bytes do not reset the header deadline.
 `RequestPolicy.max_pipelined_requests` (default 8) caps the pipeline queue.
 Body stall is a generation counter — chunks do not `call_later`.
 
-Same-machine callback vs 10ms-sweep vs timeouts-off:
+Same-machine callback vs 10ms-sweep vs timeouts-off vs 50ms-sweep:
 `benchmarks/server/baseline-20260828.md`. Sweep ≈ callback on plaintext;
 timeouts-off is ~+5% plaintext (not worth dropping timeouts);
-10ms sweep was −7% on 2MB stream, which is why the period is 50ms.
+10ms sweep was −7% on 2MB stream; 50ms sweep recovered 2MB (3,734 stream /
+3,471 buffer) and kept plaintext at 130.8k.
