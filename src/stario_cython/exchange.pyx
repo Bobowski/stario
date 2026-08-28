@@ -125,6 +125,7 @@ cdef object RESPOND_DATE_ERROR = (
 cdef object RESPOND_TE_ERROR = (
     "respond() always sends Content-Length; do not set Transfer-Encoding."
 )
+cdef object _dec(size_t n)
 
 
 cdef void _check_respond_owned(
@@ -156,12 +157,16 @@ cdef void _check_respond_owned(
         )
 
 
-cdef void _check_respond_length(Headers h, object content_length) except *:
+cdef void _check_respond_length(Headers h, size_t content_length) except *:
     cdef object existing = h.c_get(b"content-length")
-    if existing is not None and existing != content_length:
+    cdef object expected
+    if existing is None:
+        return
+    expected = _dec(content_length)
+    if existing != expected:
         raise StarioRuntime(
             "Content-Length on w.headers does not match respond()",
-            context={"headers": existing, "respond": content_length},
+            context={"headers": existing, "respond": expected},
             help_text=(
                 "Omit Content-Length on w.headers; respond() derives it from "
                 "the on-wire body (after compression). If you set it, it must match."
@@ -1594,7 +1599,9 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
-        _check_respond_owned(h, content_type)
+        # Empty maps cannot conflict with Date/Content-Type/Content-Length.
+        if not h.c_empty():
+            _check_respond_owned(h, content_type)
         # Empty headers + no compression: writelines of existing buffers (no join,
         # no _out_buf churn — keeps tiny plaintext/json competitive).
         if h.c_empty() and (
@@ -1642,7 +1649,7 @@ cdef class RequestExchange:
                         self._frame(flat, encoding, &native_out, &native_len)
                         self._declared_length = <Py_ssize_t>native_len
                         self._bytes_written = 0
-                        _check_respond_length(h, _dec(native_len))
+                        _check_respond_length(h, native_len)
                         self._buf_bytes(_status_line(status))
                         self._buf_bytes(self._date_box[0])
                         if self._out_buf is None:
@@ -1675,7 +1682,7 @@ cdef class RequestExchange:
                     return
             self._declared_length = nbytes
             self._bytes_written = 0
-            _check_respond_length(h, _dec(<size_t>nbytes))
+            _check_respond_length(h, <size_t>nbytes)
             self._buf_bytes(_status_line(status))
             self._buf_bytes(self._date_box[0])
             if self._out_buf is None:

@@ -16,6 +16,9 @@ cdef inline void _lower_copy(
 
 cdef enum:
     HEADER_NAME_STACK = 256
+    SKIP_NONE = 0
+    SKIP_TYPE_LENGTH = 1
+    SKIP_TYPE_LENGTH_ENCODING = 2
 
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
 cdef object _intern_name(const char* src, size_t n)
@@ -27,6 +30,7 @@ cdef class Headers:
     cdef Py_ssize_t _n
 
     cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept
+    cdef Py_ssize_t _compact_except(self, const char* name, Py_ssize_t n) noexcept
     cdef void _store_at(self, Py_ssize_t index, object wire, object line)
     cdef object c_get(self, object name)
     cdef void c_set(self, object name, object value)

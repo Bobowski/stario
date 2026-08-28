@@ -134,8 +134,8 @@ cdef object _make_wire_name(const char* src, size_t n):
     cdef char* dst = PyBytes_AS_STRING(wire)
     if n:
         memcpy(dst, src, n)
-    dst[n] = 58
-    dst[n + 1] = 32
+    dst[n] = ':'
+    dst[n + 1] = ' '
     return wire
 
 
@@ -204,56 +204,52 @@ cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1:
     return stario_fold_header_name(name, buf, <Py_ssize_t>NAME_STACK, out_n)
 
 
-cdef object _intern_name(const char* src, size_t n):
-    cdef char buf[NAME_STACK]
-    cdef const char* normalized
+cdef inline int _intern_lookup(const char* src, size_t n) noexcept:
     cdef uint32_t slot
     cdef uint8_t entry
     cdef int index
-    if n >= NAME_STACK:
-        raise ValueError("Invalid header name: too long")
-    _lower_copy(buf, src, n)
-    normalized = buf
-    if n == 4 and memcmp(normalized, "host", 4) == 0:
-        return _INTERN_PY[0]
-    if n == 10 and memcmp(normalized, "connection", 10) == 0:
-        return _INTERN_PY[1]
-    if n == 15 and memcmp(normalized, "accept-encoding", 15) == 0:
-        return _INTERN_PY[13]
-    if n == 6 and memcmp(normalized, "expect", 6) == 0:
-        return _INTERN_PY[27]
-    slot = _hash_bytes(normalized, n) & (INTERN_TABLE_SIZE - 1)
-    while True:
-        entry = _INTERN_SLOT[slot]
-        if entry == 0:
-            return PyBytes_FromStringAndSize(normalized, <Py_ssize_t>n)
-        index = <int>entry - 1
-        if (
-            _INTERN_N[index] == <Py_ssize_t>n
-            and memcmp(_INTERN_C[index], normalized, n) == 0
-        ):
-            return _INTERN_PY[index]
-        slot = (slot + 1) & (INTERN_TABLE_SIZE - 1)
-
-
-cdef object _intern_wire_name(const char* src, size_t n):
-    cdef uint32_t slot
-    cdef uint8_t entry
-    cdef int index
-    if n >= NAME_STACK - 2:
-        raise ValueError("Invalid header name: too long")
     slot = _hash_bytes(src, n) & (INTERN_TABLE_SIZE - 1)
     while True:
         entry = _INTERN_SLOT[slot]
         if entry == 0:
-            return _make_wire_name(src, n)
+            return -1
         index = <int>entry - 1
         if (
             _INTERN_N[index] == <Py_ssize_t>n
             and memcmp(_INTERN_C[index], src, n) == 0
         ):
-            return _INTERN_WIRE[index]
+            return index
         slot = (slot + 1) & (INTERN_TABLE_SIZE - 1)
+
+
+cdef object _intern_name(const char* src, size_t n):
+    cdef char buf[NAME_STACK]
+    cdef int index
+    if n >= NAME_STACK:
+        raise ValueError("Invalid header name: too long")
+    _lower_copy(buf, src, n)
+    if n == 4 and memcmp(buf, "host", 4) == 0:
+        return _INTERN_PY[0]
+    if n == 10 and memcmp(buf, "connection", 10) == 0:
+        return _INTERN_PY[1]
+    if n == 15 and memcmp(buf, "accept-encoding", 15) == 0:
+        return _INTERN_PY[13]
+    if n == 6 and memcmp(buf, "expect", 6) == 0:
+        return _INTERN_PY[27]
+    index = _intern_lookup(buf, n)
+    if index < 0:
+        return PyBytes_FromStringAndSize(buf, <Py_ssize_t>n)
+    return _INTERN_PY[index]
+
+
+cdef object _intern_wire_name(const char* src, size_t n):
+    cdef int index
+    if n >= NAME_STACK - 2:
+        raise ValueError("Invalid header name: too long")
+    index = _intern_lookup(src, n)
+    if index < 0:
+        return _make_wire_name(src, n)
+    return _INTERN_WIRE[index]
 
 
 cdef object _value_line(object value):
@@ -263,8 +259,8 @@ cdef object _value_line(object value):
     cdef char* dst = PyBytes_AS_STRING(out)
     if n:
         memcpy(dst, PyBytes_AS_STRING(raw), <size_t>n)
-    dst[n] = 13
-    dst[n + 1] = 10
+    dst[n] = '\r'
+    dst[n + 1] = '\n'
     return out
 
 
@@ -291,8 +287,8 @@ cdef inline bint _wire_is(
     ws = PyBytes_AS_STRING(raw)
     return (
         memcmp(ws, name, <size_t>n) == 0
-        and ws[n] == 58
-        and ws[n + 1] == 32
+        and ws[n] == ':'
+        and ws[n + 1] == ' '
     )
 
 
@@ -337,6 +333,18 @@ cdef class Headers:
                 return i
         return -1
 
+    cdef Py_ssize_t _compact_except(self, const char* name, Py_ssize_t n) noexcept:
+        cdef Py_ssize_t i
+        cdef Py_ssize_t w = 0
+        for i in range(self._n):
+            if _wire_is(self._names[i], name, n):
+                continue
+            if w != i:
+                self._names[w] = self._names[i]
+                self._values[w] = self._values[i]
+            w += 1
+        return w
+
     cdef void _store_at(self, Py_ssize_t index, object wire, object line):
         cdef Py_ssize_t size = <Py_ssize_t>len(self._names)
         if index < size:
@@ -362,15 +370,7 @@ cdef class Headers:
         cdef Py_ssize_t n = PyBytes_GET_SIZE(key)
         cdef object wire = _intern_wire_name(src, <size_t>n)
         cdef object line = _value_line(value)
-        cdef Py_ssize_t i
-        cdef Py_ssize_t w = 0
-        for i in range(self._n):
-            if _wire_is(self._names[i], src, n):
-                continue
-            if w != i:
-                self._names[w] = self._names[i]
-                self._values[w] = self._values[i]
-            w += 1
+        cdef Py_ssize_t w = self._compact_except(src, n)
         self._store_at(w, wire, line)
         self._n = w + 1
 
@@ -385,18 +385,10 @@ cdef class Headers:
 
     cdef void c_remove(self, object name):
         cdef bytes key = <bytes>name
-        cdef const char* src = PyBytes_AS_STRING(key)
-        cdef Py_ssize_t n = PyBytes_GET_SIZE(key)
-        cdef Py_ssize_t i
-        cdef Py_ssize_t w = 0
-        for i in range(self._n):
-            if _wire_is(self._names[i], src, n):
-                continue
-            if w != i:
-                self._names[w] = self._names[i]
-                self._values[w] = self._values[i]
-            w += 1
-        self._n = w
+        self._n = self._compact_except(
+            PyBytes_AS_STRING(key),
+            PyBytes_GET_SIZE(key),
+        )
 
     cdef void c_clear(self):
         self._n = 0
@@ -486,15 +478,17 @@ cdef class Headers:
             name = <bytes>self._names[i]
             nn = PyBytes_GET_SIZE(name)
             ns = PyBytes_AS_STRING(name)
-            if skip_mode and (
-                (nn == 14 and memcmp(ns, "content-type: ", 14) == 0)
-                or (nn == 16 and memcmp(ns, "content-length: ", 16) == 0)
-            ):
-                continue
-            if skip_mode == 2 and nn == 18 and memcmp(
-                ns, "content-encoding: ", 18
-            ) == 0:
-                continue
+            if skip_mode != SKIP_NONE:
+                if (
+                    _wire_is(name, "content-type", 12)
+                    or _wire_is(name, "content-length", 14)
+                ):
+                    continue
+                if (
+                    skip_mode == SKIP_TYPE_LENGTH_ENCODING
+                    and _wire_is(name, "content-encoding", 16)
+                ):
+                    continue
             self._add_ba(buf, length, ns, nn)
             value = <bytes>self._values[i]
             self._add_ba(
@@ -510,21 +504,21 @@ cdef class Headers:
         object buf,
         Py_ssize_t* length,
     ) except -1:
-        return self._write_pairs(buf, length, 0)
+        return self._write_pairs(buf, length, SKIP_NONE)
 
     cdef int c_write_response_wire_ba(
         self,
         object buf,
         Py_ssize_t* length,
     ) except -1:
-        return self._write_pairs(buf, length, 1)
+        return self._write_pairs(buf, length, SKIP_TYPE_LENGTH)
 
     cdef int c_write_compressed_response_wire_ba(
         self,
         object buf,
         Py_ssize_t* length,
     ) except -1:
-        return self._write_pairs(buf, length, 2)
+        return self._write_pairs(buf, length, SKIP_TYPE_LENGTH_ENCODING)
 
     def add(self, str name, str value):
         self.c_add(_encode_name(name), _encode_value(value))
@@ -600,10 +594,13 @@ cdef class Headers:
         return result
 
     def __contains__(self, name):
+        cdef char buf[NAME_STACK]
+        cdef Py_ssize_t n
         try:
-            return self.c_get(_encode_name(name)) is not None
-        except ValueError:
+            _fold_header_name(name, buf, &n)
+        except (TypeError, ValueError):
             return False
+        return self._find_n(buf, n) >= 0
 
     def __len__(self):
         cdef set seen = set()

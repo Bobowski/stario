@@ -58,7 +58,9 @@ def _check_respond_owned(headers: Headers, content_type: bytes) -> None:
 
 def _check_respond_length(headers: Headers, content_length: bytes) -> None:
     existing = headers.unsafe_get(b"content-length")
-    if existing is not None and existing != content_length:
+    if existing is None:
+        return
+    if existing != content_length:
         raise StarioRuntime(
             "Content-Length on w.headers does not match respond()",
             context={"headers": existing, "respond": content_length},
@@ -204,7 +206,9 @@ class Writer:
         self._bind_declared_length(
             0 if not _response_may_have_body(status) else len(body)
         )
-        _check_respond_owned(h, content_type)
+        # Empty maps cannot conflict with Date/Content-Type/Content-Length.
+        if h:
+            _check_respond_owned(h, content_type)
 
         # Minimal fast path: no custom headers and no compression work.
         if not h and (
@@ -249,7 +253,7 @@ class Writer:
                     h.unsafe_set(b"content-encoding", compressor.encoding)
                     merge_vary(h, b"accept-encoding")
 
-            final_length = b"%d" % len(body) if _response_may_have_body(status) else b"0"
+            final_length = b"%d" % len(body)
             _check_respond_length(h, final_length)
             h.unsafe_set(b"content-type", content_type)
             h.unsafe_set(b"content-length", final_length)
