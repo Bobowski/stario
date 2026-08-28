@@ -4,12 +4,17 @@ Lifecycle (signal handling, graceful drain, date-header refresh) is the
 standard ``stario.http.server.Server``. This module injects the compiled
 protocol factory and keeps the Cython defaults (uvloop + NoOpTracer).
 
-Header timeout is armed only while headers (or a deferred small body) are
-still arriving. Idle/keep-alive timeout is armed only when the connection
-has no in-flight request. One TimerHandle is reused per connection so wrk
-keep-alive does not ``call_later`` per request. Body stall timeout lives on
-the exchange. ``RequestPolicy.max_pipelined_requests`` (default 8) caps the
-pipeline queue.
+Header, idle, and body-stall timeouts share one cleanup: a sweeper over the
+connection set calls ``loop.time()`` once per wake and compares stored
+deadlines. Header timeout is armed only while headers (or a deferred small
+body) are still arriving. Idle/keep-alive timeout is armed only when the
+connection has no in-flight request. Body stall is a generation counter on
+the exchange — chunks do not ``call_later``. ``RequestPolicy.max_pipelined_requests``
+(default 8) caps the pipeline queue.
+
+``STARIO_CYTHON_TIMEOUTS=callback`` restores per-connection TimerHandles for
+wrk A/B. ``STARIO_CYTHON_TIMEOUTS=off`` disables header/idle/body-stall
+cleanup (profiling).
 """
 
 from __future__ import annotations

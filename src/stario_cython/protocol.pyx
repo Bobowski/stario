@@ -4,8 +4,13 @@
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
 URL bytes and header fragments are written into the current exchange arena.
 Path/query decoding is cached here because it is connection-parse work.
+
+Header, idle, and body-stall timeouts share one cleanup path. Default is a
+sweeper over the connection set: each wake calls ``loop.time()`` once, then
+compares stored deadlines. See ``stario_cython.timeouts``.
 """
 
+import asyncio
 from collections import deque
 
 from libc.stdint cimport uint16_t, uint32_t, uint64_t
@@ -25,6 +30,10 @@ from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport Request, RequestExchange, acquire_exchange, _status_line
 from stario_cython.llhttp cimport *
+from stario_cython.timeouts import (
+    TIMEOUT_MODE as _PY_TIMEOUT_MODE,
+    sweep_interval as _py_sweep_interval,
+)
 
 cdef enum:
     URL_CACHE_CAP = 256
@@ -179,6 +188,12 @@ cdef int PARSER_QUANTUM = 512 * 1024
 cdef int TIMEOUT_NONE = 0
 cdef int TIMEOUT_HEADER = 1
 cdef int TIMEOUT_IDLE = 2
+cdef int CLEANUP_OFF = 0
+cdef int CLEANUP_CALLBACK = 1
+cdef int CLEANUP_SWEEP = 2
+cdef int TIMEOUT_MODE = 2
+cdef double TIMEOUT_SWEEP_INTERVAL = 0.01
+cdef object _SWEEPS_ATTR = "_stario_timeout_sweeps"
 # GET and large/chunked bodies dispatch at headers-complete. Small
 # Content-Length bodies dispatch at message-complete so body() is cached.
 
@@ -290,6 +305,64 @@ cdef int _cb_message_complete(llhttp_t* parser) noexcept:
     cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
     proto._on_message_complete()
     return -1 if proto.rejected else 0
+
+
+def _bind_timeout_policy():
+    global TIMEOUT_MODE, TIMEOUT_SWEEP_INTERVAL
+    TIMEOUT_MODE = <int>_PY_TIMEOUT_MODE
+    TIMEOUT_SWEEP_INTERVAL = <double>_py_sweep_interval()
+
+
+_bind_timeout_policy()
+
+
+async def _timeout_sweep_loop(loop, connections, key):
+    """One ``loop.time()`` per wake, then compare every live connection."""
+    sleep = asyncio.sleep
+    interval = TIMEOUT_SWEEP_INTERVAL
+    try:
+        while True:
+            await sleep(interval)
+            if not connections:
+                continue
+            now = loop.time()
+            for proto in tuple(connections):
+                proto.check_timeouts(now)
+    except asyncio.CancelledError:
+        sweeps = getattr(loop, _SWEEPS_ATTR, None)
+        if sweeps is not None:
+            sweeps.pop(key, None)
+        raise
+
+
+def _ensure_timeout_sweeper(loop, connections):
+    if TIMEOUT_MODE != CLEANUP_SWEEP:
+        return
+    sweeps = getattr(loop, _SWEEPS_ATTR, None)
+    if sweeps is None:
+        sweeps = {}
+        setattr(loop, _SWEEPS_ATTR, sweeps)
+    key = id(connections)
+    task = sweeps.get(key)
+    if task is not None and not task.done():
+        return
+    coro = _timeout_sweep_loop(loop, connections, key)
+    try:
+        task = loop.create_task(coro, name="stario-timeout-sweep")
+    except TypeError:
+        task = loop.create_task(coro)
+    sweeps[key] = task
+
+
+def _stop_timeout_sweeper(loop, connections):
+    if connections:
+        return
+    sweeps = getattr(loop, _SWEEPS_ATTR, None)
+    if not sweeps:
+        return
+    task = sweeps.pop(id(connections), None)
+    if task is not None and not task.done():
+        task.cancel()
 
 
 cdef class HttpProtocol:
@@ -414,9 +487,10 @@ cdef class HttpProtocol:
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
         self.connections.add(self)
-        # First request: header timer only. wrk keep-alive must not re-arm
-        # a TimerHandle per request (see _arm_timeout).
+        # First request: header deadline only. wrk keep-alive must not
+        # allocate a TimerHandle per request (see _arm_timeout).
         self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
+        _ensure_timeout_sweeper(self.loop, self.connections)
 
     def ensure_disconnect(self):
         if self.disconnect is None:
@@ -430,6 +504,7 @@ cdef class HttpProtocol:
         self.closed = True
         self._cancel_timeout()
         self.connections.discard(self)
+        _stop_timeout_sweeper(self.loop, self.connections)
         if self.idle_exchange is not None:
             self.idle_exchange.release_global()
             self.idle_exchange = None
@@ -468,8 +543,9 @@ cdef class HttpProtocol:
         if self.rejected or self.parser == NULL or not data:
             return
         if self.timeout_kind == TIMEOUT_IDLE:
-            # Keep-alive traffic: drop the idle deadline without cancelling
-            # the TimerHandle. The watchdog reschedules or stops when it fires.
+            # Keep-alive traffic: drop the idle deadline. Sweep mode has
+            # nothing else to cancel; callback mode leaves the handle to
+            # no-op or reschedule when it fires.
             self.timeout_kind = TIMEOUT_NONE
             self.timeout_deadline = 0.0
         if self.held_data is not None:
@@ -484,25 +560,34 @@ cdef class HttpProtocol:
         self._after_pump()
 
     cdef void _arm_timeout(self, int kind, double seconds):
-        """Arm header or idle deadline. Reuses one TimerHandle per connection.
+        """Arm header or idle deadline.
 
-        wrk keep-alive would die if we ``call_later`` per request. Store a
-        deadline (cheap) and only allocate a handle when none exists, or when
-        the new deadline is *sooner* than the current fire time (slowloris
-        tests with 10ms headers after a 5s idle handle).
+        Sweep mode (default): store ``loop.time() + seconds`` on the
+        connection. The sweeper compares that deadline to one ``now`` per
+        wake — no ``call_later`` on the keep-alive path.
+
+        Callback mode: reuse one TimerHandle per connection. wrk keep-alive
+        would die if we ``call_later`` per request. Store a deadline and only
+        allocate a handle when none exists, or when the new deadline is
+        *sooner* than the current fire time (slowloris tests with 10ms
+        headers after a 5s idle handle).
         """
         cdef object loop
         cdef object transport
         cdef double now
         cdef double deadline
+        if TIMEOUT_MODE == CLEANUP_OFF:
+            return
         transport = self.transport
         if transport is None or transport.is_closing() or seconds <= 0:
             return
+        self.timeout_kind = kind
         loop = self.loop
         now = loop.time()
         deadline = now + seconds
-        self.timeout_kind = kind
         self.timeout_deadline = deadline
+        if TIMEOUT_MODE == CLEANUP_SWEEP:
+            return
         if self.timeout_handle is None:
             self.timeout_handle = loop.call_later(seconds, self._on_timeout)
             self.timeout_handle_when = deadline
@@ -520,6 +605,48 @@ cdef class HttpProtocol:
         if handle is not None:
             handle.cancel()
             self.timeout_handle = None
+
+    cdef void _check_body_stall(self, RequestExchange exchange, double now):
+        if exchange is None or exchange._timeout <= 0 or not exchange._waiting:
+            return
+        if exchange._stall_touch != exchange._stall_seen:
+            exchange._stall_seen = exchange._stall_touch
+            exchange._stall_deadline = now + exchange._timeout
+            return
+        if exchange._stall_deadline > 0.0 and now >= exchange._stall_deadline:
+            exchange.fire_body_stall()
+
+    cpdef void check_timeouts(self, double now):
+        """Compare stored deadlines against ``now`` (one value per sweep)."""
+        cdef RequestExchange reading
+        cdef RequestExchange active
+        cdef object transport
+        cdef double seconds
+        if self.rejected:
+            return
+        if self.timeout_kind != TIMEOUT_NONE:
+            if self.timeout_deadline <= 0.0:
+                if self.timeout_kind == TIMEOUT_HEADER:
+                    seconds = self.header_timeout
+                else:
+                    seconds = self.keep_alive_timeout
+                if seconds <= 0.0:
+                    self.timeout_kind = TIMEOUT_NONE
+                    self.timeout_deadline = 0.0
+                else:
+                    self.timeout_deadline = now + seconds
+            elif now >= self.timeout_deadline:
+                self.timeout_kind = TIMEOUT_NONE
+                self.timeout_deadline = 0.0
+                transport = self.transport
+                if transport is not None and not transport.is_closing():
+                    transport.close()
+                return
+        reading = self.reading_exchange
+        active = self.active_exchange
+        self._check_body_stall(reading, now)
+        if active is not None and active is not reading:
+            self._check_body_stall(active, now)
 
     def _on_timeout(self):
         cdef object transport
@@ -547,7 +674,7 @@ cdef class HttpProtocol:
         transport.close()
 
     cdef void _after_pump(self):
-        """Arm a header timer only if this read left headers (or a deferred
+        """Arm a header deadline only if this read left headers (or a deferred
         small body) unfinished. Full wrk requests dispatch inside the pump,
         so this is a no-op on the keep-alive hot path.
         """

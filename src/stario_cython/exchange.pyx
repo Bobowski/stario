@@ -65,6 +65,7 @@ from stario_cython.headers cimport (
     _intern_name,
     _lower_copy,
 )
+from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
 
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
@@ -93,6 +94,18 @@ cdef int ABORT_NONE = 0
 cdef int ABORT_TOO_LARGE = 1
 cdef int ABORT_DISCONNECTED = 2
 cdef int ABORT_TIMEOUT = 3
+cdef int _TIMEOUT_MODE = 2
+cdef int _TIMEOUT_OFF = 0
+cdef int _TIMEOUT_CALLBACK = 1
+cdef int _TIMEOUT_SWEEP = 2
+
+
+def _bind_timeout_mode():
+    global _TIMEOUT_MODE
+    _TIMEOUT_MODE = <int>_PY_TIMEOUT_MODE
+
+
+_bind_timeout_mode()
 
 cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
 cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
@@ -858,6 +871,9 @@ cdef class RequestExchange:
         self._cached = None
         self._data_ready = None
         self._stall_handle = None
+        self._stall_deadline = 0.0
+        self._stall_touch = 0
+        self._stall_seen = 0
         self._compression = _UNBOUND
         self._brotli_enabled = False
         self._gzip_enabled = False
@@ -2048,28 +2064,53 @@ cdef class RequestExchange:
         if handle is not None:
             handle.cancel()
             self._stall_handle = None
+        self._stall_deadline = 0.0
+        self._stall_seen = self._stall_touch
 
     cdef void _reset_stall_timer(self) noexcept:
-        """Arm/refresh slowloris stall timeout while a body consumer is waiting."""
+        """Arm/refresh slowloris stall timeout while a body consumer is waiting.
+
+        Sweep mode only bumps a generation counter. The connection sweeper
+        stores ``now + timeout`` once per wake — body chunks do not call
+        ``loop.time()`` or ``call_later``.
+        """
         cdef object loop
         cdef object connection
-        self._cancel_stall_timer()
+        cdef object handle
         if not self._waiting or self._body_complete or self._timeout <= 0:
+            self._cancel_stall_timer()
             return
+        if _TIMEOUT_MODE == _TIMEOUT_OFF:
+            self._cancel_stall_timer()
+            return
+        if _TIMEOUT_MODE == _TIMEOUT_SWEEP:
+            handle = self._stall_handle
+            if handle is not None:
+                handle.cancel()
+                self._stall_handle = None
+            self._stall_touch += 1
+            return
+        self._cancel_stall_timer()
         connection = self._connection
         if connection is None:
             return
         loop = connection.loop
         self._stall_handle = loop.call_later(self._timeout, self._on_stall_timeout)
 
-    def _on_stall_timeout(self):
+    cdef void fire_body_stall(self):
         self._stall_handle = None
+        self._stall_deadline = 0.0
+        self._stall_seen = self._stall_touch
         if self._abort_reason != ABORT_NONE or self._body_complete:
             return
         self._abort_reason = ABORT_TIMEOUT
         self._clear_body_storage()
-        self._connection.set_body_paused(self, False)
+        if self._connection is not None:
+            self._connection.set_body_paused(self, False)
         self._wake()
+
+    def _on_stall_timeout(self):
+        self.fire_body_stall()
 
     cdef void _maybe_continue(self):
         if self._expect_continue:

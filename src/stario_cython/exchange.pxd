@@ -1,5 +1,5 @@
 from libc.stddef cimport size_t
-from libc.stdint cimport uint32_t
+from libc.stdint cimport uint32_t, uint64_t
 
 from stario_cython.compression_buf cimport StarioBrotli, StarioGzip
 from stario_cython.headers cimport Headers
@@ -96,6 +96,9 @@ cdef class RequestExchange:
     cdef object _cached
     cdef object _data_ready
     cdef object _stall_handle
+    cdef double _stall_deadline
+    cdef uint64_t _stall_touch
+    cdef uint64_t _stall_seen
     cdef int _buffered
     cdef int _total_read
     cdef int _max_size
@@ -180,6 +183,7 @@ cdef class RequestExchange:
     cdef void _wake(self)
     cdef void _cancel_stall_timer(self) noexcept
     cdef void _reset_stall_timer(self) noexcept
+    cdef void fire_body_stall(self)
     cdef void _maybe_continue(self)
     cdef void _done(self)
     cdef void _maybe_pause(self)

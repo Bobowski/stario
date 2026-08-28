@@ -643,6 +643,55 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stalled_chunked_body_returns_408() -> None:
+    """Chunked / large bodies dispatch at headers-complete. A stalled
+    ``body()`` wait must 408 via the shared connection sweeper (or the
+    callback stall handle), not hang the handler.
+    """
+    app = App()
+
+    async def handler(c, w) -> None:
+        await c.req.body()
+        responses.text(w, "ok")
+
+    app.post("/", handler)
+    proto, app, transport = _attach(
+        app=app, body_timeout=0.02, header_timeout=5.0
+    )
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello"
+        )
+        await asyncio.sleep(0.08)
+        await _drain(app)
+        assert response_status(transport.writes) == 408
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_timeout_sweeper_is_one_task_per_connection_set() -> None:
+    from stario_cython.timeouts import timeout_cleanup_mode
+
+    if timeout_cleanup_mode() != "sweep":
+        pytest.skip("default cleanup is the connection sweeper")
+    proto, app, transport = _attach(header_timeout=5.0)
+    try:
+        loop = asyncio.get_running_loop()
+        sweeps = getattr(loop, "_stario_timeout_sweeps", None)
+        assert sweeps, "connection_made should start a sweeper"
+        live = [task for task in sweeps.values() if task is not None and not task.done()]
+        assert len(live) == 1
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
 async def test_pipeline_cap_rejects_ninth_queued_request() -> None:
     app = App()
     release = asyncio.Event()
