@@ -116,7 +116,7 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
         assert b"404" in missing.split(b"\r\n", 1)[0]
         assert b"gone" in missing
         assert seen == ["404"]
-        assert app.eager_starts == []
+        assert app.eager_starts == [True]
 
         writer.write(b"POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
         await writer.drain()
@@ -125,7 +125,7 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
         assert b"nope" in denied
         assert b"allow: get" in denied.lower()
         assert seen == ["404", "405"]
-        assert app.eager_starts == []
+        assert app.eager_starts == [True, True]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -171,7 +171,7 @@ async def test_handler_exception_aborts_without_http_mapping() -> None:
             response = b""
         assert b"500" not in response
         assert b"422" not in response
-        assert app.eager_starts == []
+        assert app.eager_starts == [True]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -232,55 +232,11 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         await writer.drain()
         second = await read_response(reader)
         assert b"abcde" in second
-        assert app.eager_starts == []
+        assert app.eager_starts == [True, True]
         assert writers[0] is writers[1]
         writer.close()
         await writer.wait_closed()
     finally:
-        server.close()
-        await server.wait_closed()
-
-
-@pytest.mark.asyncio
-async def test_suspending_handler_is_tracked_as_a_task() -> None:
-    loop = asyncio.get_running_loop()
-    app = TrackingApp()
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def hang(_c, w):
-        started.set()
-        await release.wait()
-        responses.text(w, "ok")
-
-    app.get("/hang", hang)
-    connections: set[HttpProtocol] = set()
-    port = free_port()
-    server = await loop.create_server(
-        lambda: HttpProtocol(
-            loop,
-            app,
-            NoOpTracer(),
-            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
-            CompressionConfig(),
-            connections,
-        ),
-        "127.0.0.1",
-        port,
-    )
-    try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"GET /hang HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-        await writer.drain()
-        await started.wait()
-        assert app.eager_starts == [False]
-        assert app.tasks
-        release.set()
-        assert b"ok" in await read_response(reader)
-        writer.close()
-        await writer.wait_closed()
-    finally:
-        release.set()
         server.close()
         await server.wait_closed()
 

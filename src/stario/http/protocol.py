@@ -27,7 +27,7 @@ from .compression import CompressionConfig
 from .config import RequestPolicy
 from .context import Context
 from .headers import Headers
-from .invoke import start_handler
+from .invoke import on_handler_done
 from .request import BodyReader, Request
 from .wire import decode_method, decode_path
 from .writer import (
@@ -394,15 +394,19 @@ class HttpProtocol(asyncio.Protocol):
             span.start()
             span.attrs({"request.method": context.req.method, "request.path": path})
 
-        task = start_handler(
-            context,
-            writer,
-            handler,
+        task = self.app.create_task(
+            handler(context, writer),
             loop=self.loop,
-            create_task=self.app.create_task,
             eager_start=eager_start,
         )
-        self._active_task = task
+        if task.done():
+            on_handler_done(context, writer, task)
+            self._active_task = None
+        else:
+            task.add_done_callback(
+                lambda done, c=context, w=writer: on_handler_done(c, w, done)
+            )
+            self._active_task = task
 
     def on_response_completed(self) -> None:
         t = self.transport

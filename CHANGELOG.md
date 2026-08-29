@@ -20,10 +20,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, abort if
   nothing was sent, close the span. No auto-`end()`.
-- Cython GET path: drive handlers with `send()` (no `asyncio.Task` unless they
-  suspend), skip body machinery when there is no upload, reuse the respond
-  header block while Date is unchanged, and arm idle timeouts on the sweeper
-  instead of `loop.time()` per request.
+- Cython GET path: skip upload state when there is no body, reuse the
+  `respond()` header block while Date is unchanged, cache `text()` encodes,
+  and arm idle timeouts on the sweeper instead of `loop.time()` per request.
 
 ## 4.1.0 - 2026-08-17
 

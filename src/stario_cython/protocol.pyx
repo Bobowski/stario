@@ -25,7 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
-from stario.http.invoke import finish_handler, on_handler_done, resume_started
+from stario.http.invoke import on_handler_done
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -979,8 +979,6 @@ cdef class HttpProtocol:
         cdef object span
         cdef object host
         cdef object method
-        cdef object coro
-        cdef object pending
         cdef const char* url
         cdef Py_ssize_t n
         cdef Py_ssize_t i
@@ -1045,25 +1043,14 @@ cdef class HttpProtocol:
                 self._hot_route = route
                 self._hot_routes_version = self.app.routes_version
         exchange.route = route
-        coro = handler(exchange, exchange)
-        try:
-            pending = coro.send(None)
-        except StopIteration:
-            if not exchange._completed or self.noop_span is None:
-                finish_handler(exchange, exchange)
-            exchange.handler_finished()
-            return
-        except Exception as exc:
-            finish_handler(exchange, exchange, exc)
-            exchange.handler_finished()
-            return
         task = self._create_task(
-            resume_started(coro, pending),
+            handler(exchange, exchange),
             loop=self.loop,
-            eager_start=False,
+            eager_start=eager_start,
         )
         if task.done():
-            on_handler_done(exchange, exchange, task)
+            if not exchange._completed or self.noop_span is None:
+                on_handler_done(exchange, exchange, task)
             exchange.handler_finished()
         else:
             task.add_done_callback(exchange.on_handler_done)
