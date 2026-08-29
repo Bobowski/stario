@@ -175,26 +175,62 @@ Lower is better.
 
 Markup is unchanged between branches. Spread is run noise.
 
-`benchmarks/html/micro.py` (main; cython-core within 3%):
+`benchmarks/html/micro.py` — µs/call, best of 7. Event loop unused.
 
-| Case | µs |
-| --- | ---: |
-| Div() cached empty | 0.061 |
-| Div('text') | 0.366 |
-| Div({'class': 'card'}) | 0.784 |
-| Div(classes(5 tokens)) | 1.499 |
-| @baked positional | 0.565 |
-| @baked + render | 0.753 |
-| render small prebuilt tree | 0.712 |
+| Case | main | cython-core | core / main |
+| --- | ---: | ---: | ---: |
+| Div() cached empty | 0.061 | 0.060 | 0.98× |
+| Div('text') | 0.366 | 0.364 | 0.99× |
+| Div({'class': 'card'}) | 0.784 | 0.795 | 1.01× |
+| Div(classes(5 tokens)) | 1.499 | 1.508 | 1.01× |
+| Div(data(2 keys)) | 1.152 | 1.203 | 1.04× |
+| Div(styles(2 props)) | 1.673 | 1.709 | 1.02× |
+| Div(classes(3 conditional)) | 1.066 | 1.093 | 1.03× |
+| @baked positional | 0.565 | 0.576 | 1.02× |
+| @baked keyword | 0.577 | 0.589 | 1.02× |
+| @baked + render | 0.753 | 0.772 | 1.03× |
+| render small prebuilt tree | 0.712 | 0.708 | 0.99× |
 
 ## Request-header micro (`headers_micro.py`, cython-core only)
 
-100,000 requests × 7 repeats. Median ns/request. No event loop.
+100,000 requests × 7 repeats. Median **nanoseconds** per request. No event loop.
 
 Arena linear lookup stays the win when the handler reads headers
 (one read at 8 fields: **169 ns** vs lazy dict **478 ns**, **−65%**).
-No-read cases stay ~140–150 ns. Full table:
-`benchmarks/loop-compare/results/html/headers-micro.json`.
+No-read cases stay ~140–150 ns.
+
+| fields | workload | eager | lazy | arena hash | arena linear | adaptive-3 | linear vs lazy |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | no application reads | 453 | 140 | 145 | 143 | 150 | +1.6% |
+| 8 | one arbitrary read | 479 | 478 | 177 | 169 | 177 | −64.6% |
+| 8 | one missing optional read | 467 | 468 | 157 | 153 | 159 | −67.3% |
+| 8 | three distinct reads | 524 | 520 | 231 | 212 | 523 | −59.3% |
+| 8 | same header 8x | 651 | 644 | 355 | 336 | 639 | −47.8% |
+| 8 | same missing header 8x | 586 | 583 | 268 | 240 | 568 | −58.8% |
+| 8 | same header 64x | 1809 | 1811 | 1788 | 1664 | 1850 | −8.1% |
+| 8 | single Cookie getlist | 500 | 495 | 196 | 190 | 195 | −61.6% |
+| 10 | three Cookie lines getlist | 636 | 639 | 264 | 265 | 263 | −58.5% |
+| 10 | three Cookie lines getlist 3x | 737 | 734 | 437 | 440 | 787 | −40.1% |
+| 16 | no application reads | 889 | 269 | 293 | 269 | 295 | +0.2% |
+| 16 | one arbitrary read | 920 | 918 | 312 | 291 | 309 | −68.3% |
+| 16 | one missing optional read | 915 | 909 | 300 | 278 | 299 | −69.4% |
+| 16 | three distinct reads | 971 | 979 | 375 | 352 | 962 | −64.0% |
+| 16 | same header 8x | 1103 | 1106 | 512 | 465 | 1082 | −57.9% |
+| 16 | same missing header 8x | 1037 | 1026 | 421 | 375 | 1007 | −63.4% |
+| 16 | same header 64x | 2238 | 2240 | 1952 | 1809 | 2285 | −19.2% |
+| 16 | single Cookie getlist | 952 | 951 | 336 | 323 | 336 | −66.0% |
+| 18 | three Cookie lines getlist | 1104 | 1112 | 407 | 402 | 412 | −63.8% |
+| 18 | three Cookie lines getlist 3x | 1210 | 1200 | 593 | 598 | 1248 | −50.2% |
+| 32 | no application reads | 1934 | 514 | 562 | 522 | 563 | +1.6% |
+| 32 | one arbitrary read | 1994 | 1979 | 594 | 540 | 597 | −72.7% |
+| 32 | one missing optional read | 1973 | 1965 | 589 | 545 | 591 | −72.3% |
+| 32 | three distinct reads | 2031 | 2019 | 648 | 605 | 1980 | −70.0% |
+| 32 | same header 8x | 2149 | 2144 | 795 | 724 | 2116 | −66.2% |
+| 32 | same missing header 8x | 2091 | 2087 | 748 | 669 | 2064 | −67.9% |
+| 32 | same header 64x | 3294 | 3299 | 2216 | 2080 | 3308 | −37.0% |
+| 32 | single Cookie getlist | 2010 | 2001 | 632 | 571 | 632 | −71.5% |
+| 34 | three Cookie lines getlist | 2205 | 2189 | 692 | 667 | 690 | −69.5% |
+| 34 | three Cookie lines getlist 3x | 2300 | 2294 | 910 | 896 | 2375 | −61.0% |
 
 ## vs the 2026-08-28 Cython baseline
 
