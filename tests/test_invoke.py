@@ -6,7 +6,7 @@ import logging
 import stario.responses as responses
 from stario.http.app import App
 from stario.http.context import Context
-from stario.http.invoke import on_handler_done
+from stario.http.invoke import on_handler_done, resume_started, start_handler
 from stario.http.writer import Writer
 from tests.helpers import DummyWriter, make_context
 
@@ -63,6 +63,50 @@ def test_on_handler_done_aborts_when_handler_writes_nothing(
         assert w.completed
         assert w.status is None
         assert "without sending a response" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_start_handler_finishes_inline_without_a_task() -> None:
+    async def run() -> None:
+        app = App()
+
+        async def hello(_c: Context, w: Writer) -> None:
+            responses.text(w, "ok")
+
+        app.get("/hello", hello)
+        ctx = make_context("/hello", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        handler, ctx.route = app.find_handler("", "/hello", "GET")
+        task = start_handler(
+            ctx,
+            w,  # type: ignore[arg-type]
+            handler,
+            loop=asyncio.get_running_loop(),
+            create_task=app.create_task,
+        )
+        assert task is None
+        assert w.status == 200
+        assert w.body == "ok"
+
+    asyncio.run(run())
+
+
+def test_resume_started_continues_after_first_await() -> None:
+    async def run() -> None:
+        gate = asyncio.Event()
+
+        async def work() -> str:
+            await gate.wait()
+            return "done"
+
+        coro = work()
+        pending = coro.send(None)
+        task = asyncio.get_running_loop().create_task(resume_started(coro, pending))
+        await asyncio.sleep(0)
+        assert not task.done()
+        gate.set()
+        assert await task == "done"
 
     asyncio.run(run())
 

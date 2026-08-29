@@ -25,7 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
-from stario.http.invoke import on_handler_done
+from stario.http.invoke import finish_handler, on_handler_done, resume_started
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -183,6 +183,7 @@ cdef tuple _split_request_target_n(const char* url, Py_ssize_t n):
         _url_store(url, n, h, path, query)
     return (path, query)
 
+cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
 cdef int PAUSE_WRITE = 1
 cdef int PAUSE_PIPELINE = 2
@@ -406,6 +407,11 @@ cdef class HttpProtocol:
     cdef bint pump_scheduled
     cdef object _create_task
     cdef object _find_handler
+    cdef object _hot_path
+    cdef object _hot_method
+    cdef object _hot_handler
+    cdef object _hot_route
+    cdef int _hot_routes_version
 
     def __cinit__(self):
         _bind_settings()
@@ -459,6 +465,11 @@ cdef class HttpProtocol:
         self.connections = connections
         self._create_task = app.create_task
         self._find_handler = app.find_handler
+        self._hot_path = None
+        self._hot_method = None
+        self._hot_handler = None
+        self._hot_route = None
+        self._hot_routes_version = -1
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -572,7 +583,9 @@ cdef class HttpProtocol:
         if transport is None or transport.is_closing() or seconds <= 0:
             return
         self.timeout_kind = kind
-        self.timeout_deadline = self.loop.time() + seconds
+        # Sweeper fills now+seconds on the next Date tick. Avoid loop.time()
+        # on the keep-alive hot path (every wrk GET).
+        self.timeout_deadline = 0.0
 
     cdef void _cancel_timeout(self):
         self.timeout_kind = TIMEOUT_NONE
@@ -849,20 +862,27 @@ cdef class HttpProtocol:
         if self.transport is None or self.transport.is_closing():
             return
         try:
-            exchange.reset_body(
-                exchange._req_expect_continue,
-                <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
-            )
-            # Small Content-Length bodies that fit in the current read complete
-            # before the handler runs, so body() hits the cached bytes instead
-            # of waiting on an Event during llhttp_execute. Expect: 100-continue
-            # and large/chunked bodies still dispatch at headers-complete.
             if (
-                not exchange._req_expect_continue
-                and (flags & F_CONTENT_LENGTH)
-                and 0 < content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                (flags & F_CHUNKED)
+                or (flags & F_CONTENT_LENGTH and content_length > 0)
+                or exchange._req_expect_continue
             ):
-                return
+                exchange.reset_body(
+                    exchange._req_expect_continue,
+                    <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
+                )
+                # Small Content-Length bodies that fit in the current read complete
+                # before the handler runs, so body() hits the cached bytes instead
+                # of waiting on an Event during llhttp_execute. Expect: 100-continue
+                # and large/chunked bodies still dispatch at headers-complete.
+                if (
+                    not exchange._req_expect_continue
+                    and (flags & F_CONTENT_LENGTH)
+                    and content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                ):
+                    return
+            else:
+                exchange.mark_nobody()
             self._dispatch(exchange, self._build_request(exchange, exchange))
         except Exception:
             self._close_error(400, "Invalid HTTP request")
@@ -958,6 +978,9 @@ cdef class HttpProtocol:
         cdef object task
         cdef object span
         cdef object host
+        cdef object method
+        cdef object coro
+        cdef object pending
         cdef const char* url
         cdef Py_ssize_t n
         cdef Py_ssize_t i
@@ -999,17 +1022,45 @@ cdef class HttpProtocol:
         exchange.start_response()
         req = exchange.req
         path = req.path
+        method = req.method
         span = exchange.span
         if span is not None and self.noop_span is None:
             span.start()
-            span.attrs({"request.method": req.method, "request.path": path})
-        host = req.host if self.app.host_routing else ""
-        handler, route = self._find_handler(host, path, req.method)
+            span.attrs({"request.method": method, "request.path": path})
+        if (
+            not self.app.host_routing
+            and path is self._hot_path
+            and method is self._hot_method
+            and self._hot_routes_version == self.app.routes_version
+        ):
+            handler = self._hot_handler
+            route = self._hot_route
+        else:
+            host = req.host if self.app.host_routing else ""
+            handler, route = self._find_handler(host, path, method)
+            if not self.app.host_routing:
+                self._hot_path = path
+                self._hot_method = method
+                self._hot_handler = handler
+                self._hot_route = route
+                self._hot_routes_version = self.app.routes_version
         exchange.route = route
+        coro = handler(exchange, exchange)
+        try:
+            pending = coro.send(None)
+        except StopIteration:
+            if not exchange._completed or self.noop_span is None:
+                finish_handler(exchange, exchange)
+            exchange.handler_finished()
+            return
+        except Exception as exc:
+            finish_handler(exchange, exchange, exc)
+            exchange.handler_finished()
+            return
         task = self._create_task(
-            handler(exchange, exchange),
+            resume_started(coro, pending),
             loop=self.loop,
-            eager_start=eager_start,
+            eager_start=False,
         )
         if task.done():
             on_handler_done(exchange, exchange, task)

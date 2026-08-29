@@ -133,6 +133,7 @@ cdef class RequestExchange:
     cdef void park(self)
     cdef void release_global(self)
     cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size) noexcept
+    cdef void mark_nobody(self) noexcept
     cdef int _reserve_request_arena(self, Py_ssize_t bytes_needed) noexcept
     cdef int _reserve_request_headers(self) noexcept
     cdef int append_request_url(self, const char* data, size_t length) noexcept

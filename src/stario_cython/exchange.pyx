@@ -125,6 +125,38 @@ cdef bytes CL_HEADER = b"content-length: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
+
+cdef object _HEAD_DATE = None
+cdef object _HEAD_CT = None
+cdef object _HEAD_BYTES = None
+cdef int _HEAD_STATUS = -1
+cdef Py_ssize_t _HEAD_N = -1
+
+
+cdef object _respond_head(int status, object date, object content_type, Py_ssize_t nbytes):
+    global _HEAD_DATE, _HEAD_CT, _HEAD_BYTES, _HEAD_STATUS, _HEAD_N
+    if (
+        date is _HEAD_DATE
+        and content_type is _HEAD_CT
+        and status == _HEAD_STATUS
+        and nbytes == _HEAD_N
+        and _HEAD_BYTES is not None
+    ):
+        return _HEAD_BYTES
+    _HEAD_BYTES = b"".join((
+        _status_line(status),
+        date,
+        CT_PREFIX,
+        content_type,
+        CL_PREFIX,
+        _dec(<size_t>nbytes),
+        CRLF2,
+    ))
+    _HEAD_DATE = date
+    _HEAD_CT = content_type
+    _HEAD_STATUS = status
+    _HEAD_N = nbytes
+    return _HEAD_BYTES
 cdef bytes CHUNK_END = b"0\r\n\r\n"
 cdef tuple _DEC_SMALL = tuple(str(i).encode("ascii") for i in range(256))
 
@@ -1590,25 +1622,13 @@ cdef class RequestExchange:
                     (_status_line(status), self._date_box[0], ZERO_CL)
                 )
             elif isinstance(body, (list, tuple)):
-                self._transport.writelines((
-                    _status_line(status),
-                    self._date_box[0],
-                    CT_PREFIX,
-                    content_type,
-                    CL_PREFIX,
-                    _dec(<size_t>nbytes),
-                    CRLF2,
-                ))
+                self._transport.write(
+                    _respond_head(status, self._date_box[0], content_type, nbytes)
+                )
                 self._transport.writelines(body)
             else:
                 self._transport.writelines((
-                    _status_line(status),
-                    self._date_box[0],
-                    CT_PREFIX,
-                    content_type,
-                    CL_PREFIX,
-                    _dec(<size_t>nbytes),
-                    CRLF2,
+                    _respond_head(status, self._date_box[0], content_type, nbytes),
                     body,
                 ))
         else:
@@ -1912,6 +1932,23 @@ cdef class RequestExchange:
         self._discard_body = False
         self._expected_size = expected_size
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
+
+    cdef void mark_nobody(self) noexcept:
+        """GET/HEAD/empty POST: no upload, body() is b'' without Event waits."""
+        self._clear_body_storage()
+        self._cached = b""
+        self._data_ready = None
+        self._cancel_stall_timer()
+        self._expect_continue = False
+        self._total_read = 0
+        self._read_max_size = -1
+        self._consumed_as = CONSUMED_NONE
+        self._abort_reason = ABORT_NONE
+        self._body_active = False
+        self._body_complete = True
+        self._waiting = False
+        self._discard_body = False
+        self._expected_size = 0
 
     cdef void _clear_body_storage(self) noexcept:
         if self._chunks is not None:

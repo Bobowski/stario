@@ -14,7 +14,7 @@ from typing import Any
 import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context
-from stario.http.invoke import on_handler_done
+from stario.http.invoke import start_handler
 from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
@@ -133,23 +133,26 @@ class App(Router):
             span.start()
             span.attrs({"request.method": c.req.method, "request.path": path})
 
-        task = self.create_task(handler(c, w), eager_start=True)
+        task = start_handler(
+            c,
+            w,
+            handler,
+            loop=asyncio.get_running_loop(),
+            create_task=self.create_task,
+            eager_start=True,
+        )
+        if task is None:
+            return
         try:
-            if not task.done():
-                await task
+            await task
         except asyncio.CancelledError:
             if not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             raise
-        finally:
-            if task.done():
-                on_handler_done(c, w, task)
         if task.cancelled():
             return
         exc = task.exception()
-        # TestClient / run_with_app: surface failures that never started a
-        # response. If headers already went out, on_handler_done aborted.
         if exc is not None and not w.started:
             raise exc

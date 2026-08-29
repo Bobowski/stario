@@ -383,12 +383,13 @@ def _descend_or_create(
 class Router:
     """Route table: host routes override hostless defaults when they fully match."""
 
-    __slots__ = ("_find_handler", "_has_hosts", "_hosts", "_path")
+    __slots__ = ("_find_handler", "_has_hosts", "_hosts", "_path", "routes_version")
 
     def __init__(self) -> None:
         self._path = Node()
         self._hosts = Node()
         self._has_hosts = False
+        self.routes_version = 0
 
         @lru_cache(maxsize=1024)
         def find_handler(
@@ -420,6 +421,7 @@ class Router:
 
     def _clear_match_cache(self) -> None:
         self._find_handler.cache_clear()
+        self.routes_version += 1
 
     def _match(
         self,
