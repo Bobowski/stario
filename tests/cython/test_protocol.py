@@ -1252,7 +1252,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
             ConnectionAbortedError,
         ):
             response = b""
-        assert b"500" not in response
+        assert b"500" in response.split(b"\r\n", 1)[0]
         assert errors
         assert "stream chunk limit" in str(errors[0])
         writer.close()

@@ -702,7 +702,7 @@ async def test_stalled_chunked_body_aborts_without_hanging() -> None:
         )
         await asyncio.sleep(_WAIT)
         await _drain(app)
-        assert response_status(transport.writes) is None
+        assert response_status(transport.writes) == 500
         assert transport.is_closing()
     finally:
         if not transport.is_closing():
