@@ -66,10 +66,6 @@ def json(w: Writer, value: JsonValue, status: int = 200) -> None:
     w.respond(payload, b"application/json; charset=utf-8", status)
 
 
-_TEXT_SRC: str | None = None
-_TEXT_RAW: bytes = b""
-
-
 def text(w: Writer, body: str, status: int = 200) -> None:
     """Send `body` as UTF-8 `text/plain`.
 
@@ -77,14 +73,7 @@ def text(w: Writer, body: str, status: int = 200) -> None:
     - `body`: Message body as a Unicode string.
     - `status`: HTTP status code.
     """
-    global _TEXT_SRC, _TEXT_RAW
-    if body is _TEXT_SRC:
-        raw = _TEXT_RAW
-    else:
-        raw = body.encode("utf-8")
-        _TEXT_SRC = body
-        _TEXT_RAW = raw
-    w.respond(raw, b"text/plain; charset=utf-8", status)
+    w.respond(body.encode("utf-8"), b"text/plain; charset=utf-8", status)
 
 
 def redirect(w: Writer, url: str, status: int = 307) -> None:

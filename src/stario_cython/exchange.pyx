@@ -125,38 +125,6 @@ cdef bytes CL_HEADER = b"content-length: "
 cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
-
-cdef object _HEAD_DATE = None
-cdef object _HEAD_CT = None
-cdef object _HEAD_BYTES = None
-cdef int _HEAD_STATUS = -1
-cdef Py_ssize_t _HEAD_N = -1
-
-
-cdef object _respond_head(int status, object date, object content_type, Py_ssize_t nbytes):
-    global _HEAD_DATE, _HEAD_CT, _HEAD_BYTES, _HEAD_STATUS, _HEAD_N
-    if (
-        date is _HEAD_DATE
-        and content_type is _HEAD_CT
-        and status == _HEAD_STATUS
-        and nbytes == _HEAD_N
-        and _HEAD_BYTES is not None
-    ):
-        return _HEAD_BYTES
-    _HEAD_BYTES = b"".join((
-        _status_line(status),
-        date,
-        CT_PREFIX,
-        content_type,
-        CL_PREFIX,
-        _dec(<size_t>nbytes),
-        CRLF2,
-    ))
-    _HEAD_DATE = date
-    _HEAD_CT = content_type
-    _HEAD_STATUS = status
-    _HEAD_N = nbytes
-    return _HEAD_BYTES
 cdef bytes CHUNK_END = b"0\r\n\r\n"
 cdef tuple _DEC_SMALL = tuple(str(i).encode("ascii") for i in range(256))
 
@@ -1611,8 +1579,8 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
-        # Empty headers + no compression: writelines of existing buffers (no join,
-        # no _out_buf churn — keeps tiny plaintext/json competitive).
+        # Empty headers + no compression: writelines of interned pieces
+        # (status, Date, type, length, body). No join, no cross-request cache.
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
@@ -1622,13 +1590,25 @@ cdef class RequestExchange:
                     (_status_line(status), self._date_box[0], ZERO_CL)
                 )
             elif isinstance(body, (list, tuple)):
-                self._transport.write(
-                    _respond_head(status, self._date_box[0], content_type, nbytes)
-                )
+                self._transport.writelines((
+                    _status_line(status),
+                    self._date_box[0],
+                    CT_PREFIX,
+                    content_type,
+                    CL_PREFIX,
+                    _dec(<size_t>nbytes),
+                    CRLF2,
+                ))
                 self._transport.writelines(body)
             else:
                 self._transport.writelines((
-                    _respond_head(status, self._date_box[0], content_type, nbytes),
+                    _status_line(status),
+                    self._date_box[0],
+                    CT_PREFIX,
+                    content_type,
+                    CL_PREFIX,
+                    _dec(<size_t>nbytes),
+                    CRLF2,
                     body,
                 ))
         else:

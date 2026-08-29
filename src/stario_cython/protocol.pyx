@@ -407,11 +407,6 @@ cdef class HttpProtocol:
     cdef bint pump_scheduled
     cdef object _create_task
     cdef object _find_handler
-    cdef object _hot_path
-    cdef object _hot_method
-    cdef object _hot_handler
-    cdef object _hot_route
-    cdef int _hot_routes_version
 
     def __cinit__(self):
         _bind_settings()
@@ -465,11 +460,6 @@ cdef class HttpProtocol:
         self.connections = connections
         self._create_task = app.create_task
         self._find_handler = app.find_handler
-        self._hot_path = None
-        self._hot_method = None
-        self._hot_handler = None
-        self._hot_route = None
-        self._hot_routes_version = -1
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -1025,23 +1015,8 @@ cdef class HttpProtocol:
         if span is not None and self.noop_span is None:
             span.start()
             span.attrs({"request.method": method, "request.path": path})
-        if (
-            not self.app.host_routing
-            and path is self._hot_path
-            and method is self._hot_method
-            and self._hot_routes_version == self.app.routes_version
-        ):
-            handler = self._hot_handler
-            route = self._hot_route
-        else:
-            host = req.host if self.app.host_routing else ""
-            handler, route = self._find_handler(host, path, method)
-            if not self.app.host_routing:
-                self._hot_path = path
-                self._hot_method = method
-                self._hot_handler = handler
-                self._hot_route = route
-                self._hot_routes_version = self.app.routes_version
+        host = req.host if self.app.host_routing else ""
+        handler, route = self._find_handler(host, path, method)
         exchange.route = route
         task = self._create_task(
             handler(exchange, exchange),
