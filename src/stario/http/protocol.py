@@ -336,13 +336,16 @@ class HttpProtocol(asyncio.Protocol):
             self._active_writer = writer
 
             # Handler coroutine is the task body (no App.__call__ wrapper).
-            self._active_task = schedule_request(
+            # Eager-complete responses already ran on_response_completed; do
+            # not stash a done task or idle shutdown will skip this connection.
+            task = schedule_request(
                 self.app,
                 context,
                 writer,
                 loop=self.loop,
                 eager_start=True,
             )
+            self._active_task = None if task.done() else task
 
         else:
             # Pipeline queue: must not run the next handler until bytes are fully written.
@@ -401,13 +404,14 @@ class HttpProtocol(asyncio.Protocol):
             next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
             self._active_context = next_c
-            self._active_task = schedule_request(
+            task = schedule_request(
                 self.app,
                 next_c,
                 next_w,
                 loop=self.loop,
                 eager_start=False,
             )
+            self._active_task = None if task.done() else task
             t.resume_reading()
         else:
             self._active_context = None

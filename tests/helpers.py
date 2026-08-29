@@ -56,6 +56,8 @@ class DummyWriter:
         self.started = True
         self._status_code = status
         self.headers.set("content-type", content_type.decode("latin-1"))
+        self.ended = True
+        self._completed = True
 
     def write_headers(self, status: int):
         self.status = status
