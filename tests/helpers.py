@@ -5,7 +5,6 @@ freely: `from tests.helpers import DummyWriter, make_context, ...`.
 """
 
 import asyncio
-import inspect
 from collections.abc import Awaitable, Callable, Coroutine, Generator
 from contextlib import contextmanager
 from typing import Any, cast
@@ -187,9 +186,7 @@ async def invoke_handler(
     loop = asyncio.get_running_loop()
     ctx = make_context(path, method, host, app=app, query=query, loop=loop)
     w = writer or DummyWriter()
-    result = handler(ctx, cast(Writer, w))
-    if inspect.isawaitable(result):
-        await result
+    await handler(ctx, cast(Writer, w))
     return ctx, w
 
 

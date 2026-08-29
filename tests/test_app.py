@@ -1,8 +1,5 @@
 """Tests for app-level routing and host dispatch."""
 
-import asyncio
-from typing import cast
-
 import pytest
 
 from stario.exceptions import (
@@ -10,13 +7,12 @@ from stario.exceptions import (
     HttpException,
     RedirectException,
     StarioError,
-    StarioRuntime,
 )
 from stario.http.app import App
 from stario.http.context import Context
 from stario.http.writer import Writer
 from stario.routing import UrlPath
-from tests.helpers import DummyWriter, make_context, run_with_app
+from tests.helpers import run_with_app
 
 
 def test_eager_create_task_uses_direct_task_with_uvloop() -> None:
@@ -77,28 +73,17 @@ class TestAppErrorSurface:
         assert writer.ended
 
     def test_handler_must_send_explicit_response(self):
-        seen: list[type[Exception]] = []
-
         async def missing_response(_c: Context, _w: Writer) -> None:
             return None
 
-        async def runtime_error_handler(
-            _c: Context,
-            w: Writer,
-            exc: Exception,
-        ) -> None:
-            seen.append(type(exc))
-            w.respond(b"missing", b"text/plain", 500)
-
         def setup(app: App) -> None:
-            app.on_error(StarioRuntime, runtime_error_handler)
             app.get("/missing", missing_response)
 
         _context, writer = run_with_app(setup, "/missing")
 
-        assert seen == [StarioRuntime]
         assert writer.status == 500
-        assert writer.body == "missing"
+        assert writer.body == "Internal Server Error"
+        assert writer.ended
 
     def test_default_http_exception_handler(self):
         async def handler(_c: Context, _w: Writer) -> None:
@@ -150,10 +135,7 @@ class TestAppErrorSurface:
         assert writer.status == 500
         assert writer.body == "Internal Server Error"
 
-    def test_on_error_handles_subclass_via_mro(self):
-        async def custom(_c: Context, w: Writer, _exc: Exception) -> None:
-            w.respond(b"handled", b"text/plain", 418)
-
+    def test_unregistered_exception_is_500(self):
         class MyValueError(ValueError):
             pass
 
@@ -161,120 +143,52 @@ class TestAppErrorSurface:
             raise MyValueError("subtype")
 
         def setup(app: App) -> None:
-            app.on_error(ValueError, custom)
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 418
-        assert writer.body == "handled"
-
-    def test_error_handler_failure_falls_back_to_500(self):
-        async def bad_handler(_c: Context, _w: Writer, _exc: Exception) -> None:
-            raise RuntimeError("handler failed")
-
-        async def handler(_c: Context, _w: Writer) -> None:
-            raise ValueError("original")
-
-        def setup(app: App) -> None:
-            app.on_error(ValueError, bad_handler)
             app.get("/x", handler)
 
         _context, writer = run_with_app(setup, "/x")
 
         assert writer.status == 500
         assert writer.body == "Internal Server Error"
+        assert not hasattr(App, "on_error")
+
+    def test_http_exception_subclass_is_still_typed(self):
+        class Gone(HttpException):
+            def __init__(self) -> None:
+                super().__init__(410, "gone")
+
+        async def handler(_c: Context, _w: Writer) -> None:
+            raise Gone()
+
+        def setup(app: App) -> None:
+            app.get("/x", handler)
+
+        _context, writer = run_with_app(setup, "/x")
+
+        assert writer.status == 410
+        assert writer.body == "gone"
+
+    def test_call_uses_find_handler(self):
+        seen: list[tuple[str, str, str]] = []
+
+        async def handler(_c: Context, w: Writer) -> None:
+            w.respond(b"ok", b"text/plain", 200)
+
+        def setup(app: App) -> None:
+            app.get("/x", handler)
+            original = app.find_handler
+
+            def wrapped(host: str, path: str, method: str):
+                seen.append((host, path, method))
+                return original(host, path, method)
+
+            app.find_handler = wrapped  # type: ignore[method-assign]
+
+        _context, writer = run_with_app(setup, "/x")
+
+        assert seen == [("", "/x", "GET")]
+        assert writer.status == 200
+        assert writer.body == "ok"
 
     def test_app_requires_running_loop(self):
         with pytest.raises(StarioError, match="requires a running event loop"):
             App()
-
-
-class TestSyncHandlers:
-    def test_sync_handler_sends_response(self):
-        def hello(_c: Context, w: Writer) -> None:
-            w.respond(b"ok", b"text/plain", 200)
-
-        def setup(app: App) -> None:
-            app.get("/hello", hello)
-
-        _context, writer = run_with_app(setup, "/hello")
-
-        assert writer.status == 200
-        assert writer.body == "ok"
-        assert writer.ended
-
-    def test_sync_handler_must_send_explicit_response(self):
-        def missing(_c: Context, _w: Writer) -> None:
-            return None
-
-        def setup(app: App) -> None:
-            app.get("/missing", missing)
-
-        _context, writer = run_with_app(setup, "/missing")
-
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-
-    def test_sync_handler_http_exception(self):
-        def handler(_c: Context, _w: Writer) -> None:
-            raise HttpException(422, "nope")
-
-        def setup(app: App) -> None:
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 422
-        assert writer.body == "nope"
-
-    def test_dispatch_returns_none_for_sync(self):
-        async def run() -> None:
-            app = App()
-
-            def hello(_c: Context, w: Writer) -> None:
-                w.respond(b"ok", b"text/plain", 200)
-
-            app.get("/hello", hello)
-            ctx = make_context("/hello", app=app, loop=asyncio.get_running_loop())
-            w = DummyWriter()
-            task = app.dispatch(ctx, cast(Writer, w))
-            assert task is None
-            assert w.status == 200
-
-        asyncio.run(run())
-
-    def test_dispatch_returns_task_for_async(self):
-        async def run() -> None:
-            app = App()
-
-            async def hello(_c: Context, w: Writer) -> None:
-                await asyncio.sleep(0)
-                w.respond(b"ok", b"text/plain", 200)
-
-            app.get("/hello", hello)
-            ctx = make_context("/hello", app=app, loop=asyncio.get_running_loop())
-            w = DummyWriter()
-            task = app.dispatch(ctx, cast(Writer, w), eager_start=False)
-            assert task is not None
-            assert not task.done()
-            await task
-            assert w.status == 200
-
-        asyncio.run(run())
-
-    def test_sync_handler_with_async_error_handler(self):
-        async def custom(_c: Context, w: Writer, _exc: Exception) -> None:
-            w.respond(b"handled", b"text/plain", 418)
-
-        def handler(_c: Context, _w: Writer) -> None:
-            raise ValueError("boom")
-
-        def setup(app: App) -> None:
-            app.on_error(ValueError, custom)
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 418
-        assert writer.body == "handled"

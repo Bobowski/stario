@@ -40,13 +40,13 @@ class Context:
     req: Request
     """Parsed HTTP request (method, path, headers, body reader)."""
     span: Span
-    """Telemetry span for this request; started/ended by the app callable."""
+    """Telemetry span for this request; started/ended by `schedule_request`."""
     _disconnect: asyncio.Future[None] = field(repr=False)
     """Completes when the client closes this request's connection."""
     state: dict[str, Any] = field(default_factory=lambda: {})
     """Mutable dict for middleware to pass data to inner layers and the handler."""
     route: RouteMatch = field(default=EMPTY_ROUTE_MATCH)
-    """Filled by `App.__call__` before the handler runs; do not assign in handlers."""
+    """Filled by `find_handler` before the handler runs; do not assign in handlers."""
 
     @property
     def disconnect(self) -> asyncio.Future[None]:
@@ -144,8 +144,6 @@ class _Alive[T]:
         )
 
 
-type SyncHandler = Callable[[Context, Writer], None]
-type AsyncHandler = Callable[[Context, Writer], Awaitable[None]]
-type Handler = SyncHandler | AsyncHandler
+type Handler = Callable[[Context, Writer], Awaitable[None]]
 
 type Middleware = Callable[[Handler], Handler]

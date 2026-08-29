@@ -6,16 +6,19 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
-### Added
+### Breaking changes
 
-- Sync handlers — register `def handler(c, w):` beside `async def`. Classification
-  happens at `app.add` / `app.get` / …, not per request. The server contract is
-  `App.dispatch()`: sync handlers run immediately once the request is ready;
-  async handlers are scheduled as tasks. `await app(c, w)` still works (it
-  awaits the task when the route is async). Sync handlers cannot use `await`;
-  read the body with `await c.req.body()` on an async handler. Middleware that
-  wraps a sync leaf is adapted so existing `await handler(c, w)` middleware
-  keeps working; the composed route then takes the async path.
+- `App.on_error` and exception-handler MRO are gone. Uncaught `HttpException`,
+  `RedirectException`, and `ClientDisconnected` are handled explicitly; every
+  other exception is 500.
+- Route handlers must be `async def` (or a callable whose `__call__` is async).
+- The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
+  instead of `create_task(app(c, w))`. `App.__call__` remains for tests.
+
+### Changed
+
+- Request finish (missing response, writer `end`/`abort`, span) lives in
+  `stario.http.invoke.schedule_request`.
 
 ## 4.1.0 - 2026-08-17
 

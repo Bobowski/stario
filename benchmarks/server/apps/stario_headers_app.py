@@ -10,18 +10,18 @@ BODY = b"ok"
 CONTENT_TYPE = b"text/plain"
 
 
-def no_reads(_c, w):
+async def no_reads(_c, w):
     w.respond(BODY, CONTENT_TYPE)
 
 
-def one_read(c, w):
+async def one_read(c, w):
     if c.req.headers.get("authorization") != "Bearer benchmark-token":
         w.respond(b"bad authorization", CONTENT_TYPE, 500)
         return
     w.respond(BODY, CONTENT_TYPE)
 
 
-def three_reads(c, w):
+async def three_reads(c, w):
     headers = c.req.headers
     values = (
         headers.get("authorization"),
@@ -38,14 +38,14 @@ def three_reads(c, w):
     w.respond(BODY, CONTENT_TYPE)
 
 
-def cookie_list(c, w):
+async def cookie_list(c, w):
     if c.req.headers.getlist("cookie") != ["session=abc123; theme=dark"]:
         w.respond(b"bad cookie", CONTENT_TYPE, 500)
         return
     w.respond(BODY, CONTENT_TYPE)
 
 
-def response_headers(_c, w):
+async def response_headers(_c, w):
     w.headers.set("cache-control", "no-store")
     w.headers.set("x-request-id", "request-1")
     w.headers.add("vary", "origin")

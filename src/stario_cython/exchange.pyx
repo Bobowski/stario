@@ -1473,7 +1473,7 @@ cdef class RequestExchange:
         self.reset_response(self._req_encoding)
 
     def on_handler_done(self, task):
-        """``Task.add_done_callback`` entry; recycles after async ``dispatch``."""
+        """``Task.add_done_callback`` entry; recycles after the handler task."""
         self.handler_finished()
 
     cdef void handler_finished(self):

@@ -13,15 +13,15 @@ def json_response(w, value, status: int = 200) -> None:
     w.respond(ujson.dumps(value).encode("utf-8"), JSON_CONTENT_TYPE, status)
 
 
-def plaintext(c, w):
+async def plaintext(c, w):
     responses.text(w, HELLO)
 
 
-def json_endpoint(c, w):
+async def json_endpoint(c, w):
     json_response(w, {"message": HELLO})
 
 
-def get_user(c, w):
+async def get_user(c, w):
     user_id = c.route.params["user_id"]
     json_response(w, {"id": user_id, "name": f"User {user_id}"})
 

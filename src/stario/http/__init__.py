@@ -1,7 +1,8 @@
 """HTTP stack for Stario apps and servers.
 
 **Dispatch** — `Router` in `stario.http.dispatch` matches requests to handlers.
-`App` subclasses it and adds error handling plus the protocol entrypoint.
+`App` subclasses it and tracks tasks. The protocol runs `find_handler` then
+the matched handler as a task (`stario.http.invoke`).
 
 **Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
 
@@ -23,12 +24,7 @@ For tests, `aload_app` is re-exported from `stario.testing`.
 
 from stario.http.app import App
 from stario.http.context import Context, Handler, Middleware, RouteMatch
-from stario.http.dispatch import (
-    Router,
-    default_not_found,
-    handler_is_async,
-    method_not_allowed_handler,
-)
+from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
 from stario.http.headers import Headers
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
@@ -47,7 +43,6 @@ __all__ = [
     "Router",
     "Writer",
     "default_not_found",
-    "handler_is_async",
     "method_not_allowed_handler",
     "normalized_location",
 ]

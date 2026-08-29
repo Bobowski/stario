@@ -25,6 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
+from stario.http.invoke import schedule_request
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -403,8 +404,7 @@ cdef class HttpProtocol:
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
-    cdef object _create_task
-    cdef object _app_dispatch
+    cdef object _schedule_request
 
     def __cinit__(self):
         _bind_settings()
@@ -456,8 +456,7 @@ cdef class HttpProtocol:
         self.date_box = date_box
         self.compression = compression
         self.connections = connections
-        self._create_task = app.create_task
-        self._app_dispatch = app.dispatch
+        self._schedule_request = schedule_request
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -950,19 +949,16 @@ cdef class HttpProtocol:
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
-        cdef object task
         self.active_exchange = exchange
         exchange.start_response()
-        task = self._app_dispatch(
+        self._schedule_request(
+            self.app,
             exchange,
             exchange,
             loop=self.loop,
             eager_start=eager_start,
+            on_done=exchange.on_handler_done,
         )
-        if task is None or task.done():
-            exchange.handler_finished()
-        else:
-            task.add_done_callback(exchange.on_handler_done)
 
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
@@ -974,7 +970,7 @@ cdef class HttpProtocol:
         """Advance the connection after the response is fully sent.
 
         Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
-        the handler returns. An async handler (or ``app.create_task`` work)
+        the handler coroutine returns. The handler (or ``app.create_task`` work)
         may still run after this; the connection is free to start the next
         pipelined/keep-alive exchange immediately.
         """

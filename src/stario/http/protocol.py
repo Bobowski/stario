@@ -1,9 +1,9 @@
 """
-Per-connection HTTP/1.1: httptools parses bytes; async handlers run as tasks so this layer never blocks the event loop. Sync handlers run immediately via `app.dispatch()`.
+Per-connection HTTP/1.1: httptools parses bytes; handlers run as tasks so this layer never blocks the event loop.
 
 Shared `disconnect` futures tie body reads and long responses to the same socket lifetime. Pipelining and keep-alive
-follow RFC behavior even when common clients use parallel connections instead. App work is scheduled via `app.create_task`
-so shutdown can observe the same task set the app registered.
+follow RFC behavior even when common clients use parallel connections instead. Each request is
+`find_handler` then `create_task(handler(c, w))` so shutdown can observe the same task set.
 """
 
 import asyncio
@@ -25,6 +25,7 @@ from .compression import CompressionConfig
 from .config import RequestPolicy
 from .context import Context
 from .headers import Headers
+from .invoke import schedule_request
 from .request import BodyReader, Request
 from .wire import decode_method, decode_path
 from .writer import (
@@ -248,15 +249,12 @@ class HttpProtocol(asyncio.Protocol):
         ):
             return
 
-        # Reject before dispatch. Sync handlers now run inline in this
-        # callback; waiting for HttpParserUpgrade from feed_data is too late.
-        if parser.should_upgrade():
-            self._close_with_error(400, "Upgrade not supported")
-            return
-
         url = b"".join(self._reading_url_parts)
         parsed_url = parse_url(url)
         if not self._validate_request_framing(headers):
+            return
+        if parser.should_upgrade():
+            self._close_with_error(400, "Upgrade not supported")
             return
 
         body_reader = self._reading_body
@@ -298,8 +296,7 @@ class HttpProtocol(asyncio.Protocol):
             )
             self._reading_body = body_reader
 
-        # Hand off to the app: one Request + Writer per message. Sync handlers
-        # run inline; async handlers are scheduled as tasks (see on_response_completed).
+        # Hand off to the app: one Request + Writer per message; handler runs in a task (see on_response_completed).
         try:
             method = decode_method(parser.get_method())
             path_str = decode_path(parsed_url.path)
@@ -338,12 +335,14 @@ class HttpProtocol(asyncio.Protocol):
             self._active_context = context
             self._active_writer = writer
 
-            # dispatch() may complete the response (and start a pipelined
-            # follow-up) before returning; only store the task if this
-            # exchange is still the active one.
-            task = self.app.dispatch(context, writer, loop=self.loop)
-            if self._active_context is context:
-                self._active_task = task
+            # Handler coroutine is the task body (no App.__call__ wrapper).
+            self._active_task = schedule_request(
+                self.app,
+                context,
+                writer,
+                loop=self.loop,
+                eager_start=True,
+            )
 
         else:
             # Pipeline queue: must not run the next handler until bytes are fully written.
@@ -402,9 +401,13 @@ class HttpProtocol(asyncio.Protocol):
             next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
             self._active_context = next_c
-            task = self.app.dispatch(next_c, next_w, loop=self.loop)
-            if self._active_context is next_c:
-                self._active_task = task
+            self._active_task = schedule_request(
+                self.app,
+                next_c,
+                next_w,
+                loop=self.loop,
+                eager_start=False,
+            )
             t.resume_reading()
         else:
             self._active_context = None
