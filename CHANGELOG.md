@@ -18,7 +18,7 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 ### Changed
 
 - Request finish (missing response, writer `end`/`abort`, span) lives in
-  `stario.http.invoke.schedule_request`.
+  `stario.http.invoke`. Cython resolves the handler in `_start_exchange`.
 
 ## 4.1.0 - 2026-08-17
 
