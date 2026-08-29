@@ -2,8 +2,8 @@
 Application object: route table, shutdown-aware tasks, thin test entrypoint.
 
 The HTTP protocol does not call this class per request. It uses
-`find_handler` and `create_task(handler(c, w))`. `App.__call__` exists so
-tests and `TestClient` share that same path.
+`find_handler` then drives the handler (a Task only if it suspends).
+`App.__call__` exists so tests and `TestClient` share that same path.
 """
 
 import asyncio
