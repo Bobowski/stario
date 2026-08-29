@@ -77,6 +77,16 @@ def finish_scheduled(c: Context, w: Writer, task: asyncio.Task[None]) -> None:
     """Apply handler outcome, guarantee `end`/`abort`, close the request span."""
     span = c.span
     record = type(span) is not NoOpSpan
+    if (
+        w.completed
+        and not task.cancelled()
+        and task.exception() is None
+    ):
+        if record:
+            span.attr("response.status_code", w.status_code)
+            span.end()
+        return
+
     fail_span = False
     exc: BaseException | None = None
 
@@ -142,13 +152,18 @@ def schedule_request(
         eager_start=eager_start,
     )
 
-    def _done(done: asyncio.Task[None], /) -> None:
-        finish_scheduled(c, w, done)
+    if task.done():
+        finish_scheduled(c, w, task)
         if on_done is not None:
+            on_done(task)
+        return task
+
+    if on_done is None:
+        task.add_done_callback(lambda done: finish_scheduled(c, w, done))
+    else:
+        def _done(done: asyncio.Task[None], /) -> None:
+            finish_scheduled(c, w, done)
             on_done(done)
 
-    if task.done():
-        _done(task)
-    else:
         task.add_done_callback(_done)
     return task

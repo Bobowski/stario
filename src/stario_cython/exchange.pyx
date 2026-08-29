@@ -43,6 +43,7 @@ from stario.http.compression import (
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
+from stario.http.invoke import finish_scheduled
 from stario.http.request import host_without_port
 from stario.http.writer import get_status_line
 
@@ -1473,7 +1474,8 @@ cdef class RequestExchange:
         self.reset_response(self._req_encoding)
 
     def on_handler_done(self, task):
-        """``Task.add_done_callback`` entry; recycles after the handler task."""
+        """Finish the writer/span, then recycle after the handler task."""
+        finish_scheduled(self, self, task)
         self.handler_finished()
 
     cdef void handler_finished(self):

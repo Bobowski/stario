@@ -25,7 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
-from stario.http.invoke import schedule_request
+from stario.http.invoke import finish_scheduled, trailing_slash_redirect
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -404,7 +404,9 @@ cdef class HttpProtocol:
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
-    cdef object _schedule_request
+    cdef object _create_task
+    cdef object _find_handler
+    cdef object _trailing_slash
 
     def __cinit__(self):
         _bind_settings()
@@ -456,7 +458,9 @@ cdef class HttpProtocol:
         self.date_box = date_box
         self.compression = compression
         self.connections = connections
-        self._schedule_request = schedule_request
+        self._create_task = app.create_task
+        self._find_handler = app.find_handler
+        self._trailing_slash = trailing_slash_redirect
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -949,16 +953,37 @@ cdef class HttpProtocol:
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
+        cdef object req
+        cdef object path
+        cdef object handler
+        cdef object route
+        cdef object task
+        cdef object span
+        cdef object host
         self.active_exchange = exchange
         exchange.start_response()
-        self._schedule_request(
-            self.app,
-            exchange,
-            exchange,
+        req = exchange.req
+        path = req.path
+        span = exchange.span
+        if span is not None and self.noop_span is None:
+            span.start()
+            span.attrs({"request.method": req.method, "request.path": path})
+        if path != "/" and path.endswith("/"):
+            handler = self._trailing_slash
+        else:
+            host = req.host if self.app.host_routing else ""
+            handler, route = self._find_handler(host, path, req.method)
+            exchange.route = route
+        task = self._create_task(
+            handler(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
-            on_done=exchange.on_handler_done,
         )
+        if task.done():
+            finish_scheduled(exchange, exchange, task)
+            exchange.handler_finished()
+        else:
+            task.add_done_callback(exchange.on_handler_done)
 
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
