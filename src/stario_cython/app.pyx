@@ -277,7 +277,7 @@ cdef class App(Router):
                 else:
                     c.route = route
                 result = handler(c, w)
-                if _isawaitable(result):
+                if result is not None:
                     return self._continue_async(
                         c, w, result, is_ex, ex, traced, span, method, path, route
                     )
@@ -329,6 +329,89 @@ cdef class App(Router):
                 span.fail(str(exc))
                 span.exception(exc)
         _finish_writer(is_ex, ex, w, failed_after_start, traced, span)
+        return None
+
+    cpdef object dispatch_exchange(self, RequestExchange ex):
+        """RequestExchange hot path: no type check, no DummyWriter branches."""
+        cdef Request req = ex.req
+        cdef object span = ex.span
+        cdef object path = req.path
+        cdef object method = req.method
+        cdef object host
+        cdef object handler
+        cdef object route
+        cdef object target
+        cdef object query_bytes
+        cdef object err_handler
+        cdef object result
+        cdef object err_result
+        cdef bint traced = type(span) is not NOOP_SPAN_TYPE
+        cdef bint failed_after_start = False
+        cdef bint handler_responded
+        cdef bint started
+        cdef Py_ssize_t n
+        cdef object w = ex
+
+        if traced:
+            span.start()
+            span.attrs({"request.method": method, "request.path": path})
+
+        try:
+            n = PyUnicode_GET_LENGTH(path)
+            if n > 1 and PyUnicode_READ_CHAR(path, n - 1) == 47:
+                target = normalize_path(path)
+                query_bytes = req.query_bytes
+                if query_bytes:
+                    target = f"{target}?{query_bytes.decode('latin-1')}"
+                responses.redirect(w, target, 308)
+            else:
+                if not self._has_hosts:
+                    host = EMPTY_HOST
+                else:
+                    host = req.host
+                handler, route = self.find_handler(host, path, method)
+                ex.route = route
+                result = handler(ex, w)
+                if result is not None:
+                    return self._continue_async(
+                        ex, w, result, True, ex, traced, span, method, path, route
+                    )
+                if ex._status_code < 0 and not ex._completed:
+                    raise StarioRuntime(
+                        "Handler returned without sending a response",
+                        context={
+                            "method": method,
+                            "path": path,
+                            "route": route.pattern or None,
+                        },
+                        help_text=(
+                            "Call a response helper such as responses.text/json/html/empty, "
+                            "or explicitly use Writer.write_headers()/write()/end()."
+                        ),
+                    )
+        except Exception as exc:
+            handler_responded = False
+            started = ex._status_code >= 0
+            failed_after_start = started
+            if not started:
+                err_handler = self._find_error_handler(type(exc))
+                if err_handler is not None:
+                    try:
+                        err_result = err_handler(ex, w, exc)
+                        if _isawaitable(err_result):
+                            return self._continue_async(
+                                ex, w, err_result, True, ex, traced, span, method, path, route
+                            )
+                        handler_responded = ex._status_code >= 0 or ex._completed
+                    except Exception as handler_exc:
+                        failed_after_start = ex._status_code >= 0
+                        exc = handler_exc
+                if not handler_responded:
+                    responses.text(w, "Internal Server Error", 500)
+            if not handler_responded and traced:
+                span.fail(str(exc))
+                span.exception(exc)
+        _finish_writer(True, ex, w, failed_after_start, traced, span)
         return None
 
     async def __call__(self, object c, object w):

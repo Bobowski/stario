@@ -4,11 +4,15 @@ Profiler notes on commit `9e428a3` plus follow-up captures on
 `cursor/cython-app-router-poc-b193`. Official suite numbers stay in
 [`baseline-20260828-app-router.md`](baseline-20260828-app-router.md).
 
-The remaining Granian lead on tiny GET is **not I/O and not the router**.
+The remaining Granian lead on tiny GET was **not I/O and not the router**.
 Stario already does **one `read` + one `writev` per request**. Granian pays
 extra `write` / `futex` / `epoll` for a Rust→Python thread hop and still
-wins because each Stario request spends ~700–900 ns more in Python/Cython
+won because each Stario request spent ~700–900 ns more in Python/Cython
 userspace: `asyncio.Task` + the App coroutine + the handler coroutine.
+
+That path is now implemented: **`App.dispatch` / `dispatch_exchange`** for
+sync handlers. Measured GET plaintext **crossed ahead** of Granian RSGI on
+this host (see [Measured](#measured-sync-get-dispatch-vs-granian)).
 
 ## The gap
 
@@ -118,7 +122,7 @@ Dropping the inner `async def` as well (~270 ns) overshoots.
 
 ## What would jump ahead (ranked)
 
-### 1. Do not allocate `asyncio.Task` on non-suspending GET (~300 ns)
+### 1. Do not allocate `asyncio.Task` on non-suspending GET (~300 ns) — **done**
 
 `HttpProtocol._start_exchange` always does `asyncio.Task(app(...), eager_start=True)`
 even when the handler never awaits. The Task is `.done()` before
@@ -192,17 +196,43 @@ Python scheduling, not libuv.
 A native HTTP core is a different product goal (HTTP/2, TLS, multi-thread).
 It is not the 740 ns plaintext lever.
 
-## Suggested order of work
+## Measured: sync GET dispatch vs Granian
 
-1. **Sync/cdef dispatch on the protocol callback** for handlers that do not
-   suspend: no Task, no App coroutine, no inner `async def`. Biggest jump,
-   one design, avoids cloning `Task.__step`.
-2. Keep `asyncio.Task(eager_start=True)` for `await req.body()` / streaming /
-   `c.alive()`.
-3. Optionally cdef `responses.text` or inline encode+`respond` for the
-   helper.
-4. Re-measure only GET `/plaintext`, `/json`, `/user/{id}` against Granian
-   RSGI with the same wrk knobs as the official suite.
+`App.dispatch` / `dispatch_exchange` run plain `def` handlers inline. The
+protocol does not allocate `asyncio.Task` when `dispatch` returns `None`.
+Benchmark GET `/plaintext`, `/json`, `/user/{id}` are now sync (`ujson` /
+`str.encode` still per request). POST stays `async def`.
+
+Same wrk knobs as the official App/Router suite (`RUNS=5 WARMUP=1 DURATION=10s
+THREADS=2 CONNECTIONS=128`). Sequential same-host runs; medians ± stdev after
+IQR trim.
+
+| Run | Stario plaintext | Granian plaintext | Stario / Granian |
+| --- | ---: | ---: | ---: |
+| Official App/Router (async GET, `20260828T210831Z`) | 136,005 | **151,270** | 0.90× |
+| Sync `dispatch` (`20260829T061538Z`) | 144,802 | **150,019** | 0.97× |
+| + `dispatch_exchange` (`20260829T062337Z`) | **152,836** | 150,095 | **1.02×** |
+| GET trio (`20260829T062546Z`) | **163,892** | 146,041 | **1.12×** |
+
+GET trio (`20260829T062546Z`, same knobs, `ENDPOINTS=plaintext,json,params`):
+
+| Endpoint | Stario | Granian RSGI | Stario / Granian |
+| --- | ---: | ---: | ---: |
+| Plaintext | **163,892 ± 3,512** | 146,041 ± 967 | **1.12×** |
+| JSON | **152,699 ± 4,089** | 151,269 ± 2,267 | 1.01× |
+| Params | **158,827 ± 1,004** | 150,484 ± 3,349 | **1.06×** |
+
+Same-host wrk moves around (plaintext 145k–164k across these runs). The
+direction is stable: skipping Task + App/handler coroutines on GET closed the
+~11% Granian lead and, with the RequestExchange-specialized `dispatch_exchange`,
+crossed ahead on this box.
+
+```bash
+RUNS=5 WARMUP=1 DURATION=10s THREADS=2 CONNECTIONS=128 \
+  ENDPOINTS=plaintext,json,params \
+  benchmarks/server/run.sh stario-cython granian-rsgi
+```
+
 
 ## Reproduce the profiles
 

@@ -83,3 +83,5 @@ in this run (same as the 2026-08-28 Cython protocol snapshot).
 
 Profiler follow-up (what would close the remaining GET gap):
 [`baseline-20260829-granian-gap.md`](baseline-20260829-granian-gap.md).
+Sync GET handlers + `dispatch_exchange` later crossed ahead of Granian on
+plaintext in `20260829T062337Z` / `20260829T062546Z` (see that note).
