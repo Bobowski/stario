@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from types import FrameType
-from typing import Any, Literal
+from typing import Any
 
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
@@ -29,7 +29,7 @@ from .bootstrap import (
     ShutdownTrigger,
     bootstrap_run,
 )
-from .config import ServerConfig
+from .config import EventLoopKind, ServerConfig
 from .protocol import HttpProtocol
 
 type SignalHandler = Callable[[int, FrameType | None], object]
@@ -44,26 +44,26 @@ _FORCE_CLOSE_CAP = 1.0
 _ACCEPT_REGISTER_YIELDS = 10
 
 
-def resolve_loop_runner(event_loop: Literal["asyncio", "uvloop"]) -> LoopRun[Any]:
-    """Return `asyncio.run` or `uvloop.run` for the configured event loop."""
+def resolve_loop_runner(event_loop: EventLoopKind) -> LoopRun[Any]:
+    """Return `asyncio.run`, `uvloop.run`, or `zuvloop.run` for the configured loop."""
     if event_loop == "asyncio":
         return asyncio.run
-    if sys.platform == "win32":
+    if event_loop == "uvloop" and sys.platform == "win32":
         raise StarioError(
             "uvloop is not supported on Windows",
-            help_text="Set event_loop='asyncio' in ServerConfig.",
+            help_text="Set event_loop='asyncio' or 'zuvloop' in ServerConfig.",
         )
     try:
-        uvloop = importlib.import_module("uvloop")
+        module = importlib.import_module(event_loop)
     except ImportError as exc:
         raise StarioError(
-            "uvloop is not installed",
-            help_text="Install uvloop or set event_loop='asyncio' in ServerConfig.",
+            f"{event_loop} is not installed",
+            help_text=f"Install {event_loop} or set event_loop='asyncio' in ServerConfig.",
         ) from exc
-    run = getattr(uvloop, "run", None)
+    run = getattr(module, "run", None)
     if run is None:
         raise StarioError(
-            "uvloop does not expose run()",
+            f"{event_loop} does not expose run()",
             help_text="Set event_loop='asyncio' in ServerConfig.",
         )
     return run

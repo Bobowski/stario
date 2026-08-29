@@ -23,6 +23,29 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     assert config.reuse_addr is False
 
 
+def test_server_config_from_env_accepts_zuvloop(monkeypatch) -> None:
+    monkeypatch.setenv("STARIO_LOOP", "zuvloop")
+    assert server_config_from_env().event_loop == "zuvloop"
+
+
+def test_resolve_loop_runner_imports_named_module(monkeypatch) -> None:
+    import types
+
+    from stario.http.server import resolve_loop_runner
+
+    calls: list[str] = []
+
+    def fake_import(name: str):
+        calls.append(name)
+        module = types.SimpleNamespace(run=lambda coro: coro)
+        return module
+
+    monkeypatch.setattr("stario.http.server.importlib.import_module", fake_import)
+    run = resolve_loop_runner("zuvloop")
+    assert calls == ["zuvloop"]
+    assert run is not None
+
+
 @pytest.mark.parametrize(
     ("env_name", "value", "fragment"),
     [

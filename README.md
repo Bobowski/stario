@@ -29,14 +29,15 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 Python 3.14 or newer is required. The package tracks current Python and the standard library (including APIs the framework builds on) rather than supporting older runtimes.
 
-**uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
+**Faster event loops (optional):** Stario defaults to the stdlib asyncio loop. On Linux/macOS, install an optional extra and set `STARIO_LOOP`:
 
 ```bash
-uv add "stario[uvloop]"
-# or: pip install "stario[uvloop]"
+uv add "stario[uvloop]"    # MagicStack uvloop
+uv add "stario[zuvloop]"   # Kludex zuvloop (Zig + libuv)
+# or: pip install "stario[uvloop]" / "stario[zuvloop]"
 ```
 
-Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows.
+Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` or `STARIO_LOOP=zuvloop`. uvloop is not supported on Windows; zuvloop is.
 
 ## Quick start
 

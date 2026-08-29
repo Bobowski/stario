@@ -35,7 +35,8 @@ DEFAULT_REUSE_ADDR = True
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
 DEFAULT_EVENT_LOOP = "asyncio"
 
-type EventLoopKind = Literal["asyncio", "uvloop"]
+type EventLoopKind = Literal["asyncio", "uvloop", "zuvloop"]
+_EVENT_LOOP_KINDS: frozenset[str] = frozenset(("asyncio", "uvloop", "zuvloop"))
 
 
 class RequestPolicy:
@@ -199,9 +200,9 @@ class ServerConfig:
                 "host must be non-empty for TCP listen",
                 help_text="Set STARIO_HOST or pass a non-empty host to ServerConfig.",
             )
-        if event_loop not in ("asyncio", "uvloop"):
+        if event_loop not in _EVENT_LOOP_KINDS:
             raise StarioError(
-                "event_loop must be 'asyncio' or 'uvloop'",
+                "event_loop must be 'asyncio', 'uvloop', or 'zuvloop'",
                 help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
             )
 
@@ -221,12 +222,12 @@ class ServerConfig:
 
 def _event_loop_from_env() -> EventLoopKind:
     loop = env_str("STARIO_LOOP", DEFAULT_EVENT_LOOP).lower()
-    if loop not in ("asyncio", "uvloop"):
-        raise StarioError(
-            "STARIO_LOOP must be 'asyncio' or 'uvloop'",
-            help_text="Set STARIO_LOOP to asyncio or uvloop.",
-        )
-    return loop
+    if loop == "asyncio" or loop == "uvloop" or loop == "zuvloop":
+        return loop
+    raise StarioError(
+        "STARIO_LOOP must be 'asyncio', 'uvloop', or 'zuvloop'",
+        help_text="Set STARIO_LOOP to asyncio, uvloop, or zuvloop.",
+    )
 
 
 def server_config_from_env() -> ServerConfig:

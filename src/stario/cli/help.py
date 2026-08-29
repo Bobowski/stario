@@ -6,7 +6,7 @@ Server environment variables (Stario does not load .env files; use your shell or
 Listen:
   STARIO_HOST=127.0.0.1
   STARIO_PORT=8000
-  STARIO_LOOP=asyncio|uvloop
+  STARIO_LOOP=asyncio|uvloop|zuvloop
   STARIO_UNIX_SOCKET=          (empty = TCP)
   STARIO_UNIX_SOCKET_MODE=660  (octal; after bind on unix socket)
   STARIO_BACKLOG=2048
@@ -45,6 +45,7 @@ Compression:
 Examples:
   STARIO_PORT=9000 STARIO_TRACER=json stario serve main:bootstrap
   STARIO_LOOP=uvloop stario watch main:bootstrap --watch app/
+  STARIO_LOOP=zuvloop stario serve main:bootstrap
 """
 
 _ROOT_EXAMPLES = """\
