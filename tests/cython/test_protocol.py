@@ -1022,7 +1022,7 @@ async def test_content_length_body_survives_many_64k_segments() -> None:
     loop = asyncio.get_running_loop()
     app = App()
     started = asyncio.Event()
-    payload = bytes(range(256)) * 1024  # 256 KiB, not a multiple of one pattern
+    payload = bytes(range(256)) * 2048  # 512 KiB: above the 256 KiB deferral cap
 
     async def echo(c, w):
         started.set()
