@@ -4,6 +4,8 @@ Compares **main** and **cython-core** on [uvloop](https://github.com/MagicStack/
 and [zuvloop](https://github.com/Kludex/zuvloop) across the official Stario HTTP
 suite from `cython-core` (read + upload endpoints).
 
+**Results from this machine:** [RESULTS.md](RESULTS.md).
+
 ```bash
 # worktrees (cython-core required for the expanded app + Cython protocol)
 git worktree add /tmp/stario-cython origin/cython-core
