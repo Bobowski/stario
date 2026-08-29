@@ -144,6 +144,6 @@ class _Alive[T]:
         )
 
 
-type Handler = Callable[[Context, Writer], Awaitable[None]]
+type Handler = Callable[[Context, Writer], Awaitable[None] | None]
 
 type Middleware = Callable[[Handler], Handler]

@@ -392,3 +392,25 @@ async def test_cython_app_plaintext_and_params_over_protocol() -> None:
         assert b"42" in second
         writer.close()
         await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_sync_handler_skips_create_task_over_protocol() -> None:
+    app = App()
+    tasks_before = []
+
+    def plaintext(_c, w):
+        tasks_before.append(len(app.tasks))
+        responses.text(w, "sync-ok")
+
+    app.get("/plaintext", plaintext)
+
+    async with running_server(app) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /plaintext HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        body = await read_response(reader)
+        assert b"sync-ok" in body
+        writer.close()
+        await writer.wait_closed()
+    assert tasks_before == [0]

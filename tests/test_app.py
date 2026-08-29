@@ -109,6 +109,18 @@ class TestAppErrorSurface:
         assert writer.status == 422
         assert writer.body == "nope"
 
+    def test_sync_handler_text_response(self):
+        def handler(_c: Context, w: Writer) -> None:
+            w.respond(b"ok", b"text/plain", 200)
+
+        def setup(app: App) -> None:
+            app.get("/x", handler)
+
+        _context, writer = run_with_app(setup, "/x")
+
+        assert writer.status == 200
+        assert writer.body == "ok"
+
     def test_default_redirect_exception_handler(self):
         async def handler(_c: Context, _w: Writer) -> None:
             raise RedirectException(303, "/next")

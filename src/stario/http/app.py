@@ -8,6 +8,7 @@ structure. `create_task` registers work the server can wait on during shutdownâ€
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from functools import lru_cache
+from inspect import isawaitable
 from typing import Any
 
 import stario.responses as responses
@@ -25,20 +26,20 @@ from stario.telemetry.spans import NoOpSpan
 from .dispatch import Router
 from .writer import Writer
 
-type ErrorHandler[E: Exception] = Callable[[Context, Writer, E], Awaitable[None]]
+type ErrorHandler[E: Exception] = Callable[[Context, Writer, E], Awaitable[None] | None]
 
 
-async def _default_http_exception(_c: Context, w: Writer, exc: HttpException) -> None:
+def _default_http_exception(_c: Context, w: Writer, exc: HttpException) -> None:
     responses.text(w, exc.detail or "Error", exc.status_code)
 
 
-async def _default_redirect_exception(
+def _default_redirect_exception(
     _c: Context, w: Writer, exc: RedirectException
 ) -> None:
     responses.redirect(w, exc.location, exc.status_code)
 
 
-async def _default_client_disconnected(
+def _default_client_disconnected(
     _c: Context, w: Writer, _exc: ClientDisconnected
 ) -> None:
     w.abort()
@@ -104,7 +105,7 @@ class App(Router):
         """Register a handler for uncaught exceptions of type `exc_type` (subclasses use MRO; most specific wins).
 
         - `exc_type`: Exception class to match.
-        - `handler`: Async callable receiving `(context, writer, exc)`.
+        - `handler`: Callable receiving `(context, writer, exc)` (sync or async).
 
         Only runs while the writer has not started (`w.started` is false); after
         headers are sent, failures use `w.abort()` in the `finally` block.
@@ -172,6 +173,14 @@ class App(Router):
 
     # --- protocol entrypoint (called once per HTTP request) ---
 
+    def dispatch(self, c: Context, w: Writer) -> Coroutine[Any, Any, None] | None:
+        """Run one request without wrapping sync handlers in `asyncio.Task`.
+
+        Returns `None` when the handler finished immediately (plain `def`), or a
+        coroutine the HTTP protocol should schedule when the handler is async.
+        """
+        return _dispatch(self, c, w)
+
     async def __call__(self, c: Context, w: Writer) -> None:
         """Protocol entrypoint: open a span, resolve routes, handle errors, and finish started responses.
 
@@ -188,31 +197,93 @@ class App(Router):
         raises, the request span is marked failed and 500 is sent when the
         handler did not start or complete the writer. Handlers must explicitly
         send a response on the success path.
+
+        Sync handlers (`def plaintext(c, w)`) are supported: they run inline
+        and do not need `await`.
         """
-        span = c.span
-        # Cython (and benchmark) servers use NoOpTracer. Skip method calls and
-        # the attrs dict on that path; RecordingSpan and others still record.
-        record = type(span) is not NoOpSpan
-        if record:
-            span.start()
-            span.attrs({"request.method": c.req.method, "request.path": c.req.path})
-        failed_after_start = False
+        pending = self.dispatch(c, w)
+        if pending is not None:
+            await pending
 
-        try:
-            path = c.req.path
-            # Canonicalize trailing slashes before routing (query string preserved).
-            if path != "/" and path.endswith("/"):
-                target = normalize_path(path)
-                if c.req.query_bytes:
-                    target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
-                responses.redirect(w, target, 308)
-                return
 
-            # If it's a valid path, find the handler and call it.
-            host = c.req.host if self.host_routing else ""
-            handler, c.route = self.find_handler(host, path, c.req.method)
-            await handler(c, w)
-            # Success path must leave the writer started or explicitly completed.
+def _finish_writer(
+    c: Context, w: Writer, failed_after_start: bool, record: bool
+) -> None:
+    if failed_after_start and not w.completed:
+        w.abort()
+    elif not w.completed:
+        w.end()
+    if record:
+        c.span.attr("response.status_code", w.status_code)
+        c.span.end()
+
+
+async def _continue_async(
+    app: App,
+    c: Context,
+    w: Writer,
+    pending: Awaitable[None],
+    record: bool,
+) -> None:
+    failed_after_start = False
+    try:
+        await pending
+        if not w.started and not w.completed:
+            raise StarioRuntime(
+                "Handler returned without sending a response",
+                context={
+                    "method": c.req.method,
+                    "path": c.req.path,
+                    "route": c.route.pattern or None,
+                },
+                help_text=(
+                    "Call a response helper such as responses.text/json/html/empty, "
+                    "or explicitly use Writer.write_headers()/write()/end()."
+                ),
+            )
+    except Exception as exc:
+        handler_responded = False
+        failed_after_start = w.started
+        if not w.started:
+            if handler := app._find_error_handler(type(exc)):
+                try:
+                    err_result = handler(c, w, exc)
+                    if isawaitable(err_result):
+                        await err_result
+                    handler_responded = w.started or w.completed
+                except Exception as handler_exc:
+                    failed_after_start = w.started
+                    exc = handler_exc
+            if not handler_responded:
+                responses.text(w, "Internal Server Error", 500)
+        if not handler_responded and record:
+            c.span.fail(str(exc))
+            c.span.exception(exc)
+    finally:
+        _finish_writer(c, w, failed_after_start, record)
+
+
+def _dispatch(app: App, c: Context, w: Writer) -> Coroutine[Any, Any, None] | None:
+    span = c.span
+    record = type(span) is not NoOpSpan
+    if record:
+        span.start()
+        span.attrs({"request.method": c.req.method, "request.path": c.req.path})
+    failed_after_start = False
+
+    try:
+        path = c.req.path
+        if path != "/" and path.endswith("/"):
+            target = normalize_path(path)
+            if c.req.query_bytes:
+                target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
+            responses.redirect(w, target, 308)
+        else:
+            host = c.req.host if app.host_routing else ""
+            handler, c.route = app.find_handler(host, path, c.req.method)
+            result = handler(c, w)
+            if isawaitable(result):
+                return _continue_async(app, c, w, result, record)
             if not w.started and not w.completed:
                 raise StarioRuntime(
                     "Handler returned without sending a response",
@@ -226,30 +297,23 @@ class App(Router):
                         "or explicitly use Writer.write_headers()/write()/end()."
                     ),
                 )
-
-        except Exception as exc:
-            handler_responded = False
-            failed_after_start = w.started
-            if not w.started:
-                # Headers not sent yet: try typed error handlers, then generic 500.
-                if handler := self._find_error_handler(type(exc)):
-                    try:
-                        await handler(c, w, exc)
-                        handler_responded = w.started or w.completed
-                    except Exception as handler_exc:
-                        failed_after_start = w.started
-                        exc = handler_exc
-                if not handler_responded:
-                    responses.text(w, "Internal Server Error", 500)
-            if not handler_responded and record:
-                span.fail(str(exc))
-                span.exception(exc)
-        finally:
-            # After headers: abort the transport on failure; otherwise finish the message.
-            if failed_after_start and not w.completed:
-                w.abort()
-            elif not w.completed:
-                w.end()
-            if record:
-                span.attr("response.status_code", w.status_code)
-                span.end()
+    except Exception as exc:
+        handler_responded = False
+        failed_after_start = w.started
+        if not w.started:
+            if handler := app._find_error_handler(type(exc)):
+                try:
+                    err_result = handler(c, w, exc)
+                    if isawaitable(err_result):
+                        return _continue_async(app, c, w, err_result, record)
+                    handler_responded = w.started or w.completed
+                except Exception as handler_exc:
+                    failed_after_start = w.started
+                    exc = handler_exc
+            if not handler_responded:
+                responses.text(w, "Internal Server Error", 500)
+        if not handler_responded and record:
+            span.fail(str(exc))
+            span.exception(exc)
+    _finish_writer(c, w, failed_after_start, record)
+    return None

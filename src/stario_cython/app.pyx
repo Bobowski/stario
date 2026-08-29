@@ -9,6 +9,7 @@ server and tests still go through the generic attribute path.
 
 import asyncio
 from functools import lru_cache
+from inspect import isawaitable as _isawaitable
 
 from cpython.unicode cimport PyUnicode_GET_LENGTH, PyUnicode_READ_CHAR
 
@@ -31,15 +32,15 @@ cdef object EXCHANGE_TYPE = RequestExchange
 cdef object EMPTY_HOST = ""
 
 
-async def _default_http_exception(_c, w, exc):
+def _default_http_exception(_c, w, exc):
     responses.text(w, exc.detail or "Error", exc.status_code)
 
 
-async def _default_redirect_exception(_c, w, exc):
+def _default_redirect_exception(_c, w, exc):
     responses.redirect(w, exc.location, exc.status_code)
 
 
-async def _default_client_disconnected(_c, w, _exc):
+def _default_client_disconnected(_c, w, _exc):
     w.abort()
 
 
@@ -53,6 +54,27 @@ cdef inline bint _writer_completed(bint is_ex, RequestExchange ex, object w):
     if is_ex:
         return ex._completed
     return w.completed
+
+
+cdef void _finish_writer(
+    bint is_ex,
+    RequestExchange ex,
+    object w,
+    bint failed_after_start,
+    bint traced,
+    object span,
+):
+    cdef bint completed = _writer_completed(is_ex, ex, w)
+    if failed_after_start and not completed:
+        w.abort()
+    elif not completed:
+        w.end()
+    if traced:
+        if is_ex:
+            span.attr("response.status_code", ex.status_code)
+        else:
+            span.attr("response.status_code", w.status_code)
+        span.end()
 
 
 cdef class App(Router):
@@ -129,7 +151,72 @@ cdef class App(Router):
                 return
             await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
 
-    async def __call__(self, object c, object w):
+    async def _continue_async(
+        self,
+        object c,
+        object w,
+        object pending,
+        bint is_ex,
+        RequestExchange ex,
+        bint traced,
+        object span,
+        object method,
+        object path,
+        object route,
+    ):
+        cdef object err_handler
+        cdef object err_result
+        cdef bint failed_after_start = False
+        cdef bint handler_responded
+        cdef bint started
+        try:
+            await pending
+            if not _writer_started(is_ex, ex, w) and not _writer_completed(is_ex, ex, w):
+                raise StarioRuntime(
+                    "Handler returned without sending a response",
+                    context={
+                        "method": method,
+                        "path": path,
+                        "route": route.pattern or None,
+                    },
+                    help_text=(
+                        "Call a response helper such as responses.text/json/html/empty, "
+                        "or explicitly use Writer.write_headers()/write()/end()."
+                    ),
+                )
+        except Exception as exc:
+            handler_responded = False
+            started = _writer_started(is_ex, ex, w)
+            failed_after_start = started
+            if not started:
+                err_handler = self._find_error_handler(type(exc))
+                if err_handler is not None:
+                    try:
+                        err_result = err_handler(c, w, exc)
+                        if _isawaitable(err_result):
+                            await err_result
+                        handler_responded = (
+                            _writer_started(is_ex, ex, w)
+                            or _writer_completed(is_ex, ex, w)
+                        )
+                    except Exception as handler_exc:
+                        failed_after_start = _writer_started(is_ex, ex, w)
+                        exc = handler_exc
+                if not handler_responded:
+                    responses.text(w, "Internal Server Error", 500)
+            if not handler_responded and traced:
+                span.fail(str(exc))
+                span.exception(exc)
+        finally:
+            _finish_writer(is_ex, ex, w, failed_after_start, traced, span)
+
+    cpdef object dispatch(self, object c, object w):
+        """Run one request. Returns None when finished, or a coroutine to Task.
+
+        Sync handlers (``def plaintext(c, w)``) complete here with no
+        ``asyncio.Task`` and no App coroutine. Async handlers return a
+        continuation the protocol schedules with ``eager_start``.
+        """
         cdef RequestExchange ex = None
         cdef Request req
         cdef object span
@@ -141,12 +228,13 @@ cdef class App(Router):
         cdef object target
         cdef object query_bytes
         cdef object err_handler
+        cdef object result
+        cdef object err_result
         cdef bint is_ex = type(c) is EXCHANGE_TYPE
         cdef bint traced
         cdef bint failed_after_start = False
         cdef bint handler_responded
         cdef bint started
-        cdef bint completed
         cdef Py_ssize_t n
 
         if is_ex:
@@ -176,34 +264,36 @@ cdef class App(Router):
                 if query_bytes:
                     target = f"{target}?{query_bytes.decode('latin-1')}"
                 responses.redirect(w, target, 308)
-                return
-
-            if not self._has_hosts:
-                host = EMPTY_HOST
-            elif is_ex:
-                host = req.host
             else:
-                host = c.req.host
-            handler, route = self.find_handler(host, path, method)
-            if is_ex:
-                ex.route = route
-            else:
-                c.route = route
-            await handler(c, w)
-            if not _writer_started(is_ex, ex, w) and not _writer_completed(is_ex, ex, w):
-                raise StarioRuntime(
-                    "Handler returned without sending a response",
-                    context={
-                        "method": method,
-                        "path": path,
-                        "route": route.pattern or None,
-                    },
-                    help_text=(
-                        "Call a response helper such as responses.text/json/html/empty, "
-                        "or explicitly use Writer.write_headers()/write()/end()."
-                    ),
-                )
-
+                if not self._has_hosts:
+                    host = EMPTY_HOST
+                elif is_ex:
+                    host = req.host
+                else:
+                    host = c.req.host
+                handler, route = self.find_handler(host, path, method)
+                if is_ex:
+                    ex.route = route
+                else:
+                    c.route = route
+                result = handler(c, w)
+                if _isawaitable(result):
+                    return self._continue_async(
+                        c, w, result, is_ex, ex, traced, span, method, path, route
+                    )
+                if not _writer_started(is_ex, ex, w) and not _writer_completed(is_ex, ex, w):
+                    raise StarioRuntime(
+                        "Handler returned without sending a response",
+                        context={
+                            "method": method,
+                            "path": path,
+                            "route": route.pattern or None,
+                        },
+                        help_text=(
+                            "Call a response helper such as responses.text/json/html/empty, "
+                            "or explicitly use Writer.write_headers()/write()/end()."
+                        ),
+                    )
         except Exception as exc:
             handler_responded = False
             started = _writer_started(is_ex, ex, w)
@@ -212,7 +302,20 @@ cdef class App(Router):
                 err_handler = self._find_error_handler(type(exc))
                 if err_handler is not None:
                     try:
-                        await err_handler(c, w, exc)
+                        err_result = err_handler(c, w, exc)
+                        if _isawaitable(err_result):
+                            return self._continue_async(
+                                c,
+                                w,
+                                err_result,
+                                is_ex,
+                                ex,
+                                traced,
+                                span,
+                                method,
+                                path,
+                                getattr(c, "route", None),
+                            )
                         handler_responded = (
                             _writer_started(is_ex, ex, w)
                             or _writer_completed(is_ex, ex, w)
@@ -225,18 +328,13 @@ cdef class App(Router):
             if not handler_responded and traced:
                 span.fail(str(exc))
                 span.exception(exc)
-        finally:
-            completed = _writer_completed(is_ex, ex, w)
-            if failed_after_start and not completed:
-                w.abort()
-            elif not completed:
-                w.end()
-            if traced:
-                if is_ex:
-                    span.attr("response.status_code", ex.status_code)
-                else:
-                    span.attr("response.status_code", w.status_code)
-                span.end()
+        _finish_writer(is_ex, ex, w, failed_after_start, traced, span)
+        return None
+
+    async def __call__(self, object c, object w):
+        cdef object pending = self.dispatch(c, w)
+        if pending is not None:
+            await pending
 
 
 __all__ = ["App"]
