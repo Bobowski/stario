@@ -404,7 +404,7 @@ cdef class HttpProtocol:
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
     cdef object _create_task
-    cdef object _dispatch
+    cdef object _app_dispatch
 
     def __cinit__(self):
         _bind_settings()
@@ -457,7 +457,7 @@ cdef class HttpProtocol:
         self.compression = compression
         self.connections = connections
         self._create_task = app.create_task
-        self._dispatch = app.dispatch
+        self._app_dispatch = app.dispatch
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -953,7 +953,7 @@ cdef class HttpProtocol:
         cdef object task
         self.active_exchange = exchange
         exchange.start_response()
-        task = self._dispatch(
+        task = self._app_dispatch(
             exchange,
             exchange,
             loop=self.loop,

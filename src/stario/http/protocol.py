@@ -248,6 +248,12 @@ class HttpProtocol(asyncio.Protocol):
         ):
             return
 
+        # Reject before dispatch. Sync handlers now run inline in this
+        # callback; waiting for HttpParserUpgrade from feed_data is too late.
+        if parser.should_upgrade():
+            self._close_with_error(400, "Upgrade not supported")
+            return
+
         url = b"".join(self._reading_url_parts)
         parsed_url = parse_url(url)
         if not self._validate_request_framing(headers):
