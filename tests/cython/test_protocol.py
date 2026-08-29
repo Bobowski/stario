@@ -8,7 +8,7 @@ from stario import App
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
-from stario.testing.tracer import TestTracer
+from stario.testing.tracer import TestTracer as RecordingTestTracer
 from tests.cython.http import free_port, read_response
 
 
@@ -77,7 +77,7 @@ async def test_trailing_slash_redirect_finishes_span_without_fail() -> None:
     connections: set[HttpProtocol] = set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
 
         def factory():
             return HttpProtocol(

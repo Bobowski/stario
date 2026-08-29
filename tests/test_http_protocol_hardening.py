@@ -18,7 +18,7 @@ from stario.http.compression import CompressionConfig
 from stario.http.config import RequestPolicy
 from stario.http.protocol import HttpProtocol
 from stario.telemetry.noop import NoOpTracer
-from stario.testing.tracer import TestTracer
+from stario.testing.tracer import TestTracer as RecordingTestTracer
 
 
 class _RecordingTransport(asyncio.Transport):
@@ -693,7 +693,7 @@ async def test_keep_alive_serves_second_request_on_same_connection() -> None:
 
 
 def _assert_status_span(
-    tracer: TestTracer,
+    tracer: RecordingTestTracer,
     status: int,
     *,
     method: str | None = None,
@@ -716,7 +716,7 @@ def _assert_status_span(
 
 @pytest.mark.asyncio
 async def test_protocol_413_finishes_span_without_fail() -> None:
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
         proto, app, transport = _make_protocol(max_body_bytes=20, tracer=tracer)
         try:
             proto.data_received(
@@ -733,7 +733,7 @@ async def test_protocol_413_finishes_span_without_fail() -> None:
 
 @pytest.mark.asyncio
 async def test_protocol_400_finishes_span_without_fail() -> None:
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
         proto, app, transport = _make_protocol(tracer=tracer)
         try:
             proto.data_received(b"\x00\xff\xfe not http \r\n\r\n")
@@ -748,7 +748,7 @@ async def test_protocol_400_finishes_span_without_fail() -> None:
 
 @pytest.mark.asyncio
 async def test_trailing_slash_308_finishes_span_without_fail() -> None:
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
         proto, app, transport = _make_protocol(tracer=tracer)
         try:
             proto.data_received(b"GET /search/?q=cats HTTP/1.1\r\nHost: t\r\n\r\n")

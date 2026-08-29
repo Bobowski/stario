@@ -11,7 +11,7 @@ import pytest
 import stario.responses as responses
 from stario import App, Relay
 from stario.datastar import SSE
-from stario.testing.tracer import TestTracer
+from stario.testing.tracer import TestTracer as RecordingTestTracer
 from stario_cython.request import Request
 from tests.cython.http import (
     RecordingTransport,
@@ -791,7 +791,7 @@ def test_request_shim_reexports_exchange_type() -> None:
 
 
 def _assert_status_span(
-    tracer: TestTracer,
+    tracer: RecordingTestTracer,
     status: int,
     *,
     method: str | None = None,
@@ -814,7 +814,7 @@ def _assert_status_span(
 
 @pytest.mark.asyncio
 async def test_protocol_413_finishes_span_without_fail() -> None:
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
         proto, app, transport = _attach(tracer=tracer, max_body_bytes=20)
         try:
             proto.data_received(
@@ -831,7 +831,7 @@ async def test_protocol_413_finishes_span_without_fail() -> None:
 
 @pytest.mark.asyncio
 async def test_protocol_400_finishes_span_without_fail() -> None:
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
         proto, app, transport = _attach(tracer=tracer)
         try:
             proto.data_received(b"\x00\xff\xfe not http \r\n\r\n")
@@ -846,7 +846,7 @@ async def test_protocol_400_finishes_span_without_fail() -> None:
 
 @pytest.mark.asyncio
 async def test_trailing_slash_308_finishes_span_without_fail() -> None:
-    with TestTracer() as tracer:
+    with RecordingTestTracer() as tracer:
         proto, app, transport = _attach(tracer=tracer)
         try:
             proto.data_received(b"GET /search/?q=cats HTTP/1.1\r\nHost: t\r\n\r\n")
