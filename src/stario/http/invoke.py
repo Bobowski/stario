@@ -25,6 +25,7 @@ def _finish_incomplete(w: Writer) -> None:
     if w.started:
         w.abort()
         return
+    w.headers.set("connection", "close")
     w.respond(_INTERNAL_ERROR, _PLAIN, 500)
 
 
