@@ -2,18 +2,20 @@
 Application object: route table, shutdown-aware tasks, thin test entrypoint.
 
 The HTTP protocol does not call this class per request. It uses
-`find_handler` (from `Router`) and `schedule_request` to run the matched
-handler as a task. `App.__call__` exists so tests and `TestClient` share
-that same schedule/finish path.
+`find_handler` and `create_task(handler(c, w))`. `App.__call__` exists so
+tests and `TestClient` share that same path.
 """
 
 import asyncio
+import contextlib
 from collections.abc import Coroutine
 from typing import Any
 
+import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context
-from stario.http.invoke import schedule_request
+from stario.http.invoke import on_handler_done
+from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
 from .writer import Writer
@@ -22,8 +24,8 @@ from .writer import Writer
 class App(Router):
     """Route table plus task tracking for graceful shutdown.
 
-    Handlers are `async def`. Uncaught `HttpException`, `RedirectException`,
-    and `ClientDisconnected` become those HTTP outcomes; anything else is 500.
+    Handlers are `async def` and must write a complete response. Uncaught
+    exceptions are logged and abort the writer; they are not mapped to HTTP.
     Use `create_task` for work tied to a running server so drain can observe it.
     """
 
@@ -110,15 +112,44 @@ class App(Router):
             await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
 
     async def __call__(self, c: Context, w: Writer) -> None:
-        """Test / `TestClient` entrypoint: same schedule as the HTTP protocol.
+        """Test / `TestClient` entrypoint: `find_handler` then the handler coroutine.
 
-        Protocols should call `schedule_request` (or `find_handler` + `create_task`)
-        directly so the handler coroutine is the task body.
+        Trailing-slash 308 is a protocol concern (Cython writes it inline). Tests
+        that go through `App.__call__` get the same redirect here so they stay
+        honest without a shared helper.
         """
-        task = schedule_request(self, c, w, eager_start=True)
-        if task.done():
+        path = c.req.path
+        if path != "/" and path.endswith("/"):
+            target = "/" + path.strip("/")
+            if c.req.query_bytes:
+                target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
+            responses.redirect(w, target, 308)
             return
+
+        host = c.req.host if self.host_routing else ""
+        handler, c.route = self.find_handler(host, path, c.req.method)
+        span = c.span
+        if type(span) is not NoOpSpan:
+            span.start()
+            span.attrs({"request.method": c.req.method, "request.path": path})
+
+        task = self.create_task(handler(c, w), eager_start=True)
         try:
-            await task
-        except Exception:
+            if not task.done():
+                await task
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            raise
+        finally:
+            if task.done():
+                on_handler_done(c, w, task)
+        if task.cancelled():
             return
+        exc = task.exception()
+        # TestClient / run_with_app: surface failures that never started a
+        # response. If headers already went out, on_handler_done aborted.
+        if exc is not None and not w.started:
+            raise exc

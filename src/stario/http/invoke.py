@@ -1,169 +1,48 @@
-"""
-Per-request schedule: resolve a handler, run it as a task, finish the writer.
+"""Handler-task finish: log failures, abort if nothing was sent, close the span.
 
-The protocol calls `schedule_request` instead of `App.__call__`. Routing is
-`find_handler` (plus an explicit trailing-slash 308). Errors are three built-in
-types — no registry, no MRO walk of user exceptions.
+Does not map exceptions to HTTP and does not call `Writer.end()`.
 """
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
-from typing import Any
+import logging
 
-import stario.responses as responses
-from stario.exceptions import (
-    ClientDisconnected,
-    HttpException,
-    RedirectException,
-    StarioRuntime,
-)
-from stario.http.context import Context, Handler
+from stario.http.context import Context
 from stario.http.writer import Writer
-from stario.routing.locations import normalize_path
 from stario.telemetry.spans import NoOpSpan
 
-type DoneCallback = Callable[[asyncio.Task[None]], None]
+_log = logging.getLogger("stario.http")
 
 
-async def trailing_slash_redirect(c: Context, w: Writer) -> None:
-    """308 to the canonical path (leading `/`, no trailing slash). Query kept."""
-    target = normalize_path(c.req.path)
-    if c.req.query_bytes:
-        target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
-    responses.redirect(w, target, 308)
-
-
-def resolve_handler(app: Any, c: Context) -> Handler:
-    """Return the handler for this request. Trailing slashes do not hit the trie."""
-    path = c.req.path
-    if path != "/" and path.endswith("/"):
-        return trailing_slash_redirect
-    host = c.req.host if app.host_routing else ""
-    handler, c.route = app.find_handler(host, path, c.req.method)
-    return handler
-
-
-def apply_failure(_c: Context, w: Writer, exc: BaseException) -> bool:
-    """Write the explicit built-in outcome, or 500.
-
-    Returns True when telemetry should record a failure: headers already
-    sent, an unsafe redirect, or any exception that is not one of
-    `HttpException`, `RedirectException`, or `ClientDisconnected`.
-    """
-    if w.started:
-        return True
-    try:
-        if isinstance(exc, HttpException):
-            responses.text(w, exc.detail or "Error", exc.status_code)
-            return False
-        if isinstance(exc, RedirectException):
-            responses.redirect(w, exc.location, exc.status_code)
-            return False
-        if isinstance(exc, ClientDisconnected):
-            w.abort()
-            return False
-    except Exception:
-        if w.started:
-            return True
-        responses.text(w, "Internal Server Error", 500)
-        return True
-    responses.text(w, "Internal Server Error", 500)
-    return True
-
-
-def finish_scheduled(c: Context, w: Writer, task: asyncio.Task[None]) -> None:
-    """Apply handler outcome, guarantee `end`/`abort`, close the request span."""
+def on_handler_done(c: Context, w: Writer, task) -> None:
+    """Run after the handler task finishes (success, failure, or cancel)."""
+    if not task.done():
+        return
     span = c.span
     record = type(span) is not NoOpSpan
-    if (
-        w.completed
-        and not task.cancelled()
-        and task.exception() is None
-    ):
-        if record:
-            span.attr("response.status_code", w.status_code)
-            span.end()
-        return
-
-    fail_span = False
-    exc: BaseException | None = None
 
     if task.cancelled():
         if not w.completed:
-            w.end()
+            w.abort()
     else:
         exc = task.exception()
-        if exc is None and not w.started and not w.completed:
-            exc = StarioRuntime(
-                "Handler returned without sending a response",
-                context={
-                    "method": c.req.method,
-                    "path": c.req.path,
-                    "route": c.route.pattern or None,
-                },
-                help_text=(
-                    "Call a response helper such as responses.text/json/html/empty, "
-                    "or explicitly use Writer.write_headers()/write()/end()."
-                ),
-            )
         if exc is not None:
-            fail_span = apply_failure(c, w, exc)
+            _log.error("Handler failed", exc_info=exc)
+            if record:
+                span.fail(str(exc))
+                span.exception(exc)
             if not w.completed:
-                if w.started:
-                    w.abort()
-                else:
-                    w.end()
+                w.abort()
         elif not w.completed:
-            w.end()
+            _log.error(
+                "Handler returned without sending a response (%s %s)",
+                c.req.method,
+                c.req.path,
+            )
+            if record:
+                span.fail("Handler returned without sending a response")
+            w.abort()
 
     if record:
-        if fail_span and exc is not None:
-            span.fail(str(exc))
-            span.exception(exc)
         span.attr("response.status_code", w.status_code)
         span.end()
-
-
-def schedule_request(
-    app: Any,
-    c: Context,
-    w: Writer,
-    *,
-    loop: asyncio.AbstractEventLoop | None = None,
-    eager_start: bool = False,
-    on_done: DoneCallback | None = None,
-) -> asyncio.Task[None]:
-    """Find the handler and run `handler(c, w)` as a tracked task.
-
-    Finish (errors, missing response, `writer.end()`, span) runs in a done
-    callback — there is no wrapper coroutine around the handler.
-    """
-    span = c.span
-    if type(span) is not NoOpSpan:
-        span.start()
-        span.attrs({"request.method": c.req.method, "request.path": c.req.path})
-
-    handler = resolve_handler(app, c)
-    task = app.create_task(
-        handler(c, w),
-        loop=loop,
-        eager_start=eager_start,
-    )
-
-    if task.done():
-        finish_scheduled(c, w, task)
-        if on_done is not None:
-            on_done(task)
-        return task
-
-    if on_done is None:
-        task.add_done_callback(lambda done: finish_scheduled(c, w, done))
-    else:
-        def _done(done: asyncio.Task[None], /) -> None:
-            finish_scheduled(c, w, done)
-            on_done(done)
-
-        task.add_done_callback(_done)
-    return task

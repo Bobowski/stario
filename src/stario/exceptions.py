@@ -2,26 +2,28 @@
 Failure types:
 
 - `StarioError` — invalid framework or API usage: wrong arguments, invalid
-  configuration, or calls that are wrong regardless of object state (uncaught
-  on the request path → 500). Examples: bad `UrlPath` params, duplicate route
-  registration, invalid bootstrap shape, unfilled `@baked` slots, invalid
-  `Content-Length`.
+  configuration, or calls that are wrong regardless of object state. Uncaught
+  on the request path: logged and the writer is aborted. Examples: bad
+  `UrlPath` params, duplicate route registration, invalid bootstrap shape,
+  unfilled `@baked` slots, invalid `Content-Length`.
 
 - `StarioRuntime` — valid API call at the wrong lifecycle phase of a
   framework-managed object during request handling or async session work
-  (subclass of `StarioError`; uncaught → 500). The *what* may be fine; the
+  (subclass of `StarioError`). Uncaught on the request path: logged and
+  the writer is aborted. The *what* may be fine; the
   *when* is wrong — reorder control flow rather than change a parameter.
   Examples: handler returned without a response, `Writer` used after `end()`,
   request body read twice, SSE after a finalized response, `Relay` subscription
   outside `async with`. `str(exc)` keeps structured context and help text.
 
-- `HttpException` / `RedirectException` — intentional HTTP outcomes. The
-  request finish path maps them with `responses.text` / `responses.redirect`.
-- `ClientDisconnected` — peer closed during request body read (the finish
-  path aborts the connection without a response body).
+- `HttpException` / `RedirectException` — types handlers may raise or catch.
+  The protocol does not map them to HTTP. Write the response in the handler
+  (`responses.text` / `responses.redirect`) or the request is a failure.
+- `ClientDisconnected` — peer closed during request body read. The protocol
+  logs the failure and aborts if the handler did not finish a response.
 
-There is no `on_error` registry. Those three types are the only special
-cases; every other exception is 500.
+Uncaught handler exceptions are logged and abort the writer. They are not
+turned into status codes.
 
 `HttpException` and `RedirectException` are re-exported from the `stario` package
 root; prefer `from stario import HttpException, RedirectException` in application code.
@@ -86,12 +88,9 @@ class HttpException(Exception):
     """
     Intentional HTTP response with a plain-text body (4xx/5xx only).
 
-    Handlers can `raise` instead of branching on `Writer` after partial output
-    (still only safe before headers are sent). Use `RedirectException` for 3xx
-    redirects so URLs are not confused with body text.
-
-    The finish path sends `detail` as `text/plain`, or `"Error"` when `detail`
-    is empty.
+    Handlers may raise this from `body()` / size limits, or catch it and write
+    a response. The protocol does not map it to HTTP. Use `RedirectException`
+    for 3xx so URLs are not confused with body text.
     """
 
     __slots__ = ("detail", "status_code")
@@ -138,9 +137,9 @@ class ClientDisconnected(Exception):
     """
     The peer closed the connection while the request body was still being read.
 
-    The finish path calls `Writer.abort()` (no response body). For long-lived
-    responses (SSE, chunked), prefer polling `c.disconnected` or using
-    `c.alive()` instead of relying on this exception.
+    If the handler does not finish a response, the protocol logs the failure
+    and aborts. For long-lived responses (SSE, chunked), prefer polling
+    `c.disconnected` or using `c.alive()` instead of relying on this exception.
     """
 
     def __init__(

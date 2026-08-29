@@ -8,17 +8,18 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Breaking changes
 
-- `App.on_error` and exception-handler MRO are gone. Uncaught `HttpException`,
-  `RedirectException`, and `ClientDisconnected` are handled explicitly; every
-  other exception is 500.
+- `App.on_error` and exception-to-HTTP mapping are gone. Uncaught handler
+  exceptions are logged and abort the writer; they are not turned into 4xx/5xx
+  bodies. Handlers must write a complete response (`respond` / `end`).
 - Route handlers must be `async def` (or a callable whose `__call__` is async).
 - The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
-  instead of `create_task(app(c, w))`. `App.__call__` remains for tests.
+  instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
+  the Cython protocol (no handler task).
 
 ### Changed
 
-- Request finish (missing response, writer `end`/`abort`, span) lives in
-  `stario.http.invoke`. Cython resolves the handler in `_start_exchange`.
+- Handler-task finish is `stario.http.invoke.on_handler_done`: log, abort if
+  nothing was sent, close the span. No auto-`end()`.
 
 ## 4.1.0 - 2026-08-17
 

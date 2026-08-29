@@ -28,7 +28,7 @@ UNSAFE_REDIRECT_MATCH = (
 
 
 def _redirect_from_exception(w: Writer, exc: RedirectException) -> None:
-    """Same path as the explicit RedirectException finish mapping."""
+    """Same path as `responses.redirect(w, exc.location, exc.status_code)`."""
     responses.redirect(w, exc.location, exc.status_code)
 
 

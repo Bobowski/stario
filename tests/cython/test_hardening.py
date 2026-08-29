@@ -649,9 +649,9 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stalled_chunked_body_returns_408() -> None:
+async def test_stalled_chunked_body_aborts_without_hanging() -> None:
     """Chunked / large bodies dispatch at headers-complete. A stalled
-    ``body()`` wait must 408 via the shared connection sweeper, not hang.
+    ``body()`` wait must abort via the shared connection sweeper, not hang.
     """
     app = App()
 
@@ -670,7 +670,8 @@ async def test_stalled_chunked_body_returns_408() -> None:
         )
         await asyncio.sleep(_WAIT)
         await _drain(app)
-        assert response_status(transport.writes) == 408
+        assert response_status(transport.writes) is None
+        assert transport.is_closing()
     finally:
         if not transport.is_closing():
             transport.close()

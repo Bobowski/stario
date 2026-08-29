@@ -3,9 +3,7 @@
 import pytest
 
 from stario.exceptions import (
-    ClientDisconnected,
     HttpException,
-    RedirectException,
     StarioError,
 )
 from stario.http.app import App
@@ -59,18 +57,15 @@ class TestHostRouting:
 
 
 class TestAppErrorSurface:
-    def test_dispatch_unhandled_exception_returns_500_and_ends(self):
+    def test_unhandled_exception_is_raised_and_aborts(self):
         async def boom(_c: Context, _w: Writer) -> None:
             raise RuntimeError("boom")
 
         def setup(app: App) -> None:
             app.get("/boom", boom)
 
-        _context, writer = run_with_app(setup, "/boom")
-
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-        assert writer.ended
+        with pytest.raises(RuntimeError, match="boom"):
+            run_with_app(setup, "/boom")
 
     def test_handler_must_send_explicit_response(self):
         async def missing_response(_c: Context, _w: Writer) -> None:
@@ -81,91 +76,19 @@ class TestAppErrorSurface:
 
         _context, writer = run_with_app(setup, "/missing")
 
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-        assert writer.ended
+        assert writer.completed
+        assert writer.status is None
+        assert not writer.ended
 
-    def test_default_http_exception_handler(self):
+    def test_http_exception_is_not_mapped_to_http(self):
         async def handler(_c: Context, _w: Writer) -> None:
             raise HttpException(422, "nope")
 
         def setup(app: App) -> None:
             app.get("/x", handler)
 
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 422
-        assert writer.body == "nope"
-
-    def test_default_redirect_exception_handler(self):
-        async def handler(_c: Context, _w: Writer) -> None:
-            raise RedirectException(303, "/next")
-
-        def setup(app: App) -> None:
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 303
-        assert writer.headers.get("location") == "/next"
-        assert writer.body == ""
-
-    def test_default_client_disconnected_handler_aborts_without_body(self):
-        async def handler(_c: Context, _w: Writer) -> None:
-            raise ClientDisconnected()
-
-        def setup(app: App) -> None:
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status is None
-        assert writer.body is None
-        assert writer.completed
-
-    def test_unsafe_redirect_exception_falls_back_to_500(self):
-        async def handler(_c: Context, _w: Writer) -> None:
-            raise RedirectException(302, "javascript:alert(1)")
-
-        def setup(app: App) -> None:
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-
-    def test_unregistered_exception_is_500(self):
-        class MyValueError(ValueError):
-            pass
-
-        async def handler(_c: Context, _w: Writer) -> None:
-            raise MyValueError("subtype")
-
-        def setup(app: App) -> None:
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-        assert not hasattr(App, "on_error")
-
-    def test_http_exception_subclass_is_still_typed(self):
-        class Gone(HttpException):
-            def __init__(self) -> None:
-                super().__init__(410, "gone")
-
-        async def handler(_c: Context, _w: Writer) -> None:
-            raise Gone()
-
-        def setup(app: App) -> None:
-            app.get("/x", handler)
-
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 410
-        assert writer.body == "gone"
+        with pytest.raises(HttpException, match="nope"):
+            run_with_app(setup, "/x")
 
     def test_call_uses_find_handler(self):
         seen: list[tuple[str, str, str]] = []

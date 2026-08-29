@@ -22,6 +22,164 @@ class TrackingApp(App):
 
 
 @pytest.mark.asyncio
+async def test_trailing_slash_redirects_without_create_task() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+
+    async def search(_c, w):
+        responses.text(w, "hit")
+
+    app.get("/search", search)
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /search/?q=cats&page=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        await writer.drain()
+        first = await read_response(reader)
+        assert b"308" in first.split(b"\r\n", 1)[0]
+        assert b"location: /search?q=cats&page=2" in first.lower()
+        assert app.eager_starts == []
+
+        writer.write(b"GET //aftra.io/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        second = await read_response(reader)
+        assert b"308" in second.split(b"\r\n", 1)[0]
+        assert b"location: /aftra.io" in second.lower()
+        assert app.eager_starts == []
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_not_found_and_method_not_allowed_use_handlers() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+    seen: list[str] = []
+
+    async def hello(_c, w):
+        responses.text(w, "hi")
+
+    async def custom_404(_c, w):
+        seen.append("404")
+        responses.text(w, "gone", 404)
+
+    def custom_405(allowed: frozenset[str]):
+        async def respond(_c, w):
+            seen.append("405")
+            w.headers.set("Allow", ", ".join(sorted(allowed)))
+            responses.text(w, "nope", 405)
+
+        return respond
+
+    app.get("/hello", hello)
+    app.not_found("/", custom_404)
+    app.method_not_allowed("/", custom_405)
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        missing = await read_response(reader)
+        assert b"404" in missing.split(b"\r\n", 1)[0]
+        assert b"gone" in missing
+        assert seen == ["404"]
+        assert app.eager_starts == [True]
+
+        writer.write(b"POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        denied = await read_response(reader)
+        assert b"405" in denied.split(b"\r\n", 1)[0]
+        assert b"nope" in denied
+        assert b"allow: get" in denied.lower()
+        assert seen == ["404", "405"]
+        assert app.eager_starts == [True, True]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_aborts_without_http_mapping() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+
+    async def boom(_c, _w):
+        raise RuntimeError("boom")
+
+    app.get("/boom", boom)
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /boom HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        try:
+            response = await read_response(reader)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+        ):
+            response = b""
+        assert b"500" not in response
+        assert b"422" not in response
+        assert app.eager_starts == [True]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_plaintext_and_post_and_keepalive() -> None:
     loop = asyncio.get_running_loop()
     app = TrackingApp()
@@ -1053,8 +1211,15 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
             b"x"
         )
         await writer.drain()
-        response = await read_response(reader)
-        assert b"500" in response.split(b"\r\n", 1)[0]
+        try:
+            response = await read_response(reader)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+        ):
+            response = b""
+        assert b"500" not in response
         assert errors
         assert "stream chunk limit" in str(errors[0])
         writer.close()

@@ -25,7 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
-from stario.http.invoke import finish_scheduled, trailing_slash_redirect
+from stario.http.invoke import on_handler_done
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -406,7 +406,6 @@ cdef class HttpProtocol:
     cdef bint pump_scheduled
     cdef object _create_task
     cdef object _find_handler
-    cdef object _trailing_slash
 
     def __cinit__(self):
         _bind_settings()
@@ -460,7 +459,6 @@ cdef class HttpProtocol:
         self.connections = connections
         self._create_task = app.create_task
         self._find_handler = app.find_handler
-        self._trailing_slash = trailing_slash_redirect
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -960,7 +958,44 @@ cdef class HttpProtocol:
         cdef object task
         cdef object span
         cdef object host
+        cdef const char* url
+        cdef Py_ssize_t n
+        cdef Py_ssize_t i
+        cdef Py_ssize_t path_end
+        cdef Py_ssize_t start
+        cdef Py_ssize_t end
         self.active_exchange = exchange
+        n = exchange._req_url_length
+        if n > 1:
+            url = exchange._req_arena + exchange._req_url_offset
+            path_end = n
+            for i in range(n):
+                if url[i] == 63:
+                    path_end = i
+                    break
+            if path_end > 1 and url[path_end - 1] == 47:
+                start = 0
+                end = path_end
+                while start < end and url[start] == 47:
+                    start += 1
+                while end > start and url[end - 1] == 47:
+                    end -= 1
+                exchange.start_response()
+                exchange._buf_bytes(_status_line(308))
+                exchange._buf_bytes(exchange._date_box[0])
+                exchange._buf_bytes(b"location: /")
+                if end > start:
+                    exchange._buf_add(url + start, end - start)
+                if path_end + 1 < n:
+                    exchange._buf_bytes(b"?")
+                    exchange._buf_add(url + path_end + 1, n - path_end - 1)
+                exchange._buf_bytes(b"\r\ncontent-length: 0\r\n\r\n")
+                exchange._flush()
+                exchange._status_code = 308
+                exchange._completed = True
+                exchange._done()
+                exchange.handler_finished()
+                return
         exchange.start_response()
         req = exchange.req
         path = req.path
@@ -968,19 +1003,16 @@ cdef class HttpProtocol:
         if span is not None and self.noop_span is None:
             span.start()
             span.attrs({"request.method": req.method, "request.path": path})
-        if path != "/" and path.endswith("/"):
-            handler = self._trailing_slash
-        else:
-            host = req.host if self.app.host_routing else ""
-            handler, route = self._find_handler(host, path, req.method)
-            exchange.route = route
+        host = req.host if self.app.host_routing else ""
+        handler, route = self._find_handler(host, path, req.method)
+        exchange.route = route
         task = self._create_task(
             handler(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
         )
         if task.done():
-            finish_scheduled(exchange, exchange, task)
+            on_handler_done(exchange, exchange, task)
             exchange.handler_finished()
         else:
             task.add_done_callback(exchange.on_handler_done)

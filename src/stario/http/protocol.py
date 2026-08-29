@@ -18,14 +18,16 @@ from httptools import (  # pyright: ignore[reportMissingTypeStubs]
     parse_url,  # pyright: ignore[reportUnknownVariableType]
 )
 
+import stario.responses as responses
 from stario.telemetry.core import Tracer
+from stario.telemetry.spans import NoOpSpan
 
 from .app import App
 from .compression import CompressionConfig
 from .config import RequestPolicy
 from .context import Context
 from .headers import Headers
-from .invoke import schedule_request
+from .invoke import on_handler_done
 from .request import BodyReader, Request
 from .wire import decode_method, decode_path
 from .writer import (
@@ -335,17 +337,7 @@ class HttpProtocol(asyncio.Protocol):
             self._active_context = context
             self._active_writer = writer
 
-            # Handler coroutine is the task body (no App.__call__ wrapper).
-            # Eager-complete responses already ran on_response_completed; do
-            # not stash a done task or idle shutdown will skip this connection.
-            task = schedule_request(
-                self.app,
-                context,
-                writer,
-                loop=self.loop,
-                eager_start=True,
-            )
-            self._active_task = None if task.done() else task
+            self._start_handler(context, writer, eager_start=True)
 
         else:
             # Pipeline queue: must not run the next handler until bytes are fully written.
@@ -377,6 +369,45 @@ class HttpProtocol(asyncio.Protocol):
     # Request Handling
     # =========================================================================
 
+    def _start_handler(
+        self,
+        context: Context,
+        writer: Writer,
+        *,
+        eager_start: bool,
+    ) -> None:
+        path = context.req.path
+        if path != "/" and path.endswith("/"):
+            target = "/" + path.strip("/")
+            if context.req.query_bytes:
+                target = f"{target}?{context.req.query_bytes.decode('latin-1')}"
+            responses.redirect(writer, target, 308)
+            self._active_task = None
+            return
+
+        host = context.req.host if self.app.host_routing else ""
+        handler, context.route = self.app.find_handler(
+            host, path, context.req.method
+        )
+        span = context.span
+        if type(span) is not NoOpSpan:
+            span.start()
+            span.attrs({"request.method": context.req.method, "request.path": path})
+
+        task = self.app.create_task(
+            handler(context, writer),
+            loop=self.loop,
+            eager_start=eager_start,
+        )
+        if task.done():
+            on_handler_done(context, writer, task)
+            self._active_task = None
+        else:
+            task.add_done_callback(
+                lambda done, c=context, w=writer: on_handler_done(c, w, done)
+            )
+            self._active_task = task
+
     def on_response_completed(self) -> None:
         t = self.transport
         w = self._active_writer
@@ -404,14 +435,7 @@ class HttpProtocol(asyncio.Protocol):
             next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
             self._active_context = next_c
-            task = schedule_request(
-                self.app,
-                next_c,
-                next_w,
-                loop=self.loop,
-                eager_start=False,
-            )
-            self._active_task = None if task.done() else task
+            self._start_handler(next_c, next_w, eager_start=False)
             t.resume_reading()
         else:
             self._active_context = None

@@ -2,7 +2,7 @@
 
 **Dispatch** — `Router` in `stario.http.dispatch` matches requests to handlers.
 `App` subclasses it and tracks tasks. The protocol runs `find_handler` then
-the matched handler as a task (`stario.http.invoke`).
+the matched handler as a task.
 
 **Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
 

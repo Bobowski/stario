@@ -40,7 +40,7 @@ class Context:
     req: Request
     """Parsed HTTP request (method, path, headers, body reader)."""
     span: Span
-    """Telemetry span for this request; started/ended by `schedule_request`."""
+    """Telemetry span for this request; started/ended around the handler task."""
     _disconnect: asyncio.Future[None] = field(repr=False)
     """Completes when the client closes this request's connection."""
     state: dict[str, Any] = field(default_factory=lambda: {})

@@ -43,7 +43,7 @@ from stario.http.compression import (
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
-from stario.http.invoke import finish_scheduled
+from stario.http.invoke import on_handler_done
 from stario.http.request import host_without_port
 from stario.http.writer import get_status_line
 
@@ -110,6 +110,7 @@ _bind_timeout_mode()
 cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
 cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
 cdef bytes STATUS_304 = b"HTTP/1.1 304 Not Modified\r\n"
+cdef bytes STATUS_308 = b"HTTP/1.1 308 Permanent Redirect\r\n"
 cdef bytes STATUS_400 = b"HTTP/1.1 400 Bad Request\r\n"
 cdef bytes STATUS_404 = b"HTTP/1.1 404 Not Found\r\n"
 cdef bytes STATUS_405 = b"HTTP/1.1 405 Method Not Allowed\r\n"
@@ -347,6 +348,8 @@ cdef object _status_line(int status):
         return STATUS_204
     if status == 304:
         return STATUS_304
+    if status == 308:
+        return STATUS_308
     if status == 400:
         return STATUS_400
     if status == 404:
@@ -1474,8 +1477,8 @@ cdef class RequestExchange:
         self.reset_response(self._req_encoding)
 
     def on_handler_done(self, task):
-        """Finish the writer/span, then recycle after the handler task."""
-        finish_scheduled(self, self, task)
+        """Log/abort on failure, then recycle after the handler task."""
+        on_handler_done(self, self, task)
         self.handler_finished()
 
     cdef void handler_finished(self):
