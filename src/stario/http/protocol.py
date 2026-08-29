@@ -520,6 +520,7 @@ class HttpProtocol(asyncio.Protocol):
                 if raw:
                     method = decode_method(raw)
             except Exception:
+                # Partial/garbage requests; status is still recorded.
                 pass
         if self._reading_url_parts:
             try:
@@ -527,6 +528,7 @@ class HttpProtocol(asyncio.Protocol):
                 if parsed.path:
                     path = decode_path(parsed.path)
             except Exception:
+                # Same: identity is optional on the error span.
                 pass
         return method, path
 

@@ -9,12 +9,12 @@ from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.writer import Writer
 from stario.telemetry.noop import NoOpTracer
-from stario.testing.tracer import TestTracer as RecordingTestTracer
+from stario.testing.tracer import TestTracer
 from tests.helpers import DummyWriter, make_context
 
 
 def test_finish_request_span_records_status_without_fail() -> None:
-    with RecordingTestTracer() as tracer:
+    with TestTracer() as tracer:
         span = tracer.create("request")
         finish_request_span(span, status=308, method="GET", path="/search/")
         finished = tracer.get_span(span.id)

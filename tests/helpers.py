@@ -17,6 +17,7 @@ from stario.http.headers import Headers
 from stario.http.request import BodyReader, Request
 from stario.http.writer import Writer
 from stario.telemetry.noop import NoOpTracer
+from stario.testing.tracer import TestTracer
 from stario.testing.transport import MemoryTransport as _MemoryTransport
 
 type AppSetup = Callable[[App], None]
@@ -262,3 +263,26 @@ def split_response(raw: bytes) -> tuple[bytes, bytes]:
     """Split raw HTTP/1.1 wire bytes into (head, body)."""
     head, _, body = raw.partition(b"\r\n\r\n")
     return head, body
+
+
+def assert_status_span(
+    tracer: TestTracer,
+    status: int,
+    *,
+    method: str | None = None,
+    path: str | None = None,
+) -> None:
+    """Assert a finished request span recorded `status` and was not failed."""
+    matches = [
+        span
+        for span in tracer.finished_spans()
+        if span.attributes.get("response.status_code") == status
+    ]
+    assert matches, f"no finished span with status {status}: {tracer.finished_spans()}"
+    span = matches[0]
+    assert span.ok
+    if method is not None:
+        assert span.attributes.get("request.method") == method
+    if path is not None:
+        assert span.attributes.get("request.path") == path
+    assert not tracer.has_open_spans()

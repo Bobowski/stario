@@ -1,14 +1,11 @@
 """Handler-task finish: log failures, abort if nothing was sent, close the span.
 
 Does not map exceptions to HTTP and does not call `Writer.end()`.
-Protocol 308 / 4xx paths share `finish_request_span` so every status on the
-wire gets a started-and-ended span. `NoOpSpan` is a no-op (wrk GET stays free).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from stario.http.context import Context
 from stario.http.writer import Writer
@@ -18,18 +15,13 @@ _log = logging.getLogger("stario.http")
 
 
 def finish_request_span(
-    span: Any,
+    span: object,
     *,
     status: int | None = None,
     method: str | None = None,
     path: str | None = None,
 ) -> None:
-    """Start and end a request span that produced an HTTP status (or was dropped).
-
-    Protocol 308 / 4xx call this instead of `fail`. Uncaught handler exceptions
-    still go through `on_handler_done`. `NoOpSpan` and `None` are skipped.
-    `RecordingSpan.start()` is idempotent; `end()` requires a prior start.
-    """
+    """Start and end a request span. Skips `None` / `NoOpSpan`. Does not `fail`."""
     if span is None or type(span) is NoOpSpan:
         return
     span.start()
@@ -75,5 +67,4 @@ def on_handler_done(c: Context, w: Writer, task) -> None:
             w.abort()
 
     if record:
-        span.attr("response.status_code", w.status_code)
-        span.end()
+        finish_request_span(span, status=w.status_code)
