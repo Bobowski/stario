@@ -174,7 +174,7 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handler_exception_aborts_without_http_mapping() -> None:
+async def test_handler_exception_writes_500() -> None:
     loop = asyncio.get_running_loop()
     app = TrackingApp()
 
@@ -201,16 +201,9 @@ async def test_handler_exception_aborts_without_http_mapping() -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"GET /boom HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         await writer.drain()
-        try:
-            response = await read_response(reader)
-        except (
-            asyncio.IncompleteReadError,
-            ConnectionResetError,
-            ConnectionAbortedError,
-        ):
-            response = b""
-        assert b"500" not in response
-        assert b"422" not in response
+        response = await read_response(reader)
+        assert b"500" in response.split(b"\r\n", 1)[0]
+        assert b"Internal Server Error" in response
         assert app.eager_starts == [True]
         writer.close()
         await writer.wait_closed()

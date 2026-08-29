@@ -1,4 +1,4 @@
-"""Handler-task finish: log and abort, do not map exceptions to HTTP."""
+"""Handler-task finish: log and write 500 if nothing was sent."""
 
 import asyncio
 import logging
@@ -48,7 +48,9 @@ def test_find_handler_is_the_resolve_step() -> None:
     asyncio.run(run())
 
 
-def test_on_handler_done_aborts_on_exception(caplog: logging.LogCaptureFixture) -> None:
+def test_on_handler_done_writes_500_on_exception(
+    caplog: logging.LogCaptureFixture,
+) -> None:
     async def run() -> None:
         app = App()
         ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
@@ -61,13 +63,14 @@ def test_on_handler_done_aborts_on_exception(caplog: logging.LogCaptureFixture) 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             on_handler_done(ctx, w, task)  # type: ignore[arg-type]
         assert w.completed
-        assert w.status is None
+        assert w.status == 500
+        assert w.body == "Internal Server Error"
         assert "Handler failed" in caplog.text
 
     asyncio.run(run())
 
 
-def test_on_handler_done_aborts_when_handler_writes_nothing(
+def test_on_handler_done_writes_500_when_handler_writes_nothing(
     caplog: logging.LogCaptureFixture,
 ) -> None:
     async def run() -> None:
@@ -82,8 +85,32 @@ def test_on_handler_done_aborts_when_handler_writes_nothing(
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             on_handler_done(ctx, w, task)  # type: ignore[arg-type]
         assert w.completed
-        assert w.status is None
+        assert w.status == 500
+        assert w.body == "Internal Server Error"
         assert "without sending a response" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_aborts_if_headers_already_started(
+    caplog: logging.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        w.write_headers(200)
+
+        async def boom_after_headers() -> None:
+            raise RuntimeError("after headers")
+
+        task = app.create_task(boom_after_headers(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.status == 200
+        assert w.completed
+        assert not w.ended
+        assert "Handler failed" in caplog.text
 
     asyncio.run(run())
 

@@ -79,15 +79,38 @@ class TestHostRouting:
 
 
 class TestAppErrorSurface:
-    def test_unhandled_exception_is_raised_and_aborts(self):
+    def test_unhandled_exception_writes_500(self, caplog: pytest.LogCaptureFixture):
         async def boom(_c: Context, _w: Writer) -> None:
             raise RuntimeError("boom")
 
         def setup(app: App) -> None:
             app.get("/boom", boom)
 
-        with pytest.raises(RuntimeError, match="boom"):
-            run_with_app(setup, "/boom")
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            _context, writer = run_with_app(setup, "/boom")
+
+        assert writer.status == 500
+        assert writer.body == "Internal Server Error"
+        assert writer.completed
+        assert "Handler failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unhandled_exception_is_500_on_test_client(self):
+        app = App()
+
+        async def boom(_c: Context, _w: Writer) -> None:
+            raise RuntimeError("boom")
+
+        app.get("/boom", boom)
+        async with TestClient(app) as client:
+            response = await client.get("/boom")
+            assert response.status_code == 500
+            assert response.text == "Internal Server Error"
+            span = client.tracer.get_span(response.span_id)
+            assert span is not None
+            assert span.attributes.get("response.status_code") == 500
+            assert not span.ok
+            assert not client.tracer.has_open_spans()
 
     def test_handler_must_send_explicit_response(self):
         async def missing_response(_c: Context, _w: Writer) -> None:
@@ -99,8 +122,8 @@ class TestAppErrorSurface:
         _context, writer = run_with_app(setup, "/missing")
 
         assert writer.completed
-        assert writer.status is None
-        assert not writer.ended
+        assert writer.status == 500
+        assert writer.body == "Internal Server Error"
 
     def test_write_then_raise_keeps_response_and_is_logged(
         self, caplog: pytest.LogCaptureFixture
@@ -120,15 +143,17 @@ class TestAppErrorSurface:
         assert writer.completed
         assert "Handler failed" in caplog.text
 
-    def test_http_exception_is_not_mapped_to_http(self):
+    def test_http_exception_is_not_mapped_to_its_status(self):
         async def handler(_c: Context, _w: Writer) -> None:
             raise HttpException(422, "nope")
 
         def setup(app: App) -> None:
             app.get("/x", handler)
 
-        with pytest.raises(HttpException, match="nope"):
-            run_with_app(setup, "/x")
+        _context, writer = run_with_app(setup, "/x")
+
+        assert writer.status == 500
+        assert writer.body == "Internal Server Error"
 
     def test_call_uses_find_handler(self):
         seen: list[tuple[str, str, str]] = []

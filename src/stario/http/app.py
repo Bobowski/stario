@@ -25,8 +25,10 @@ class App(Router):
     """Route table plus task tracking for graceful shutdown.
 
     Handlers are `async def` and must write a complete response. Uncaught
-    exceptions are logged and abort the writer; they are not mapped to HTTP.
-    Use `create_task` for work tied to a running server so drain can observe it.
+    exceptions are logged; if nothing was sent, the framework writes 500.
+    A response already on the wire is not rewritten. `HttpException` is not
+    mapped to its status. Use `create_task` for work tied to a running server
+    so drain can observe it.
     """
 
     def __init__(self) -> None:

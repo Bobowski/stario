@@ -1,6 +1,7 @@
-"""Handler-task finish: log failures, abort if nothing was sent, close the span.
+"""Handler-task finish: log failures, send 500 if nothing was sent, close the span.
 
-Does not map exceptions to HTTP and does not call `Writer.end()`.
+Does not map exception types to HTTP (no `HttpException` → 4xx). A write-then-raise
+keeps the bytes already on the wire. Cancellation still aborts.
 """
 
 from __future__ import annotations
@@ -12,6 +13,19 @@ from stario.http.writer import Writer
 from stario.telemetry.spans import NoOpSpan
 
 _log = logging.getLogger("stario.http")
+
+_INTERNAL_ERROR = b"Internal Server Error"
+_PLAIN = b"text/plain; charset=utf-8"
+
+
+def _finish_incomplete(w: Writer) -> None:
+    """500 if the handler never started a response; otherwise abort."""
+    if w.completed:
+        return
+    if w.started:
+        w.abort()
+        return
+    w.respond(_INTERNAL_ERROR, _PLAIN, 500)
 
 
 def finish_request_span(
@@ -54,8 +68,7 @@ def on_handler_done(c: Context, w: Writer, task) -> None:
             if record:
                 span.fail(str(exc))
                 span.exception(exc)
-            if not w.completed:
-                w.abort()
+            _finish_incomplete(w)
         elif not w.completed:
             _log.error(
                 "Handler returned without sending a response (%s %s)",
@@ -64,7 +77,7 @@ def on_handler_done(c: Context, w: Writer, task) -> None:
             )
             if record:
                 span.fail("Handler returned without sending a response")
-            w.abort()
+            _finish_incomplete(w)
 
     if record:
         finish_request_span(span, status=w.status_code)
