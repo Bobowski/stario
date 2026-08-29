@@ -80,3 +80,6 @@ wrapper coroutine, `responses.text`/`ujson` from Python, and protocol
 
 Stario already leads Granian on validate, form, and all upload/body cases
 in this run (same as the 2026-08-28 Cython protocol snapshot).
+
+Profiler follow-up (what would close the remaining GET gap):
+[`baseline-20260829-granian-gap.md`](baseline-20260829-granian-gap.md).
