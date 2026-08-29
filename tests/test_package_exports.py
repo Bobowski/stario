@@ -50,6 +50,7 @@ def test_core_modules_import() -> None:
                 "RouteMatch",
                 "normalized_location",
                 "default_not_found",
+                "handler_is_async",
             ],
         ),
         (

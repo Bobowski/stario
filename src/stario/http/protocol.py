@@ -1,5 +1,5 @@
 """
-Per-connection HTTP/1.1: httptools parses bytes; handlers run as tasks so this layer never blocks the event loop.
+Per-connection HTTP/1.1: httptools parses bytes; async handlers run as tasks so this layer never blocks the event loop. Sync handlers run immediately via `app.dispatch()`.
 
 Shared `disconnect` futures tie body reads and long responses to the same socket lifetime. Pipelining and keep-alive
 follow RFC behavior even when common clients use parallel connections instead. App work is scheduled via `app.create_task`
@@ -292,7 +292,8 @@ class HttpProtocol(asyncio.Protocol):
             )
             self._reading_body = body_reader
 
-        # Hand off to the app: one Request + Writer per message; handler runs in a task (see on_response_completed).
+        # Hand off to the app: one Request + Writer per message. Sync handlers
+        # run inline; async handlers are scheduled as tasks (see on_response_completed).
         try:
             method = decode_method(parser.get_method())
             path_str = decode_path(parsed_url.path)
@@ -331,10 +332,12 @@ class HttpProtocol(asyncio.Protocol):
             self._active_context = context
             self._active_writer = writer
 
-            # Reuse the protocol loop here; this is one task per request.
-            self._active_task = self.app.create_task(
-                self.app(context, writer), loop=self.loop
-            )
+            # dispatch() may complete the response (and start a pipelined
+            # follow-up) before returning; only store the task if this
+            # exchange is still the active one.
+            task = self.app.dispatch(context, writer, loop=self.loop)
+            if self._active_context is context:
+                self._active_task = task
 
         else:
             # Pipeline queue: must not run the next handler until bytes are fully written.
@@ -393,9 +396,9 @@ class HttpProtocol(asyncio.Protocol):
             next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
             self._active_context = next_c
-            self._active_task = self.app.create_task(
-                self.app(next_c, next_w), loop=self.loop
-            )
+            task = self.app.dispatch(next_c, next_w, loop=self.loop)
+            if self._active_context is next_c:
+                self._active_task = task
             t.resume_reading()
         else:
             self._active_context = None

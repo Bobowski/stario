@@ -6,6 +6,17 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- Sync handlers — register `def handler(c, w):` beside `async def`. Classification
+  happens at `app.add` / `app.get` / …, not per request. The server contract is
+  `App.dispatch()`: sync handlers run immediately once the request is ready;
+  async handlers are scheduled as tasks. `await app(c, w)` still works (it
+  awaits the task when the route is async). Sync handlers cannot use `await`;
+  read the body with `await c.req.body()` on an async handler. Middleware that
+  wraps a sync leaf is adapted so existing `await handler(c, w)` middleware
+  keeps working; the composed route then takes the async path.
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

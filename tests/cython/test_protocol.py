@@ -22,6 +22,62 @@ class TrackingApp(App):
 
 
 @pytest.mark.asyncio
+async def test_sync_handler_skips_create_task() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+
+    def plaintext(_c, w):
+        responses.text(w, "Hello, World!")
+
+    async def echo(c, w):
+        body = await c.req.body()
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.get("/plaintext", plaintext)
+    app.post("/echo", echo)
+
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /plaintext HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        first = await read_response(reader)
+        assert b"Hello, World!" in first
+        assert app.eager_starts == []
+
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"abcde"
+        )
+        await writer.drain()
+        second = await read_response(reader)
+        assert b"abcde" in second
+        assert app.eager_starts == [True]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_plaintext_and_post_and_keepalive() -> None:
     loop = asyncio.get_running_loop()
     app = TrackingApp()

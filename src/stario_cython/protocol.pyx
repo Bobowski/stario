@@ -404,6 +404,7 @@ cdef class HttpProtocol:
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
     cdef object _create_task
+    cdef object _dispatch
 
     def __cinit__(self):
         _bind_settings()
@@ -456,6 +457,7 @@ cdef class HttpProtocol:
         self.compression = compression
         self.connections = connections
         self._create_task = app.create_task
+        self._dispatch = app.dispatch
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -951,12 +953,13 @@ cdef class HttpProtocol:
         cdef object task
         self.active_exchange = exchange
         exchange.start_response()
-        task = self._create_task(
-            self.app(exchange, exchange),
+        task = self._dispatch(
+            exchange,
+            exchange,
             loop=self.loop,
             eager_start=eager_start,
         )
-        if task.done():
+        if task is None or task.done():
             exchange.handler_finished()
         else:
             task.add_done_callback(exchange.on_handler_done)
@@ -971,7 +974,7 @@ cdef class HttpProtocol:
         """Advance the connection after the response is fully sent.
 
         Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
-        the handler coroutine returns. The handler (or ``app.create_task`` work)
+        the handler returns. An async handler (or ``app.create_task`` work)
         may still run after this; the connection is free to start the next
         pipelined/keep-alive exchange immediately.
         """

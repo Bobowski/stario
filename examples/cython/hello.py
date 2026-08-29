@@ -2,7 +2,7 @@ import stario.responses as responses
 from stario import App, Span
 
 
-async def plaintext(_c, w):
+def plaintext(_c, w):
     responses.text(w, "Hello, World!")
 
 

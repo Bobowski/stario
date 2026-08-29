@@ -23,7 +23,12 @@ For tests, `aload_app` is re-exported from `stario.testing`.
 
 from stario.http.app import App
 from stario.http.context import Context, Handler, Middleware, RouteMatch
-from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
+from stario.http.dispatch import (
+    Router,
+    default_not_found,
+    handler_is_async,
+    method_not_allowed_handler,
+)
 from stario.http.headers import Headers
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
@@ -42,6 +47,7 @@ __all__ = [
     "Router",
     "Writer",
     "default_not_found",
+    "handler_is_async",
     "method_not_allowed_handler",
     "normalized_location",
 ]

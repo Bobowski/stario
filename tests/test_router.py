@@ -1,9 +1,16 @@
 """Tests for the trie-based HTTP router."""
 
+from functools import partial
+
 import pytest
 
 from stario.exceptions import StarioError
-from stario.http import Router, default_not_found, method_not_allowed_handler
+from stario.http import (
+    Router,
+    default_not_found,
+    handler_is_async,
+    method_not_allowed_handler,
+)
 from stario.http.context import EMPTY_ROUTE_MATCH, Context, Handler
 from stario.http.writer import Writer
 from stario.routing import Route, UrlPath
@@ -11,6 +18,10 @@ from tests.helpers import DummyWriter, run_handler, run_with_app
 
 
 async def noop_handler(c: Context, w: Writer) -> None:
+    return None
+
+
+def sync_noop(c: Context, w: Writer) -> None:
     return None
 
 
@@ -266,6 +277,81 @@ class TestRouterUse:
         assert match is EMPTY_ROUTE_MATCH
         run_handler(handler, "/missing", host="api.example.com")
         assert calls == ["host-404"]
+
+
+class TestHandlerClassification:
+    def test_async_def_is_async(self):
+        assert handler_is_async(noop_handler) is True
+
+    def test_sync_def_is_sync(self):
+        assert handler_is_async(sync_noop) is False
+
+    def test_partial_of_async_is_async(self):
+        async def takes_flag(c: Context, w: Writer, _flag: int) -> None:
+            return None
+
+        assert handler_is_async(partial(takes_flag, _flag=1)) is True
+
+    def test_callable_object_async_call(self):
+        class Home:
+            async def __call__(self, c: Context, w: Writer) -> None:
+                return None
+
+        assert handler_is_async(Home()) is True
+
+    def test_rejects_non_callable(self):
+        with pytest.raises(StarioError, match="Handler must be callable"):
+            handler_is_async("not-a-handler")  # type: ignore[arg-type]
+
+    def test_rejects_async_generator(self):
+        async def stream(c: Context, w: Writer):
+            yield None
+
+        with pytest.raises(StarioError, match="async generator"):
+            handler_is_async(stream)
+
+    def test_registration_classifies_sync_and_async(self):
+        router = Router()
+        router.get("/async", noop_handler)
+        router.post("/sync", sync_noop)
+
+        _handler, _match, async_flag = router.resolve("", "/async", "GET")
+        assert async_flag is True
+        _handler, _match, sync_flag = router.resolve("", "/sync", "POST")
+        assert sync_flag is False
+
+    def test_default_not_found_is_sync(self):
+        router = Router()
+        _handler, _match, is_async = router.resolve("", "/missing", "GET")
+        assert _handler is default_not_found
+        assert is_async is False
+
+    def test_default_method_not_allowed_is_sync(self):
+        router = Router()
+        router.get("/r", noop_handler)
+        handler, _match, is_async = router.resolve("", "/r", "POST")
+        assert handler is method_not_allowed_handler(frozenset({"GET"}))
+        assert is_async is False
+
+    def test_sync_handler_with_middleware_becomes_async(self):
+        def scope_middleware(handler: Handler) -> Handler:
+            async def wrapped(c: Context, w: Writer) -> None:
+                await handler(c, w)
+
+            return wrapped
+
+        router = Router()
+        router.use("/", scope_middleware)
+        router.get("/users", sync_noop)
+
+        _handler, _match, is_async = router.resolve("", "/users", "GET")
+        assert is_async is True
+        run_handler(_handler, "/users")
+
+    def test_get_rejects_non_callable(self):
+        router = Router()
+        with pytest.raises(StarioError, match="Handler must be callable"):
+            router.get("/x", "nope")  # type: ignore[arg-type]
 
 
 class TestRouterDispatch:

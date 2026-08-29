@@ -5,16 +5,23 @@ Host routes are tried first when present; hostless routes are shared defaults (G
 Patterns come from `stario.routing.UrlPath`. Register a `Route` with `add()`.
 
 **Match cache.** `find_handler` memoizes `(host, path, method)` → `(handler, route_match)`
-(LRU, 1024 entries). Registration clears the cache.
+(LRU, 1024 entries). Registration clears the cache. `resolve()` also returns whether
+the matched callable is async.
+
+**Sync vs async.** `handler_is_async()` runs when a handler is added — not per request.
+Sync handlers run immediately on the protocol thread; async handlers are scheduled as
+tasks. Middleware wrapping a sync leaf is adapted so existing `await handler(c, w)`
+middleware keeps working; the composed callable is then async.
 
 **404 / 405 policy.** `not_found(pattern, ...)` and `method_not_allowed(pattern, ...)`
 attach handlers on the trie branch walked for `pattern`. During a request, the deepest
 node along the host/path walk with a policy handler wins (prefix-scoped inheritance).
 """
 
+import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from types import MappingProxyType
 from typing import Literal, cast
 
@@ -38,15 +45,70 @@ def _as_pattern(path: UrlPath | str) -> UrlPath:
     return path if isinstance(path, UrlPath) else UrlPath(path)
 
 
+def handler_is_async(handler: object) -> bool:
+    """Return whether `handler` is an async callable. Checked at registration.
+
+    Accepts functions, `functools.partial` of those functions, and callable
+    objects whose `__call__` is async. Async generators are rejected — a handler
+    writes to `Writer`, it does not yield.
+    """
+    if not callable(handler):
+        raise StarioError(
+            "Handler must be callable",
+            context={"got": type(handler).__name__},
+            help_text=(
+                "Register `def handler(c, w):` or `async def handler(c, w):`. "
+                "Sync handlers cannot use await; they run as soon as the request is ready."
+            ),
+        )
+
+    fn: object = handler
+    while isinstance(fn, partial):
+        fn = fn.func
+
+    if inspect.isasyncgenfunction(fn):
+        raise StarioError(
+            "Handler cannot be an async generator",
+            help_text="Use `async def handler(c, w):` and write to the Writer, not `yield`.",
+        )
+    if inspect.iscoroutinefunction(fn):
+        return True
+
+    call = getattr(fn, "__call__", None)
+    if call is not None and call is not fn:
+        if inspect.isasyncgenfunction(call):
+            raise StarioError(
+                "Handler cannot be an async generator",
+                help_text="Use `async def __call__(self, c, w):` and write to the Writer, not `yield`.",
+            )
+        if inspect.iscoroutinefunction(call):
+            return True
+    return False
+
+
+def _adapt_sync_handler(handler: Handler) -> Handler:
+    """Wrap a sync leaf so async middleware can `await handler(c, w)`."""
+
+    async def adapted(c: Context, w: Writer) -> None:
+        handler(c, w)
+
+    adapted.__name__ = getattr(handler, "__name__", "adapted")
+    adapted.__qualname__ = getattr(handler, "__qualname__", adapted.__name__)
+    adapted.__wrapped__ = handler  # type: ignore[attr-defined]
+    return adapted
+
+
 @dataclass(slots=True)
 class Endpoint:
     handler: Handler
     route_match: RouteMatch
+    is_async: bool = True
 
 
 @dataclass(slots=True)
 class Node:
     not_found_handler: Handler | None = None
+    not_found_is_async: bool = False
     method_not_allowed_handler: MethodNotAllowedHandler | None = None
     middleware: tuple[Middleware, ...] = ()
     host_depth: int = 0
@@ -137,7 +199,7 @@ def _branch_has_endpoints(node: Node) -> bool:
     )
 
 
-async def default_not_found(_c: Context, w: Writer) -> None:
+def default_not_found(_c: Context, w: Writer) -> None:
     responses.text(w, "Not Found", 404)
 
 
@@ -145,11 +207,21 @@ async def default_not_found(_c: Context, w: Writer) -> None:
 def method_not_allowed_handler(allowed: frozenset[str]) -> Handler:
     allow_header = ", ".join(sorted(allowed))
 
-    async def respond(_c: Context, w: Writer) -> None:
+    def respond(_c: Context, w: Writer) -> None:
         w.headers.set("Allow", allow_header)
         responses.text(w, "Method Not Allowed", 405)
 
     return respond
+
+
+type _WalkResult = tuple[
+    Node,
+    dict[str, str] | None,
+    Handler,
+    bool,
+    bool,
+    MethodNotAllowedHandler | None,
+]
 
 
 def _walk_values(
@@ -158,13 +230,11 @@ def _walk_values(
     params: dict[str, str] | None,
     not_found: Handler,
     not_found_custom: bool,
+    not_found_is_async: bool,
     method_na: MethodNotAllowedHandler | None,
     *,
     path: str | None = None,
-) -> (
-    tuple[Node, dict[str, str] | None, Handler, bool, MethodNotAllowedHandler | None]
-    | None
-):
+) -> _WalkResult | None:
     """Walk request host or path segments on the trie."""
     path_off = 0 if path is None or path == "/" else 1
     i = 0
@@ -199,10 +269,18 @@ def _walk_values(
         if (nf := child.not_found_handler) is not None:
             not_found = nf
             not_found_custom = True
+            not_found_is_async = child.not_found_is_async
         if (mna := child.method_not_allowed_handler) is not None:
             method_na = mna
         current = child
-    return current, params, not_found, not_found_custom, method_na
+    return (
+        current,
+        params,
+        not_found,
+        not_found_custom,
+        not_found_is_async,
+        method_na,
+    )
 
 
 def _resolve(
@@ -211,10 +289,16 @@ def _resolve(
     path: str,
     path_segments: tuple[str, ...],
     method: str,
-) -> tuple[Handler, RouteMatch, MatchStatus, bool]:
+) -> tuple[Handler, RouteMatch, MatchStatus, bool, bool]:
     params: dict[str, str] | None = None
-    not_found = root.not_found_handler or default_not_found
-    not_found_custom = root.not_found_handler is not None
+    if root.not_found_handler is not None:
+        not_found = root.not_found_handler
+        not_found_is_async = root.not_found_is_async
+        not_found_custom = True
+    else:
+        not_found = default_not_found
+        not_found_is_async = False
+        not_found_custom = False
     method_na = root.method_not_allowed_handler
     current = root
 
@@ -224,11 +308,18 @@ def _resolve(
         params,
         not_found,
         not_found_custom,
+        not_found_is_async,
         method_na,
     )
     if walked is None:
-        return not_found, EMPTY_ROUTE_MATCH, "not_found", not_found_custom
-    current, params, not_found, not_found_custom, method_na = walked
+        return (
+            not_found,
+            EMPTY_ROUTE_MATCH,
+            "not_found",
+            not_found_custom,
+            not_found_is_async,
+        )
+    current, params, not_found, not_found_custom, not_found_is_async, method_na = walked
 
     walked = _walk_values(
         current,
@@ -236,35 +327,48 @@ def _resolve(
         params,
         not_found,
         not_found_custom,
+        not_found_is_async,
         method_na,
         path=path,
     )
     if walked is None:
-        return not_found, EMPTY_ROUTE_MATCH, "not_found", not_found_custom
-    current, params, not_found, not_found_custom, method_na = walked
+        return (
+            not_found,
+            EMPTY_ROUTE_MATCH,
+            "not_found",
+            not_found_custom,
+            not_found_is_async,
+        )
+    current, params, not_found, not_found_custom, not_found_is_async, method_na = walked
 
     endpoint = None if current.endpoints is None else current.endpoints.get(method)
 
     if endpoint is None:
         if current.methods:
+            produced = (method_na or method_not_allowed_handler)(current.methods)
             return (
-                (method_na or method_not_allowed_handler)(current.methods),
+                produced,
                 EMPTY_ROUTE_MATCH,
                 "method_not_allowed",
                 not_found_custom,
+                handler_is_async(produced),
             )
-        return not_found, EMPTY_ROUTE_MATCH, "not_found", not_found_custom
+        return (
+            not_found,
+            EMPTY_ROUTE_MATCH,
+            "not_found",
+            not_found_custom,
+            not_found_is_async,
+        )
 
-    if params is None:
-        return endpoint.handler, endpoint.route_match, "found", not_found_custom
-    return (
-        endpoint.handler,
-        RouteMatch(
+    match = (
+        endpoint.route_match
+        if params is None
+        else RouteMatch(
             pattern=endpoint.route_match.pattern, params=MappingProxyType(params)
-        ),
-        "found",
-        not_found_custom,
+        )
     )
+    return endpoint.handler, match, "found", not_found_custom, endpoint.is_async
 
 
 def _descend_or_create(
@@ -356,7 +460,7 @@ class Router:
             host: str,
             path: str,
             method: str,
-        ) -> tuple[Handler, RouteMatch]:
+        ) -> tuple[Handler, RouteMatch, bool]:
             return self._match(
                 host,
                 path,
@@ -377,6 +481,16 @@ class Router:
         path: str,
         method: str,
     ) -> tuple[Handler, RouteMatch]:
+        handler, match, _is_async = self._find_handler(host, path, method)
+        return handler, match
+
+    def resolve(
+        self,
+        host: str,
+        path: str,
+        method: str,
+    ) -> tuple[Handler, RouteMatch, bool]:
+        """Like `find_handler`, plus whether the matched callable is async."""
         return self._find_handler(host, path, method)
 
     def _clear_match_cache(self) -> None:
@@ -389,30 +503,38 @@ class Router:
         method: str,
         path_segments: tuple[str, ...],
         host_labels: tuple[str, ...],
-    ) -> tuple[Handler, RouteMatch]:
+    ) -> tuple[Handler, RouteMatch, bool]:
         if self._has_hosts and host:
-            host_handler, host_match, host_status, host_nf_custom = _resolve(
-                self._hosts, host_labels, path, path_segments, method
-            )
+            (
+                host_handler,
+                host_match,
+                host_status,
+                host_nf_custom,
+                host_async,
+            ) = _resolve(self._hosts, host_labels, path, path_segments, method)
             if host_status == "found":
-                return host_handler, host_match
-            path_handler, path_match, path_status, _path_nf_custom = _resolve(
-                self._path, (), path, path_segments, method
-            )
+                return host_handler, host_match, host_async
+            (
+                path_handler,
+                path_match,
+                path_status,
+                _path_nf_custom,
+                path_async,
+            ) = _resolve(self._path, (), path, path_segments, method)
             if path_status == "found":
-                return path_handler, path_match
+                return path_handler, path_match, path_async
             if host_status == "method_not_allowed":
-                return host_handler, host_match
+                return host_handler, host_match, host_async
             if path_status == "method_not_allowed":
-                return path_handler, path_match
+                return path_handler, path_match, path_async
             if host_nf_custom:
-                return host_handler, host_match
-            return path_handler, path_match
+                return host_handler, host_match, host_async
+            return path_handler, path_match, path_async
 
-        path_handler, path_match, path_status, _path_nf_custom = _resolve(
+        path_handler, path_match, _path_status, _path_nf_custom, path_async = _resolve(
             self._path, (), path, path_segments, method
         )
-        return path_handler, path_match
+        return path_handler, path_match, path_async
 
     def _registration_tree(self, pattern: UrlPath) -> Node:
         if pattern.host:
@@ -460,7 +582,9 @@ class Router:
         self._clear_match_cache()
 
     def not_found(self, pattern: UrlPath | str, handler: Handler) -> None:
-        self._policy_node(pattern).not_found_handler = handler
+        node = self._policy_node(pattern)
+        node.not_found_handler = handler
+        node.not_found_is_async = handler_is_async(handler)
         self._clear_match_cache()
 
     def method_not_allowed(
@@ -481,6 +605,7 @@ class Router:
     ) -> None:
         route = _as_pattern(path)
         method = method.upper()
+        is_async = handler_is_async(handler)
         tree = self._registration_tree(route)
         scoped_middleware = _collect_middleware(tree, route)
         if route.host:
@@ -491,8 +616,15 @@ class Router:
         current = trie_descend(tree, route, create=True, host_tree=tree is self._hosts)
 
         wrapped = handler
-        for mw in reversed([*scoped_middleware, *middleware]):
-            wrapped = mw(wrapped)
+        stack = [*scoped_middleware, *middleware]
+        if stack:
+            # Existing middleware does `await handler(c, w)`. Adapt a sync leaf
+            # so that contract still holds; the composed callable is async.
+            if not is_async:
+                wrapped = _adapt_sync_handler(wrapped)
+            for mw in reversed(stack):
+                wrapped = mw(wrapped)
+            is_async = handler_is_async(wrapped)
 
         existing = None if current.endpoints is None else current.endpoints.get(method)
         if existing is not None:
@@ -508,6 +640,7 @@ class Router:
                 pattern=route.text,
                 params=EMPTY_ROUTE_MATCH.params,
             ),
+            is_async=is_async,
         )
         if current.endpoints is None:
             current.endpoints = {method: endpoint}
@@ -613,5 +746,6 @@ class Router:
 __all__ = [
     "Router",
     "default_not_found",
+    "handler_is_async",
     "method_not_allowed_handler",
 ]
