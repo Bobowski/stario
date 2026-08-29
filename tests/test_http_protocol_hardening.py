@@ -18,6 +18,7 @@ from stario.http.compression import CompressionConfig
 from stario.http.config import RequestPolicy
 from stario.http.protocol import HttpProtocol
 from stario.telemetry.noop import NoOpTracer
+from stario.testing.tracer import TestTracer
 
 
 class _RecordingTransport(asyncio.Transport):
@@ -60,12 +61,14 @@ def _make_protocol(
     body_timeout: float = 30.0,
     keep_alive_timeout: float = 5.0,
     app: App | None = None,
+    tracer=None,
 ) -> tuple[HttpProtocol, App, _RecordingTransport]:
     loop = asyncio.get_running_loop()
     connections: set[HttpProtocol] = set()
     if app is None:
         app = App()
-    tracer = NoOpTracer()
+    if tracer is None:
+        tracer = NoOpTracer()
     proto = HttpProtocol(
         loop,
         app,
@@ -687,3 +690,72 @@ async def test_keep_alive_serves_second_request_on_same_connection() -> None:
         if not transport.is_closing():
             transport.close()
         await _drain(app)
+
+
+def _assert_status_span(
+    tracer: TestTracer,
+    status: int,
+    *,
+    method: str | None = None,
+    path: str | None = None,
+) -> None:
+    matches = [
+        span
+        for span in tracer._finished
+        if span.attributes.get("response.status_code") == status
+    ]
+    assert matches, f"no finished span with status {status}: {tracer._finished}"
+    span = matches[0]
+    assert span.ok
+    if method is not None:
+        assert span.attributes.get("request.method") == method
+    if path is not None:
+        assert span.attributes.get("request.path") == path
+    assert not tracer.has_open_spans()
+
+
+@pytest.mark.asyncio
+async def test_protocol_413_finishes_span_without_fail() -> None:
+    with TestTracer() as tracer:
+        proto, app, transport = _make_protocol(max_body_bytes=20, tracer=tracer)
+        try:
+            proto.data_received(
+                b"POST /upload HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n"
+            )
+            await _drain(app)
+            assert _response_status(transport) == 413
+            _assert_status_span(tracer, 413, method="POST", path="/upload")
+        finally:
+            if not transport.is_closing():
+                transport.close()
+            await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_protocol_400_finishes_span_without_fail() -> None:
+    with TestTracer() as tracer:
+        proto, app, transport = _make_protocol(tracer=tracer)
+        try:
+            proto.data_received(b"\x00\xff\xfe not http \r\n\r\n")
+            await _drain(app)
+            assert _response_status(transport) == 400
+            _assert_status_span(tracer, 400)
+        finally:
+            if not transport.is_closing():
+                transport.close()
+            await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_trailing_slash_308_finishes_span_without_fail() -> None:
+    with TestTracer() as tracer:
+        proto, app, transport = _make_protocol(tracer=tracer)
+        try:
+            proto.data_received(b"GET /search/?q=cats HTTP/1.1\r\nHost: t\r\n\r\n")
+            await _drain(app)
+            assert _response_status(transport) == 308
+            _assert_status_span(tracer, 308, method="GET", path="/search/")
+        finally:
+            if not transport.is_closing():
+                transport.close()
+            await _drain(app)

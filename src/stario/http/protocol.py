@@ -27,7 +27,7 @@ from .compression import CompressionConfig
 from .config import RequestPolicy
 from .context import Context
 from .headers import Headers
-from .invoke import on_handler_done
+from .invoke import finish_request_span, on_handler_done
 from .request import BodyReader, Request
 from .wire import decode_method, decode_path
 from .writer import (
@@ -345,7 +345,13 @@ class HttpProtocol(asyncio.Protocol):
             if self._pipeline is None:
                 self._pipeline = deque()
             if len(self._pipeline) >= self._request_policy.max_pipelined_requests:
-                self._close_with_error(503, "Pipeline queue full")
+                self._close_with_error(
+                    503,
+                    "Pipeline queue full",
+                    span=context.span,
+                    method=context.req.method,
+                    path=context.req.path,
+                )
                 return
             self._pipeline.append((context, writer))
 
@@ -382,6 +388,12 @@ class HttpProtocol(asyncio.Protocol):
             if context.req.query_bytes:
                 target = f"{target}?{context.req.query_bytes.decode('latin-1')}"
             responses.redirect(writer, target, 308)
+            finish_request_span(
+                context.span,
+                status=308,
+                method=context.req.method,
+                path=path,
+            )
             self._active_task = None
             return
 
@@ -497,10 +509,52 @@ class HttpProtocol(asyncio.Protocol):
         self._reading_headers = None
         self._reading_url_parts = []
 
-    def _close_with_error(self, status_code: int, message: str) -> None:
+    def _request_identity(self) -> tuple[str | None, str | None]:
+        """Best-effort method/path for a protocol error before `Request` exists."""
+        method: str | None = None
+        path: str | None = None
+        parser = self.parser
+        if parser is not None:
+            try:
+                raw = parser.get_method()
+                if raw:
+                    method = decode_method(raw)
+            except Exception:
+                pass
+        if self._reading_url_parts:
+            try:
+                parsed = parse_url(b"".join(self._reading_url_parts))
+                if parsed.path:
+                    path = decode_path(parsed.path)
+            except Exception:
+                pass
+        return method, path
+
+    def _close_with_error(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        span: object | None = None,
+        method: str | None = None,
+        path: str | None = None,
+    ) -> None:
         transport = self.transport
         if transport is None or transport.is_closing() or self._rejected:
             return
+
+        if span is None:
+            inferred_method, inferred_path = self._request_identity()
+            if method is None:
+                method = inferred_method
+            if path is None:
+                path = inferred_path
+            if self.tracer is not None:
+                span = self.tracer.create(method or "request")
+
+        abandoned: list[object] = []
+        if self._pipeline:
+            abandoned = [queued[0].span for queued in self._pipeline]
 
         self._rejected = True
         self._cancel_timeout()
@@ -517,3 +571,6 @@ class HttpProtocol(asyncio.Protocol):
         ]
         transport.write(b"".join(parts))
         transport.close()
+        finish_request_span(span, status=status_code, method=method, path=path)
+        for queued_span in abandoned:
+            finish_request_span(queued_span)

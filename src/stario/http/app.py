@@ -14,7 +14,7 @@ from typing import Any
 import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context
-from stario.http.invoke import on_handler_done
+from stario.http.invoke import finish_request_span, on_handler_done
 from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
@@ -124,6 +124,9 @@ class App(Router):
             if c.req.query_bytes:
                 target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
             responses.redirect(w, target, 308)
+            finish_request_span(
+                c.span, status=308, method=c.req.method, path=path
+            )
             return
 
         host = c.req.host if self.host_routing else ""

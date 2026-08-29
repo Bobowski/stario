@@ -12,6 +12,7 @@ from stario.http.app import App
 from stario.http.context import Context
 from stario.http.writer import Writer
 from stario.routing import UrlPath
+from stario.testing import TestClient
 from tests.helpers import run_with_app
 
 
@@ -56,6 +57,25 @@ class TestHostRouting:
 
         assert writer.status == 308
         assert writer.headers.unsafe_get(b"location") == b"/search?q=cats&page=2"
+
+    @pytest.mark.asyncio
+    async def test_trailing_slash_redirect_finishes_span(self):
+        app = App()
+
+        async def search(_c: Context, w: Writer) -> None:
+            w.respond(b"ok", b"text/plain", 200)
+
+        app.get("/search", search)
+        async with TestClient(app) as client:
+            response = await client.get("/search/?q=cats", follow_redirects=False)
+            assert response.status_code == 308
+            span = client.tracer.get_span(response.span_id)
+            assert span is not None
+            assert span.attributes.get("response.status_code") == 308
+            assert span.attributes.get("request.method") == "GET"
+            assert span.attributes.get("request.path") == "/search/"
+            assert span.ok
+            assert not client.tracer.has_open_spans()
 
 
 class TestAppErrorSurface:

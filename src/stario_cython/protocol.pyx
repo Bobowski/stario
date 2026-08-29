@@ -25,7 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
-from stario.http.invoke import on_handler_done
+from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -1007,6 +1007,14 @@ cdef class HttpProtocol:
                 exchange._flush()
                 exchange._status_code = 308
                 exchange._completed = True
+                if self.noop_span is None:
+                    req = exchange.req
+                    finish_request_span(
+                        exchange.span,
+                        status=308,
+                        method=req.method,
+                        path=req.path,
+                    )
                 exchange._done()
                 exchange.handler_finished()
                 return
@@ -1042,7 +1050,21 @@ cdef class HttpProtocol:
 
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
+        cdef object span
+        cdef object req
         for exchange in self.pending_exchanges:
+            if self.noop_span is None:
+                span = exchange.span
+                if span is not None:
+                    req = exchange.req
+                    try:
+                        finish_request_span(
+                            span,
+                            method=req.method if req is not None else None,
+                            path=req.path if req is not None else None,
+                        )
+                    except Exception:
+                        pass
             exchange.cancel_before_start()
         self.pending_exchanges.clear()
 
@@ -1084,22 +1106,60 @@ cdef class HttpProtocol:
         self._set_pause_reason(PAUSE_PIPELINE, False)
         self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
+    cdef void _finish_protocol_span(
+        self,
+        int status,
+        object span,
+        object method,
+        object path,
+    ) noexcept:
+        if self.noop_span is not None:
+            return
+        try:
+            if span is None and self.tracer is not None:
+                span = self.tracer.create("request")
+            finish_request_span(span, status=status, method=method, path=path)
+        except Exception:
+            pass
+
     cdef void _close_error(self, int status, object message) noexcept:
         cdef object transport
         cdef object body
         cdef object date
+        cdef object span
+        cdef object method
+        cdef object path
+        cdef tuple split
+        cdef RequestExchange exchange
         if self.rejected:
             return
         self.rejected = True
         self._cancel_timeout()
         transport = self.transport
+        exchange = self.reading_exchange
+        span = None
+        method = None
+        path = None
+        if exchange is not None:
+            span = exchange.span
+            if exchange._req_url_length > 0:
+                split = _split_request_target_n(
+                    exchange._req_arena + exchange._req_url_offset,
+                    exchange._req_url_length,
+                )
+                path = split[0]
+                if self.parser != NULL:
+                    method = _method_str(<int>llhttp_get_method(self.parser))
+            elif self.request_dispatched and exchange.req is not None:
+                method = exchange.req.method
+                path = exchange.req.path
         try:
             if transport is None or transport.is_closing():
                 return
-            if self.reading_exchange is not None:
-                self.reading_exchange.c_abort()
-                if not self.reading_exchange.handler_started:
-                    self.reading_exchange.cancel_before_start()
+            if exchange is not None:
+                exchange.c_abort()
+                if not exchange.handler_started:
+                    exchange.cancel_before_start()
             self._drop_pending()
             body = message.encode("utf-8")
             date = self.date_box[0]
@@ -1114,6 +1174,7 @@ cdef class HttpProtocol:
                     body,
                 ))
             )
+            self._finish_protocol_span(status, span, method, path)
             transport.close()
         except Exception:
             try:

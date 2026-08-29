@@ -8,6 +8,7 @@ from stario import App
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
+from stario.testing.tracer import TestTracer
 from tests.cython.http import free_port, read_response
 
 
@@ -67,6 +68,50 @@ async def test_trailing_slash_redirects_without_create_task() -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_trailing_slash_redirect_finishes_span_without_fail() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    with TestTracer() as tracer:
+
+        def factory():
+            return HttpProtocol(
+                loop,
+                app,
+                tracer,
+                [date],
+                CompressionConfig(),
+                connections,
+            )
+
+        port = free_port()
+        server = await loop.create_server(factory, "127.0.0.1", port)
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(
+                b"GET /search/?q=cats&page=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            await writer.drain()
+            first = await read_response(reader)
+            assert b"308" in first.split(b"\r\n", 1)[0]
+            assert app.eager_starts == []
+            span = tracer.find_span("request")
+            assert span is not None
+            assert span.attributes.get("response.status_code") == 308
+            assert span.attributes.get("request.method") == "GET"
+            assert span.attributes.get("request.path") == "/search/"
+            assert span.ok
+            assert not tracer.has_open_spans()
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
 
 
 @pytest.mark.asyncio

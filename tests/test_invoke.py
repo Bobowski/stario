@@ -6,9 +6,30 @@ import logging
 import stario.responses as responses
 from stario.http.app import App
 from stario.http.context import Context
-from stario.http.invoke import on_handler_done
+from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.writer import Writer
+from stario.telemetry.noop import NoOpTracer
+from stario.testing.tracer import TestTracer
 from tests.helpers import DummyWriter, make_context
+
+
+def test_finish_request_span_records_status_without_fail() -> None:
+    with TestTracer() as tracer:
+        span = tracer.create("request")
+        finish_request_span(span, status=308, method="GET", path="/search/")
+        finished = tracer.get_span(span.id)
+        assert finished is not None
+        assert finished.attributes["response.status_code"] == 308
+        assert finished.attributes["request.method"] == "GET"
+        assert finished.attributes["request.path"] == "/search/"
+        assert finished.ok
+        assert not tracer.has_open_spans()
+
+
+def test_finish_request_span_skips_noop() -> None:
+    span = NoOpTracer().create("request")
+    finish_request_span(span, status=400)
+    finish_request_span(None, status=413)
 
 
 def test_find_handler_is_the_resolve_step() -> None:

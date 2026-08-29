@@ -21,6 +21,11 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, abort if
   nothing was sent, close the span. No auto-`end()`. A write-then-raise still
   logs (`Handler failed`); the response already on the wire is not rewritten.
+- Every request that writes an HTTP status gets a started-and-ended span:
+  handler responses, trailing-slash 308, and protocol 400 / 413 / 431 / 429
+  (Cython) / 503 (Python pipeline). Protocol outcomes are not `fail`ed.
+  `NoOpSpan` still skips start/end. Idle timeout and `connection_lost` with
+  no status still do not create a span.
 - Cython GET path: skip upload state when there is no body (`mark_nobody`),
   and arm idle timeouts on the Date-tick sweeper instead of `loop.time()`
   per keep-alive request.
