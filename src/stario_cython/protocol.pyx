@@ -1142,17 +1142,21 @@ cdef class HttpProtocol:
         path = None
         if exchange is not None:
             span = exchange.span
-            if exchange._req_url_length > 0:
-                split = _split_request_target_n(
-                    exchange._req_arena + exchange._req_url_offset,
-                    exchange._req_url_length,
-                )
-                path = split[0]
-                if self.parser != NULL:
-                    method = _method_str(<int>llhttp_get_method(self.parser))
-            elif self.request_dispatched and exchange.req is not None:
-                method = exchange.req.method
-                path = exchange.req.path
+            try:
+                if exchange._req_url_length > 0:
+                    split = _split_request_target_n(
+                        exchange._req_arena + exchange._req_url_offset,
+                        exchange._req_url_length,
+                    )
+                    path = split[0]
+                    if self.parser != NULL:
+                        method = _method_str(<int>llhttp_get_method(self.parser))
+                elif self.request_dispatched and exchange.req is not None:
+                    method = exchange.req.method
+                    path = exchange.req.path
+            except Exception:
+                method = None
+                path = None
         try:
             if transport is None or transport.is_closing():
                 return
