@@ -19,7 +19,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 ### Changed
 
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, abort if
-  nothing was sent, close the span. No auto-`end()`.
+  nothing was sent, close the span. No auto-`end()`. A write-then-raise still
+  logs (`Handler failed`); the response already on the wire is not rewritten.
 - Cython GET path: skip upload state when there is no body (`mark_nobody`),
   and arm idle timeouts on the Date-tick sweeper instead of `loop.time()`
   per keep-alive request.

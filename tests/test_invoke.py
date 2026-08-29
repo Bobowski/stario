@@ -67,6 +67,29 @@ def test_on_handler_done_aborts_when_handler_writes_nothing(
     asyncio.run(run())
 
 
+def test_on_handler_done_logs_exception_after_completed_response(
+    caplog: logging.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        w.respond(b"ok", b"text/plain", 200)
+
+        async def boom_after_write() -> None:
+            raise RuntimeError("after write")
+
+        task = app.create_task(boom_after_write(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.status == 200
+        assert w.body == "ok"
+        assert w.completed
+        assert "Handler failed" in caplog.text
+
+    asyncio.run(run())
+
+
 def test_on_handler_done_does_not_end_a_completed_response() -> None:
     async def run() -> None:
         app = App()

@@ -12,8 +12,8 @@ cross-request caches: `733a25f`.
   pieces via `writelines`. No join, no retained header blob.
 - Arm idle timeout as “deadline 0”; the Date-tick sweeper fills
   `now + keep_alive`. No `loop.time()` on the wrk GET path.
-- Skip `on_handler_done` when the eager task already completed a
-  response under the NoOp tracer.
+- Skip `on_handler_done` only on a clean NoOp success (eager task done,
+  response already complete, no exception / cancel). Failures still log.
 - `find_handler` then `create_task(handler(c, w))` every request.
 
 ## What we removed

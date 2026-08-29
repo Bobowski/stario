@@ -1024,7 +1024,14 @@ cdef class HttpProtocol:
             eager_start=eager_start,
         )
         if task.done():
-            if not exchange._completed or self.noop_span is None:
+            # Skip only a clean NoOp success. Write-then-raise / cancel / an
+            # incomplete response must still hit on_handler_done (log + abort).
+            if (
+                not exchange._completed
+                or self.noop_span is None
+                or task.cancelled()
+                or task.exception() is not None
+            ):
                 on_handler_done(exchange, exchange, task)
             exchange.handler_finished()
         else:

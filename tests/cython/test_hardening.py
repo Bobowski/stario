@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 
 import pytest
@@ -66,6 +67,35 @@ async def test_upgrade_request_yields_400() -> None:
         )
         await _drain(app)
         assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_write_then_raise_logs_and_keeps_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """NoOp + eager complete must still log; the 200 already on the wire stays."""
+
+    async def handler(_c, w) -> None:
+        responses.text(w, "ok")
+        raise RuntimeError("after write")
+
+    app = App()
+    app.get("/x", handler)
+    proto, app, transport = _attach(app)
+    try:
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            proto.data_received(b"GET /x HTTP/1.1\r\nHost: t\r\n\r\n")
+            await _drain(app)
+        raw = b"".join(transport.writes)
+        assert response_status(transport.writes) == 200
+        assert b"ok" in raw
+        assert b"500" not in raw
+        assert "Handler failed" in caplog.text
+        assert "after write" in caplog.text
     finally:
         if not transport.is_closing():
             transport.close()

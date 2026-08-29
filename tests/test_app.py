@@ -1,5 +1,7 @@
 """Tests for app-level routing and host dispatch."""
 
+import logging
+
 import pytest
 
 from stario.exceptions import (
@@ -79,6 +81,24 @@ class TestAppErrorSurface:
         assert writer.completed
         assert writer.status is None
         assert not writer.ended
+
+    def test_write_then_raise_keeps_response_and_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        async def handler(_c: Context, w: Writer) -> None:
+            w.respond(b"ok", b"text/plain", 200)
+            raise RuntimeError("after write")
+
+        def setup(app: App) -> None:
+            app.get("/x", handler)
+
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            _context, writer = run_with_app(setup, "/x")
+
+        assert writer.status == 200
+        assert writer.body == "ok"
+        assert writer.completed
+        assert "Handler failed" in caplog.text
 
     def test_http_exception_is_not_mapped_to_http(self):
         async def handler(_c: Context, _w: Writer) -> None:
