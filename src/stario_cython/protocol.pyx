@@ -41,7 +41,10 @@ from stario_cython.timeouts import (
 cdef enum:
     URL_CACHE_CAP = 256
     URL_CACHE_MAX_KEY = 512
-    SMALL_BODY_COMPLETE_DISPATCH = 64 * 1024
+    # 256 KiB sits above API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
+    # body() is then already bytes when the handler starts. File uploads
+    # (MiB) still dispatch at headers-complete so stream() can start early.
+    SMALL_BODY_COMPLETE_DISPATCH = 256 * 1024
 
 cdef char* _UC_KEY[256]
 cdef Py_ssize_t _UC_LEN[256]

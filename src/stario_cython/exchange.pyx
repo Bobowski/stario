@@ -71,7 +71,8 @@ from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
-cdef int STREAM_CHUNK_LIMIT = 256 * 1024
+cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
+cdef int STREAM_CHUNK_CL = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
@@ -1949,7 +1950,7 @@ cdef class RequestExchange:
         # does not b"".join ~32x64KiB tails. Do not wait for CONSUMED_BODY:
         # the first body bytes often win that race (same llhttp_execute as
         # headers-complete, or a pipelined request still queued). stream()
-        # sets CONSUMED_STREAM before feeding so it keeps 64KiB tails.
+        # sets CONSUMED_STREAM before feeding so it keeps stream-sized tails.
         if (
             self._consumed_as != CONSUMED_STREAM
             and self._expected_size > 0
@@ -1972,7 +1973,7 @@ cdef class RequestExchange:
         return 0
 
     cdef int _adopt_expected_body_buffer(self) noexcept:
-        """Compact already-fed 64KiB tails into one Content-Length buffer.
+        """Compact already-fed stream-sized tails into one Content-Length buffer.
 
         Used when body() starts after some bytes already landed in stream-sized
         pieces. Later c_feed memcpy's into this tail; complete skips join.
@@ -2293,7 +2294,12 @@ cdef class RequestExchange:
                 help_text="Call stream() only once per request.",
             )
         if max_chunk is None:
-            chunk_size = DEFAULT_STREAM_CHUNK
+            if self._expected_size > 0:
+                chunk_size = self._expected_size
+                if chunk_size > STREAM_CHUNK_CL:
+                    chunk_size = STREAM_CHUNK_CL
+            else:
+                chunk_size = DEFAULT_STREAM_CHUNK
         else:
             chunk_size = <Py_ssize_t>max_chunk
             if chunk_size <= 0:

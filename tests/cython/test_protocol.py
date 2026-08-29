@@ -243,7 +243,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
 
 @pytest.mark.asyncio
 async def test_small_content_length_body_is_complete_when_handler_runs() -> None:
-    """Content-Length bodies <= 64KiB dispatch after llhttp finishes the message."""
+    """Content-Length bodies <= 256KiB dispatch after llhttp finishes the message."""
     loop = asyncio.get_running_loop()
     app = App()
 
@@ -917,11 +917,11 @@ async def test_exchange_pool_reuses_across_connections() -> None:
 
 @pytest.mark.asyncio
 async def test_handler_starts_before_content_length_body_arrives() -> None:
-    """Bodies larger than 64KiB still dispatch at headers-complete."""
+    """Bodies larger than 256KiB still dispatch at headers-complete."""
     loop = asyncio.get_running_loop()
     app = App()
     started = asyncio.Event()
-    payload = b"x" * (65 * 1024)
+    payload = b"x" * (257 * 1024)
 
     async def echo(c, w):
         started.set()
@@ -993,7 +993,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        payload = b"abcdefghij" * 7000  # 70 KiB: above the small-body deferral cap
+        payload = b"abcdefghij" * 30000  # 300 KiB: above the 256 KiB deferral cap
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"
@@ -1180,7 +1180,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
 
     async def upload(c, w):
         try:
-            async for _ in c.req.stream(max_chunk=256 * 1024):
+            async for _ in c.req.stream(max_chunk=1024 * 1024):
                 pass
         except ValueError as exc:
             errors.append(exc)
@@ -1271,6 +1271,100 @@ async def test_stream_respects_max_chunk_batches() -> None:
         assert sizes
         assert all(size <= 8 * 1024 for size in sizes)
         assert any(size == 8 * 1024 for size in sizes[:-1] or sizes)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_medium_content_length_body_is_complete_when_handler_runs() -> None:
+    """200 KiB is under the 256 KiB complete-before-dispatch cutoff."""
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def echo(c, w):
+        payload = await c.req.body()
+        assert payload == b"y" * (200 * 1024)
+        w.respond(payload, b"text/plain; charset=utf-8")
+
+    app.post("/echo", echo)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"y" * (200 * 1024)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+        )
+        await writer.drain()
+        assert payload in await read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stream_default_chunk_follows_content_length() -> None:
+    """Known Content-Length: default stream() yields min(length, 256 KiB)."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    sizes: list[int] = []
+
+    async def upload(c, w):
+        async for chunk in c.req.stream():
+            sizes.append(len(chunk))
+        w.respond(str(sum(sizes)).encode("ascii"), b"text/plain")
+
+    app.post("/upload", upload)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"z" * (300 * 1024)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+        )
+        await writer.drain()
+        assert str(len(payload)).encode("ascii") in await read_response(reader)
+        assert sizes == [256 * 1024, 44 * 1024]
         writer.close()
         await writer.wait_closed()
     finally:

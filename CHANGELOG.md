@@ -24,6 +24,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - Cython GET path: skip upload state when there is no body (`mark_nobody`),
   and arm idle timeouts on the Date-tick sweeper instead of `loop.time()`
   per keep-alive request.
+- Cython uploads: Content-Length bodies ≤ 256 KiB dispatch after the
+  message is complete (`body()` is already bytes). `stream()` with a known
+  Content-Length yields `min(length, 256 KiB)` instead of a fixed 64 KiB.
 
 ## 4.1.0 - 2026-08-17
 
