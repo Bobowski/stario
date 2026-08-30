@@ -42,6 +42,17 @@ wheels = [
 ]
 
 [[package]]
+name = "hello-world"
+version = "0.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "stario" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "stario", specifier = ">=4,<5" }]
+
+[[package]]
 name = "httptools"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -87,17 +98,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/25/9f/0f0adb06d9215f928
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a8/ba/d93dd3bdebd138bfe41f75f8bea8aa5d200f8b73dccdb01d4c6b1d0c53da/stario-4.1.0-py3-none-any.whl", hash = "sha256:5661e10239bb2c9c3ecc1e4773ed79fb620b0c7b8775a58bad5d374328a0a653", size = 166167, upload-time = "2026-08-17T13:22:40.222Z" },
 ]
-
-[[package]]
-name = "tiles"
-version = "0.0.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "stario" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "stario", specifier = ">=4,<5" }]
 
 [[package]]
 name = "watchfiles"
