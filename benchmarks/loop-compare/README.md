@@ -4,8 +4,9 @@ Compares **main** and **cython-core** on [uvloop](https://github.com/MagicStack/
 and [zuvloop](https://github.com/Kludex/zuvloop) across the official Stario HTTP
 suite from `cython-core` (read + upload endpoints).
 
-**Results from this machine:** [RESULTS.md](RESULTS.md) (zuvloop 0.0.12).
-Retest vs **zuvloop 0.0.13** is in `RESULTS-0.0.13.md` once the run finishes.
+**Results from this machine:**
+- [RESULTS.md](RESULTS.md) — zuvloop **0.0.12**
+- [RESULTS-0.0.13.md](RESULTS-0.0.13.md) — zuvloop **0.0.13** retest
 
 ```bash
 # worktrees (cython-core required for the expanded app + Cython protocol)
