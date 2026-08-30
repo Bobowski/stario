@@ -28,11 +28,6 @@ def _response_may_have_body(status_code: int) -> bool:
     return status_code not in _NO_BODY_STATUSES and not 100 <= status_code < 200
 
 
-def _append_wire_headers(parts: list[bytes], headers: Headers) -> None:
-    """Append header lines to `parts` for the writer hot path."""
-    headers.unsafe_append_wire_lines(parts)
-
-
 @lru_cache(maxsize=128)
 def get_status_line(status_code: int) -> bytes:
     """Build HTTP/1.1 status line."""
@@ -134,6 +129,15 @@ class Writer:
 
         Skips negotiation if `Content-Encoding` is already set on `headers`.
         Uses the whole-body compression path, not per-chunk.
+
+        `respond()` always emits `Date`, `Content-Type` (from `content_type`),
+        and `Content-Length` (from the on-wire body, after compression). Extra
+        headers already on `w.headers` are written as-is.
+
+        If those owned names are already set, they must match what `respond()`
+        would emit (`StarioRuntime` on mismatch). Do not set `Date` or
+        `Transfer-Encoding`. `Content-Encoding` already on the map disables
+        auto-compression and is sent unchanged.
         """
         if self._transport.is_closing():
             if not self._completed:
@@ -159,6 +163,10 @@ class Writer:
         self._bind_declared_length(
             0 if not _response_may_have_body(status) else len(body)
         )
+        existing_ce = None
+        existing_cl = None
+        if h:
+            existing_ce, existing_cl = h.respond_scan(content_type)
 
         # Minimal fast path: no custom headers and no compression work.
         if not h and (
@@ -192,8 +200,7 @@ class Writer:
             # Content-Length is set.
             if not _response_may_have_body(status):
                 body = b""
-                h.unsafe_set(b"content-length", b"0")
-            elif h.unsafe_get(b"content-encoding") is None:
+            elif existing_ce is None:
                 compressor = self._compression.select(
                     self._accept_encoding,
                     data=body,
@@ -204,12 +211,15 @@ class Writer:
                     h.unsafe_set(b"content-encoding", compressor.encoding)
                     merge_vary(h, b"accept-encoding")
 
+            final_length = b"%d" % len(body)
+            if existing_cl is not None:
+                h.require_respond_length(existing_cl, final_length)
             h.unsafe_set(b"content-type", content_type)
-            h.unsafe_set(b"content-length", b"%d" % len(body))
+            h.unsafe_set(b"content-length", final_length)
             self._bind_declared_length(len(body))
 
             parts = [get_status_line(status), self._get_date_header()]
-            _append_wire_headers(parts, h)
+            h.unsafe_append_wire_lines(parts)
             parts.append(b"\r\n")
             parts.append(body)
             content = b"".join(parts)
@@ -295,10 +305,7 @@ class Writer:
                 merge_vary(headers, b"accept-encoding")
 
         parts = [get_status_line(status_code), self._get_date_header()]
-        # Hot path: read headers._data directly and append wire chunks separately.
-        # iter_items() / unsafe_items() add generator or list overhead here; name+value
-        # concat allocates an intermediate bytes per line. Four appends + join is fastest.
-        _append_wire_headers(parts, headers)
+        headers.unsafe_append_wire_lines(parts)
         parts.append(b"\r\n")
         self._transport.write(b"".join(parts))
         self._status_code = status_code

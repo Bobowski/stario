@@ -29,8 +29,24 @@ from .bootstrap import (
     ShutdownTrigger,
     bootstrap_run,
 )
-from .config import ServerConfig
+from .compression import CompressionConfig
+from .config import RequestPolicy, ServerConfig
 from .protocol import HttpProtocol
+
+# Connections may be the Python protocol or the Cython HttpProtocol.
+type Connection = Any
+type ProtocolMaker = Callable[
+    [
+        asyncio.AbstractEventLoop,
+        App,
+        Tracer,
+        list[bytes],
+        CompressionConfig,
+        set[Connection],
+        RequestPolicy,
+    ],
+    asyncio.Protocol,
+]
 
 type SignalHandler = Callable[[int, FrameType | None], object]
 type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
@@ -39,6 +55,10 @@ type LoopRun[T] = Callable[[Coroutine[Any, Any, T]], T]
 
 # Upper bound on the force-close loop after the graceful wait (see _drain_listener).
 _FORCE_CLOSE_CAP = 1.0
+
+# Keep in sync with ``stario_cython.protocol``: Cython skips its own sweeper
+# task when the Date tick already walks connections once a second.
+_DATE_TICK_SWEEPS_TIMEOUTS = "_stario_date_tick_sweeps_timeouts"
 
 # Yield to the event loop this many times while waiting for connection_made to register.
 _ACCEPT_REGISTER_YIELDS = 10
@@ -86,21 +106,27 @@ class Server:
         tracer: Tracer,
         *,
         config: ServerConfig | None = None,
+        make_protocol: ProtocolMaker | None = None,
     ) -> None:
         """Configure listening, bootstrap, telemetry, and per-connection compression.
 
         - `bootstrap`: Async generator `(app, span)` with a single `yield`.
         - `tracer`: Telemetry backend implementing the `Tracer` protocol.
         - `config`: Listen address, limits, compression, shutdown policy, and event loop.
+        - `make_protocol`: Optional factory for a non-default HTTP protocol
+          (used by the Cython core). Receives the shared date box so the
+          writer can read `date_box[0]` without a per-response call.
         """
 
         self.bootstrap = bootstrap
         self.config = config if config is not None else ServerConfig()
         self.tracer = tracer
+        self.make_protocol = make_protocol
 
         self._used = False
-        self._date_header = b""
+        self._date_box = [b""]
         self._urgent_drain = False
+        self._live_connections: set[Connection] | None = None
 
     def run(self) -> None:
         """Block until shutdown; picks the event loop from `config.event_loop`.
@@ -167,20 +193,29 @@ class Server:
         self,
         listen_sock: socket.socket | None,
         app: App,
-        connections: set[HttpProtocol],
+        connections: set[Connection],
     ) -> asyncio.Server:
         loop = asyncio.get_running_loop()
+        make_protocol = self.make_protocol
 
-        def protocol_factory() -> HttpProtocol:
+        def protocol_factory() -> asyncio.Protocol:
+            if make_protocol is not None:
+                return make_protocol(
+                    loop,
+                    app,
+                    self.tracer,
+                    self._date_box,
+                    self.config.compression,
+                    connections,
+                    self.config.requests,
+                )
             return HttpProtocol(
                 loop,
                 app,
                 self.tracer,
-                lambda: (
-                    self._date_header
-                ),  # callable: reads refreshed bytes each response
+                lambda: self._date_box[0],
                 self.config.compression,
-                connections,  # shared set; protocol adds/removes self on connect/lost
+                connections,
                 self.config.requests,
             )
 
@@ -198,7 +233,7 @@ class Server:
         self,
         server: asyncio.Server,
         app: App,
-        connections: set[HttpProtocol],
+        connections: set[Connection],
         span: ProxySpan | None = None,
     ) -> None:
         """Stop accepting, drain in-flight work, then tear down transports and tasks.
@@ -271,7 +306,7 @@ class Server:
 
     async def _wait_for_managed_work_to_drain(
         self,
-        connections: set[HttpProtocol],
+        connections: set[Connection],
         tasks: set[asyncio.Task[Any]],
     ) -> None:
         # Wait until no open connections and no pending app.create_task work, or timeout.
@@ -297,7 +332,7 @@ class Server:
             else:
                 await asyncio.sleep(timeout)
 
-    async def _force_close_open_transports(self, connections: set[HttpProtocol]) -> int:
+    async def _force_close_open_transports(self, connections: set[Connection]) -> int:
         transports = [
             protocol.transport
             for protocol in connections
@@ -419,7 +454,8 @@ class Server:
         span: ProxySpan,
     ) -> AsyncGenerator[asyncio.Server]:
         """Bind on enter; drain in-flight work on exit."""
-        connections: set[HttpProtocol] = set()
+        connections: set[Connection] = set()
+        self._live_connections = connections
         listener = await self._create_listener(listen_sock, app, connections)
 
         # Startup span ends once we are listening; shutdown span opens on exit.
@@ -434,28 +470,53 @@ class Server:
             self._open_shutdown_span(span, "expected_stop")  # signal or app.shutdown
         finally:
             await self._drain_listener(listener, app, connections, span)
+            self._live_connections = None
+
+    def _sweep_connection_timeouts(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Compare stored deadlines to one ``loop.time()`` (Date-tick cadence)."""
+        connections = self._live_connections
+        if not connections:
+            return
+        now = loop.time()
+        for proto in tuple(connections):
+            check = getattr(proto, "check_timeouts", None)
+            if check is None:
+                continue
+            try:
+                check(now)
+            except Exception:
+                continue
 
     @asynccontextmanager
     async def _date_tick(self) -> AsyncGenerator[None]:
-        """Refresh the shared Date header now, then once per second until exit."""
+        """Refresh Date, then once per second also sweep connection timeouts.
+
+        Header/idle/body-stall defaults are 5s/5s/30s. One-second granularity
+        matches Date and avoids a second timer on the event loop.
+        """
 
         def refresh() -> None:
             now = datetime.now(UTC)
             # Preformatted wire bytes; Writer concatenates without per-response format_datetime.
-            self._date_header = b"date: %s\r\n" % format_datetime(
+            self._date_box[0] = b"date: %s\r\n" % format_datetime(
                 now, usegmt=True
             ).encode("ascii")
+
+        loop = asyncio.get_running_loop()
+        setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, True)
 
         async def tick() -> None:
             while True:
                 await asyncio.sleep(1)
                 refresh()
+                self._sweep_connection_timeouts(loop)
 
         refresh()  # first value before any connection can read it
         task = asyncio.create_task(tick())
         try:
             yield
         finally:
+            setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, False)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task

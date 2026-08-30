@@ -16,6 +16,23 @@ from stario.routing import UrlPath
 from tests.helpers import run_with_app
 
 
+def test_eager_create_task_uses_direct_task_with_uvloop() -> None:
+    uvloop = pytest.importorskip("uvloop")
+
+    async def run() -> None:
+        app = App()
+
+        async def complete_immediately() -> int:
+            return 42
+
+        task = app.create_task(complete_immediately(), eager_start=True)
+
+        assert task.done()
+        assert task.result() == 42
+
+    uvloop.run(run())
+
+
 class TestHostRouting:
     def test_wildcard_host_uses_route_params(self):
         seen: list[tuple[str, str]] = []

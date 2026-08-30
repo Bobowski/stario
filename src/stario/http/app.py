@@ -20,6 +20,7 @@ from stario.exceptions import (
 )
 from stario.http.context import Context
 from stario.routing.locations import normalize_path
+from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
 from .writer import Writer
@@ -121,6 +122,7 @@ class App(Router):
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         name: str | None = None,
+        eager_start: bool = False,
     ) -> asyncio.Task[T]:
         """Schedule a coroutine on the running loop and retain the task until it completes.
 
@@ -131,6 +133,7 @@ class App(Router):
         - `coro`: Coroutine to run.
         - `loop`: Optional loop to schedule on when the caller already has it.
         - `name`: Optional task name for debuggers.
+        - `eager_start`: Run immediately until the first suspension.
 
         The new `asyncio.Task`.
 
@@ -144,9 +147,15 @@ class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        task = loop.create_task(coro, name=name)
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task = asyncio.Task(
+            coro,
+            loop=loop,
+            name=name,
+            eager_start=eager_start,
+        )
+        if not task.done():
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
         return task
 
     async def drain_tasks(self) -> None:
@@ -181,8 +190,12 @@ class App(Router):
         send a response on the success path.
         """
         span = c.span
-        span.start()
-        span.attrs({"request.method": c.req.method, "request.path": c.req.path})
+        # Cython (and benchmark) servers use NoOpTracer. Skip method calls and
+        # the attrs dict on that path; RecordingSpan and others still record.
+        record = type(span) is not NoOpSpan
+        if record:
+            span.start()
+            span.attrs({"request.method": c.req.method, "request.path": c.req.path})
         failed_after_start = False
 
         try:
@@ -228,14 +241,15 @@ class App(Router):
                         exc = handler_exc
                 if not handler_responded:
                     responses.text(w, "Internal Server Error", 500)
-            if not handler_responded:
+            if not handler_responded and record:
                 span.fail(str(exc))
                 span.exception(exc)
         finally:
             # After headers: abort the transport on failure; otherwise finish the message.
             if failed_after_start and not w.completed:
                 w.abort()
-            else:
+            elif not w.completed:
                 w.end()
-            span.attr("response.status_code", w.status_code)
-            span.end()
+            if record:
+                span.attr("response.status_code", w.status_code)
+                span.end()
