@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Stario multi-room chat — larger-app example (app.main:bootstrap)"
 requires-python = ">=3.14"
 dependencies = [
-
+    "stario",
 ]
 
 [dependency-groups]
@@ -18,3 +18,6 @@ testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.uv.sources]
+stario = { path = "../../" }
