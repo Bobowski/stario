@@ -56,7 +56,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "stario", directory = "../../" }]
+requires-dist = [{ name = "stario", editable = "../../" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -171,7 +171,7 @@ wheels = [
 [[package]]
 name = "stario"
 version = "4.1.0"
-source = { directory = "../../" }
+source = { editable = "../../" }
 dependencies = [
     { name = "aiofiles" },
     { name = "brotli" },

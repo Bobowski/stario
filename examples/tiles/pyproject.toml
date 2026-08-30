@@ -8,4 +8,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-stario = { path = "../../" }
+stario = { path = "../../", editable = true }
