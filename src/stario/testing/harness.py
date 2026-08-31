@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 class TestRequest:
     """Simple request the test client passes into ``app(c, w)``."""
 
+    __test__ = False
+
     __slots__ = (
         "_body",
         "_consumed_stream",
@@ -102,6 +104,8 @@ class TestRequest:
 
 class TestWriter:
     """Collects one handler response: status, headers, body bytes."""
+
+    __test__ = False
 
     def __init__(self, disconnect: asyncio.Future[None] | None = None) -> None:
         self.headers = Headers()
@@ -219,6 +223,8 @@ class TestWriter:
 @dataclass(slots=True)
 class TestContext:
     """Handler context for in-process TestClient exchanges."""
+
+    __test__ = False
 
     app: App
     req: Request
