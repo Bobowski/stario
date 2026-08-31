@@ -1214,7 +1214,7 @@ cdef class HttpProtocol:
             return True
         return False
 
-    cdef RequestExchange _take_exchange(self):
+    cdef inline RequestExchange _take_exchange(self):
         """Reuse the idle exchange or take one from the global pool."""
         cdef RequestExchange ex = self.idle_exchange
         if ex is not None:
@@ -1733,7 +1733,7 @@ cdef class HttpProtocol:
         self._h2_window_update(0, True)
         self._h2_send()
 
-    cdef void _h2_window_update(self, int32_t stream_id, bint force=False) noexcept:
+    cdef inline void _h2_window_update(self, int32_t stream_id, bint force=False) noexcept:
         """Ack recv credit. ``stream_id == 0`` is the connection window.
 
         Batching alone never fires for small POSTs; force-ack so keep-alive
