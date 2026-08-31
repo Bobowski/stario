@@ -7,21 +7,13 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from stario.http.app import App
-from stario.http.compression import CompressionConfig
-from stario.http.context import Context
 from stario.http.headers import Headers
-from stario.http.request import BodyReader, Request
-from stario.http.writer import Writer
 from stario.telemetry.core import Span
 from stario.testing.cookies import serialize_cookie_header
-from stario.testing.encode import (
-    date_header,
-    encode_request_body,
-    expand_pairs,
-)
+from stario.testing.encode import encode_request_body, expand_pairs
+from stario.testing.harness import TestContext, TestRequest, TestWriter
 from stario.testing.models import ClientRequest
 from stario.testing.tracer import TestTracer
-from stario.testing.transport import MemoryTransport
 from stario.testing.types import (
     CookieMap,
     FileData,
@@ -33,8 +25,8 @@ from stario.testing.types import (
 
 @dataclass(slots=True)
 class WiredDispatch:
-    ctx: Context
-    writer: Writer
+    ctx: TestContext
+    writer: TestWriter
     disconnect: asyncio.Future[None]
     root_span: Span
     client_request: ClientRequest
@@ -50,28 +42,19 @@ def wire_dispatch(
     pqs: str,
     phdrs: Headers,
     pbody: bytes,
-    compression: CompressionConfig,
-    transport_write: Callable[[bytes], None],
 ) -> WiredDispatch:
     loop = asyncio.get_running_loop()
     disconnect = loop.create_future()
     root_span = tracer.create(pm)
-    request = _make_request(
+    request = TestRequest(
         method=pm,
         path=ppath,
-        query_string=pqs,
+        query_bytes=pqs.encode("ascii"),
         headers=phdrs,
         body=pbody,
-        disconnect=disconnect,
     )
-    writer = Writer(
-        transport=MemoryTransport(transport_write),
-        get_date_header=date_header,
-        on_completed=lambda: None,
-        compression=compression,
-        accept_encoding=phdrs.get("accept-encoding"),
-    )
-    ctx = Context(
+    writer = TestWriter(disconnect=disconnect)
+    ctx = TestContext(
         app=app,
         req=request,
         span=root_span,
@@ -182,31 +165,7 @@ async def run_dispatch(
     finally:
         if on_finished is not None:
             on_finished(exc)
+        if not wired.writer.completed:
+            wired.writer.end()
         if not wired.disconnect.done():
             wired.disconnect.set_result(None)
-
-
-def _make_request(
-    *,
-    method: str,
-    path: str,
-    query_string: str,
-    headers: Headers,
-    body: bytes,
-    disconnect: asyncio.Future[None] | None = None,
-) -> Request:
-    reader = BodyReader(
-        pause=lambda: None,
-        resume=lambda: None,
-        disconnect=disconnect,
-    )
-    if body:
-        reader.feed(body)
-    reader.complete()
-    return Request(
-        method=method,
-        path=path,
-        query_bytes=query_string.encode("ascii"),
-        headers=headers,
-        body=reader,
-    )

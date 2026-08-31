@@ -17,7 +17,7 @@ Failure types:
   outside `async with`. `str(exc)` keeps structured context and help text.
 
 - `RequestBodyError` — request body read failed (413 payload too large or 408
-  upload stall). Raised by `BodyReader` / the Cython exchange. Not mapped to
+  upload stall). Raised by the Cython exchange. Not mapped to
   HTTP by the protocol; use `stario.http.middleware.catch_errors` (or write the
   response in the handler) to turn it into a client-facing status.
 

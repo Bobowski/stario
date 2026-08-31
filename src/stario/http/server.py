@@ -31,9 +31,8 @@ from .bootstrap import (
 )
 from .compression import CompressionConfig
 from .config import RequestPolicy, ServerConfig
-from .protocol import HttpProtocol
+from stario_cython.protocol import HttpProtocol
 
-# Connections may be the Python protocol or the Cython HttpProtocol.
 type Connection = Any
 type ProtocolMaker = Callable[
     [
@@ -47,6 +46,31 @@ type ProtocolMaker = Callable[
     ],
     asyncio.Protocol,
 ]
+
+
+def _make_http_protocol(
+    loop: asyncio.AbstractEventLoop,
+    app: App,
+    tracer: Tracer,
+    date_box: list[bytes],
+    compression: CompressionConfig,
+    connections: set[Connection],
+    requests: RequestPolicy,
+) -> asyncio.Protocol:
+    return HttpProtocol(
+        loop,
+        app,
+        tracer,
+        date_box,
+        compression,
+        connections,
+        max_header_bytes=requests.max_header_bytes,
+        max_body_bytes=requests.max_body_bytes,
+        header_timeout=requests.header_timeout,
+        keep_alive_timeout=requests.keep_alive_timeout,
+        body_timeout=requests.body_timeout,
+        max_pipelined_requests=requests.max_pipelined_requests,
+    )
 
 type SignalHandler = Callable[[int, FrameType | None], object]
 type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
@@ -113,9 +137,7 @@ class Server:
         - `bootstrap`: Async generator `(app, span)` with a single `yield`.
         - `tracer`: Telemetry backend implementing the `Tracer` protocol.
         - `config`: Listen address, limits, compression, shutdown policy, and event loop.
-        - `make_protocol`: Optional factory for a non-default HTTP protocol
-          (used by the Cython core). Receives the shared date box so the
-          writer can read `date_box[0]` without a per-response call.
+        - `make_protocol`: Optional factory; default is the Cython HTTP protocol.
         """
 
         self.bootstrap = bootstrap
@@ -199,21 +221,12 @@ class Server:
         make_protocol = self.make_protocol
 
         def protocol_factory() -> asyncio.Protocol:
-            if make_protocol is not None:
-                return make_protocol(
-                    loop,
-                    app,
-                    self.tracer,
-                    self._date_box,
-                    self.config.compression,
-                    connections,
-                    self.config.requests,
-                )
-            return HttpProtocol(
+            factory = make_protocol if make_protocol is not None else _make_http_protocol
+            return factory(
                 loop,
                 app,
                 self.tracer,
-                lambda: self._date_box[0],
+                self._date_box,
                 self.config.compression,
                 connections,
                 self.config.requests,

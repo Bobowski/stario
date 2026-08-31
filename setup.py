@@ -45,11 +45,6 @@ codec_link_args = _pkg_config(_CODEC_PACKAGES, "--libs-only-other")
 
 extensions = [
     Extension(
-        "stario_cython.headers",
-        sources=["src/stario_cython/headers.pyx"],
-        extra_compile_args=["-O3", "-fno-strict-aliasing"],
-    ),
-    Extension(
         "stario_cython.exchange",
         sources=[
             "src/stario_cython/exchange.pyx",

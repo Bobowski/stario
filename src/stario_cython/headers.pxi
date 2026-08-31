@@ -1,29 +1,4 @@
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
-"""One Headers type: a retained pair list plus the intern table.
-
-Application ``get``/``set`` still see clean names and values. Internally each
-pair is stored already shaped for the writer: ``name: `` and ``value\\r\\n``.
-Lookup is a linear scan (typical maps are a handful of fields). ``Set-Cookie``
-stays repeated pairs. ``respond()`` walks the arrays once to validate owned
-names, then dumps them with two ``memcpy``s per pair.
-
-Request wire storage belongs to ``RequestExchange`` (arena + ``RequestHeaders``).
-"""
-
-from libc.stdint cimport uint8_t, uint32_t
-from libc.string cimport memcmp, memcpy
-from cpython.bytearray cimport (
-    PyByteArray_AS_STRING,
-    PyByteArray_GET_SIZE,
-    PyByteArray_Resize,
-)
-from cpython.bytes cimport (
-    PyBytes_AS_STRING,
-    PyBytes_FromStringAndSize,
-    PyBytes_GET_SIZE,
-)
-
-from stario.exceptions import StarioRuntime
+"""Headers pair list. Included into ``exchange.pyx`` (one extension)."""
 
 cdef bytes _VALID_VALUE = bytes(
     b for b in range(256) if b == 0x09 or (b >= 0x20 and b != 0x7F)

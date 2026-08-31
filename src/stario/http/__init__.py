@@ -33,7 +33,7 @@ from stario.http.middleware import (
 )
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
-from stario.http.request import Request
+from stario.http.request import ParsedCookies, Request
 from stario.http.writer import Writer
 
 __all__ = [
@@ -42,6 +42,7 @@ __all__ = [
     "Handler",
     "Headers",
     "Middleware",
+    "ParsedCookies",
     "ParsedQuery",
     "Request",
     "RouteMatch",

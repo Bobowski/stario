@@ -38,12 +38,8 @@ def test_items_preserve_wire_order_and_duplicates() -> None:
     assert qp.as_lists() == {"b": ["2", "3"], "a": ["1"]}
 
 
-def test_first_read_fills_key_value_arrays() -> None:
+def test_first_get_then_as_dict() -> None:
     qp = ParsedQuery(b"a=1&a=2")
-    assert qp._keys is None
-    assert qp._values is None
     assert qp.get("a") == "1"
-    assert qp._keys == ["a", "a"]
-    assert qp._values == ["1", "2"]
     assert qp.as_dict() == {"a": "1"}
     assert qp.as_lists() == {"a": ["1", "2"]}

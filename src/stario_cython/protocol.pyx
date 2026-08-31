@@ -44,8 +44,13 @@ from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
 
-from stario_cython.exchange cimport Request, RequestExchange, acquire_exchange, _status_line
-from stario_cython.headers cimport Headers
+from stario_cython.exchange cimport (
+    Headers,
+    Request,
+    RequestExchange,
+    acquire_exchange,
+    _status_line,
+)
 from stario_cython.llhttp cimport *
 from stario_cython.nghttp2 cimport (
     ssize_t,
@@ -1181,7 +1186,7 @@ cdef class HttpProtocol:
     def close_if_idle(self) -> bool:
         """Close the connection if it is waiting for a new request.
 
-        Matches ``stario.http.protocol.HttpProtocol.close_if_idle`` so the
+        Matches the previous Python ``HttpProtocol.close_if_idle`` so the
         shared ``Server`` drain path can reuse Cython connections.
         """
         cdef object transport

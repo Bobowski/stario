@@ -1,17 +1,18 @@
-# cython: language_level=3
-"""One request's lifecycle: arena-backed request headers, body, and response.
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+"""One request's lifecycle: headers, arena-backed request, body, and response.
 
-``RequestExchange`` is pooled. The protocol appends URL and header fragments
-into the arena; this module indexes Host/Cookie/Authorization at parse time,
-keeps ``RequestHeaders`` read-only, lazily parses cookies and query bytes,
-and writes the response (including native compression).
+``Headers`` lives here (one extension). ``RequestExchange`` is pooled. The
+protocol appends URL and header fragments into the arena; this module indexes
+Host/Cookie/Authorization at parse time, keeps ``RequestHeaders`` read-only,
+scans cookies and query on demand, and writes the response (including native
+compression).
 """
 
 import asyncio
-from types import MappingProxyType
+import http
 
 from libc.stddef cimport size_t
-from libc.stdint cimport int32_t, uint32_t, uint64_t
+from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport free, realloc
 from libc.stdio cimport sprintf
 from libc.string cimport memcmp, memcpy
@@ -30,7 +31,6 @@ from cpython.exc cimport PyErr_Clear, PyErr_Occurred
 from cpython.mem cimport PyMem_Free, PyMem_Malloc
 from cpython.unicode cimport PyUnicode_DecodeLatin1, PyUnicode_DecodeUTF8
 
-from stario import cookies as cookie_helpers
 from stario.exceptions import (
     ClientDisconnected,
     RequestBodyError,
@@ -45,8 +45,7 @@ from stario.http.compression import (
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
 from stario.http.invoke import on_handler_done
-from stario.http.request import host_without_port
-from stario.http.writer import get_status_line
+from stario.http.host import host_without_port
 
 from stario_cython.compression_buf cimport (
     StarioBrotli,
@@ -60,14 +59,12 @@ from stario_cython.compression_buf cimport (
     stario_gzip_finish_borrowed,
     stario_gzip_release,
 )
-from stario_cython.headers cimport (
-    Headers,
-    HEADER_NAME_STACK,
-    _fold_header_name,
-    _intern_name,
-    _lower_copy,
-)
 from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
+
+include "headers.pxi"
+
+cdef enum:
+    HEADER_NAME_STACK = NAME_STACK
 
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
@@ -380,7 +377,11 @@ cdef object _status_line(int status):
         return STATUS_431
     if status == 500:
         return STATUS_500
-    return get_status_line(status)
+    try:
+        phrase = http.HTTPStatus(status).phrase.encode("ascii")
+    except ValueError:
+        phrase = b""
+    return b"HTTP/1.1 %d %s\r\n" % (status, phrase)
 
 
 cdef object _dec(size_t n):
@@ -792,6 +793,101 @@ cdef object _cookie_unquote(const char* s, Py_ssize_t n):
     return _decode_latin1(s, n)
 
 
+cdef int _next_cookie_pair(
+    const char* s,
+    Py_ssize_t n,
+    Py_ssize_t* i,
+    Py_ssize_t* name_start,
+    Py_ssize_t* name_end,
+    Py_ssize_t* val_start,
+    Py_ssize_t* val_end,
+) noexcept:
+    """Advance ``i`` to the next ``name=value`` pair. 1 found, 0 done."""
+    cdef Py_ssize_t j
+    while i[0] < n:
+        while i[0] < n and _is_ows(s[i[0]]):
+            i[0] += 1
+        if i[0] >= n:
+            return 0
+        name_start[0] = i[0]
+        while i[0] < n and s[i[0]] != 59 and s[i[0]] != 61:
+            i[0] += 1
+        if i[0] >= n or s[i[0]] == 59:
+            while i[0] < n and s[i[0]] != 59:
+                i[0] += 1
+            if i[0] < n:
+                i[0] += 1
+            continue
+        name_end[0] = i[0]
+        _strip_span(s, name_start, name_end)
+        i[0] += 1
+        while i[0] < n and _is_ows(s[i[0]]):
+            i[0] += 1
+        val_start[0] = i[0]
+        if i[0] < n and s[i[0]] == 34:
+            j = i[0] + 1
+            while j < n:
+                if s[j] == 92 and j + 1 < n:
+                    j += 2
+                    continue
+                if s[j] == 34:
+                    j += 1
+                    break
+                j += 1
+            val_end[0] = j
+            while j < n and s[j] != 59:
+                j += 1
+            i[0] = j
+        else:
+            while i[0] < n and s[i[0]] != 59:
+                i[0] += 1
+            val_end[0] = i[0]
+            _strip_span(s, val_start, val_end)
+        if i[0] < n and s[i[0]] == 59:
+            i[0] += 1
+        if name_end[0] <= name_start[0]:
+            continue
+        if s[name_start[0]] == 36:
+            continue
+        if _cookie_attr_name(s + name_start[0], name_end[0] - name_start[0]):
+            continue
+        return 1
+    return 0
+
+
+cdef object _cookie_decode_value(const char* s, Py_ssize_t start, Py_ssize_t end):
+    if end > start and s[start] == 34:
+        return _cookie_unquote(s + start, end - start)
+    return _decode_latin1(s + start, end - start)
+
+
+cdef object _cookie_find_in_line(
+    const char* s,
+    Py_ssize_t n,
+    const char* name,
+    Py_ssize_t nlen,
+):
+    """Last ``name=`` in this header, or ``None``. Decodes only that value."""
+    cdef Py_ssize_t i = 0
+    cdef Py_ssize_t name_start
+    cdef Py_ssize_t name_end
+    cdef Py_ssize_t val_start
+    cdef Py_ssize_t val_end
+    cdef Py_ssize_t found_start = -1
+    cdef Py_ssize_t found_end = 0
+    while _next_cookie_pair(
+        s, n, &i, &name_start, &name_end, &val_start, &val_end
+    ):
+        if name_end - name_start == nlen and memcmp(
+            s + name_start, name, <size_t>nlen
+        ) == 0:
+            found_start = val_start
+            found_end = val_end
+    if found_start < 0:
+        return None
+    return _cookie_decode_value(s, found_start, found_end)
+
+
 cdef void _parse_cookie_line(
     const char* s,
     Py_ssize_t n,
@@ -802,62 +898,250 @@ cdef void _parse_cookie_line(
     cdef Py_ssize_t name_end
     cdef Py_ssize_t val_start
     cdef Py_ssize_t val_end
-    cdef Py_ssize_t j
-    cdef object name
-    cdef object value
-    while i < n:
-        while i < n and _is_ows(s[i]):
-            i += 1
-        if i >= n:
-            break
-        name_start = i
-        while i < n and s[i] != 59 and s[i] != 61:
-            i += 1
-        if i >= n or s[i] == 59:
-            while i < n and s[i] != 59:
-                i += 1
-            if i < n:
-                i += 1
-            continue
-        name_end = i
-        _strip_span(s, &name_start, &name_end)
-        i += 1
-        while i < n and _is_ows(s[i]):
-            i += 1
-        val_start = i
-        if i < n and s[i] == 34:
-            j = i + 1
-            while j < n:
-                if s[j] == 92 and j + 1 < n:
-                    j += 2
+    while _next_cookie_pair(
+        s, n, &i, &name_start, &name_end, &val_start, &val_end
+    ):
+        out[_decode_latin1(s + name_start, name_end - name_start)] = (
+            _cookie_decode_value(s, val_start, val_end)
+        )
+
+
+cdef class ParsedCookies:
+    """Cookie scan. ``get`` walks C pairs and decodes only the name you ask for.
+
+    Later ``Cookie`` headers win; within one header, later pairs win. ``get``
+    starts at the last header so unused earlier cookies stay untouched.
+    ``as_dict`` / ``items`` parse everything.
+    """
+
+    cdef object _headers
+    cdef list _lines
+
+    def __cinit__(self):
+        self._headers = None
+        self._lines = None
+
+    def __init__(self, lines=None):
+        self._headers = None
+        self._lines = []
+        if lines:
+            self._extend_lines(lines)
+
+    cdef void bind_request_headers(self, object headers) noexcept:
+        self._headers = headers
+        self._lines = None
+
+    cdef void _extend_lines(self, object lines) except *:
+        cdef object line
+        if self._lines is None:
+            self._lines = []
+        for line in lines:
+            if isinstance(line, str):
+                self._lines.append((<str>line).encode("latin-1"))
+            elif line:
+                self._lines.append(line)
+
+    cdef list _cookie_lines(self):
+        cdef object headers
+        cdef list values
+        cdef list out
+        cdef object value
+        if self._lines is not None:
+            return self._lines
+        headers = self._headers
+        out = []
+        if headers is None:
+            self._lines = out
+            return out
+        if isinstance(headers, RequestHeaders):
+            values = (<RequestHeaders>headers).c_getlist_n("cookie", 6)
+            out.extend(values)
+        else:
+            for value in headers.getlist("cookie"):
+                if isinstance(value, str):
+                    out.append((<str>value).encode("latin-1"))
+                elif value:
+                    out.append(value)
+        self._lines = out
+        return out
+
+    cdef object _get_arena(self, const char* name, Py_ssize_t nlen):
+        cdef RequestHeaders headers
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef Py_ssize_t index
+        cdef object found
+        headers = <RequestHeaders>self._headers
+        owner = <RequestExchange>headers._owner
+        if owner._req_cookie_index < 0:
+            return None
+        for index in range(owner._req_raw_count - 1, -1, -1):
+            header = &owner._req_raw_headers[index]
+            if header.name_length != 6 or memcmp(
+                owner._req_arena + header.name_offset,
+                "cookie",
+                6,
+            ) != 0:
+                continue
+            found = _cookie_find_in_line(
+                owner._req_arena + header.value_offset,
+                <Py_ssize_t>header.value_length,
+                name,
+                nlen,
+            )
+            if found is not None:
+                return found
+        return None
+
+    cdef object _get_lines(self, const char* name, Py_ssize_t nlen):
+        cdef list lines
+        cdef Py_ssize_t i
+        cdef bytes raw
+        cdef object found
+        lines = self._cookie_lines()
+        i = PyList_GET_SIZE(lines)
+        while i > 0:
+            i -= 1
+            raw = <bytes>lines[i]
+            found = _cookie_find_in_line(
+                PyBytes_AS_STRING(raw),
+                PyBytes_GET_SIZE(raw),
+                name,
+                nlen,
+            )
+            if found is not None:
+                return found
+        return None
+
+    def get(self, name, default=None):
+        cdef bytes key
+        cdef object found
+        if not isinstance(name, str):
+            return default
+        key = (<str>name).encode("latin-1")
+        if self._headers is not None and isinstance(self._headers, RequestHeaders):
+            found = self._get_arena(
+                PyBytes_AS_STRING(key),
+                PyBytes_GET_SIZE(key),
+            )
+        else:
+            found = self._get_lines(
+                PyBytes_AS_STRING(key),
+                PyBytes_GET_SIZE(key),
+            )
+        if found is None:
+            return default
+        return found
+
+    def as_dict(self):
+        cdef dict out = {}
+        cdef RequestHeaders headers
+        cdef bytes raw
+        cdef object value
+        if self._headers is not None and isinstance(self._headers, RequestHeaders):
+            headers = <RequestHeaders>self._headers
+            headers.c_parse_cookies(out)
+            return out
+        for raw in self._cookie_lines():
+            _parse_cookie_line(
+                PyBytes_AS_STRING(raw),
+                PyBytes_GET_SIZE(raw),
+                out,
+            )
+        return out
+
+    def items(self):
+        return list(self.as_dict().items())
+
+    def keys(self):
+        return list(self.as_dict().keys())
+
+    def values(self):
+        return list(self.as_dict().values())
+
+    def __iter__(self):
+        return iter(self.as_dict())
+
+    def __len__(self):
+        return len(self.as_dict())
+
+    cdef bint _has_any(self):
+        cdef list lines
+        cdef bytes raw
+        cdef RequestHeaders headers
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef Py_ssize_t index
+        cdef Py_ssize_t i
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        if self._headers is not None and isinstance(self._headers, RequestHeaders):
+            headers = <RequestHeaders>self._headers
+            owner = <RequestExchange>headers._owner
+            if owner._req_cookie_index < 0:
+                return False
+            for index in range(owner._req_raw_count):
+                header = &owner._req_raw_headers[index]
+                if header.name_length != 6 or memcmp(
+                    owner._req_arena + header.name_offset,
+                    "cookie",
+                    6,
+                ) != 0:
                     continue
-                if s[j] == 34:
-                    j += 1
-                    break
-                j += 1
-            val_end = j
-            while j < n and s[j] != 59:
-                j += 1
-            i = j
-        else:
-            while i < n and s[i] != 59:
-                i += 1
-            val_end = i
-            _strip_span(s, &val_start, &val_end)
-        if i < n and s[i] == 59:
-            i += 1
-        if name_end <= name_start:
-            continue
-        if s[name_start] == 36:
-            continue
-        if _cookie_attr_name(s + name_start, name_end - name_start):
-            continue
-        name = _decode_latin1(s + name_start, name_end - name_start)
-        if val_end > val_start and s[val_start] == 34:
-            value = _cookie_unquote(s + val_start, val_end - val_start)
-        else:
-            value = _decode_latin1(s + val_start, val_end - val_start)
-        out[name] = value
+                i = 0
+                if _next_cookie_pair(
+                    owner._req_arena + header.value_offset,
+                    <Py_ssize_t>header.value_length,
+                    &i,
+                    &name_start,
+                    &name_end,
+                    &val_start,
+                    &val_end,
+                ):
+                    return True
+            return False
+        lines = self._cookie_lines()
+        for raw in lines:
+            i = 0
+            if _next_cookie_pair(
+                PyBytes_AS_STRING(raw),
+                PyBytes_GET_SIZE(raw),
+                &i,
+                &name_start,
+                &name_end,
+                &val_start,
+                &val_end,
+            ):
+                return True
+        return False
+
+    def __bool__(self):
+        return self._has_any()
+
+    def __contains__(self, name):
+        cdef object sentinel = object()
+        if not isinstance(name, str):
+            return False
+        return self.get(name, sentinel) is not sentinel
+
+    def __getitem__(self, name):
+        cdef object sentinel = object()
+        cdef object found = self.get(name, sentinel)
+        if found is sentinel:
+            raise KeyError(name)
+        return found
+
+    def __eq__(self, other):
+        if isinstance(other, ParsedCookies):
+            return self.as_dict() == other.as_dict()
+        if isinstance(other, dict):
+            return self.as_dict() == other
+        return NotImplemented
+
+    def __repr__(self):
+        return f"ParsedCookies({self.as_dict()!r})"
 
 
 cdef void _raise_readonly_request_headers() except *:
@@ -973,17 +1257,15 @@ cdef class Request:
 
     @property
     def cookies(self):
-        cdef dict parsed
+        cdef ParsedCookies parsed
         if self._cookies is None:
-            parsed = {}
+            parsed = ParsedCookies.__new__(ParsedCookies)
             if isinstance(self.headers, RequestHeaders):
-                (<RequestHeaders>self.headers).c_parse_cookies(parsed)
+                parsed.bind_request_headers(<RequestHeaders>self.headers)
             else:
-                parsed = cookie_helpers.parse_cookie_headers(
-                    self.headers.getlist("cookie")
-                )
+                parsed.__init__(self.headers.getlist("cookie"))
             self._cookies = parsed
-        return MappingProxyType(self._cookies)
+        return self._cookies
 
     async def body(self, max_size=None):
         if max_size is not None and max_size < 0:

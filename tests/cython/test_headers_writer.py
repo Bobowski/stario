@@ -3,7 +3,7 @@ import gzip
 
 import brotli
 import pytest
-from stario_cython.headers import Headers
+from stario_cython.exchange import Headers
 
 import stario.cookies as cookies
 from stario import App

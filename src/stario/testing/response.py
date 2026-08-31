@@ -10,11 +10,7 @@ from uuid import UUID
 
 from stario.http.headers import Headers
 from stario.testing.models import ClientRequest
-from stario.testing.transport import (
-    GrowingSink,
-    parse_chunk_size_line,
-    wait_sink,
-)
+from stario.testing.transport import GrowingSink, wait_sink
 
 
 @dataclass(slots=True)
@@ -96,9 +92,6 @@ class TestStreamResponse:
     span_id: UUID
     cookies: dict[str, str]
     sink: GrowingSink
-    _body_start: int
-    _chunked: bool
-    _content_length: int | None
     _disconnect_future: asyncio.Future[None]
     _app_task: asyncio.Task[None]
     _deadline: float | None = field(repr=False, default=None)
@@ -108,7 +101,7 @@ class TestStreamResponse:
         return self._disconnect_future
 
     async def body(self) -> bytes:
-        """Concatenate all body chunks after transfer decoding (same as iterating `iter_bytes`)."""
+        """Concatenate all body chunks after they arrive."""
 
         parts: list[bytes] = []
         async for chunk in self.iter_bytes():
@@ -116,11 +109,7 @@ class TestStreamResponse:
         return b"".join(parts)
 
     async def iter_bytes(self) -> AsyncIterator[bytes]:
-        """Yield decoded body chunks as they arrive (chunked / fixed-length / until close).
-
-        Only `identity` `Content-Encoding` is supported; request
-        `Accept-Encoding: identity` or use buffered methods for compression.
-        """
+        """Yield body chunks as the handler writes them."""
 
         ce = (self.headers.get("content-encoding") or "").strip().lower()
         if ce and ce != "identity":
@@ -129,63 +118,24 @@ class TestStreamResponse:
                 f"{ce!r}; use accept-encoding that yields identity or use buffered client.get()."
             )
 
-        sink = self.sink
-        pos = self._body_start
-        deadline = self._deadline
-
         if self.status_code in {204, 304} or self.request.method == "HEAD":
             return
 
-        if self._chunked:
-            while True:
-                parsed = parse_chunk_size_line(sink.buf, pos)
-                while parsed is None:
-                    if sink.app_done:
-                        raise RuntimeError("Incomplete chunked encoding in stream.")
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                    parsed = parse_chunk_size_line(sink.buf, pos)
-                chunk_size, pos = parsed
-                if chunk_size == 0:
-                    return
-                end_data = pos + chunk_size
-                while len(sink.buf) < end_data + 2:
-                    if sink.app_done and len(sink.buf) < end_data:
-                        raise RuntimeError("Truncated chunked body in stream.")
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                payload = bytes(sink.buf[pos:end_data])
-                pos = end_data + 2
-                if payload:
-                    yield payload
+        sink = self.sink
+        pos = 0
+        deadline = self._deadline
 
-        elif self._content_length is not None:
-            remain = self._content_length
-            while remain > 0:
+        while True:
+            avail = len(sink.buf) - pos
+            while avail <= 0 and not sink.app_done:
+                seen = sink.gen
+                await wait_sink(sink, seen, deadline=deadline)
                 avail = len(sink.buf) - pos
-                while avail <= 0:
-                    if sink.app_done:
-                        raise RuntimeError("Truncated fixed-length body in stream.")
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                    avail = len(sink.buf) - pos
-                take = min(avail, remain)
-                yield bytes(sink.buf[pos : pos + take])
-                pos += take
-                remain -= take
-
-        else:
-            while True:
-                avail = len(sink.buf) - pos
-                while avail <= 0 and not sink.app_done:
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                    avail = len(sink.buf) - pos
-                if avail > 0:
-                    yield bytes(sink.buf[pos:])
-                    pos = len(sink.buf)
-                if sink.app_done:
-                    return
+            if avail > 0:
+                yield bytes(sink.buf[pos:])
+                pos = len(sink.buf)
+            if sink.app_done:
+                return
 
     async def iter_events(self) -> AsyncIterator[dict[str, str]]:
         """Parse `text/event-stream` into dicts (keys such as `event`, `id`, `data`)."""

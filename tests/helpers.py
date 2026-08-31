@@ -5,20 +5,17 @@ freely: `from tests.helpers import DummyWriter, make_context, ...`.
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine, Generator
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, cast
 from urllib.parse import urlencode
 
 from stario.http.app import App
-from stario.http.compression import CompressionConfig
 from stario.http.context import Context
 from stario.http.headers import Headers
-from stario.http.request import BodyReader, Request
 from stario.http.writer import Writer
 from stario.telemetry.noop import NoOpTracer
+from stario.testing.harness import TestContext, TestRequest, TestWriter
 from stario.testing.tracer import TestTracer
-from stario.testing.transport import MemoryTransport as _MemoryTransport
 
 type AppSetup = Callable[[App], None]
 
@@ -66,6 +63,11 @@ class DummyWriter:
         self._status_code = status
         return self
 
+    def write(self, data: bytes):
+        if data:
+            self.body = data.decode("utf-8")
+        return self
+
     def end(self, data: bytes | None = None) -> None:
         if data is not None:
             self.body = data.decode("utf-8")
@@ -77,14 +79,9 @@ class DummyWriter:
         self.ended = False
         self._completed = True
 
-
-def make_body_reader(body: bytes = b"", **kwargs: Any) -> BodyReader:
-    """A completed BodyReader pre-fed through the public protocol hooks."""
-    reader = BodyReader(pause=lambda: None, resume=lambda: None, **kwargs)
-    if body:
-        reader.feed(body)
-    reader.complete()
-    return reader
+    @property
+    def closing(self) -> bool:
+        return self._completed
 
 
 def make_request(
@@ -96,7 +93,7 @@ def make_request(
     body: bytes = b"",
     query: dict[str, object] | None = None,
     query_bytes: bytes | None = None,
-) -> Request:
+) -> TestRequest:
     hdrs = Headers()
     if headers:
         for name, value in headers.items():
@@ -107,12 +104,12 @@ def make_request(
     if query_bytes is None:
         query_bytes = urlencode(query or {}, doseq=True).encode("ascii")
 
-    return Request(
+    return TestRequest(
         method=method,
         path=path,
         query_bytes=query_bytes,
         headers=hdrs,
-        body=make_body_reader(body),
+        body=body,
     )
 
 
@@ -125,13 +122,13 @@ def make_context(
     query: dict[str, object] | None = None,
     loop: asyncio.AbstractEventLoop,
     disconnect: asyncio.Future[Any] | None = None,
-) -> Context:
+) -> TestContext:
     if disconnect is None:
         disconnect = loop.create_future()
     if app is None:
         app = App()
     tracer = NoOpTracer()
-    return Context(
+    return TestContext(
         app=app,
         req=make_request(method=method, path=path, host=host, query=query),
         span=tracer.create("request"),
@@ -148,7 +145,7 @@ async def invoke_app(
     *,
     query: dict[str, object] | None = None,
     writer: DummyWriter | None = None,
-) -> tuple[Context, DummyWriter]:
+) -> tuple[TestContext, DummyWriter]:
     loop = asyncio.get_running_loop()
     ctx = make_context(path, method, host, app=app, query=query, loop=loop)
     w = writer or DummyWriter()
@@ -163,8 +160,8 @@ def run_with_app(
     host: str = "",
     *,
     query: dict[str, object] | None = None,
-) -> tuple[Context, DummyWriter]:
-    async def _run() -> tuple[Context, DummyWriter]:
+) -> tuple[TestContext, DummyWriter]:
+    async def _run() -> tuple[TestContext, DummyWriter]:
         loop = asyncio.get_running_loop()
         if isinstance(setup, App):
             app = setup
@@ -185,7 +182,7 @@ async def invoke_handler(
     app: App | None = None,
     query: dict[str, object] | None = None,
     writer: DummyWriter | None = None,
-) -> tuple[Context, DummyWriter]:
+) -> tuple[TestContext, DummyWriter]:
     loop = asyncio.get_running_loop()
     ctx = make_context(path, method, host, app=app, query=query, loop=loop)
     w = writer or DummyWriter()
@@ -202,7 +199,7 @@ def run_handler(
     app: App | None = None,
     query: dict[str, object] | None = None,
     writer: DummyWriter | None = None,
-) -> tuple[Context, DummyWriter]:
+) -> tuple[TestContext, DummyWriter]:
     return asyncio.run(
         invoke_handler(
             handler,
@@ -220,43 +217,20 @@ def run_async(awaitable: Awaitable[None]) -> None:
     asyncio.run(cast(Coroutine[Any, Any, None], awaitable))
 
 
-@contextmanager
-def make_writer(
-    *,
-    compression: CompressionConfig | None = None,
-    accept_encoding: str | bytes = "",
-) -> Generator[tuple[Writer, bytearray]]:
-    """A real Writer wired to an in-memory sink, with loop cleanup."""
-    loop = asyncio.new_event_loop()
-    sink = bytearray()
-    extra: dict[str, Any] = {}
-    if compression is not None:
-        extra["compression"] = compression
-    try:
-        transport = _MemoryTransport(sink.extend)
-        writer = Writer(
-            transport=transport,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-            accept_encoding=accept_encoding,
-            **extra,
-        )
-        yield writer, sink
-    finally:
-        loop.close()
+def make_writer() -> TestWriter:
+    """A TestClient-style writer that collects status, headers, and body."""
+    return TestWriter()
 
 
-def make_writer_raw() -> tuple[Writer, bytearray, asyncio.AbstractEventLoop]:
-    """Writer + sink + owning loop; caller must close the loop (try/finally)."""
-    loop = asyncio.new_event_loop()
-    sink = bytearray()
-    transport = _MemoryTransport(sink.extend)
-    writer = Writer(
-        transport=transport,
-        get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-        on_completed=lambda: None,
-    )
-    return writer, sink, loop
+class _ClosedLoop:
+    def close(self) -> None:
+        return None
+
+
+def make_writer_raw() -> tuple[TestWriter, bytearray, _ClosedLoop]:
+    """TestWriter plus its body buffer (not HTTP/1.1 wire bytes)."""
+    writer = TestWriter()
+    return writer, writer.sink.buf, _ClosedLoop()
 
 
 def split_response(raw: bytes) -> tuple[bytes, bytes]:
