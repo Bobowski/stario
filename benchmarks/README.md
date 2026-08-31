@@ -49,8 +49,9 @@ then list-scan). Same decoder, pooled `ParsedQuery.__init__(raw)` per request.
 PYTHONPATH=src:. .venv/bin/python benchmarks/query_micro.py
 ```
 
-Defaults are 80,000 requests and seven repeats. Latest numbers:
-[`query-micro-20260831.md`](query-micro-20260831.md).
+Defaults are 80,000 requests and seven repeats.
+[`query-micro-20260831.md`](query-micro-20260831.md) is the older
+scan-on-get vs eager matrix, kept for history.
 
 `QUERY_BENCH_MATRIX=1` or `--matrix` prints distinct-reads (K) × pair-count (N).
 That K is different parameter names on one query, not repeats of one name.
