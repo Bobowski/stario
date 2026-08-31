@@ -32,7 +32,7 @@ from cpython.unicode cimport PyUnicode_DecodeLatin1, PyUnicode_DecodeUTF8
 from stario import cookies as cookie_helpers
 from stario.exceptions import (
     ClientDisconnected,
-    HttpException,
+    RequestBodyError,
     StarioError,
     StarioRuntime,
 )
@@ -829,7 +829,7 @@ cdef class Request:
             return b""
         if type(self._body) is bytes:
             if max_size is not None and len(self._body) > max_size:
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             return self._body
         return await self._body.read(max_size=max_size)
 
@@ -2066,9 +2066,9 @@ cdef class RequestExchange:
 
     cdef void _raise_abort(self):
         if self._abort_reason == ABORT_TOO_LARGE:
-            raise HttpException(413, "Request body too large")
+            raise RequestBodyError(413, "Request body too large")
         if self._abort_reason == ABORT_TIMEOUT:
-            raise HttpException(
+            raise RequestBodyError(
                 408,
                 "Request timeout: body upload too slow. "
                 "This may indicate a slowloris attack or very poor connection.",
@@ -2363,7 +2363,7 @@ cdef class RequestExchange:
             )
         if self._cached is not None:
             if max_size is not None and len(self._cached) > max_size:
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             self._consumed_as = CONSUMED_BODY
             return self._cached
         self._consumed_as = CONSUMED_BODY
@@ -2378,7 +2378,7 @@ cdef class RequestExchange:
                 self._read_max_size >= 0
                 and self._total_read > self._read_max_size
             ):
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             if self._connection is not None:
                 self._connection.set_body_paused(self, False)
             if self._body_complete:
@@ -2391,7 +2391,7 @@ cdef class RequestExchange:
         if self._cached is None:
             self._cached = self._body_to_bytes()
         if max_size is not None and len(self._cached) > max_size:
-            raise HttpException(413, "Request body too large")
+            raise RequestBodyError(413, "Request body too large")
         return self._cached
 
 

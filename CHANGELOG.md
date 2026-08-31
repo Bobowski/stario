@@ -10,13 +10,21 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 - `App.on_error` and exception-type mapping are gone. Uncaught handler
   exceptions are logged. If the handler sent nothing, the framework writes
-  **500**; a response already on the wire is not rewritten. `HttpException`
-  is not turned into its status. Handlers must write a complete response
-  (`respond` / `end`).
+  **500**; a response already on the wire is not rewritten. Handlers must
+  write a complete response (`respond` / `end`) or use
+  `stario.http.middleware.catch_errors` to map app exceptions.
+- **`HttpException` removed.** Body read failures raise `RequestBodyError`
+  (408/413). Map them with `catch_request_body_errors()` or custom middleware.
 - Route handlers must be `async def` (or a callable whose `__call__` is async).
 - The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
   instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
   the Cython protocol (no handler task).
+
+### Added
+
+- `stario.http.middleware.catch_errors` — wrap handlers so listed exceptions
+  become HTTP responses when nothing was sent yet. Presets:
+  `catch_request_body_errors()` and `respond_request_body_error`.
 
 ### Changed
 

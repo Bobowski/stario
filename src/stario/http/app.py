@@ -26,8 +26,8 @@ class App(Router):
 
     Handlers are `async def` and must write a complete response. Uncaught
     exceptions are logged; if nothing was sent, the framework writes 500.
-    A response already on the wire is not rewritten. `HttpException` is not
-    mapped to its status. Use `create_task` for work tied to a running server
+    A response already on the wire is not rewritten. Use `catch_errors` middleware
+    or write error responses in handlers. Use `create_task` for work tied to a running server
     so drain can observe it.
     """
 

@@ -4,12 +4,11 @@ import logging
 
 import pytest
 
-from stario.exceptions import (
-    HttpException,
-    StarioError,
-)
+import stario.responses as responses
+from stario.exceptions import StarioError
 from stario.http.app import App
 from stario.http.context import Context
+from stario.http.middleware import catch_errors
 from stario.http.writer import Writer
 from stario.routing import UrlPath
 from stario.testing import TestClient
@@ -143,9 +142,12 @@ class TestAppErrorSurface:
         assert writer.completed
         assert "Handler failed" in caplog.text
 
-    def test_http_exception_is_not_mapped_to_its_status(self):
+    def test_uncaught_app_error_becomes_500_without_middleware(self):
+        class AppError(Exception):
+            pass
+
         async def handler(_c: Context, _w: Writer) -> None:
-            raise HttpException(422, "nope")
+            raise AppError("nope")
 
         def setup(app: App) -> None:
             app.get("/x", handler)
@@ -154,6 +156,25 @@ class TestAppErrorSurface:
 
         assert writer.status == 500
         assert writer.body == "Internal Server Error"
+
+    def test_catch_errors_middleware_maps_app_exception(self):
+        class AppError(Exception):
+            pass
+
+        async def respond(_c: Context, w: Writer, exc: BaseException) -> None:
+            responses.text(w, str(exc), 422)
+
+        async def handler(_c: Context, _w: Writer) -> None:
+            raise AppError("nope")
+
+        def setup(app: App) -> None:
+            app.use("/", catch_errors(AppError, respond=respond))
+            app.get("/x", handler)
+
+        _context, writer = run_with_app(setup, "/x")
+
+        assert writer.status == 422
+        assert writer.body == "nope"
 
     def test_call_uses_find_handler(self):
         seen: list[tuple[str, str, str]] = []

@@ -1,6 +1,6 @@
 """Handler-task finish: log failures, send 500 if nothing was sent, close the span.
 
-Does not map exception types to HTTP (no `HttpException` → 4xx). A write-then-raise
+Does not map exception types to HTTP. A write-then-raise
 keeps the bytes already on the wire. Cancellation still aborts.
 """
 

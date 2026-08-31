@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from stario import cookies as cookie_helpers
-from stario.exceptions import ClientDisconnected, HttpException, StarioRuntime
+from stario.exceptions import ClientDisconnected, RequestBodyError, StarioRuntime
 
 from .headers import Headers
 from .query import ParsedQuery
@@ -130,9 +130,9 @@ class BodyReader:
     def _raise_abort(self) -> None:
         reason = self._abort_reason
         if reason == "too_large":
-            raise HttpException(413, "Request body too large")
+            raise RequestBodyError(413, "Request body too large")
         if reason == "timeout":
-            raise HttpException(
+            raise RequestBodyError(
                 408,
                 "Request timeout: body upload too slow. "
                 "This may indicate a slowloris attack or very poor connection.",
@@ -214,8 +214,8 @@ class BodyReader:
     async def stream(self) -> AsyncIterator[bytes]:
         """Iterate body chunks as they arrive (single consumer per request).
 
-        - `HttpException` (`413`): If the body exceeds the configured maximum size.
-        - `HttpException` (`408`): If bytes stall longer than the body read timeout (slowloris protection).
+        - `RequestBodyError` (`413`): If the body exceeds the configured maximum size.
+        - `RequestBodyError` (`408`): If bytes stall longer than the body read timeout (slowloris protection).
         - `ClientDisconnected`: Peer closed before the request body finished uploading.
         - `StarioRuntime`: If `stream()` or `body()` already consumed this body.
         """
@@ -262,7 +262,7 @@ class BodyReader:
 
         - `max_size`: Optional maximum bytes for this read. The protocol-wide cap still applies.
 
-        - `HttpException` (`413` / `408`): For oversize or stalled uploads.
+        - `RequestBodyError` (`413` / `408`): For oversize or stalled uploads.
         - `ClientDisconnected`: Peer closed before the request body finished uploading.
         - `StarioRuntime`: If the body was already streamed.
         """
@@ -281,7 +281,7 @@ class BodyReader:
 
         if self._cached is not None:
             if max_size is not None and len(self._cached) > max_size:
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             self._consumed_as = "body"
             return self._cached
 
@@ -294,7 +294,7 @@ class BodyReader:
             while index < len(self._chunks):
                 chunk = self._chunks[index]
                 if max_size is not None and total + len(chunk) > max_size:
-                    raise HttpException(413, "Request body too large")
+                    raise RequestBodyError(413, "Request body too large")
                 index, chunk = self._take_chunk(index)
                 total += len(chunk)
                 chunks.append(chunk)
@@ -407,8 +407,8 @@ class Request:
         Internally uses `BodyReader.read` on the protocol-owned reader (size cap, timeouts, backpressure).
 
         - `max_size`: Optional lower per-call limit. The server's configured maximum body size still applies.
-        - `HttpException` (`413`): When the body exceeds the configured maximum size.
-        - `HttpException` (`408`): When bytes stall longer than the body read timeout (slow upload / slowloris guard).
+        - `RequestBodyError` (`413`): When the body exceeds the configured maximum size.
+        - `RequestBodyError` (`408`): When bytes stall longer than the body read timeout (slow upload / slowloris guard).
         - `ClientDisconnected`: When the peer closes before the request body finishes uploading.
         - `StarioRuntime`: If the body was already streamed via `stream()`.
         """
@@ -421,7 +421,7 @@ class Request:
 
         Internally uses `BodyReader.stream`.
 
-        - `HttpException` (`413` / `408`): For oversize or stalled uploads (same rules as `body()`).
+        - `RequestBodyError` (`413` / `408`): For oversize or stalled uploads (same rules as `body()`).
         - `ClientDisconnected`: When the peer closes before the request body finishes uploading.
         - `StarioRuntime`: If `stream()` or `body()` already consumed this body.
         """

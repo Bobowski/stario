@@ -16,19 +16,24 @@ Failure types:
   request body read twice, SSE after a finalized response, `Relay` subscription
   outside `async with`. `str(exc)` keeps structured context and help text.
 
-- `HttpException` / `RedirectException` — types handlers may raise or catch.
-  The protocol does not map them to HTTP. Write the response in the handler
-  (`responses.text` / `responses.redirect`) or the request is a failure.
+- `RequestBodyError` — request body read failed (413 payload too large or 408
+  upload stall). Raised by `BodyReader` / the Cython exchange. Not mapped to
+  HTTP by the protocol; use `stario.http.middleware.catch_errors` (or write the
+  response in the handler) to turn it into a client-facing status.
+
+- `RedirectException` — optional handler shortcut for 3xx redirects. The
+  protocol does not map it; call `responses.redirect` (or catch and write).
+
 - `ClientDisconnected` — peer closed during request body read. The protocol
   logs the failure and aborts if the handler did not finish a response.
 
-Uncaught handler exceptions are logged and abort the writer. They are not
-turned into status codes.
+Uncaught handler exceptions are logged. If nothing was sent, the framework
+writes **500**; bytes already on the wire are not rewritten.
 
-`HttpException` and `RedirectException` are re-exported from the `stario` package
-root; prefer `from stario import HttpException, RedirectException` in application code.
+`RedirectException` is re-exported from the `stario` package root. Import
+`RequestBodyError` from `stario.exceptions` when catching body read failures.
 
-Wrong status codes on the HTTP exception constructors raise `StarioError` (a usage
+Wrong status codes on redirect constructors raise `StarioError` (a usage
 mistake), not an HTTP response. `RedirectException` validates `location` when
 `responses.redirect` runs, not at construction.
 
@@ -84,27 +89,28 @@ class StarioRuntime(StarioError):
     """
 
 
-class HttpException(Exception):
+class RequestBodyError(StarioRuntime):
     """
-    Intentional HTTP response with a plain-text body (4xx/5xx only).
+    Request body read failed: payload too large (413) or upload stalled (408).
 
-    Handlers may raise this from `body()` / size limits, or catch it and write
-    a response. The protocol does not map it to HTTP. Use `RedirectException`
-    for 3xx so URLs are not confused with body text.
+    Raised while buffering or streaming the request body. Uncaught in a handler
+    becomes a framework **500**; map to the intended status with middleware:
+
+    ```python
+    from stario.exceptions import RequestBodyError
+    from stario.http.middleware import catch_errors, respond_request_body_error
+
+    app.use("/", catch_errors(RequestBodyError, respond=respond_request_body_error))
+    ```
     """
 
     __slots__ = ("detail", "status_code")
 
     def __init__(self, status_code: int, detail: str = "") -> None:
-        # HttpException is for error bodies the client should read — not 1xx/2xx
-        # continuations and not 3xx redirects (use RedirectException).
-        if not 400 <= status_code < 600:
+        if status_code not in (408, 413):
             raise StarioError(
-                f"HttpException requires a 4xx or 5xx status code, got {status_code}",
-                help_text=(
-                    "Use RedirectException for redirects, or responses.text/json/html "
-                    "for successful (2xx) bodies."
-                ),
+                f"RequestBodyError requires status 408 or 413, got {status_code}",
+                help_text="Use 413 for oversize bodies and 408 for upload stalls.",
             )
         self.status_code = status_code
         self.detail = detail
@@ -126,7 +132,7 @@ class RedirectException(Exception):
         if not (300 <= status_code < 400):
             raise StarioError(
                 f"RedirectException requires a 3xx status_code, got {status_code}",
-                help_text="Use HttpException for response bodies (4xx/5xx).",
+                help_text="Use responses.text/json/html for response bodies (4xx/5xx).",
             )
         self.status_code = status_code
         self.location = location

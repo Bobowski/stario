@@ -2,7 +2,7 @@
 
 import pytest
 
-from stario.exceptions import ClientDisconnected, HttpException, StarioRuntime
+from stario.exceptions import ClientDisconnected, RequestBodyError, StarioRuntime
 from stario.http.headers import Headers
 from stario.http.request import BodyReader, Request
 from tests.helpers import make_body_reader
@@ -69,7 +69,7 @@ class TestRequestBody:
         reader.complete()
         req = Request(method="POST", path="/", headers=Headers(), body=reader)
 
-        with pytest.raises(HttpException) as excinfo:
+        with pytest.raises(RequestBodyError) as excinfo:
             await req.body(max_size=4)
 
         assert excinfo.value.status_code == 413
@@ -120,7 +120,7 @@ class TestBodyReaderTimeout:
             async for chunk in reader.stream():
                 chunks.append(chunk)
 
-        with pytest.raises(HttpException) as excinfo:
+        with pytest.raises(RequestBodyError) as excinfo:
             await drain()
 
         assert excinfo.value.status_code == 408
@@ -140,7 +140,7 @@ class TestBodyReaderFailures:
         assert await stream.__anext__() == b"12345"
 
         reader.feed(b"6789012345x")  # total 16 > 10
-        with pytest.raises(HttpException) as excinfo:
+        with pytest.raises(RequestBodyError) as excinfo:
             await stream.__anext__()
         assert excinfo.value.status_code == 413
 
@@ -152,7 +152,7 @@ class TestBodyReaderFailures:
         reader.feed(b"hello")
         reader.complete()
 
-        with pytest.raises(HttpException):
+        with pytest.raises(RequestBodyError):
             await reader.read(max_size=3)
 
         assert await reader.read(max_size=10) == b"hello"
