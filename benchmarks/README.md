@@ -8,6 +8,8 @@ Three suites, one per layer we care about:
   servers and ASGI framework stacks under `wrk`.
 - `headers_micro.py` — Cython request-header storage tradeoffs: eager dict,
   current-style lazy dict, direct arena scans, and adaptive promotion.
+- `parser_micro.py` — HTTP/1.1 request parse: httptools, zttp, Cython
+  llhttp callbacks, and the complete-message C scanner.
 
 The goal is repeatable local signal, not lab-grade numbers. Run on a quiet
 machine and compare repeated runs before drawing conclusions.
@@ -37,6 +39,22 @@ HEADERS_BENCH_REPEATS=9 \
 HEADERS_BENCH_JSON=/tmp/headers-micro.json \
 PYTHONPATH=src:. .venv/bin/python benchmarks/headers_micro.py
 ```
+
+## HTTP/1.1 parser (`parser_micro.py`)
+
+Compares the language-boundary cost of one complete request:
+
+- `cython-h1` — `stario_h1_try` (production complete-message path)
+- `cython-llhttp` — `llhttp_execute` with the same C callbacks
+- `httptools` — Python callback API (what the Python Stario protocol uses)
+- `zttp` — Zig core, pull events (optional: `uv pip install zttp`)
+
+```bash
+PYTHONPATH=src:. .venv/bin/python benchmarks/parser_micro.py
+```
+
+`PARSER_BENCH_ITERATIONS`, `PARSER_BENCH_REPEATS`, and `PARSER_BENCH_JSON`
+override defaults. This is not a substitute for `benchmarks/server`.
 
 ## HTML generation (`html/`)
 

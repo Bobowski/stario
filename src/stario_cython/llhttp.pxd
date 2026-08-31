@@ -1,4 +1,4 @@
-from libc.stdint cimport uint8_t, uint16_t, uint64_t
+from libc.stdint cimport int64_t, uint8_t, uint16_t, uint64_t
 
 
 cdef extern from "llhttp.h":
@@ -63,3 +63,14 @@ cdef extern from "stario_alloc.h":
     void* stario_parser_get_data(const llhttp_t* parser)
     uint16_t stario_parser_flags(const llhttp_t* parser)
     uint64_t stario_parser_content_length(const llhttp_t* parser)
+
+cdef extern from "stario_h1.h":
+    int64_t STARIO_H1_ERROR
+    int64_t STARIO_H1_INCOMPLETE
+    int64_t stario_h1_try(
+        llhttp_t* parser,
+        const llhttp_settings_t* settings,
+        const char* data,
+        size_t len,
+        size_t max_message,
+    )

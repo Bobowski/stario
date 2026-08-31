@@ -1,7 +1,21 @@
 # Cython protocol (cython-core)
 
 This worktree is `projects/stario` on branch `cython-core`. uvloop owns the
-socket and llhttp parses in C. The protocol lives in `src/stario_cython`.
+socket. Complete identity-body HTTP/1.1 requests (wrk keep-alive GETs, small
+POSTs) parse in `vendor/stario_h1` — a strict C complete-message scanner that
+fires the same callbacks and fills the same `llhttp_t` fields as llhttp.
+Chunked bodies, Expect: 100-continue, unknown methods, and split reads fall
+back to llhttp. The protocol lives in `src/stario_cython`.
+
+`STARIO_CYTHON_PARSER=llhttp` forces llhttp for every request (A/B hatch).
+
+HTTP/3 cannot ride `asyncio.Protocol`. That API is a TCP/Unix byte stream.
+HTTP/3 is HTTP over QUIC over UDP: you need `asyncio.DatagramProtocol` (or a
+raw UDP socket) and a QUIC stack. zttp's Python API can parse HTTP/3 if you
+feed whole datagrams (`receive_datagram`), but that is a second server path,
+not a drop-in on this protocol. TLS is mandatory and lives inside QUIC, not
+as `ssl.SSLContext` on a stream transport. HTTP/2 *can* share
+`asyncio.Protocol` (TCP + TLS + ALPN).
 
 `projects/stario` stays on `main` and stays a workspace member. Do not
 `uv sync` this folder from the monorepo root. Use an isolated venv:

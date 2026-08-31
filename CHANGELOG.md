@@ -6,6 +6,15 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Changed
+
+- Cython HTTP/1.1 parse: complete identity-body requests use a C
+  complete-message scanner (`vendor/stario_h1`) that writes the existing
+  llhttp callbacks and `llhttp_t` fields. Chunked / Expect / split reads
+  still use llhttp. `STARIO_CYTHON_PARSER=llhttp` disables the fast path.
+  Parser microbench: `benchmarks/parser_micro.py` (httptools, zttp, Cython
+  llhttp, C h1).
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

@@ -15,7 +15,8 @@ the exchange — chunks do not ``call_later``. ``RequestPolicy.max_pipelined_req
 ``STARIO_CYTHON_TIMEOUTS=off`` disables header/idle/body-stall cleanup
 (profiling hatch). Under Server the sweep rides the Date-header tick (1s).
 ``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback sweeper period used
-without Server (default 1s).
+without Server (default 1s). ``STARIO_CYTHON_PARSER=llhttp`` disables the
+complete-message C parser and uses llhttp for every request.
 """
 
 from __future__ import annotations

@@ -69,9 +69,33 @@ extensions = [
             "vendor/llhttp/src/http.c",
             "vendor/llhttp/src/api.c",
             "vendor/llhttp/src/stario_alloc.c",
+            "vendor/stario_h1/stario_h1.c",
         ],
-        include_dirs=["vendor/llhttp/include", "vendor", "src"],
-        extra_compile_args=["-O3", "-fno-strict-aliasing"],
+        include_dirs=[
+            "vendor/llhttp/include",
+            "vendor/stario_h1",
+            "vendor",
+            "src",
+        ],
+        extra_compile_args=["-O3", "-fno-strict-aliasing", "-msse2"],
+    ),
+    Extension(
+        "stario_cython.parser_bench",
+        sources=[
+            "src/stario_cython/parser_bench.pyx",
+            "vendor/llhttp/src/llhttp.c",
+            "vendor/llhttp/src/http.c",
+            "vendor/llhttp/src/api.c",
+            "vendor/llhttp/src/stario_alloc.c",
+            "vendor/stario_h1/stario_h1.c",
+        ],
+        include_dirs=[
+            "vendor/llhttp/include",
+            "vendor/stario_h1",
+            "vendor",
+            "src",
+        ],
+        extra_compile_args=["-O3", "-fno-strict-aliasing", "-msse2"],
     ),
 ]
 

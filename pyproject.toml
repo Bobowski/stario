@@ -37,6 +37,7 @@ Issues = "https://github.com/bobowski/stario/issues"
 
 [project.optional-dependencies]
 uvloop = ["uvloop>=0.21.0,<1"]
+zttp = ["zttp"]
 
 [project.scripts]
 stario = "stario.cli.main:main"

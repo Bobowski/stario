@@ -1,9 +1,12 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
-"""asyncio Protocol + llhttp: one TCP connection, pipelining, and dispatch.
+"""asyncio Protocol + HTTP/1.1 parse: one TCP connection, pipelining, dispatch.
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
-URL bytes and header fragments are written into the current exchange arena.
-Path/query decoding is cached here because it is connection-parse work.
+Complete identity-body requests (wrk keep-alive GETs, small POSTs) go through
+a C complete-message parser that writes the same llhttp callbacks and
+``llhttp_t`` fields. Chunked, Expect, unknown methods, and partial reads fall
+back to llhttp. URL bytes and header fragments land in the current exchange
+arena. Path/query decoding is cached here because it is connection-parse work.
 
 Header, idle, and body-stall timeouts share one cleanup path. Under Server
 that path is the Date-header tick (once a second): one ``loop.time()``, then
@@ -12,9 +15,10 @@ sweeper at the same period. See ``stario_cython.timeouts``.
 """
 
 import asyncio
+import os
 from collections import deque
 
-from libc.stdint cimport uint16_t, uint32_t, uint64_t
+from libc.stdint cimport int64_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcmp, memcpy
 from cpython.bytes cimport PyBytes_FromStringAndSize
@@ -187,6 +191,9 @@ cdef int PAUSE_WRITE = 1
 cdef int PAUSE_PIPELINE = 2
 cdef int PAUSE_BODY = 4
 cdef int PARSER_QUANTUM = 512 * 1024
+cdef int PARSER_AUTO = 0
+cdef int PARSER_LLHTTP_ONLY = 1
+cdef int PARSER_MODE = 0
 cdef int TIMEOUT_NONE = 0
 cdef int TIMEOUT_HEADER = 1
 cdef int TIMEOUT_IDLE = 2
@@ -314,7 +321,15 @@ def _bind_timeout_policy():
     TIMEOUT_SWEEP_INTERVAL = <double>_py_sweep_interval()
 
 
+def _bind_parser_policy():
+    """``STARIO_CYTHON_PARSER=llhttp`` disables the complete-message C path."""
+    global PARSER_MODE
+    raw = os.environ.get("STARIO_CYTHON_PARSER", "h1")
+    PARSER_MODE = PARSER_LLHTTP_ONLY if raw == "llhttp" else PARSER_AUTO
+
+
 _bind_timeout_policy()
+_bind_parser_policy()
 
 
 async def _timeout_sweep_loop(loop, connections, key):
@@ -403,6 +418,7 @@ cdef class HttpProtocol:
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
+    cdef public bint llhttp_in_progress
     cdef object _create_task
 
     def __cinit__(self):
@@ -422,6 +438,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.llhttp_in_progress = False
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
         self.header_timeout_reset = False
@@ -481,6 +498,7 @@ cdef class HttpProtocol:
         self.held_data = None
         self.held_offset = 0
         self.pump_scheduled = False
+        self.llhttp_in_progress = False
         self.rejected = False
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
@@ -632,17 +650,25 @@ cdef class HttpProtocol:
         ):
             self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
 
-    cdef void _pump_data(self, object data, Py_ssize_t offset) noexcept:
-        cdef const char* ptr
-        cdef Py_ssize_t n
+    cdef void _mark_llhttp_idle(self) noexcept:
+        if self.reading_exchange is None:
+            self.llhttp_in_progress = False
+
+    cdef void _pump_llhttp(
+        self,
+        const char* ptr,
+        object data,
+        Py_ssize_t offset,
+        Py_ssize_t n,
+    ) noexcept:
         cdef Py_ssize_t end
         cdef int err
-        n = len(data)
-        ptr = <const char*>data
-        if n <= PARSER_QUANTUM:
+        if n - offset <= PARSER_QUANTUM:
             err = llhttp_execute(self.parser, ptr + offset, <size_t>(n - offset))
             if err != HPE_OK:
                 self._close_error(400, "Invalid HTTP request")
+                return
+            self._mark_llhttp_idle()
             return
         while offset < n:
             end = offset + PARSER_QUANTUM
@@ -657,11 +683,44 @@ cdef class HttpProtocol:
                 self._close_error(400, "Invalid HTTP request")
                 return
             offset = end
+            self._mark_llhttp_idle()
             if self.pause_reasons:
                 if offset < n:
                     self.held_data = data
                     self.held_offset = offset
                 return
+
+    cdef void _pump_data(self, object data, Py_ssize_t offset) noexcept:
+        cdef const char* ptr
+        cdef Py_ssize_t n
+        cdef int64_t consumed
+        n = len(data)
+        ptr = <const char*>data
+        if PARSER_MODE == PARSER_AUTO and not self.llhttp_in_progress:
+            while offset < n and not self.pause_reasons and not self.rejected:
+                consumed = stario_h1_try(
+                    self.parser,
+                    _SETTINGS,
+                    ptr + offset,
+                    <size_t>(n - offset),
+                    <size_t>PARSER_QUANTUM,
+                )
+                if consumed > 0:
+                    offset += <Py_ssize_t>consumed
+                    continue
+                if consumed == -2:  # STARIO_H1_INCOMPLETE: use llhttp
+                    self.llhttp_in_progress = True
+                    break
+                self._close_error(400, "Invalid HTTP request")
+                return
+            if self.rejected:
+                return
+            if offset >= n or self.pause_reasons:
+                if self.pause_reasons and offset < n:
+                    self.held_data = data
+                    self.held_offset = offset
+                return
+        self._pump_llhttp(ptr, data, offset, n)
 
     cdef void _set_pause_reason(self, int reason, bint paused):
         cdef int previous = self.pause_reasons

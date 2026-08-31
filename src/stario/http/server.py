@@ -3,6 +3,10 @@ Runs `App` behind an asyncio listener: signal handling, bootstrap, graceful drai
 
 Bootstrap startup completes before `start_serving`; exceptions there fail startup loudly. Transport policy
 (TCP vs Unix, backlog, compression defaults) lives here so `Router`/`App` stay free of process-level concerns.
+
+``STARIO_HTTP_PARSER=zttp`` selects the optional Zig pull parser for the
+Python protocol. The Cython server ignores that variable and uses
+``STARIO_CYTHON_PARSER`` instead.
 """
 
 import asyncio
@@ -31,7 +35,21 @@ from .bootstrap import (
 )
 from .compression import CompressionConfig
 from .config import RequestPolicy, ServerConfig
-from .protocol import HttpProtocol
+from .protocol import HttpProtocol as PythonHttpProtocol
+
+
+def _python_http_protocol() -> type[PythonHttpProtocol]:
+    """httptools by default; ``STARIO_HTTP_PARSER=zttp`` selects the Zig parser."""
+    if os.environ.get("STARIO_HTTP_PARSER") != "zttp":
+        return PythonHttpProtocol
+    try:
+        from .zttp_protocol import HttpProtocol as ZttpHttpProtocol
+    except ImportError as exc:
+        raise StarioError(
+            "STARIO_HTTP_PARSER=zttp requires the zttp package",
+            help_text="Install zttp (pip install zttp) or unset STARIO_HTTP_PARSER.",
+        ) from exc
+    return ZttpHttpProtocol
 
 # Connections may be the Python protocol or the Cython HttpProtocol.
 type Connection = Any
@@ -209,7 +227,7 @@ class Server:
                     connections,
                     self.config.requests,
                 )
-            return HttpProtocol(
+            return _python_http_protocol()(
                 loop,
                 app,
                 self.tracer,
