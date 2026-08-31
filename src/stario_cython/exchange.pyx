@@ -942,6 +942,59 @@ cdef class ParsedQuery:
             return self._list_getlist(key)
         return self._index_getlist(key)
 
+    cdef object _scan_get(self, object key, object default):
+        cdef const char* s = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        if not self._resolve_span(&s, &n) or s == NULL:
+            return default
+        while _next_query_pair(
+            s, n, &i, &name_start, &name_end, &val_start, &val_end
+        ):
+            if _decode_query_component(
+                s + name_start, name_end - name_start
+            ) == key:
+                return _decode_query_component(s + val_start, val_end - val_start)
+        return default
+
+    cdef list _scan_getlist(self, object key):
+        cdef const char* s = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        cdef list out = []
+        if not self._resolve_span(&s, &n) or s == NULL:
+            return out
+        while _next_query_pair(
+            s, n, &i, &name_start, &name_end, &val_start, &val_end
+        ):
+            if _decode_query_component(
+                s + name_start, name_end - name_start
+            ) == key:
+                out.append(
+                    _decode_query_component(s + val_start, val_end - val_start)
+                )
+        return out
+
+    def _get_scan(self, key, default=None):
+        """Walk C pairs each call. Previous production path. Bench only."""
+        if not isinstance(key, str):
+            return default
+        return self._scan_get(key, default)
+
+    def _getlist_scan(self, key):
+        """Walk C pairs each call and collect matches. Bench only."""
+        if not isinstance(key, str):
+            return []
+        return self._scan_getlist(key)
+
     def _get_eager(self, key, default=None):
         """Parse every pair into Python lists, then list-scan. Bench only."""
         if not isinstance(key, str):

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Indexed query get vs eager parse-all (same Cython decoder).
+"""Query get: C-span index vs previous scan-on-get vs eager parse-all.
 
 Pooled ``ParsedQuery``: ``__init__(raw)`` each request, then get/getlist.
-Production ``get`` copies the query, fills a C span table, memcmps names.
-Eager baseline calls ``_get_eager`` (decode every name and value to Python
-lists, then list-scan).
+
+- index: production ``get`` (memcpy + C spans, memcmp names)
+- scan: previous production path (``_get_scan``: walk ``&`` / ``=`` each get)
+- eager: ``_get_eager`` (decode every name and value to Python lists)
 
 Run:
 
@@ -43,7 +44,14 @@ pyximport.install(
     language_level=3,
 )
 
-from _query_micro import run_getlist, run_many_gets, run_one_get  # noqa: E402
+from _query_micro import (  # noqa: E402
+    MODE_EAGER,
+    MODE_INDEX,
+    MODE_SCAN,
+    run_getlist,
+    run_many_gets,
+    run_one_get,
+)
 from stario_cython.exchange import ParsedQuery  # noqa: E402
 
 ITERATIONS = int(os.environ.get("QUERY_BENCH_ITERATIONS", "80000"))
@@ -51,6 +59,7 @@ REPEATS = int(os.environ.get("QUERY_BENCH_REPEATS", "7"))
 JSON_PATH = os.environ.get("QUERY_BENCH_JSON")
 
 PAIR_COUNTS = (1, 2, 3, 4, 5, 8, 12, 16, 24, 32, 48)
+MODES = (("index", MODE_INDEX), ("scan", MODE_SCAN), ("eager", MODE_EAGER))
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,55 +137,51 @@ def keys_for(names: list[str], workload: Workload) -> list[str]:
 
 def verify(raw: bytes, keys: list[str], kind: str) -> int:
     indexed = ParsedQuery(raw)
+    scan = ParsedQuery(raw)
     eager = ParsedQuery(raw)
     acc = 0
     if kind == "getlist":
-        s = indexed.getlist(keys[0])
+        i = indexed.getlist(keys[0])
+        s = scan._getlist_scan(keys[0])
         e = eager._getlist_eager(keys[0])
-        assert s == e, (s, e)
-        return len(s)
+        assert i == s == e, (i, s, e)
+        return len(i)
     for key in keys:
-        s = indexed.get(key)
+        i = indexed.get(key)
+        s = scan._get_scan(key)
         e = eager._get_eager(key)
-        assert s == e, (key, s, e)
-        if s is not None:
-            acc += len(s)
+        assert i == s == e, (key, i, s, e)
+        if i is not None:
+            acc += len(i)
     return acc
 
 
-def run_case(raw: bytes, keys: list[str], kind: str, eager: bool, iterations: int) -> int:
+def run_case(raw: bytes, keys: list[str], kind: str, mode: int, iterations: int) -> int:
     if kind == "getlist":
-        return run_getlist(raw, keys[0], iterations, eager)
+        return run_getlist(raw, keys[0], iterations, mode)
     if kind == "get" and len(keys) == 1:
-        return run_one_get(raw, keys[0], iterations, eager)
-    return run_many_gets(raw, keys, iterations, eager)
+        return run_one_get(raw, keys[0], iterations, mode)
+    return run_many_gets(raw, keys, iterations, mode)
 
 
-def benchmark_one(raw: bytes, keys: list[str], kind: str) -> tuple[float, float]:
-    expected_index = verify(raw, keys, kind)
-    expected_eager = verify(raw, keys, kind)
-    assert expected_index == expected_eager
-    assert run_case(raw, keys, kind, False, 1) == expected_index
-    assert run_case(raw, keys, kind, True, 1) == expected_eager
+def benchmark_one(raw: bytes, keys: list[str], kind: str) -> dict[str, float]:
+    expected = verify(raw, keys, kind)
+    for _name, mode in MODES:
+        assert run_case(raw, keys, kind, mode, 1) == expected
 
     warmup = max(1, ITERATIONS // 10)
-    run_case(raw, keys, kind, False, warmup)
-    run_case(raw, keys, kind, True, warmup)
+    for _name, mode in MODES:
+        run_case(raw, keys, kind, mode, warmup)
 
-    index_samples: list[float] = []
-    eager_samples: list[float] = []
+    samples: dict[str, list[float]] = {name: [] for name, _mode in MODES}
     for _ in range(REPEATS):
-        started = time.perf_counter_ns()
-        checksum = run_case(raw, keys, kind, False, ITERATIONS)
-        index_samples.append((time.perf_counter_ns() - started) / ITERATIONS)
-        assert checksum == expected_index * ITERATIONS
+        for name, mode in MODES:
+            started = time.perf_counter_ns()
+            checksum = run_case(raw, keys, kind, mode, ITERATIONS)
+            samples[name].append((time.perf_counter_ns() - started) / ITERATIONS)
+            assert checksum == expected * ITERATIONS
 
-        started = time.perf_counter_ns()
-        checksum = run_case(raw, keys, kind, True, ITERATIONS)
-        eager_samples.append((time.perf_counter_ns() - started) / ITERATIONS)
-        assert checksum == expected_eager * ITERATIONS
-
-    return statistics.median(index_samples), statistics.median(eager_samples)
+    return {name: statistics.median(vals) for name, vals in samples.items()}
 
 
 def spread_keys(names: list[str], reads: int) -> list[str]:
@@ -190,41 +195,58 @@ def spread_keys(names: list[str], reads: int) -> list[str]:
     return [names[round(i * (len(names) - 1) / (reads - 1))] for i in range(reads)]
 
 
+def fmt_ns(ns: float) -> str:
+    return f"{ns:.0f}"
+
+
 def run_matrix() -> list[dict[str, object]]:
-    """Distinct keys read (K) vs pairs on the wire (N). Long queries included."""
+    """Distinct keys read (K) vs pairs on the wire (N)."""
     pair_counts = (8, 16, 24, 32, 48)
-    read_counts = (1, 2, 3, 4, 6, 8, 12, 16, 24)
+    read_counts = (1, 2, 3, 4, 6, 8, 10, 12, 16)
     print(
         "Distinct params read (K) on a query with N pairs. "
         "Keys are spaced through the string.\n"
     )
+    print("index/scan  (`i` = index ≤ scan × 1.05)\n")
     print("| N pairs \\ K reads | " + " | ".join(str(k) for k in read_counts) + " |")
     print("|---:|" + "---:|" * len(read_counts))
     rows: list[dict[str, object]] = []
+    vs_scan_cells: dict[int, list[str]] = {}
+    vs_eager_cells: dict[int, list[str]] = {}
     for count in pair_counts:
         raw, names = make_raw(count, encoded=False, key_at="spread")
-        cells: list[str] = []
+        vs_scan_cells[count] = []
+        vs_eager_cells[count] = []
         for reads in read_counts:
             if reads > count:
-                cells.append("—")
+                vs_scan_cells[count].append("—")
+                vs_eager_cells[count].append("—")
                 continue
             keys = spread_keys(names, reads)
-            index_ns, eager_ns = benchmark_one(raw, keys, "gets")
-            ratio = index_ns / eager_ns if eager_ns else 0.0
+            times = benchmark_one(raw, keys, "gets")
+            vs_scan = times["index"] / times["scan"] if times["scan"] else 0.0
+            vs_eager = times["index"] / times["eager"] if times["eager"] else 0.0
             rows.append(
                 {
                     "pairs": count,
                     "distinct_reads": reads,
-                    "index_ns": index_ns,
-                    "eager_ns": eager_ns,
-                    "ratio": ratio,
+                    **times,
+                    "index_over_scan": vs_scan,
+                    "index_over_eager": vs_eager,
                 }
             )
-            mark = "i" if ratio <= 1.05 else "e"
-            cells.append(f"{ratio:.2f}{mark}")
-        print(f"| {count} | " + " | ".join(cells) + " |")
+            mark_s = "i" if vs_scan <= 1.05 else "s"
+            mark_e = "i" if vs_eager <= 1.05 else "e"
+            vs_scan_cells[count].append(f"{vs_scan:.2f}{mark_s}")
+            vs_eager_cells[count].append(f"{vs_eager:.2f}{mark_e}")
+        print(f"| {count} | " + " | ".join(vs_scan_cells[count]) + " |")
     print()
-    print("Cell is index/eager. `i` = index wins or tie (≤1.05). `e` = eager ahead.\n")
+    print("index/eager  (`i` = index ≤ eager × 1.05)\n")
+    print("| N pairs \\ K reads | " + " | ".join(str(k) for k in read_counts) + " |")
+    print("|---:|" + "---:|" * len(read_counts))
+    for count in pair_counts:
+        print(f"| {count} | " + " | ".join(vs_eager_cells[count]) + " |")
+    print()
     return rows
 
 
@@ -233,13 +255,9 @@ def main() -> int:
         raise SystemExit("iterations and repeats must be positive")
 
     print(
-        f"Query index vs eager parse-all: {ITERATIONS:,} requests × {REPEATS} repeats"
+        f"Query index vs scan vs eager: {ITERATIONS:,} requests × {REPEATS} repeats"
     )
-    print("Lower is better; median nanoseconds per request. Ratio < 1 means index wins.\n")
-    print(
-        "`1-3 named reads` means 1-3 distinct parameter names on one query, "
-        "not the same name three times. Pair count is how long the query is.\n"
-    )
+    print("Lower is better; median nanoseconds per request.\n")
 
     if "--matrix" in sys.argv or os.environ.get("QUERY_BENCH_MATRIX") == "1":
         print("Distinct-reads × pair-count matrix\n")
@@ -263,9 +281,9 @@ def main() -> int:
     rows: list[dict[str, object]] = []
     for workload in WORKLOADS:
         print(
-            f"| pairs | {workload.name} index | eager | index/eager |"
+            f"| pairs | {workload.name} index | scan | eager | idx/scan | idx/eager |"
         )
-        print("|---:|---:|---:|---:|")
+        print("|---:|---:|---:|---:|---:|---:|")
         for count in PAIR_COUNTS:
             if workload.reads > count > 0:
                 continue
@@ -278,20 +296,22 @@ def main() -> int:
                 repeat_first=workload.kind == "getlist",
             )
             keys = keys_for(names, workload)
-            index_ns, eager_ns = benchmark_one(raw, keys, workload.kind)
-            ratio = index_ns / eager_ns if eager_ns else 0.0
+            times = benchmark_one(raw, keys, workload.kind)
+            vs_scan = times["index"] / times["scan"] if times["scan"] else 0.0
+            vs_eager = times["index"] / times["eager"] if times["eager"] else 0.0
             rows.append(
                 {
                     "pairs": count,
                     "workload": workload.name,
                     "keys_read": keys,
-                    "index_ns": index_ns,
-                    "eager_ns": eager_ns,
-                    "ratio": ratio,
+                    **times,
+                    "index_over_scan": vs_scan,
+                    "index_over_eager": vs_eager,
                 }
             )
             print(
-                f"| {count} | {index_ns:.0f} ns | {eager_ns:.0f} ns | {ratio:.2f}× |"
+                f"| {count} | {fmt_ns(times['index'])} | {fmt_ns(times['scan'])} | "
+                f"{fmt_ns(times['eager'])} | {vs_scan:.2f}× | {vs_eager:.2f}× |"
             )
         print()
 
@@ -310,19 +330,19 @@ def main() -> int:
         )
         print(f"Wrote {path}")
 
-    print("Crossover (index loses, ratio > 1.05) per workload:")
+    print("Where index sits (median over pair counts per workload):")
     by_work: dict[str, list[dict[str, object]]] = {}
     for row in rows:
         by_work.setdefault(str(row["workload"]), []).append(row)
     for name, items in by_work.items():
-        lose = next((item for item in items if float(item["ratio"]) > 1.05), None)
-        if lose is None:
-            print(f"- {name}: index ahead through {items[-1]['pairs']} pairs")
-        else:
-            print(
-                f"- {name}: eager ahead from {lose['pairs']} pairs "
-                f"({float(lose['ratio']):.2f}×)"
-            )
+        vs_scan = statistics.median(float(item["index_over_scan"]) for item in items)
+        vs_eager = statistics.median(float(item["index_over_eager"]) for item in items)
+        at = items[-1]
+        print(
+            f"- {name}: {vs_scan:.2f}× scan, {vs_eager:.2f}× eager "
+            f"(at {at['pairs']} pairs: {fmt_ns(float(at['index']))} / "
+            f"{fmt_ns(float(at['scan']))} / {fmt_ns(float(at['eager']))} ns)"
+        )
 
     return 0
 
