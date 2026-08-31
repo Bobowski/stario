@@ -731,6 +731,20 @@ cdef class ParsedQuery:
             return self._list_getlist(key)
         return self._scan_getlist(key)
 
+    def _get_eager(self, key, default=None):
+        """Parse every pair, then list-scan. Benchmark baseline only."""
+        if not isinstance(key, str):
+            return default
+        self._ensure()
+        return self._list_get(key, default)
+
+    def _getlist_eager(self, key):
+        """Parse every pair, then collect matches. Benchmark baseline only."""
+        if not isinstance(key, str):
+            return []
+        self._ensure()
+        return self._list_getlist(key)
+
     def items(self):
         cdef Py_ssize_t i
         cdef Py_ssize_t n
