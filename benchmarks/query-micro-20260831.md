@@ -61,3 +61,32 @@ Scan keeps an advantage until you **read most of the pairs**:
 So: keep scan-on-`get`. Eager parse-all only wins when the handler reads
 almost every pair. Typical 1–3 named reads on a short or fat query stay on
 the scan side.
+
+## Distinct params read (K) × pairs on the wire (N)
+
+“1–3 named reads” means **K distinct parameter names** on one request, not
+the same name three times. N is how long the query string is (including
+unused UTM / filter / tracking pairs).
+
+Follow-up matrix, 40,000 × 5, keys spaced through the string (first … last).
+Cell is scan/eager. `s` = scan wins or tie (≤1.05). `e` = eager ahead.
+
+| N pairs \\ K reads | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 | 24 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 0.22s | 0.71s | 0.98s | 1.24e | 1.55e | 1.83e | — | — | — |
+| 16 | 0.12s | 0.62s | 0.90s | 1.08e | 1.43e | 1.64e | 2.06e | 2.33e | — |
+| 24 | 0.09s | 0.60s | 0.82s | 1.01s | 1.33e | 1.58e | 1.98e | 2.37e | 2.73e |
+| 32 | 0.07s | 0.57s | 0.81s | 1.01s | 1.37e | 1.65e | 2.06e | 2.36e | 2.79e |
+| 48 | 0.04s | 0.56s | 0.78s | 0.97s | 1.32e | 1.58e | 1.99e | 2.42e | 2.80e |
+
+On a **long** query, scan gets *more* advantageous for 1–3 distinct reads
+(unused values are the thing you skip). The flip is about **how many names
+you read**, not how many were sent:
+
+- K ≤ 3 of any N through 48: scan
+- K = 4: tie
+- K ≥ 6: eager (you are decoding most names anyway; paying for values once is cheaper than walking K times)
+
+A 30-param filter/UTM string where the handler does `get("page")`,
+`get("sort")`, `get("q")` is the long-query case we want, and scan is
+0.8× eager or better. `as_dict()` / looping every key is the eager path.

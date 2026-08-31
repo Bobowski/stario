@@ -52,6 +52,9 @@ PYTHONPATH=src:. .venv/bin/python benchmarks/query_micro.py
 Defaults are 80,000 requests and seven repeats. Latest numbers:
 [`query-micro-20260831.md`](query-micro-20260831.md).
 
+`QUERY_BENCH_MATRIX=1` or `--matrix` prints distinct-reads (K) × pair-count (N).
+That K is different parameter names on one query, not repeats of one name.
+
 ## HTML generation (`html/`)
 
 ### Comparison: `html/compare.py`
