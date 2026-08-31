@@ -25,6 +25,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - `stario.http.middleware.catch_errors` — wrap handlers so listed exceptions
   become HTTP responses when nothing was sent yet. Presets:
   `catch_request_body_errors()` and `respond_request_body_error`.
+- Cython HTTP/2 via nghttp2 on the same connection class. Switch once per socket (TLS ALPN `h2` or the cleartext connection preface). Responses go out as frames, not HTTP/1.1 text.
+- Direct TLS: `ServerConfig(ssl=…)` or `STARIO_SSL_CERTFILE` / `STARIO_SSL_KEYFILE`. Context is TLS 1.2+ with ALPN `h2`, `http/1.1`.
 
 ### Changed
 
@@ -43,6 +45,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - Cython uploads: Content-Length bodies ≤ 256 KiB dispatch after the
   message is complete (`body()` is already bytes). `stream()` with a known
   Content-Length yields `min(length, 256 KiB)` instead of a fixed 64 KiB.
+- `ParsedQuery` (Python and Cython) matches `Headers`: first read fills `_keys` / `_values`, then `get` / `getlist` / `items` linear-scan. `as_dict` / `as_lists` group those arrays for forms / Pydantic; headers have no analogue. HTTP/1 stays on [llhttp](https://github.com/nodejs/llhttp): picohttpparser was tried on the same `HttpProtocol` and is ~2.5× in a parser-only microbench, but not noticeably faster end-to-end (GET ~even, small POST behind). llhttp is also the same incremental-callback model as nghttp2.
+- HTTP/1 and HTTP/2 share the core dispatch rule (empty GET / `mark_nobody` at headers; small POST ≤256KiB waits for complete). HTTP/2 receive window is 1MiB per stream / 4MiB per connection. Recv credit is submitted as `WINDOW_UPDATE` when a stream ends and after each `mem_recv` — nghttp2 `consume()` only emits a frame at 50% of the window, which stalls keep-alive small POSTs. Mid-body updates are still batched. Outbound DATA uses nghttp2 `NO_COPY` into `h2_out`; responses queued during `mem_recv` flush once.
 
 ## 4.1.0 - 2026-08-17
 

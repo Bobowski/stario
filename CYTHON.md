@@ -1,7 +1,9 @@
 # Cython protocol (cython-core)
 
 This worktree is `projects/stario` on branch `cython-core`. uvloop owns the
-socket and llhttp parses in C. The protocol lives in `src/stario_cython`.
+socket. HTTP/1 is [llhttp](https://github.com/nodejs/llhttp);
+HTTP/2 is nghttp2. Both live in one `HttpProtocol` and share
+`RequestExchange`. The protocol lives in `src/stario_cython`.
 
 `projects/stario` stays on `main` and stays a workspace member. Do not
 `uv sync` this folder from the monorepo root. Use an isolated venv:
@@ -16,11 +18,22 @@ uv pip install --python .venv/bin/python -e ".[uvloop]" cython setuptools wheel 
 PYTHONPATH=src:. .venv/bin/python -m stario_cython examples.cython.hello:bootstrap
 ```
 
-Linux builds need `pkg-config` and the Brotli development package. Gzip
-links system zlib (`-lz`). The native protocol offers `br` and `gzip`
-only. Python Stario still negotiates zstd.
+Linux builds need `pkg-config`, the Brotli development package, and
+`libnghttp2-dev`. Gzip links system zlib (`-lz`). The native protocol
+offers `br` and `gzip` only. Python Stario still negotiates zstd.
+
+Direct TLS: `STARIO_SSL_CERTFILE` / `STARIO_SSL_KEYFILE` (or
+`ServerConfig(ssl=…)`). ALPN advertises `h2` then `http/1.1`.
 
 `STARIO_HOST` and `STARIO_PORT` set the bind address.
+
+Same-host check (2026-08-31): picohttpparser is ~2.5–3.3× llhttp in a
+parser-only microbench, but end-to-end HTTP/1 is about even on GET
+(0.98–1.07×) and behind on a tiny JSON POST (0.85×). HTTP/1 stays on
+llhttp. HTTP/2 GETs on the same process are ~1.8× HTTP/1 when `h2load`
+uses 100 streams per connection. TLS ALPN selects `h2` or `http/1.1`;
+a self-signed cert serves both. See
+[`benchmarks/server/pico-h2-20260831.md`](benchmarks/server/pico-h2-20260831.md).
 
 `PYTHONPATH=src` is required so `stario_cython` resolves after the inplace
 build.

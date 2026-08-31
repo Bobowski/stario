@@ -11,7 +11,7 @@ import asyncio
 from types import MappingProxyType
 
 from libc.stddef cimport size_t
-from libc.stdint cimport uint32_t
+from libc.stdint cimport int32_t, uint32_t, uint64_t
 from libc.stdlib cimport free, realloc
 from libc.stdio cimport sprintf
 from libc.string cimport memcmp, memcpy
@@ -25,6 +25,7 @@ from cpython.bytes cimport (
     PyBytes_FromStringAndSize,
     PyBytes_GET_SIZE,
 )
+from cpython.list cimport PyList_GET_ITEM, PyList_GET_SIZE
 from cpython.exc cimport PyErr_Clear, PyErr_Occurred
 from cpython.mem cimport PyMem_Free, PyMem_Malloc
 from cpython.unicode cimport PyUnicode_DecodeLatin1, PyUnicode_DecodeUTF8
@@ -167,6 +168,22 @@ cdef inline bint _token_equals(
         if ch != <unsigned char>token[i]:
             return False
     return True
+
+
+cdef Py_ssize_t _parse_content_length(const char* s, size_t n) noexcept:
+    cdef uint64_t value = 0
+    cdef size_t i
+    cdef unsigned int digit
+    if n == 0:
+        return -1
+    for i in range(n):
+        digit = <unsigned int>(<unsigned char>s[i] - 48)
+        if digit > 9:
+            return -1
+        if value > (<uint64_t>9223372036854775807 - digit) / 10:
+            return -1
+        value = value * 10 + digit
+    return <Py_ssize_t>value
 
 
 cdef bint _contains_token(
@@ -447,35 +464,33 @@ cdef object _unquote_plus_component(const char* s, Py_ssize_t n):
         PyMem_Free(buf)
 
 
-cdef object _decode_query_component(const char* s, Py_ssize_t n):
+cdef inline bint _span_needs_unquote(const char* s, Py_ssize_t n) noexcept:
     cdef Py_ssize_t i
-    cdef bint has_pct = False
-    cdef bint has_plus = False
+    for i in range(n):
+        if s[i] == 37 or s[i] == 43:
+            return True
+    return False
+
+
+cdef object _decode_query_component(const char* s, Py_ssize_t n):
     if n <= 0:
         return ""
-    for i in range(n):
-        if s[i] == 37:
-            has_pct = True
-        elif s[i] == 43:
-            has_plus = True
-    if has_pct:
+    if _span_needs_unquote(s, n):
         return _unquote_plus_component(s, n)
-    if has_plus:
-        return _decode_latin1(s, n).replace("+", " ")
     return _decode_latin1(s, n)
 
 
-cdef dict _parse_query_bytes(const char* s, Py_ssize_t n):
-    cdef dict data = {}
+cdef int _fill_query_arrays(
+    const char* s,
+    Py_ssize_t n,
+    list keys,
+    list values,
+) except -1:
+    """One pass: decoded keys and values, same order as the wire."""
     cdef Py_ssize_t i = 0
     cdef Py_ssize_t start
     cdef Py_ssize_t eq
     cdef Py_ssize_t end
-    cdef object key
-    cdef object val
-    cdef list existing
-    if n <= 0:
-        return data
     while i < n:
         start = i
         eq = -1
@@ -486,82 +501,197 @@ cdef dict _parse_query_bytes(const char* s, Py_ssize_t n):
         end = i
         if start < end:
             if eq < 0:
-                key = _decode_query_component(s + start, end - start)
-                val = ""
+                keys.append(_decode_query_component(s + start, end - start))
+                values.append("")
             else:
-                key = _decode_query_component(s + start, eq - start)
-                val = _decode_query_component(s + eq + 1, end - eq - 1)
-            existing = data.get(key)
-            if existing is None:
-                data[key] = [val]
-            else:
-                existing.append(val)
+                keys.append(_decode_query_component(s + start, eq - start))
+                values.append(_decode_query_component(s + eq + 1, end - eq - 1))
         if i < n and s[i] == 38:
             i += 1
-    return data
+    return 0
 
 
 cdef class ParsedQuery:
-    """Cython view over query bytes. Same API as ``stario.http.query.ParsedQuery``."""
+    """Two arrays after first read. Same API as ``stario.http.query.ParsedQuery``."""
 
-    cdef dict _data
+    cdef bytes _raw
+    cdef object _owner
+    cdef Py_ssize_t _off
+    cdef Py_ssize_t _len
+    cdef list _keys
+    cdef list _values
+
+    def __cinit__(self):
+        self._raw = None
+        self._owner = None
+        self._off = 0
+        self._len = 0
+        self._keys = None
+        self._values = None
 
     def __init__(self, raw=b""):
-        cdef bytes b
-        if not raw:
-            self._data = {}
+        self._raw = raw if raw else b""
+        self._owner = None
+        self._off = 0
+        self._len = PyBytes_GET_SIZE(self._raw) if self._raw else 0
+        self._keys = None
+        self._values = None
+
+    cdef void bind_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
+        """Point at request-arena query bytes until the first read fills arrays."""
+        self._raw = None
+        self._owner = owner
+        self._off = off
+        self._len = n
+        self._keys = None
+        self._values = None
+
+    cdef void _ensure(self) except *:
+        cdef const char* s = NULL
+        cdef Py_ssize_t n
+        cdef list keys
+        cdef list values
+        cdef RequestExchange owner
+        if self._keys is not None:
             return
-        b = raw
-        self._data = _parse_query_bytes(
-            PyBytes_AS_STRING(b),
-            PyBytes_GET_SIZE(b),
-        )
+        keys = []
+        values = []
+        n = self._len
+        if n > 0:
+            if self._raw is not None:
+                s = PyBytes_AS_STRING(self._raw)
+            elif self._owner is not None:
+                owner = <RequestExchange>self._owner
+                if owner._req_arena != NULL:
+                    s = owner._req_arena + self._off
+            if s != NULL:
+                _fill_query_arrays(s, n, keys, values)
+        self._keys = keys
+        self._values = values
+        self._raw = None
+        self._owner = None
+        self._off = 0
+        self._len = 0
 
     def get(self, key, default=None):
-        cdef list vals = self._data.get(key)
-        if not vals:
-            return default
-        return vals[0]
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef list keys
+        cdef list values
+        self._ensure()
+        keys = self._keys
+        values = self._values
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            if <object>PyList_GET_ITEM(keys, i) == key:
+                return <object>PyList_GET_ITEM(values, i)
+        return default
 
     def getlist(self, key):
-        cdef list vals = self._data.get(key)
-        if not vals:
-            return []
-        return list(vals)
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef list keys
+        cdef list values
+        cdef list out = []
+        self._ensure()
+        keys = self._keys
+        values = self._values
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            if <object>PyList_GET_ITEM(keys, i) == key:
+                out.append(<object>PyList_GET_ITEM(values, i))
+        return out
 
     def items(self):
-        return [(k, v) for k, vals in self._data.items() for v in vals]
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef list keys
+        cdef list values
+        cdef list out = []
+        self._ensure()
+        keys = self._keys
+        values = self._values
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            out.append((
+                <object>PyList_GET_ITEM(keys, i),
+                <object>PyList_GET_ITEM(values, i),
+            ))
+        return out
 
     def as_dict(self, *, last=False):
         cdef dict out = {}
-        cdef list vals
-        cdef Py_ssize_t idx
-        for k, vals in self._data.items():
-            if not vals:
-                continue
-            idx = len(vals) - 1 if last else 0
-            out[k] = vals[idx]
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef object key
+        cdef list keys
+        cdef list values
+        self._ensure()
+        keys = self._keys
+        values = self._values
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            key = <object>PyList_GET_ITEM(keys, i)
+            if last or key not in out:
+                out[key] = <object>PyList_GET_ITEM(values, i)
         return out
 
     def as_lists(self):
-        return {k: list(v) for k, v in self._data.items()}
+        cdef dict out = {}
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef object key
+        cdef list existing
+        cdef list keys
+        cdef list values
+        self._ensure()
+        keys = self._keys
+        values = self._values
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            key = <object>PyList_GET_ITEM(keys, i)
+            existing = out.get(key)
+            if existing is None:
+                out[key] = [<object>PyList_GET_ITEM(values, i)]
+            else:
+                existing.append(<object>PyList_GET_ITEM(values, i))
+        return out
 
     def __contains__(self, key):
-        return key in self._data
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef list keys
+        self._ensure()
+        keys = self._keys
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            if <object>PyList_GET_ITEM(keys, i) == key:
+                return True
+        return False
 
     def __bool__(self):
-        return bool(self._data)
+        self._ensure()
+        return PyList_GET_SIZE(self._keys) != 0
 
     def __len__(self):
-        return len(self._data)
+        cdef set seen = set()
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef list keys
+        self._ensure()
+        keys = self._keys
+        n = PyList_GET_SIZE(keys)
+        for i in range(n):
+            seen.add(<object>PyList_GET_ITEM(keys, i))
+        return len(seen)
 
     def __eq__(self, other):
         if isinstance(other, ParsedQuery):
-            return self._data == other._data
+            return self.items() == other.items()
         return NotImplemented
 
     def __repr__(self):
-        return f"ParsedQuery({self._data!r})"
+        return f"ParsedQuery({self.as_lists()!r})"
 
 
 cdef inline bint _is_ows(char c) noexcept:
@@ -773,11 +903,38 @@ cdef class Request:
         self.headers = headers
         self.protocol_version = protocol_version
         self.keep_alive = keep_alive
-        self.query_bytes = query_bytes
+        self._query_bytes = query_bytes
+        self._q_owner = None
+        self._q_off = 0
+        self._q_len = 0
         self._body = body
         self._query = None
         self._cookies = None
         self._host = None
+
+    cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
+        self._q_owner = owner
+        self._q_off = off
+        self._q_len = n
+        self._query_bytes = None
+
+    cdef object _materialize_query(self):
+        cdef RequestExchange owner
+        if self._query_bytes is not None:
+            return self._query_bytes
+        if self._q_len <= 0 or self._q_owner is None:
+            self._query_bytes = b""
+            return self._query_bytes
+        owner = <RequestExchange>self._q_owner
+        self._query_bytes = PyBytes_FromStringAndSize(
+            owner._req_arena + self._q_off,
+            self._q_len,
+        )
+        return self._query_bytes
+
+    @property
+    def query_bytes(self):
+        return self._materialize_query()
 
     @property
     def host(self):
@@ -802,10 +959,16 @@ cdef class Request:
 
     @property
     def query(self):
-        cdef bytes raw
+        cdef ParsedQuery parsed
         if self._query is None:
-            raw = self.query_bytes
-            self._query = ParsedQuery(raw if raw else b"")
+            if self._query_bytes is not None:
+                self._query = ParsedQuery(self._query_bytes)
+            elif self._q_len > 0 and self._q_owner is not None:
+                parsed = ParsedQuery.__new__(ParsedQuery)
+                parsed.bind_span(self._q_owner, self._q_off, self._q_len)
+                self._query = parsed
+            else:
+                self._query = ParsedQuery(b"")
         return self._query
 
     @property
@@ -866,6 +1029,18 @@ cdef class RequestExchange:
         self._tail_used = 0
         self._tail_cap = 0
         self._expected_size = -1
+        self._http2 = False
+        self._h2_stream_id = 0
+        self._h2_pending = b""
+        self._h2_pending_off = 0
+        self._h2_body_done = False
+        self._h2_method = None
+        self._h2_dispatched = False
+        self._h2_headers_done = False
+        self._h2_headers_sent = False
+        self._h2_date_line = None
+        self._h2_date_bare = None
+        self._req_content_length = -1
 
     def __init__(self):
         self.headers = Headers()
@@ -1044,6 +1219,92 @@ cdef class RequestExchange:
             i = sprintf(tmp, "%zu", n)
         return self._buf_add(tmp, i)
 
+    cdef object _h2_date_value(self):
+        cdef object line = self._date_box[0]
+        cdef bytes raw
+        cdef Py_ssize_t n
+        if line is self._h2_date_line and self._h2_date_bare is not None:
+            return self._h2_date_bare
+        raw = <bytes>line
+        n = PyBytes_GET_SIZE(raw)
+        if n > 8 and raw[0] == 100 and raw[n - 2] == 13:
+            self._h2_date_bare = raw[6 : n - 2]
+        else:
+            self._h2_date_bare = raw
+        self._h2_date_line = line
+        return self._h2_date_bare
+
+    cdef void _h2_respond(
+        self,
+        object body,
+        object content_type,
+        int status,
+        Py_ssize_t nbytes,
+    ):
+        cdef Headers h = self.headers
+        cdef object encoding
+        cdef object flat
+        cdef object scanned
+        cdef object existing_ce = None
+        cdef object existing_cl = None
+        cdef const unsigned char* native_out = NULL
+        cdef size_t native_len = 0
+        cdef list nva
+        cdef object payload = body
+        if not h.c_empty():
+            scanned = h.c_scan_respond(content_type)
+            existing_ce = scanned[0]
+            existing_cl = scanned[1]
+        if not _may_have_body(status):
+            payload = b""
+            nbytes = 0
+        elif existing_ce is None and self._may_compress(body, content_type, False, nbytes):
+            encoding = b"br" if self._req_encoding == ENCODING_BR else b"gzip"
+            flat = self._body_as_bytes(body)
+            try:
+                self._frame(flat, encoding, &native_out, &native_len)
+                nbytes = <Py_ssize_t>native_len
+                if existing_cl is not None:
+                    h.c_require_respond_length(existing_cl, _dec(native_len))
+                payload = PyBytes_FromStringAndSize(<char*>native_out, <Py_ssize_t>native_len)
+                nva = [
+                    (b":status", _dec(<size_t>status)),
+                    (b"date", self._h2_date_value()),
+                    (b"content-type", content_type),
+                    (b"content-length", _dec(native_len)),
+                    (b"content-encoding", encoding),
+                ]
+                if not h.c_vary_contains(b"accept-encoding"):
+                    nva.append((b"vary", b"accept-encoding"))
+                self._connection.h2_respond(self, nva, payload, True, True, True)
+            finally:
+                self._free_compressors()
+            self._status_code = status
+            self._declared_length = nbytes
+            self._bytes_written = nbytes
+            self._completed = True
+            self._done()
+            return
+        if existing_cl is not None:
+            h.c_require_respond_length(existing_cl, _dec(<size_t>nbytes))
+        nva = [
+            (b":status", _dec(<size_t>status)),
+            (b"date", self._h2_date_value()),
+        ]
+        if _may_have_body(status):
+            nva.append((b"content-type", content_type))
+            nva.append((b"content-length", _dec(<size_t>nbytes)))
+        if isinstance(payload, (list, tuple)):
+            payload = b"".join(payload) if payload else b""
+        self._connection.h2_respond(
+            self, nva, payload if payload is not None else b"", False, True, True
+        )
+        self._status_code = status
+        self._declared_length = nbytes
+        self._bytes_written = nbytes if nbytes > 0 else 0
+        self._completed = True
+        self._done()
+
     cdef void _flush(self):
         cdef object view
         cdef object done
@@ -1056,6 +1317,9 @@ cdef class RequestExchange:
             self._out_buf = bytearray(256)
         view = memoryview(done)[:self._out_len]
         self._out_len = 0
+        if self._http2:
+            self._connection.h2_write_data(self, view, False)
+            return
         self._transport.write(view)
 
     @property
@@ -1247,18 +1511,48 @@ cdef class RequestExchange:
         self._req_pending_value_length += <Py_ssize_t>length
         return 0
 
+    cdef int append_request_header(
+        self,
+        const char* name,
+        size_t name_length,
+        const char* value,
+        size_t value_length,
+    ) noexcept:
+        """Complete header in one pass (H2 delivers name and value together)."""
+        if name_length == 0 or name_length >= <size_t>REQUEST_NAME_MAX:
+            return -1
+        if self._req_pending_header and self.finish_request_header() != 0:
+            return -1
+        if self._reserve_request_arena(<Py_ssize_t>(name_length + value_length)) != 0:
+            return -1
+        self._req_pending_name_offset = self._req_arena_len
+        _lower_copy(self._req_arena + self._req_arena_len, name, name_length)
+        self._req_arena_len += <Py_ssize_t>name_length
+        self._req_pending_name_length = <Py_ssize_t>name_length
+        self._req_pending_value_offset = self._req_arena_len
+        if value_length:
+            memcpy(self._req_arena + self._req_arena_len, value, value_length)
+        self._req_arena_len += <Py_ssize_t>value_length
+        self._req_pending_value_length = <Py_ssize_t>value_length
+        self._req_pending_header = True
+        return self._commit_request_header()
+
     cdef int finish_request_header(self) noexcept:
-        cdef RawHeader* header
-        cdef const char* name
-        cdef const char* value
-        cdef size_t name_length
-        cdef size_t value_length
         if not self._req_pending_header:
             return 0
         if self._req_pending_name_length == 0:
             return -1
         if self._req_pending_value_offset < 0:
             self._req_pending_value_offset = self._req_arena_len
+        return self._commit_request_header()
+
+    cdef int _commit_request_header(self) noexcept:
+        cdef RawHeader* header
+        cdef const char* name
+        cdef const char* value
+        cdef size_t name_length
+        cdef size_t value_length
+        cdef Py_ssize_t parsed
         name = self._req_arena + self._req_pending_name_offset
         value = self._req_arena + self._req_pending_value_offset
         name_length = <size_t>self._req_pending_name_length
@@ -1286,6 +1580,13 @@ cdef class RequestExchange:
         elif name_length == 13 and memcmp(name, "authorization", 13) == 0:
             if self._req_authorization_index < 0:
                 self._req_authorization_index = self._req_raw_count
+        elif name_length == 14 and memcmp(name, "content-length", 14) == 0:
+            parsed = _parse_content_length(value, value_length)
+            if parsed < 0:
+                return -1
+            if self._req_content_length >= 0 and self._req_content_length != parsed:
+                return -1
+            self._req_content_length = parsed
         elif name_length == 15 and memcmp(name, "accept-encoding", 15) == 0:
             self._scan_request_accept_encoding(value, value_length)
         self._req_raw_count += 1
@@ -1429,11 +1730,31 @@ cdef class RequestExchange:
         self._clear_request_headers()
         self.handler_done = False
         self.handler_started = False
+        self._http2 = False
+        self._h2_stream_id = 0
+        self._h2_pending = b""
+        self._h2_pending_off = 0
+        self._h2_body_done = False
+        self._h2_method = None
+        self._h2_dispatched = False
+        self._h2_headers_done = False
+        self._h2_headers_sent = False
+
+    cdef void bind_http2(self, int32_t stream_id) noexcept:
+        self._http2 = True
+        self._h2_stream_id = stream_id
+        self._h2_pending = b""
+        self._h2_pending_off = 0
+        self._h2_body_done = False
+        self._h2_dispatched = False
+        self._h2_headers_done = False
+        self._h2_headers_sent = False
 
     cdef void _clear_hot_request_headers(self) noexcept:
         self._req_encoding = ENCODING_NONE
         self._req_expect_continue = False
         self._req_connection_close = False
+        self._req_content_length = -1
         self._req_accept_present = False
         self._req_br_q = -1
         self._req_gzip_q = -1
@@ -1580,6 +1901,9 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
+        if self._http2:
+            self._h2_respond(body, content_type, status, nbytes)
+            return
         # Empty headers + no compression: writelines of interned pieces
         # (status, Date, type, length, body). No join, no cross-request cache.
         if h.c_empty() and (
@@ -1701,7 +2025,10 @@ cdef class RequestExchange:
         self._free_compressors()
         self._completed = True
         self.headers.c_set(b"connection", b"close")
-        self._transport.close()
+        if self._http2:
+            self._connection.h2_abort(self)
+        else:
+            self._transport.close()
         self._done()
 
     def write_headers(self, int status_code):
@@ -1709,6 +2036,7 @@ cdef class RequestExchange:
         cdef object raw_length
         cdef object parsed_length
         cdef object encoding
+        cdef list nva
         if self._transport.is_closing():
             return self
         if self._status_code >= 0:
@@ -1739,7 +2067,7 @@ cdef class RequestExchange:
                     context={"content-length": raw_length},
                     help_text="Set Content-Length to a non-negative integer before write_headers().",
                 ) from exc
-        else:
+        elif not self._http2:
             headers.c_set(b"transfer-encoding", b"chunked")
             if headers.c_get(b"content-encoding") is None:
                 encoding = None
@@ -1756,6 +2084,14 @@ cdef class RequestExchange:
                         self._ensure_gzip()
                     headers.c_set(b"content-encoding", encoding)
                     headers.c_merge_vary(b"accept-encoding")
+        if self._http2:
+            nva = [
+                (b":status", _dec(<size_t>status_code)),
+                (b"date", self._h2_date_value()),
+            ]
+            self._connection.h2_write_headers(self, nva, False, False, False)
+            self._status_code = status_code
+            return self
         self._buf_bytes(_status_line(status_code))
         self._buf_bytes(self._date_box[0])
         if self._out_buf is None:
@@ -1798,6 +2134,15 @@ cdef class RequestExchange:
             )
         n = self._body_nbytes(data)
         if n == 0:
+            return self
+        if self._http2:
+            self._bytes_written += n
+            if isinstance(data, (list, tuple)):
+                for part in data:
+                    if part:
+                        self._connection.h2_write_data(self, part, False)
+            else:
+                self._connection.h2_write_data(self, data, False)
             return self
         if self._declared_length >= 0:
             self._bytes_written += n
@@ -1842,6 +2187,11 @@ cdef class RequestExchange:
             self.write_headers(200 if data is not None else 204)
         if data:
             self.write(data)
+        if self._http2:
+            self._connection.h2_end(self)
+            self._completed = True
+            self._done()
+            return
         if self._declared_length >= 0 and self._bytes_written != self._declared_length:
             raise StarioRuntime(
                 "Response body length mismatch: wrote "
@@ -2113,8 +2463,12 @@ cdef class RequestExchange:
     cdef void _maybe_continue(self):
         if self._expect_continue:
             self._expect_continue = False
-            if self._transport is not None and not self._transport.is_closing():
-                self._transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            if self._transport is None or self._transport.is_closing():
+                return
+            if self._http2:
+                self._connection.h2_write_headers(self, [(b":status", b"100")], True, True, True, True)
+                return
+            self._transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
 
     cdef void _maybe_pause(self):
         if self._consumed_as == CONSUMED_STREAM:

@@ -19,3 +19,20 @@ def test_server_config_rejects_blank_unix_socket() -> None:
 def test_server_config_rejects_blank_tcp_host() -> None:
     with pytest.raises(StarioError, match="host must be non-empty"):
         ServerConfig(host="   ")
+
+
+def test_server_config_ssl_and_certfile_are_exclusive() -> None:
+    import ssl
+
+    with pytest.raises(StarioError, match="either ssl= or ssl_certfile"):
+        ServerConfig(ssl=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER), ssl_certfile="x.pem")
+
+
+def test_server_config_ssl_keyfile_requires_certfile() -> None:
+    with pytest.raises(StarioError, match="ssl_keyfile requires ssl_certfile"):
+        ServerConfig(ssl_keyfile="k.pem")
+
+
+def test_server_config_missing_certfile_raises() -> None:
+    with pytest.raises(StarioError, match="TLS certificate not found"):
+        ServerConfig(ssl_certfile="/no/such/cert.pem")

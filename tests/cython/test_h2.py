@@ -1,0 +1,403 @@
+"""HTTP/2 on the Cython protocol: cleartext prior knowledge and TLS ALPN."""
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import pytest
+
+import stario.responses as responses
+from stario import App
+from stario.http.tls import load_tls_context
+from stario_cython.protocol import HttpProtocol
+from tests.cython.http import RecordingTransport, free_port, make_protocol
+
+
+async def _curl(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run curl without blocking the event loop (the server lives on it)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: subprocess.run(
+            ["curl", "-sS", "--max-time", "5", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        ),
+    )
+
+
+def _make_self_signed(dir_path: Path) -> tuple[Path, Path]:
+    cert = dir_path / "cert.pem"
+    key = dir_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return cert, key
+
+
+@pytest.mark.asyncio
+async def test_h2_prior_knowledge_plaintext() -> None:
+    app = App()
+
+    async def hello(c, w) -> None:
+        assert c.req.protocol_version == "2"
+        assert c.req.query.get("q") == "1"
+        responses.text(w, f"h2:{c.req.path}")
+
+    app.get("/hi", hello)
+    loop = asyncio.get_running_loop()
+    connections: set[HttpProtocol] = set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, connections=connections),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        result = await _curl(
+            "--http2-prior-knowledge",
+            f"http://127.0.0.1:{port}/hi?q=1",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "h2:/hi"
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_trailing_slash_redirects() -> None:
+    """H2 trailing-slash 308 is frames, not HTTP/1.1 text (same rule as H1)."""
+    app = App()
+
+    async def search(c, w) -> None:
+        responses.text(w, "nope")
+
+    app.get("/search", search)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        result = await _curl(
+            "--http2-prior-knowledge",
+            "-D",
+            "-",
+            "-o",
+            "/dev/null",
+            f"http://127.0.0.1:{port}/search/?q=1",
+        )
+        assert result.returncode == 0, result.stderr
+        assert "HTTP/2 308" in result.stdout
+        assert "location: /search?q=1" in result.stdout.lower()
+        assert "nope" not in result.stdout
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_post_empty_body() -> None:
+    app = App()
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/echo", echo)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        result = await _curl(
+            "--http2-prior-knowledge",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Length: 0",
+            f"http://127.0.0.1:{port}/echo",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ""
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_post_large_body() -> None:
+    """Bodies larger than 256KiB still dispatch at headers; body() waits on DATA."""
+    payload = b"x" * (257 * 1024)
+    app = App()
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/echo", echo)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        with tempfile.NamedTemporaryFile() as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            result = await _curl(
+                "--http2-prior-knowledge",
+                "-X",
+                "POST",
+                "--data-binary",
+                f"@{tmp.name}",
+                f"http://127.0.0.1:{port}/echo",
+            )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.encode("latin-1") == payload
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+def _iter_h2_frames(blob: bytes):
+    """Yield (type, flags, stream_id, payload) from a wire dump."""
+    i = 0
+    while i + 9 <= len(blob):
+        length = int.from_bytes(blob[i : i + 3], "big")
+        end = i + 9 + length
+        if end > len(blob):
+            break
+        yield (
+            blob[i + 3],
+            blob[i + 4],
+            int.from_bytes(blob[i + 5 : i + 9], "big") & 0x7FFFFFFF,
+            blob[i + 9 : end],
+        )
+        i = end
+
+
+@pytest.mark.asyncio
+async def test_h2_keep_alive_returns_window_credit() -> None:
+    """Small POSTs on one connection must return recv credit when streams end.
+
+    nghttp2 consume() only emits WINDOW_UPDATE at 50% of the local window
+    (2MiB for a 4MiB connection). A client that only has ~1MiB of send
+    credit then deadlocks. Credit must be submitted, not merely consumed.
+    """
+    if shutil.which("h2load") is None:
+        pytest.skip("h2load not installed")
+    payload = b"x" * 256
+    app = App()
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/echo", echo)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    nreq = 20_000
+    try:
+        with tempfile.NamedTemporaryFile() as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [
+                        "h2load",
+                        "-n",
+                        str(nreq),
+                        "-c",
+                        "1",
+                        "-m",
+                        "1",
+                        "-d",
+                        tmp.name,
+                        f"http://127.0.0.1:{port}/echo",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ),
+            )
+        assert result.returncode == 0, result.stderr
+        assert f"{nreq} succeeded" in result.stdout, result.stdout
+        assert " 0 failed" in result.stdout and " 0 errored" in result.stdout
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_post_body() -> None:
+    app = App()
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/echo", echo)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        result = await _curl(
+            "--http2-prior-knowledge",
+            "-X",
+            "POST",
+            "--data-binary",
+            "abcde",
+            f"http://127.0.0.1:{port}/echo",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "abcde"
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_tls_http11_and_h2_alpn() -> None:
+    app = App()
+
+    async def hello(c, w) -> None:
+        responses.text(w, f"v={c.req.protocol_version}")
+
+    app.get("/tls", hello)
+    loop = asyncio.get_running_loop()
+    with tempfile.TemporaryDirectory() as tmp:
+        cert, key = _make_self_signed(Path(tmp))
+        ctx = load_tls_context(certfile=cert, keyfile=key)
+        port = free_port()
+        server = await loop.create_server(
+            lambda: make_protocol(loop, app),
+            "127.0.0.1",
+            port,
+            ssl=ctx,
+        )
+        try:
+            h1 = await _curl(
+                "--http1.1",
+                "-k",
+                f"https://127.0.0.1:{port}/tls",
+            )
+            assert h1.returncode == 0, h1.stderr
+            assert h1.stdout == "v=1.1"
+
+            h2 = await _curl(
+                "--http2",
+                "-k",
+                f"https://127.0.0.1:{port}/tls",
+            )
+            assert h2.returncode == 0, h2.stderr
+            assert h2.stdout == "v=2"
+        finally:
+            server.close()
+            await server.wait_closed()
+            await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_connect_is_rejected() -> None:
+    """No tunnels or WebSockets: CONNECT must not dispatch a handler."""
+    app = App()
+    seen: list[str] = []
+
+    async def boom(c, w) -> None:
+        seen.append(c.req.method)
+        responses.text(w, "nope")
+
+    app.get("/", boom)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        result = await _curl(
+            "--http2-prior-knowledge",
+            "-X",
+            "CONNECT",
+            f"http://127.0.0.1:{port}/",
+        )
+        assert seen == []
+        assert "nope" not in result.stdout
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_preface_on_recording_transport_does_not_raise() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    proto = make_protocol(loop, app)
+    transport = RecordingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        assert proto.parse_mode == 2
+        assert transport.writes  # server SETTINGS
+        wire = b"".join(transport.writes)
+        conn_updates = [
+            int.from_bytes(payload, "big") & 0x7FFFFFFF
+            for ftype, _flags, stream_id, payload in _iter_h2_frames(wire)
+            if ftype == 0x8 and stream_id == 0 and len(payload) == 4
+        ]
+        # Connection window starts at 65535; we enlarge it to 4MiB.
+        assert conn_updates
+        assert sum(conn_updates) >= (4 * 1024 * 1024) - 65535
+    finally:
+        proto.connection_lost(None)
+        await app.drain_tasks()

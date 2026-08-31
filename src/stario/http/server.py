@@ -219,14 +219,18 @@ class Server:
                 self.config.requests,
             )
 
+        ssl_ctx = self.config.ssl
         if listen_sock is not None:
-            return await loop.create_unix_server(protocol_factory, sock=listen_sock)
+            return await loop.create_unix_server(
+                protocol_factory, sock=listen_sock, ssl=ssl_ctx
+            )
         return await loop.create_server(
             protocol_factory,
             self.config.host,
             self.config.port,
             backlog=self.config.backlog,
             reuse_address=self.config.reuse_addr,
+            ssl=ssl_ctx,
         )
 
     async def _drain_listener(
@@ -533,6 +537,7 @@ class Server:
             "server.timeout.request_body": self.config.requests.body_timeout,
             "server.timeout.keep_alive": self.config.requests.keep_alive_timeout,
             "server.event_loop": self.config.event_loop,
+            "server.tls": self.config.ssl is not None,
         }
         if self.config.compression.zstd_window_log is not None:
             attrs["server.compression.zstd_window_log"] = (

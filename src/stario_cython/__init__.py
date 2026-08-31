@@ -1,4 +1,4 @@
-"""Cython protocol for Stario: uvloop owns the socket, llhttp parses, App runs."""
+"""Cython protocol for Stario: uvloop owns the socket; llhttp + nghttp2 parse."""
 
 from __future__ import annotations
 
