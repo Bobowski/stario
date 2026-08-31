@@ -697,7 +697,9 @@ cdef class HttpProtocol:
         n = len(data)
         ptr = <const char*>data
         if PARSER_MODE == PARSER_AUTO and not self.llhttp_in_progress:
-            while offset < n and not self.pause_reasons and not self.rejected:
+            # Keep going after PAUSE_PIPELINE so a single read can fill the
+            # queue and hit the cap, matching one llhttp_execute on the buffer.
+            while offset < n and not self.rejected:
                 consumed = stario_h1_try(
                     self.parser,
                     _SETTINGS,
@@ -715,10 +717,11 @@ cdef class HttpProtocol:
                 return
             if self.rejected:
                 return
-            if offset >= n or self.pause_reasons:
-                if self.pause_reasons and offset < n:
-                    self.held_data = data
-                    self.held_offset = offset
+            if offset >= n:
+                return
+            if self.pause_reasons:
+                self.held_data = data
+                self.held_offset = offset
                 return
         self._pump_llhttp(ptr, data, offset, n)
 

@@ -571,5 +571,11 @@ int64_t stario_h1_try(
   if (fire_cb(parser, settings->on_message_complete) != 0) {
     return STARIO_H1_ERROR;
   }
+  /* Same cleanup as llhttp__after_message_complete so a later
+   * llhttp_execute does not inherit Content-Length / Connection flags. */
+  parser->flags = 0;
+  parser->upgrade = 0;
+  parser->content_length = 0;
+  parser->finish = HTTP_FINISH_SAFE;
   return (int64_t)total;
 }
