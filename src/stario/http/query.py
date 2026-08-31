@@ -1,8 +1,9 @@
 """Typing for the Cython query pair list.
 
-Runtime ``ParsedQuery`` is ``stario_cython.exchange.ParsedQuery``. ``get`` /
-``getlist`` scan C pairs and decode only matches. No Python implementation —
-this module is for IDEs and typecheckers.
+Runtime ``ParsedQuery`` is ``stario_cython.exchange.ParsedQuery``. First read
+copies the query and indexes C name/value spans; ``get`` / ``getlist`` search
+those and decode only the values you ask for. No Python implementation — this
+module is for IDEs and typecheckers.
 """
 
 from typing import TYPE_CHECKING, Protocol, overload

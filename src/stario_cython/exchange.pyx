@@ -4,8 +4,8 @@
 ``Headers`` lives here (one extension). ``RequestExchange`` is pooled. The
 protocol appends URL and header fragments into the arena; this module indexes
 Host/Cookie/Authorization at parse time, keeps ``RequestHeaders`` read-only,
-scans cookies and query on demand, and writes the response (including native
-compression).
+indexes query pairs on first read, scans cookies on demand, and writes the
+response (including native compression).
 """
 
 import asyncio
@@ -28,8 +28,12 @@ from cpython.bytes cimport (
 )
 from cpython.list cimport PyList_GET_ITEM, PyList_GET_SIZE
 from cpython.exc cimport PyErr_Clear, PyErr_Occurred
-from cpython.mem cimport PyMem_Free, PyMem_Malloc
-from cpython.unicode cimport PyUnicode_DecodeLatin1, PyUnicode_DecodeUTF8
+from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
+from cpython.unicode cimport (
+    PyUnicode_AsUTF8AndSize,
+    PyUnicode_DecodeLatin1,
+    PyUnicode_DecodeUTF8,
+)
 
 from stario.exceptions import (
     ClientDisconnected,
@@ -470,12 +474,57 @@ cdef inline bint _span_needs_unquote(const char* s, Py_ssize_t n) noexcept:
     return False
 
 
+cdef inline bint _span_all_ascii(const char* s, Py_ssize_t n) noexcept:
+    cdef Py_ssize_t i
+    for i in range(n):
+        if <unsigned char>s[i] >= 128:
+            return False
+    return True
+
+
 cdef object _decode_query_component(const char* s, Py_ssize_t n):
     if n <= 0:
         return ""
     if _span_needs_unquote(s, n):
         return _unquote_plus_component(s, n)
     return _decode_latin1(s, n)
+
+
+cdef object _decode_utf8_replace(const char* s, Py_ssize_t n):
+    if n <= 0:
+        return ""
+    return PyUnicode_DecodeUTF8(s, n, <const char*>b"replace")
+
+
+cdef Py_ssize_t _query_unquote_ascii_inplace(char* s, Py_ssize_t n) noexcept:
+    """Percent-decode ``+`` / ``%XX`` in place. Output length is always ≤ n."""
+    cdef Py_ssize_t r = 0
+    cdef Py_ssize_t w = 0
+    cdef int h1
+    cdef int h2
+    cdef unsigned char c
+    while r < n:
+        c = <unsigned char>s[r]
+        if c == 43:
+            s[w] = 32
+            r += 1
+            w += 1
+        elif c == 37 and r + 2 < n:
+            h1 = _hex_nibble(<unsigned char>s[r + 1])
+            h2 = _hex_nibble(<unsigned char>s[r + 2])
+            if h1 >= 0 and h2 >= 0:
+                s[w] = <char>((h1 << 4) | h2)
+                r += 3
+                w += 1
+            else:
+                s[w] = 37
+                r += 1
+                w += 1
+        else:
+            s[w] = <char>c
+            r += 1
+            w += 1
+    return w
 
 
 cdef int _next_query_pair(
@@ -537,17 +586,60 @@ cdef int _fill_query_arrays(
     return 0
 
 
-cdef class ParsedQuery:
-    """Query scan. ``get`` / ``getlist`` walk C pairs and decode only matches.
+cdef enum:
+    QUERY_PARAM_INIT = 16
+    QUERY_NAME_INPLACE = 1
 
-    First ``name=`` wins for ``get``. Unused values stay untouched until
-    ``items`` / ``as_dict`` / ``as_lists`` ask for everything.
+
+ctypedef struct RawQueryParam:
+    Py_ssize_t name_off
+    Py_ssize_t name_len
+    Py_ssize_t value_off
+    Py_ssize_t value_len
+    int flags
+
+
+cdef bint _query_name_matches(
+    const char* buf,
+    RawQueryParam* param,
+    const char* key,
+    Py_ssize_t klen,
+    object key_obj,
+) except -1:
+    cdef const char* name = buf + param.name_off
+    cdef Py_ssize_t nlen = param.name_len
+    if param.flags & QUERY_NAME_INPLACE:
+        if _span_all_ascii(name, nlen):
+            return nlen == klen and memcmp(name, key, <size_t>klen) == 0
+        return _decode_utf8_replace(name, nlen) == key_obj
+    if not _span_needs_unquote(name, nlen):
+        if _span_all_ascii(name, nlen):
+            return nlen == klen and memcmp(name, key, <size_t>klen) == 0
+        return _decode_latin1(name, nlen) == key_obj
+    return _decode_query_component(name, nlen) == key_obj
+
+
+cdef class ParsedQuery:
+    """Query index. First read copies the wire and fills C name/value spans.
+
+    Names that are ASCII ``+`` / ``%XX`` are decoded in place (output never
+    grows; leftover tail is ignored via the stored length). ``get`` memcmps
+    typical ASCII names like headers, then decodes only that value. First
+    ``name=`` wins. ``items`` / ``as_dict`` / ``as_lists`` still decode
+    everything.
     """
 
     cdef bytes _raw
     cdef object _owner
     cdef Py_ssize_t _off
     cdef Py_ssize_t _len
+    cdef char* _copy
+    cdef Py_ssize_t _copy_len
+    cdef Py_ssize_t _copy_cap
+    cdef RawQueryParam* _params
+    cdef Py_ssize_t _pcount
+    cdef Py_ssize_t _pcap
+    cdef bint _indexed
     cdef list _keys
     cdef list _values
 
@@ -556,28 +648,48 @@ cdef class ParsedQuery:
         self._owner = None
         self._off = 0
         self._len = 0
+        self._copy = NULL
+        self._copy_len = 0
+        self._copy_cap = 0
+        self._params = NULL
+        self._pcount = 0
+        self._pcap = 0
+        self._indexed = False
         self._keys = None
         self._values = None
 
+    def __dealloc__(self):
+        if self._copy != NULL:
+            PyMem_Free(self._copy)
+            self._copy = NULL
+        if self._params != NULL:
+            PyMem_Free(self._params)
+            self._params = NULL
+
     def __init__(self, raw=b""):
         self.bind_bytes(raw)
+
+    cdef void _reset_view(self) noexcept:
+        self._indexed = False
+        self._pcount = 0
+        self._copy_len = 0
+        self._keys = None
+        self._values = None
 
     cdef void bind_bytes(self, object raw) noexcept:
         self._raw = raw if raw else b""
         self._owner = None
         self._off = 0
         self._len = PyBytes_GET_SIZE(self._raw) if self._raw else 0
-        self._keys = None
-        self._values = None
+        self._reset_view()
 
     cdef void bind_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
-        """Point at request-arena query bytes; ``get`` scans without a dict."""
+        """Point at request-arena query bytes until the first read copies them."""
         self._raw = None
         self._owner = owner
         self._off = off
         self._len = n
-        self._keys = None
-        self._values = None
+        self._reset_view()
 
     cdef bint _resolve_span(self, const char** out, Py_ssize_t* n) noexcept:
         cdef RequestExchange owner
@@ -596,7 +708,118 @@ cdef class ParsedQuery:
         out[0] = NULL
         return False
 
+    cdef int _grow_params(self, Py_ssize_t need) except -1:
+        cdef Py_ssize_t cap = self._pcap
+        cdef void* p
+        if cap >= need:
+            return 0
+        if cap == 0:
+            cap = QUERY_PARAM_INIT
+        while cap < need:
+            cap *= 2
+        if self._params == NULL:
+            p = PyMem_Malloc(<size_t>cap * sizeof(RawQueryParam))
+        else:
+            p = PyMem_Realloc(self._params, <size_t>cap * sizeof(RawQueryParam))
+        if p == NULL:
+            raise MemoryError()
+        self._params = <RawQueryParam*>p
+        self._pcap = cap
+        return 0
+
+    cdef int _ensure_copy(self, const char* src, Py_ssize_t n) except -1:
+        cdef void* p
+        if n <= 0:
+            self._copy_len = 0
+            return 0
+        if self._copy_cap < n:
+            if self._copy == NULL:
+                p = PyMem_Malloc(<size_t>n)
+            else:
+                p = PyMem_Realloc(self._copy, <size_t>n)
+            if p == NULL:
+                raise MemoryError()
+            self._copy = <char*>p
+            self._copy_cap = n
+        memcpy(self._copy, src, <size_t>n)
+        self._copy_len = n
+        return 0
+
+    cdef void _ensure_index(self) except *:
+        cdef const char* src = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        cdef Py_ssize_t name_len
+        cdef char* buf
+        cdef RawQueryParam* param
+        if self._indexed:
+            return
+        self._pcount = 0
+        if self._resolve_span(&src, &n) and src != NULL and n > 0:
+            self._ensure_copy(src, n)
+            buf = self._copy
+            while _next_query_pair(
+                buf, n, &i, &name_start, &name_end, &val_start, &val_end
+            ):
+                self._grow_params(self._pcount + 1)
+                param = &self._params[self._pcount]
+                name_len = name_end - name_start
+                param.name_off = name_start
+                param.value_off = val_start
+                param.value_len = val_end - val_start
+                param.flags = 0
+                if (
+                    name_len > 0
+                    and _span_needs_unquote(buf + name_start, name_len)
+                    and _span_all_ascii(buf + name_start, name_len)
+                ):
+                    name_len = _query_unquote_ascii_inplace(
+                        buf + name_start, name_len
+                    )
+                    param.flags = QUERY_NAME_INPLACE
+                param.name_len = name_len
+                self._pcount += 1
+        self._raw = None
+        self._owner = None
+        self._off = 0
+        self._indexed = True
+
+    cdef object _decode_name_at(self, Py_ssize_t i):
+        cdef RawQueryParam* param = &self._params[i]
+        cdef const char* name = self._copy + param.name_off
+        cdef Py_ssize_t nlen = param.name_len
+        if param.flags & QUERY_NAME_INPLACE:
+            if _span_all_ascii(name, nlen):
+                return _decode_latin1(name, nlen)
+            return _decode_utf8_replace(name, nlen)
+        return _decode_query_component(name, nlen)
+
+    cdef object _decode_value_at(self, Py_ssize_t i):
+        cdef RawQueryParam* param = &self._params[i]
+        return _decode_query_component(
+            self._copy + param.value_off, param.value_len
+        )
+
     cdef void _ensure(self) except *:
+        cdef Py_ssize_t i
+        cdef list keys
+        cdef list values
+        if self._keys is not None:
+            return
+        self._ensure_index()
+        keys = []
+        values = []
+        for i in range(self._pcount):
+            keys.append(self._decode_name_at(i))
+            values.append(self._decode_value_at(i))
+        self._keys = keys
+        self._values = values
+
+    cdef void _ensure_eager_lists(self) except *:
         cdef const char* s = NULL
         cdef Py_ssize_t n = 0
         cdef list keys
@@ -614,81 +837,69 @@ cdef class ParsedQuery:
         self._off = 0
         self._len = 0
 
-    cdef object _scan_get(self, object key, object default):
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t name_start
-        cdef Py_ssize_t name_end
-        cdef Py_ssize_t val_start
-        cdef Py_ssize_t val_end
-        if not self._resolve_span(&s, &n) or s == NULL:
+    cdef object _index_get(self, object key, object default):
+        cdef const char* kbuf
+        cdef Py_ssize_t klen
+        cdef Py_ssize_t i
+        cdef char* buf
+        self._ensure_index()
+        if self._pcount == 0:
             return default
-        while _next_query_pair(
-            s, n, &i, &name_start, &name_end, &val_start, &val_end
-        ):
-            if _decode_query_component(
-                s + name_start, name_end - name_start
-            ) == key:
-                return _decode_query_component(s + val_start, val_end - val_start)
+        kbuf = PyUnicode_AsUTF8AndSize(key, &klen)
+        if kbuf == NULL:
+            raise
+        buf = self._copy
+        for i in range(self._pcount):
+            if _query_name_matches(
+                buf, &self._params[i], kbuf, klen, key
+            ):
+                return self._decode_value_at(i)
         return default
 
-    cdef list _scan_getlist(self, object key):
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t name_start
-        cdef Py_ssize_t name_end
-        cdef Py_ssize_t val_start
-        cdef Py_ssize_t val_end
+    cdef list _index_getlist(self, object key):
+        cdef const char* kbuf
+        cdef Py_ssize_t klen
+        cdef Py_ssize_t i
+        cdef char* buf
         cdef list out = []
-        if not self._resolve_span(&s, &n) or s == NULL:
+        self._ensure_index()
+        if self._pcount == 0:
             return out
-        while _next_query_pair(
-            s, n, &i, &name_start, &name_end, &val_start, &val_end
-        ):
-            if _decode_query_component(
-                s + name_start, name_end - name_start
-            ) == key:
-                out.append(
-                    _decode_query_component(s + val_start, val_end - val_start)
-                )
+        kbuf = PyUnicode_AsUTF8AndSize(key, &klen)
+        if kbuf == NULL:
+            raise
+        buf = self._copy
+        for i in range(self._pcount):
+            if _query_name_matches(
+                buf, &self._params[i], kbuf, klen, key
+            ):
+                out.append(self._decode_value_at(i))
         return out
 
-    cdef bint _scan_contains(self, object key):
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t name_start
-        cdef Py_ssize_t name_end
-        cdef Py_ssize_t val_start
-        cdef Py_ssize_t val_end
-        if not self._resolve_span(&s, &n) or s == NULL:
+    cdef bint _index_contains(self, object key) except -1:
+        cdef const char* kbuf
+        cdef Py_ssize_t klen
+        cdef Py_ssize_t i
+        cdef char* buf
+        self._ensure_index()
+        if self._pcount == 0:
             return False
-        while _next_query_pair(
-            s, n, &i, &name_start, &name_end, &val_start, &val_end
-        ):
-            if _decode_query_component(
-                s + name_start, name_end - name_start
-            ) == key:
+        kbuf = PyUnicode_AsUTF8AndSize(key, &klen)
+        if kbuf == NULL:
+            raise
+        buf = self._copy
+        for i in range(self._pcount):
+            if _query_name_matches(
+                buf, &self._params[i], kbuf, klen, key
+            ):
                 return True
         return False
 
-    cdef bint _has_any(self):
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t name_start
-        cdef Py_ssize_t name_end
-        cdef Py_ssize_t val_start
-        cdef Py_ssize_t val_end
+    cdef bint _has_any(self) except -1:
         if self._keys is not None:
             return PyList_GET_SIZE(self._keys) != 0
-        if not self._resolve_span(&s, &n) or s == NULL:
-            return False
-        return _next_query_pair(
-            s, n, &i, &name_start, &name_end, &val_start, &val_end
-        ) != 0
+        self._ensure_index()
+        return self._pcount != 0
 
     cdef object _list_get(self, object key, object default):
         cdef Py_ssize_t i
@@ -722,27 +933,27 @@ cdef class ParsedQuery:
             return default
         if self._keys is not None:
             return self._list_get(key, default)
-        return self._scan_get(key, default)
+        return self._index_get(key, default)
 
     def getlist(self, key):
         if not isinstance(key, str):
             return []
         if self._keys is not None:
             return self._list_getlist(key)
-        return self._scan_getlist(key)
+        return self._index_getlist(key)
 
     def _get_eager(self, key, default=None):
-        """Parse every pair, then list-scan. Benchmark baseline only."""
+        """Parse every pair into Python lists, then list-scan. Bench only."""
         if not isinstance(key, str):
             return default
-        self._ensure()
+        self._ensure_eager_lists()
         return self._list_get(key, default)
 
     def _getlist_eager(self, key):
-        """Parse every pair, then collect matches. Benchmark baseline only."""
+        """Parse every pair into Python lists, then collect. Bench only."""
         if not isinstance(key, str):
             return []
-        self._ensure()
+        self._ensure_eager_lists()
         return self._list_getlist(key)
 
     def items(self):
@@ -813,7 +1024,7 @@ cdef class ParsedQuery:
                 if <object>PyList_GET_ITEM(keys, i) == key:
                     return True
             return False
-        return self._scan_contains(key)
+        return self._index_contains(key)
 
     def __bool__(self):
         return self._has_any()

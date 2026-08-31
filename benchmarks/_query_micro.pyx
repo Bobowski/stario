@@ -1,5 +1,5 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
-"""Tight loops for query scan vs eager parse-all."""
+"""Tight loops for query index vs eager parse-all."""
 
 from stario_cython.exchange import ParsedQuery
 

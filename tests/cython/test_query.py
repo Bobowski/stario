@@ -24,6 +24,8 @@ CASES = [
     b"a=1&b=2&a=3",
     b"hello+world=x+y",
     b"x=%20%2B%20",
+    b"caf%C3%A9=1",
+    b"k00=v00&k01=v01&k02=v02&k03=v03&k04=v04&k05=v05&k06=v06&k07=v07&k08=v08&k09=v09",
 ]
 
 

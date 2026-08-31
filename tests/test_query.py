@@ -56,3 +56,29 @@ def test_first_get_then_as_dict() -> None:
     assert qp.get("a") == "1"
     assert qp.as_dict() == {"a": "1"}
     assert qp.as_lists() == {"a": ["1", "2"]}
+
+
+def test_ten_params_are_linear_gets() -> None:
+    raw = b"&".join(f"k{i:02d}=v{i:02d}".encode() for i in range(10))
+    qp = ParsedQuery(raw)
+    for i in range(10):
+        assert qp.get(f"k{i:02d}") == f"v{i:02d}"
+    assert qp.get("k00") == "v00"
+    assert qp.get("missing") is None
+
+
+def test_inplace_name_plus_and_percent() -> None:
+    qp = ParsedQuery(b"a+b=c&caf%C3%A9=1&x=%20y")
+    assert qp.get("a b") == "c"
+    assert qp.get("café") == "1"
+    assert qp.get("x") == " y"
+    assert qp.getlist("a b") == ["c"]
+
+
+def test_rebind_drops_index() -> None:
+    qp = ParsedQuery(b"a=1&b=2")
+    assert qp.get("a") == "1"
+    qp.__init__(b"c=3")
+    assert qp.get("a") is None
+    assert qp.get("c") == "3"
+    assert "b" not in qp
