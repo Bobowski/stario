@@ -24,7 +24,7 @@ TARGETS=(
 )
 TARGET_LABELS=(
   "stario|Stario (Python httptools)"
-  "stario-cython|Stario (Cython llhttp)"
+  "stario-cython|Stario (Cython llhttp/nghttp2)"
   "socketify|Socketify (uWebSockets/libuv)"
   "robyn|Robyn (Rust/Actix)"
   "granian-rsgi|Granian RSGI (Rust, no framework)"

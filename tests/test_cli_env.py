@@ -21,6 +21,7 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     assert config.unix_socket == "/tmp/stario.sock"
     assert config.graceful_shutdown_timeout == 12.5
     assert config.reuse_addr is False
+    assert config.ssl is None
 
 
 @pytest.mark.parametrize(

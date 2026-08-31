@@ -71,6 +71,7 @@ extensions = [
             "vendor/llhttp/src/stario_alloc.c",
         ],
         include_dirs=["vendor/llhttp/include", "vendor", "src"],
+        libraries=["nghttp2"],
         extra_compile_args=["-O3", "-fno-strict-aliasing"],
     ),
 ]

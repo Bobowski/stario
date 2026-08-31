@@ -1,5 +1,5 @@
 from libc.stddef cimport size_t
-from libc.stdint cimport uint32_t, uint64_t
+from libc.stdint cimport int32_t, uint32_t, uint64_t
 
 from stario_cython.compression_buf cimport StarioBrotli, StarioGzip
 from stario_cython.headers cimport Headers
@@ -18,7 +18,10 @@ cdef class Request:
     cdef public object headers
     cdef public object protocol_version
     cdef public bint keep_alive
-    cdef public object query_bytes
+    cdef object _query_bytes
+    cdef object _q_owner
+    cdef Py_ssize_t _q_off
+    cdef Py_ssize_t _q_len
     cdef public object _body
     cdef object _query
     cdef object _cookies
@@ -34,6 +37,8 @@ cdef class Request:
         object headers,
         object body,
     )
+    cdef object _materialize_query(self)
+    cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept
 
 cdef class RequestExchange:
     cdef object _transport
@@ -42,6 +47,7 @@ cdef class RequestExchange:
     cdef int _req_encoding
     cdef bint _req_expect_continue
     cdef bint _req_connection_close
+    cdef Py_ssize_t _req_content_length
     cdef char* _req_arena
     cdef Py_ssize_t _req_arena_len
     cdef Py_ssize_t _req_arena_cap
@@ -107,6 +113,17 @@ cdef class RequestExchange:
     cdef int _abort_reason
     cdef bint _body_active
     cdef bint _body_complete
+    cdef bint _http2
+    cdef int32_t _h2_stream_id
+    cdef object _h2_pending
+    cdef Py_ssize_t _h2_pending_off
+    cdef bint _h2_body_done
+    cdef object _h2_method
+    cdef bint _h2_dispatched
+    cdef bint _h2_headers_done
+    cdef bint _h2_headers_sent
+    cdef object _h2_date_line
+    cdef object _h2_date_bare
     cdef bint _expect_continue
     cdef bint _waiting
     cdef bint _discard_body
@@ -126,6 +143,9 @@ cdef class RequestExchange:
         int max_body_size,
         double body_timeout,
     ) noexcept
+    cdef void bind_http2(self, int32_t stream_id) noexcept
+    cdef object _h2_date_value(self)
+    cdef void _h2_respond(self, object body, object content_type, int status, Py_ssize_t nbytes)
     cdef void start_response(self)
     cdef void handler_finished(self)
     cdef void cancel_before_start(self)
@@ -139,7 +159,15 @@ cdef class RequestExchange:
     cdef int append_request_url(self, const char* data, size_t length) noexcept
     cdef int append_request_header_name(self, const char* data, size_t length) noexcept
     cdef int append_request_header_value(self, const char* data, size_t length) noexcept
+    cdef int append_request_header(
+        self,
+        const char* name,
+        size_t name_length,
+        const char* value,
+        size_t value_length,
+    ) noexcept
     cdef int finish_request_header(self) noexcept
+    cdef int _commit_request_header(self) noexcept
     cdef void _scan_request_accept_encoding(
         self,
         const char* value,

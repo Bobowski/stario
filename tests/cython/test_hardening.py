@@ -118,6 +118,53 @@ async def test_invalid_incoming_header_names_return_400() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"GET / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip\r\n\r\n",
+        b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+    ],
+    ids=["duplicate_content_length", "unsupported_te", "cl_plus_te"],
+)
+async def test_invalid_content_length_or_transfer_encoding_returns_400(
+    payload: bytes,
+) -> None:
+    proto, app, transport = _attach()
+    try:
+        proto.data_received(payload)
+        await _drain(app)
+        assert response_status(transport.writes) == 400
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_split_headers_then_body() -> None:
+    app = App()
+    bodies: list[bytes] = []
+
+    async def echo(c, w) -> None:
+        bodies.append(await c.req.body())
+        responses.text(w, "ok")
+
+    app.post("/", echo)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n")
+        proto.data_received(b"\r\nhello")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert bodies == [b"hello"]
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
 async def test_invalid_incoming_header_values_return_400() -> None:
     proto, app, transport = _attach()
     try:
