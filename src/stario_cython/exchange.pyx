@@ -804,21 +804,6 @@ cdef class ParsedQuery:
             self._copy + param.value_off, param.value_len
         )
 
-    cdef void _ensure(self) except *:
-        cdef Py_ssize_t i
-        cdef list keys
-        cdef list values
-        if self._keys is not None:
-            return
-        self._ensure_index()
-        keys = []
-        values = []
-        for i in range(self._pcount):
-            keys.append(self._decode_name_at(i))
-            values.append(self._decode_value_at(i))
-        self._keys = keys
-        self._values = values
-
     cdef void _ensure_eager_lists(self) except *:
         cdef const char* s = NULL
         cdef Py_ssize_t n = 0
@@ -837,22 +822,21 @@ cdef class ParsedQuery:
         self._off = 0
         self._len = 0
 
+    cdef bint _name_eq(self, Py_ssize_t i, const char* kbuf, Py_ssize_t klen, object key) except -1:
+        return _query_name_matches(self._copy, &self._params[i], kbuf, klen, key)
+
     cdef object _index_get(self, object key, object default):
         cdef const char* kbuf
         cdef Py_ssize_t klen
         cdef Py_ssize_t i
-        cdef char* buf
         self._ensure_index()
         if self._pcount == 0:
             return default
         kbuf = PyUnicode_AsUTF8AndSize(key, &klen)
         if kbuf == NULL:
             raise
-        buf = self._copy
         for i in range(self._pcount):
-            if _query_name_matches(
-                buf, &self._params[i], kbuf, klen, key
-            ):
+            if self._name_eq(i, kbuf, klen, key):
                 return self._decode_value_at(i)
         return default
 
@@ -860,7 +844,6 @@ cdef class ParsedQuery:
         cdef const char* kbuf
         cdef Py_ssize_t klen
         cdef Py_ssize_t i
-        cdef char* buf
         cdef list out = []
         self._ensure_index()
         if self._pcount == 0:
@@ -868,11 +851,8 @@ cdef class ParsedQuery:
         kbuf = PyUnicode_AsUTF8AndSize(key, &klen)
         if kbuf == NULL:
             raise
-        buf = self._copy
         for i in range(self._pcount):
-            if _query_name_matches(
-                buf, &self._params[i], kbuf, klen, key
-            ):
+            if self._name_eq(i, kbuf, klen, key):
                 out.append(self._decode_value_at(i))
         return out
 
@@ -880,24 +860,18 @@ cdef class ParsedQuery:
         cdef const char* kbuf
         cdef Py_ssize_t klen
         cdef Py_ssize_t i
-        cdef char* buf
         self._ensure_index()
         if self._pcount == 0:
             return False
         kbuf = PyUnicode_AsUTF8AndSize(key, &klen)
         if kbuf == NULL:
             raise
-        buf = self._copy
         for i in range(self._pcount):
-            if _query_name_matches(
-                buf, &self._params[i], kbuf, klen, key
-            ):
+            if self._name_eq(i, kbuf, klen, key):
                 return True
         return False
 
     cdef bint _has_any(self) except -1:
-        if self._keys is not None:
-            return PyList_GET_SIZE(self._keys) != 0
         self._ensure_index()
         return self._pcount != 0
 
@@ -931,15 +905,11 @@ cdef class ParsedQuery:
     def get(self, key, default=None):
         if not isinstance(key, str):
             return default
-        if self._keys is not None:
-            return self._list_get(key, default)
         return self._index_get(key, default)
 
     def getlist(self, key):
         if not isinstance(key, str):
             return []
-        if self._keys is not None:
-            return self._list_getlist(key)
         return self._index_getlist(key)
 
     cdef object _scan_get(self, object key, object default):
@@ -1011,71 +981,40 @@ cdef class ParsedQuery:
 
     def items(self):
         cdef Py_ssize_t i
-        cdef Py_ssize_t n
-        cdef list keys
-        cdef list values
         cdef list out = []
-        self._ensure()
-        keys = self._keys
-        values = self._values
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            out.append((
-                <object>PyList_GET_ITEM(keys, i),
-                <object>PyList_GET_ITEM(values, i),
-            ))
+        self._ensure_index()
+        for i in range(self._pcount):
+            out.append((self._decode_name_at(i), self._decode_value_at(i)))
         return out
 
     def as_dict(self, *, last=False):
         cdef dict out = {}
         cdef Py_ssize_t i
-        cdef Py_ssize_t n
         cdef object key
-        cdef list keys
-        cdef list values
-        self._ensure()
-        keys = self._keys
-        values = self._values
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            key = <object>PyList_GET_ITEM(keys, i)
+        self._ensure_index()
+        for i in range(self._pcount):
+            key = self._decode_name_at(i)
             if last or key not in out:
-                out[key] = <object>PyList_GET_ITEM(values, i)
+                out[key] = self._decode_value_at(i)
         return out
 
     def as_lists(self):
         cdef dict out = {}
         cdef Py_ssize_t i
-        cdef Py_ssize_t n
         cdef object key
         cdef list existing
-        cdef list keys
-        cdef list values
-        self._ensure()
-        keys = self._keys
-        values = self._values
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            key = <object>PyList_GET_ITEM(keys, i)
+        self._ensure_index()
+        for i in range(self._pcount):
+            key = self._decode_name_at(i)
             existing = out.get(key)
             if existing is None:
-                out[key] = [<object>PyList_GET_ITEM(values, i)]
+                out[key] = [self._decode_value_at(i)]
             else:
-                existing.append(<object>PyList_GET_ITEM(values, i))
+                existing.append(self._decode_value_at(i))
         return out
 
     def __contains__(self, key):
-        cdef Py_ssize_t i
-        cdef Py_ssize_t n
-        cdef list keys
         if not isinstance(key, str):
-            return False
-        if self._keys is not None:
-            keys = self._keys
-            n = PyList_GET_SIZE(keys)
-            for i in range(n):
-                if <object>PyList_GET_ITEM(keys, i) == key:
-                    return True
             return False
         return self._index_contains(key)
 
@@ -1085,13 +1024,9 @@ cdef class ParsedQuery:
     def __len__(self):
         cdef set seen = set()
         cdef Py_ssize_t i
-        cdef Py_ssize_t n
-        cdef list keys
-        self._ensure()
-        keys = self._keys
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            seen.add(<object>PyList_GET_ITEM(keys, i))
+        self._ensure_index()
+        for i in range(self._pcount):
+            seen.add(self._decode_name_at(i))
         return len(seen)
 
     def __eq__(self, other):

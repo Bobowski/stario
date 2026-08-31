@@ -1,8 +1,7 @@
-"""Request protocol and small host/limit helpers.
+"""Request protocol and body-size / timeout defaults.
 
 Runtime ``Request`` and ``ParsedCookies`` are Cython types from
-``stario_cython.exchange``. ``host_without_port`` and the default size/timeout
-constants stay here because config and the protocol import them.
+``stario_cython.exchange``. Host parsing lives in ``stario.http.host``.
 """
 
 from __future__ import annotations
