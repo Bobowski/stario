@@ -6,6 +6,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 4.1.1 - 2026-08-31
+
 ### Fixed
 
 - `data.bind()` with `prop` or `event` — emit a key-only attribute. Datastar bind is exclusive (signal in the key or the value, not both); the previous form also set the value and Datastar raised `KeyAndValueProvided`.
