@@ -218,7 +218,6 @@ cdef class RequestExchange:
 
 cdef class RequestHeaders(Headers):
     cdef object _owner
-    cdef bint _request_materialized
 
     cdef object c_get(self, object name)
     cdef object c_get_n(self, const char* query, Py_ssize_t query_length)
@@ -227,7 +226,6 @@ cdef class RequestHeaders(Headers):
     cdef void c_add(self, object name, object value)
     cdef void c_remove(self, object name)
     cdef void c_clear(self)
-    cdef void c_reset(self) noexcept
     cdef object c_request_host(self)
     cdef object c_request_indexed(self, Py_ssize_t index)
     cdef void c_parse_cookies(self, dict out) except *

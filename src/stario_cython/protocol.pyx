@@ -308,6 +308,31 @@ cdef int _preface_append(object hold, const char* p, Py_ssize_t n) noexcept:
     return 0
 
 
+cdef bint _trailing_slash_redirect(
+    const char* url,
+    Py_ssize_t n,
+    Py_ssize_t* start,
+    Py_ssize_t* end,
+    Py_ssize_t* path_end,
+) noexcept:
+    """True when the path has a trailing slash that should 308."""
+    cdef Py_ssize_t i
+    path_end[0] = n
+    for i in range(n):
+        if url[i] == 63:
+            path_end[0] = i
+            break
+    if path_end[0] <= 1 or url[path_end[0] - 1] != 47:
+        return False
+    start[0] = 0
+    end[0] = path_end[0]
+    while start[0] < end[0] and url[start[0]] == 47:
+        start[0] += 1
+    while end[0] > start[0] and url[end[0] - 1] == 47:
+        end[0] -= 1
+    return True
+
+
 cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
 cdef int F_TRANSFER_ENCODING = 0x200
@@ -1050,19 +1075,14 @@ cdef class HttpProtocol:
             p = PyByteArray_AS_STRING(self.preface_hold)
             n = PyByteArray_GET_SIZE(self.preface_hold)
             from_hold = True
-        elif n > 0 and n < H2_PREFACE_LEN and memcmp(p, pref, <size_t>n) == 0:
-            if _preface_append(self.preface_hold, p, n) != 0:
-                self._close_error(500, "Internal Server Error")
-            return False
         if n >= H2_PREFACE_LEN and memcmp(p, pref, <size_t>H2_PREFACE_LEN) == 0:
+            self._start_h2()
             if from_hold:
-                self._start_h2()
                 self._h2_recv(p, <size_t>n)
                 self.preface_hold.clear()
                 return False
-            self._start_h2()
             return True
-        if n < H2_PREFACE_LEN and n > 0 and memcmp(p, pref, <size_t>n) == 0:
+        if n > 0 and n < H2_PREFACE_LEN and memcmp(p, pref, <size_t>n) == 0:
             if not from_hold:
                 if _preface_append(self.preface_hold, p, n) != 0:
                     self._close_error(500, "Internal Server Error")
@@ -1194,15 +1214,12 @@ cdef class HttpProtocol:
             return True
         return False
 
-    cdef void _on_message_begin(self) noexcept:
-        cdef RequestExchange exchange
-        if self.rejected:
-            return
-        exchange = self.idle_exchange
-        if exchange is not None:
+    cdef RequestExchange _take_exchange(self):
+        """Reuse the idle exchange or take one from the global pool."""
+        cdef RequestExchange ex = self.idle_exchange
+        if ex is not None:
             self.idle_exchange = None
-            self.reading_exchange = exchange
-            exchange.reset(
+            ex.reset(
                 self,
                 self.app,
                 self.transport,
@@ -1211,22 +1228,27 @@ cdef class HttpProtocol:
                 self.max_body_bytes,
                 self.body_timeout,
             )
-        else:
-            # Pool miss: constructing an exchange can raise. Keepalive reuse
-            # above is noexcept.
-            try:
-                self.reading_exchange = acquire_exchange(
-                    self,
-                    self.app,
-                    self.transport,
-                    self.date_box,
-                    self.compression,
-                    self.max_body_bytes,
-                    self.body_timeout,
-                )
-            except Exception:
-                self._close_error(400, "Invalid HTTP request")
-                return
+            return ex
+        return acquire_exchange(
+            self,
+            self.app,
+            self.transport,
+            self.date_box,
+            self.compression,
+            self.max_body_bytes,
+            self.body_timeout,
+        )
+
+    cdef void _on_message_begin(self) noexcept:
+        if self.rejected:
+            return
+        # Pool miss: constructing an exchange can raise. Keepalive reuse
+        # in ``_take_exchange`` is noexcept.
+        try:
+            self.reading_exchange = self._take_exchange()
+        except Exception:
+            self._close_error(400, "Invalid HTTP request")
+            return
         self.head_bytes = 40
         self.request_dispatched = False
         self.request_keep_alive = True
@@ -1436,7 +1458,6 @@ cdef class HttpProtocol:
         cdef object loc
         cdef const char* url
         cdef Py_ssize_t n
-        cdef Py_ssize_t i
         cdef Py_ssize_t path_end
         cdef Py_ssize_t start
         cdef Py_ssize_t end
@@ -1445,63 +1466,19 @@ cdef class HttpProtocol:
         n = exchange._req_url_length
         if n > 1:
             url = exchange._req_arena + exchange._req_url_offset
-            path_end = n
-            for i in range(n):
-                if url[i] == 63:
-                    path_end = i
-                    break
-            if path_end > 1 and url[path_end - 1] == 47:
-                start = 0
-                end = path_end
-                while start < end and url[start] == 47:
-                    start += 1
-                while end > start and url[end - 1] == 47:
-                    end -= 1
-                if exchange._http2:
-                    loc = b"/"
-                    if end > start:
-                        loc = loc + PyBytes_FromStringAndSize(
-                            url + start, end - start
-                        )
-                    if path_end + 1 < n:
-                        loc = loc + b"?" + PyBytes_FromStringAndSize(
-                            url + path_end + 1, n - path_end - 1
-                        )
-                    exchange.start_response()
-                    exchange.headers.set("location", loc.decode("latin-1"))
-                    if self.noop_span is None:
-                        req = exchange.req
-                        finish_request_span(
-                            exchange.span,
-                            status=308,
-                            method=req.method,
-                            path=req.path,
-                        )
-                    exchange.respond(b"", b"text/plain; charset=utf-8", 308)
-                    exchange.handler_finished()
-                    return
-                exchange.start_response()
-                exchange._buf_bytes(_status_line(308))
-                exchange._buf_bytes(exchange._date_box[0])
-                exchange._buf_bytes(b"location: /")
+            if _trailing_slash_redirect(url, n, &start, &end, &path_end):
+                loc = b"/"
                 if end > start:
-                    exchange._buf_add(url + start, end - start)
+                    loc = loc + PyBytes_FromStringAndSize(url + start, end - start)
                 if path_end + 1 < n:
-                    exchange._buf_bytes(b"?")
-                    exchange._buf_add(url + path_end + 1, n - path_end - 1)
-                exchange._buf_bytes(b"\r\ncontent-length: 0\r\n\r\n")
-                exchange._flush()
-                exchange._status_code = 308
-                exchange._completed = True
-                if self.noop_span is None:
-                    req = exchange.req
-                    finish_request_span(
-                        exchange.span,
-                        status=308,
-                        method=req.method,
-                        path=req.path,
+                    loc = loc + b"?" + PyBytes_FromStringAndSize(
+                        url + path_end + 1, n - path_end - 1
                     )
-                exchange._done()
+                exchange.start_response()
+                exchange.headers.set("location", loc.decode("latin-1"))
+                req = exchange.req
+                self._finish_protocol_span(308, exchange.span, req.method, req.path)
+                exchange.respond(b"", b"text/plain; charset=utf-8", 308)
                 exchange.handler_finished()
                 return
         exchange.start_response()
@@ -1753,42 +1730,41 @@ cdef class HttpProtocol:
         if rv < 0:
             self._close_error(400, "Invalid HTTP request")
             return
-        self._h2_release_connection_window(True)
+        self._h2_window_update(0, True)
         self._h2_send()
 
-    cdef void _h2_consume_stream(self, int32_t stream_id, bint force=False) noexcept:
+    cdef void _h2_window_update(self, int32_t stream_id, bint force=False) noexcept:
+        """Ack recv credit. ``stream_id == 0`` is the connection window.
+
+        Batching alone never fires for small POSTs; force-ack so keep-alive
+        cannot stall once the window is exhausted.
+        """
         cdef int32_t unacked
-        cdef int32_t local
+        cdef int32_t local = 0
+        cdef int thresh
         if self.h2 == NULL:
             return
-        unacked = nghttp2_session_get_stream_effective_recv_data_length(
-            self.h2, stream_id
-        )
+        if stream_id == 0:
+            unacked = nghttp2_session_get_effective_recv_data_length(self.h2)
+            thresh = H2_CONN_UPDATE_THRESH
+            if not force:
+                local = nghttp2_session_get_local_window_size(self.h2)
+        else:
+            unacked = nghttp2_session_get_stream_effective_recv_data_length(
+                self.h2, stream_id
+            )
+            thresh = H2_STREAM_UPDATE_THRESH
+            if not force:
+                local = nghttp2_session_get_stream_local_window_size(
+                    self.h2, stream_id
+                )
         if unacked <= 0:
             return
-        if not force:
-            local = nghttp2_session_get_stream_local_window_size(self.h2, stream_id)
-            if unacked < H2_STREAM_UPDATE_THRESH and local >= H2_STREAM_UPDATE_THRESH:
-                return
-        # consume() only emits WINDOW_UPDATE at 50% of the local window.
-        # Force-ack with submit so small keep-alive POSTs cannot stall.
+        if not force and unacked < thresh and local >= thresh:
+            return
         nghttp2_submit_window_update(
             self.h2, NGHTTP2_FLAG_NONE, stream_id, unacked
         )
-
-    cdef void _h2_release_connection_window(self, bint force=False) noexcept:
-        cdef int32_t unacked
-        cdef int32_t local
-        if self.h2 == NULL:
-            return
-        unacked = nghttp2_session_get_effective_recv_data_length(self.h2)
-        if unacked <= 0:
-            return
-        if not force:
-            local = nghttp2_session_get_local_window_size(self.h2)
-            if unacked < H2_CONN_UPDATE_THRESH and local >= H2_CONN_UPDATE_THRESH:
-                return
-        nghttp2_submit_window_update(self.h2, NGHTTP2_FLAG_NONE, 0, unacked)
 
     cdef int _h2_out_append(self, const char* src, Py_ssize_t n) noexcept:
         cdef object buf
@@ -1868,28 +1844,7 @@ cdef class HttpProtocol:
         cdef RequestExchange ex
         if stream_id in self.h2_streams:
             return
-        if self.idle_exchange is not None:
-            ex = self.idle_exchange
-            self.idle_exchange = None
-            ex.reset(
-                self,
-                self.app,
-                self.transport,
-                self.date_box,
-                self.compression,
-                self.max_body_bytes,
-                self.body_timeout,
-            )
-        else:
-            ex = acquire_exchange(
-                self,
-                self.app,
-                self.transport,
-                self.date_box,
-                self.compression,
-                self.max_body_bytes,
-                self.body_timeout,
-            )
+        ex = self._take_exchange()
         ex.bind_http2(stream_id)
         self.h2_streams[stream_id] = ex
         if self.h2 != NULL:
@@ -1944,7 +1899,7 @@ cdef class HttpProtocol:
                 self.h2, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_INTERNAL_ERROR
             )
             return
-        self._h2_consume_stream(stream_id)
+        self._h2_window_update(stream_id)
         if (
             not ex._h2_dispatched
             and not self.rejected
@@ -1994,7 +1949,7 @@ cdef class HttpProtocol:
         # Return recv credit for this stream (and the connection share).
         # Batching alone never fires for small POSTs; without this, keep-alive
         # stalls once the connection window is exhausted.
-        self._h2_consume_stream(stream_id, True)
+        self._h2_window_update(stream_id, True)
         if ex is None:
             return
         if ex._body_active and not ex._body_complete:
@@ -2035,16 +1990,16 @@ cdef class HttpProtocol:
         cdef Py_ssize_t avail
         cdef Py_ssize_t take
         cdef object pending
+        cdef const char* src = NULL
+        cdef Py_ssize_t n = 0
         if ex is None:
             data_flags[0] |= NGHTTP2_DATA_FLAG_EOF
             return 0
         pending = ex._h2_pending
         if pending is None or pending == b"":
             avail = 0
-        elif PyByteArray_Check(pending):
-            avail = PyByteArray_GET_SIZE(pending) - ex._h2_pending_off
-        elif PyBytes_Check(pending):
-            avail = PyBytes_GET_SIZE(pending) - ex._h2_pending_off
+        elif _as_buf(pending, &src, &n):
+            avail = n - ex._h2_pending_off
         else:
             avail = 0
         if avail <= 0:
@@ -2083,17 +2038,11 @@ cdef class HttpProtocol:
             return 0
         pending = ex._h2_pending
         off = ex._h2_pending_off
-        if PyBytes_Check(pending):
-            n = PyBytes_GET_SIZE(pending)
-            src = PyBytes_AS_STRING(pending) + off
-        elif PyByteArray_Check(pending):
-            n = PyByteArray_GET_SIZE(pending)
-            src = PyByteArray_AS_STRING(pending) + off
-        else:
+        if not _as_buf(pending, &src, &n):
             return NGHTTP2_ERR_CALLBACK_FAILURE
         if off < 0 or off + <Py_ssize_t>length > n:
             return NGHTTP2_ERR_CALLBACK_FAILURE
-        if self._h2_out_append(src, <Py_ssize_t>length) != 0:
+        if self._h2_out_append(src + off, <Py_ssize_t>length) != 0:
             return NGHTTP2_ERR_CALLBACK_FAILURE
         ex._h2_pending_off = off + <Py_ssize_t>length
         if ex._h2_pending_off >= n:
@@ -2320,11 +2269,7 @@ cdef class HttpProtocol:
         self._h2_send()
 
     def h2_end(self, RequestExchange ex):
-        if self.h2 == NULL or ex is None:
-            return
-        ex._h2_body_done = True
-        nghttp2_session_resume_data(self.h2, ex._h2_stream_id)
-        self._h2_send()
+        self.h2_write_data(ex, None, True)
 
     def h2_abort(self, RequestExchange ex):
         if self.h2 == NULL or ex is None:

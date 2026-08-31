@@ -243,14 +243,6 @@ cdef object _intern_name(const char* src, size_t n):
     if n >= NAME_STACK:
         raise ValueError("Invalid header name: too long")
     _lower_copy(buf, src, n)
-    if n == 4 and memcmp(buf, "host", 4) == 0:
-        return _INTERN_PY[0]
-    if n == 10 and memcmp(buf, "connection", 10) == 0:
-        return _INTERN_PY[1]
-    if n == 15 and memcmp(buf, "accept-encoding", 15) == 0:
-        return _INTERN_PY[13]
-    if n == 6 and memcmp(buf, "expect", 6) == 0:
-        return _INTERN_PY[27]
     index = _intern_lookup(buf, n)
     if index < 0:
         return PyBytes_FromStringAndSize(buf, <Py_ssize_t>n)

@@ -99,7 +99,6 @@ cdef int ABORT_DISCONNECTED = 2
 cdef int ABORT_TIMEOUT = 3
 cdef int _TIMEOUT_MODE = 1
 cdef int _TIMEOUT_OFF = 0
-cdef int _TIMEOUT_SWEEP = 1
 
 
 def _bind_timeout_mode():
@@ -150,6 +149,36 @@ cdef inline void _require_bytes_like(object part):
         )
 
 
+cdef inline bint _range_equals_ci(
+    const char* value,
+    Py_ssize_t length,
+    const char* expected,
+    Py_ssize_t expected_length,
+) noexcept:
+    cdef Py_ssize_t i
+    cdef unsigned char c
+    if length != expected_length:
+        return False
+    for i in range(length):
+        c = <unsigned char>value[i]
+        if 65 <= c <= 90:
+            c += 32
+        if c != <unsigned char>expected[i]:
+            return False
+    return True
+
+
+cdef inline bint _range_starts_ci(
+    const char* value,
+    Py_ssize_t length,
+    const char* prefix,
+    Py_ssize_t prefix_length,
+) noexcept:
+    if length < prefix_length:
+        return False
+    return _range_equals_ci(value, prefix_length, prefix, prefix_length)
+
+
 cdef inline bint _token_equals(
     const char* value,
     size_t start,
@@ -157,17 +186,12 @@ cdef inline bint _token_equals(
     const char* token,
     size_t token_length,
 ) noexcept:
-    cdef size_t i
-    cdef unsigned char ch
-    if end - start != token_length:
-        return False
-    for i in range(token_length):
-        ch = <unsigned char>value[start + i]
-        if 65 <= ch <= 90:
-            ch += 32
-        if ch != <unsigned char>token[i]:
-            return False
-    return True
+    return _range_equals_ci(
+        value + start,
+        <Py_ssize_t>(end - start),
+        token,
+        <Py_ssize_t>token_length,
+    )
 
 
 cdef Py_ssize_t _parse_content_length(const char* s, size_t n) noexcept:
@@ -265,36 +289,6 @@ cdef int _parse_qvalue(
         q *= 10
         digits += 1
     return q
-
-
-cdef inline bint _range_equals_ci(
-    const char* value,
-    Py_ssize_t length,
-    const char* expected,
-    Py_ssize_t expected_length,
-) noexcept:
-    cdef Py_ssize_t i
-    cdef unsigned char c
-    if length != expected_length:
-        return False
-    for i in range(length):
-        c = <unsigned char>value[i]
-        if 65 <= c <= 90:
-            c += 32
-        if c != <unsigned char>expected[i]:
-            return False
-    return True
-
-
-cdef inline bint _range_starts_ci(
-    const char* value,
-    Py_ssize_t length,
-    const char* prefix,
-    Py_ssize_t prefix_length,
-) noexcept:
-    if length < prefix_length:
-        return False
-    return _range_equals_ci(value, prefix_length, prefix, prefix_length)
 
 
 cdef bint _content_type_is_compressible(object content_type):
@@ -1678,7 +1672,6 @@ cdef class RequestExchange:
             start = segment_end + 1
 
     cdef void _clear_request_headers(self) noexcept:
-        (<RequestHeaders>self.request_headers).c_reset()
         if (
             self._req_arena != NULL
             and self._req_arena_cap > REQUEST_ARENA_RETAIN_MAX
@@ -1743,12 +1736,6 @@ cdef class RequestExchange:
     cdef void bind_http2(self, int32_t stream_id) noexcept:
         self._http2 = True
         self._h2_stream_id = stream_id
-        self._h2_pending = b""
-        self._h2_pending_off = 0
-        self._h2_body_done = False
-        self._h2_dispatched = False
-        self._h2_headers_done = False
-        self._h2_headers_sent = False
 
     cdef void _clear_hot_request_headers(self) noexcept:
         self._req_encoding = ENCODING_NONE
@@ -2755,7 +2742,6 @@ cdef class RequestHeaders(Headers):
     def __init__(self, RequestExchange owner):
         Headers.__init__(self)
         self._owner = owner
-        self._request_materialized = False
 
     cdef object c_get(self, object name):
         cdef bytes key = name
@@ -2846,9 +2832,6 @@ cdef class RequestHeaders(Headers):
 
     cdef void c_clear(self):
         _raise_readonly_request_headers()
-
-    cdef void c_reset(self) noexcept:
-        self._request_materialized = False
 
     cdef object c_request_host(self):
         return self.c_request_indexed(
@@ -2961,7 +2944,7 @@ cdef class RequestHeaders(Headers):
     @property
     def materialized(self):
         """Always false: request headers stay an arena scan (never copied to a dict)."""
-        return self._request_materialized
+        return False
 
 
 cdef RequestExchange acquire_exchange(
