@@ -8,7 +8,7 @@ Three suites, one per layer we care about:
   servers and ASGI framework stacks under `wrk`.
 - `headers_micro.py` — Cython request-header storage tradeoffs: eager dict,
   current-style lazy dict, direct arena scans, and adaptive promotion.
-- `query_micro.py` — Cython query `get`: C-span index vs scan-on-get vs eager.
+- `query_micro.py` — Cython query `get` / `getlist` (production C-span index).
 
 The goal is repeatable local signal, not lab-grade numbers. Run on a quiet
 machine and compare repeated runs before drawing conclusions.
@@ -39,24 +39,18 @@ HEADERS_BENCH_JSON=/tmp/headers-micro.json \
 PYTHONPATH=src:. .venv/bin/python benchmarks/headers_micro.py
 ```
 
-## Query index vs scan vs eager (`query_micro.py`)
+## Query get (`query_micro.py`)
 
-Compares production `ParsedQuery.get` / `getlist` (copy query, index C spans,
-memcmp names, decode the value) with the previous scan-on-get path
-(`_get_scan`) and `_get_eager` (decode every name and value, then list-scan).
-Same decoder, pooled `ParsedQuery.__init__(raw)` per request.
+Times production `ParsedQuery.get` / `getlist` (copy query, index C spans,
+memcmp names, decode the value). Pooled `ParsedQuery.__init__(raw)` per request.
 
 ```bash
 PYTHONPATH=src:. .venv/bin/python benchmarks/query_micro.py
 ```
 
-Defaults are 80,000 requests and seven repeats. Latest three-way numbers:
-[`query-micro-index-20260831.md`](query-micro-index-20260831.md).
-[`query-micro-20260831.md`](query-micro-20260831.md) is the older
-scan-on-get vs eager matrix, kept for history.
-
-`QUERY_BENCH_MATRIX=1` or `--matrix` prints distinct-reads (K) × pair-count (N).
-That K is different parameter names on one query, not repeats of one name.
+Defaults are 80,000 requests and seven repeats. Older comparison notes:
+[`query-micro-index-20260831.md`](query-micro-index-20260831.md) (index vs
+scan vs eager) and [`query-micro-20260831.md`](query-micro-20260831.md).
 
 ## HTML generation (`html/`)
 

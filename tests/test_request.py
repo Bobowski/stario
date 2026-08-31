@@ -65,6 +65,12 @@ class TestRequestCookies:
         assert "session" in req.cookies
         assert bool(req.cookies) is True
 
+    def test_get_latin1_cookie_name(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", "café=1")
+        req = Request(method="GET", path="/", headers=hdrs, body=b"")
+        assert req.cookies.get("café") == "1"
+
 
 class TestRequestHost:
     def test_host_strips_port(self):

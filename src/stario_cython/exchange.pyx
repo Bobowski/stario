@@ -33,6 +33,7 @@ from cpython.unicode cimport (
     PyUnicode_AsUTF8AndSize,
     PyUnicode_DecodeLatin1,
     PyUnicode_DecodeUTF8,
+    PyUnicode_ReadChar,
 )
 
 from stario.exceptions import (
@@ -410,6 +411,29 @@ cdef object _decode_latin1(const char* s, Py_ssize_t n):
     return PyUnicode_DecodeLatin1(s, n, NULL)
 
 
+cdef int _latin1_stack(
+    object name,
+    char* buf,
+    Py_ssize_t cap,
+    Py_ssize_t* out_n,
+) except -1:
+    """Write a Latin-1 ``str`` into ``buf``. No Python ``bytes`` object."""
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n = len(name)
+    cdef unsigned int ch
+    if n > cap:
+        raise ValueError("name is too long")
+    for i in range(n):
+        ch = PyUnicode_ReadChar(name, i)
+        if ch > 255:
+            raise UnicodeEncodeError(
+                "latin-1", name, i, i + 1, "ordinal not in range(256)"
+            )
+        buf[i] = <char>ch
+    out_n[0] = n
+    return 0
+
+
 cdef object _unquote_plus_component(const char* s, Py_ssize_t n):
     """Match ``urllib.parse.unquote_plus`` on a Latin-1 query component."""
     cdef Py_ssize_t i = 0
@@ -566,26 +590,6 @@ cdef int _next_query_pair(
     return 0
 
 
-cdef int _fill_query_arrays(
-    const char* s,
-    Py_ssize_t n,
-    list keys,
-    list values,
-) except -1:
-    """One pass: decoded keys and values, same order as the wire."""
-    cdef Py_ssize_t i = 0
-    cdef Py_ssize_t name_start
-    cdef Py_ssize_t name_end
-    cdef Py_ssize_t val_start
-    cdef Py_ssize_t val_end
-    while _next_query_pair(
-        s, n, &i, &name_start, &name_end, &val_start, &val_end
-    ):
-        keys.append(_decode_query_component(s + name_start, name_end - name_start))
-        values.append(_decode_query_component(s + val_start, val_end - val_start))
-    return 0
-
-
 cdef enum:
     QUERY_PARAM_INIT = 16
     QUERY_NAME_INPLACE = 1
@@ -640,8 +644,6 @@ cdef class ParsedQuery:
     cdef Py_ssize_t _pcount
     cdef Py_ssize_t _pcap
     cdef bint _indexed
-    cdef list _keys
-    cdef list _values
 
     def __cinit__(self):
         self._raw = None
@@ -655,8 +657,6 @@ cdef class ParsedQuery:
         self._pcount = 0
         self._pcap = 0
         self._indexed = False
-        self._keys = None
-        self._values = None
 
     def __dealloc__(self):
         if self._copy != NULL:
@@ -673,8 +673,6 @@ cdef class ParsedQuery:
         self._indexed = False
         self._pcount = 0
         self._copy_len = 0
-        self._keys = None
-        self._values = None
 
     cdef void bind_bytes(self, object raw) noexcept:
         self._raw = raw if raw else b""
@@ -804,24 +802,6 @@ cdef class ParsedQuery:
             self._copy + param.value_off, param.value_len
         )
 
-    cdef void _ensure_eager_lists(self) except *:
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef list keys
-        cdef list values
-        if self._keys is not None:
-            return
-        keys = []
-        values = []
-        if self._resolve_span(&s, &n) and s != NULL:
-            _fill_query_arrays(s, n, keys, values)
-        self._keys = keys
-        self._values = values
-        self._raw = None
-        self._owner = None
-        self._off = 0
-        self._len = 0
-
     cdef bint _name_eq(self, Py_ssize_t i, const char* kbuf, Py_ssize_t klen, object key) except -1:
         return _query_name_matches(self._copy, &self._params[i], kbuf, klen, key)
 
@@ -875,33 +855,6 @@ cdef class ParsedQuery:
         self._ensure_index()
         return self._pcount != 0
 
-    cdef object _list_get(self, object key, object default):
-        cdef Py_ssize_t i
-        cdef Py_ssize_t n
-        cdef list keys
-        cdef list values
-        keys = self._keys
-        values = self._values
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            if <object>PyList_GET_ITEM(keys, i) == key:
-                return <object>PyList_GET_ITEM(values, i)
-        return default
-
-    cdef list _list_getlist(self, object key):
-        cdef Py_ssize_t i
-        cdef Py_ssize_t n
-        cdef list keys
-        cdef list values
-        cdef list out = []
-        keys = self._keys
-        values = self._values
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            if <object>PyList_GET_ITEM(keys, i) == key:
-                out.append(<object>PyList_GET_ITEM(values, i))
-        return out
-
     def get(self, key, default=None):
         if not isinstance(key, str):
             return default
@@ -911,73 +864,6 @@ cdef class ParsedQuery:
         if not isinstance(key, str):
             return []
         return self._index_getlist(key)
-
-    cdef object _scan_get(self, object key, object default):
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t name_start
-        cdef Py_ssize_t name_end
-        cdef Py_ssize_t val_start
-        cdef Py_ssize_t val_end
-        if not self._resolve_span(&s, &n) or s == NULL:
-            return default
-        while _next_query_pair(
-            s, n, &i, &name_start, &name_end, &val_start, &val_end
-        ):
-            if _decode_query_component(
-                s + name_start, name_end - name_start
-            ) == key:
-                return _decode_query_component(s + val_start, val_end - val_start)
-        return default
-
-    cdef list _scan_getlist(self, object key):
-        cdef const char* s = NULL
-        cdef Py_ssize_t n = 0
-        cdef Py_ssize_t i = 0
-        cdef Py_ssize_t name_start
-        cdef Py_ssize_t name_end
-        cdef Py_ssize_t val_start
-        cdef Py_ssize_t val_end
-        cdef list out = []
-        if not self._resolve_span(&s, &n) or s == NULL:
-            return out
-        while _next_query_pair(
-            s, n, &i, &name_start, &name_end, &val_start, &val_end
-        ):
-            if _decode_query_component(
-                s + name_start, name_end - name_start
-            ) == key:
-                out.append(
-                    _decode_query_component(s + val_start, val_end - val_start)
-                )
-        return out
-
-    def _get_scan(self, key, default=None):
-        """Walk C pairs each call. Previous production path. Bench only."""
-        if not isinstance(key, str):
-            return default
-        return self._scan_get(key, default)
-
-    def _getlist_scan(self, key):
-        """Walk C pairs each call and collect matches. Bench only."""
-        if not isinstance(key, str):
-            return []
-        return self._scan_getlist(key)
-
-    def _get_eager(self, key, default=None):
-        """Parse every pair into Python lists, then list-scan. Bench only."""
-        if not isinstance(key, str):
-            return default
-        self._ensure_eager_lists()
-        return self._list_get(key, default)
-
-    def _getlist_eager(self, key):
-        """Parse every pair into Python lists, then collect. Bench only."""
-        if not isinstance(key, str):
-            return []
-        self._ensure_eager_lists()
-        return self._list_getlist(key)
 
     def items(self):
         cdef Py_ssize_t i
@@ -1354,21 +1240,16 @@ cdef class ParsedCookies:
         return None
 
     def get(self, name, default=None):
-        cdef bytes key
+        cdef char buf[HEADER_NAME_STACK]
+        cdef Py_ssize_t n
         cdef object found
         if not isinstance(name, str):
             return default
-        key = (<str>name).encode("latin-1")
+        _latin1_stack(name, buf, HEADER_NAME_STACK, &n)
         if self._headers is not None and isinstance(self._headers, RequestHeaders):
-            found = self._get_arena(
-                PyBytes_AS_STRING(key),
-                PyBytes_GET_SIZE(key),
-            )
+            found = self._get_arena(buf, n)
         else:
-            found = self._get_lines(
-                PyBytes_AS_STRING(key),
-                PyBytes_GET_SIZE(key),
-            )
+            found = self._get_lines(buf, n)
         if found is None:
             return default
         return found
@@ -1583,13 +1464,16 @@ cdef class Request:
     def host(self):
         cdef object host_str
         cdef object host_wire
+        cdef RequestHeaders req_headers
         if self._host is not None:
             return self._host
         if isinstance(self.headers, RequestHeaders):
-            host_wire = (<RequestHeaders>self.headers).c_request_host()
-            host_str = (
-                host_wire.decode("latin-1") if host_wire is not None else ""
+            req_headers = <RequestHeaders>self.headers
+            host_str = req_headers.c_value_str(
+                (<RequestExchange>req_headers._owner)._req_host_index
             )
+            if host_str is None:
+                host_str = ""
         elif isinstance(self.headers, Headers):
             host_wire = (<Headers>self.headers).c_get(b"host")
             host_str = (
@@ -3386,19 +3270,30 @@ cdef class RequestHeaders(Headers):
             header.value_length,
         )
 
-    cdef object c_get_n(self, const char* query, Py_ssize_t query_length):
+    cdef object c_value_str(self, Py_ssize_t index):
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        if index < 0:
+            return None
+        owner = <RequestExchange>self._owner
+        header = &owner._req_raw_headers[index]
+        return _decode_latin1(
+            owner._req_arena + header.value_offset,
+            <Py_ssize_t>header.value_length,
+        )
+
+    cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept:
         cdef RequestExchange owner
         cdef RawHeader* header
         cdef Py_ssize_t index
-        cdef Py_ssize_t start = 0
         owner = <RequestExchange>self._owner
         if query_length == 4 and memcmp(query, "host", 4) == 0:
-            return self.c_request_indexed(owner._req_host_index)
+            return owner._req_host_index
         if query_length == 6 and memcmp(query, "cookie", 6) == 0:
-            return self.c_request_indexed(owner._req_cookie_index)
+            return owner._req_cookie_index
         if query_length == 13 and memcmp(query, "authorization", 13) == 0:
-            return self.c_request_indexed(owner._req_authorization_index)
-        for index in range(start, owner._req_raw_count):
+            return owner._req_authorization_index
+        for index in range(owner._req_raw_count):
             header = &owner._req_raw_headers[index]
             if (
                 header.name_length == <uint32_t>query_length
@@ -3408,11 +3303,11 @@ cdef class RequestHeaders(Headers):
                     <size_t>query_length,
                 ) == 0
             ):
-                return PyBytes_FromStringAndSize(
-                    owner._req_arena + header.value_offset,
-                    header.value_length,
-                )
-        return None
+                return index
+        return -1
+
+    cdef object c_get_n(self, const char* query, Py_ssize_t query_length):
+        return self.c_request_indexed(self.c_find_n(query, query_length))
 
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length):
         cdef RequestExchange owner
@@ -3460,11 +3355,6 @@ cdef class RequestHeaders(Headers):
     cdef void c_clear(self):
         _raise_readonly_request_headers()
 
-    cdef object c_request_host(self):
-        return self.c_request_indexed(
-            (<RequestExchange>self._owner)._req_host_index
-        )
-
     cdef void c_parse_cookies(self, dict out) except *:
         cdef RequestExchange owner = <RequestExchange>self._owner
         cdef RawHeader* header
@@ -3488,12 +3378,12 @@ cdef class RequestHeaders(Headers):
     def get(self, str name, default=None):
         cdef char buf[HEADER_NAME_STACK]
         cdef Py_ssize_t n
-        cdef object wire
+        cdef object value
         _fold_header_name(name, buf, &n)
-        wire = self.c_get_n(buf, n)
-        if wire is None:
+        value = self.c_value_str(self.c_find_n(buf, n))
+        if value is None:
             return default
-        return wire.decode("latin-1")
+        return value
 
     def unsafe_get(self, name, default=None):
         cdef object value = self.c_get(name)
@@ -3504,10 +3394,34 @@ cdef class RequestHeaders(Headers):
     def getlist(self, str name):
         cdef char buf[HEADER_NAME_STACK]
         cdef Py_ssize_t n
-        cdef list values
+        cdef RequestExchange owner
+        cdef RawHeader* header
+        cdef Py_ssize_t index
+        cdef Py_ssize_t start
+        cdef list result
         _fold_header_name(name, buf, &n)
-        values = <list>self.c_getlist_n(buf, n)
-        return [value.decode("latin-1") for value in values]
+        start = self.c_find_n(buf, n)
+        if start < 0:
+            return []
+        owner = <RequestExchange>self._owner
+        result = []
+        for index in range(start, owner._req_raw_count):
+            header = &owner._req_raw_headers[index]
+            if (
+                header.name_length == <uint32_t>n
+                and memcmp(
+                    owner._req_arena + header.name_offset,
+                    buf,
+                    <size_t>n,
+                ) == 0
+            ):
+                result.append(
+                    _decode_latin1(
+                        owner._req_arena + header.value_offset,
+                        <Py_ssize_t>header.value_length,
+                    )
+                )
+        return result
 
     def unsafe_getlist(self, name):
         cdef bytes key = name
@@ -3545,7 +3459,7 @@ cdef class RequestHeaders(Headers):
             _fold_header_name(name, buf, &n)
         except ValueError:
             return False
-        return self.c_get_n(buf, n) is not None
+        return self.c_find_n(buf, n) >= 0
 
     def __len__(self):
         cdef RequestExchange owner = <RequestExchange>self._owner

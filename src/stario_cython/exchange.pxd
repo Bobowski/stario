@@ -279,13 +279,14 @@ cdef class RequestHeaders(Headers):
     cdef object _owner
 
     cdef object c_get(self, object name)
+    cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept
+    cdef object c_value_str(self, Py_ssize_t index)
     cdef object c_get_n(self, const char* query, Py_ssize_t query_length)
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length)
     cdef void c_set(self, object name, object value)
     cdef void c_add(self, object name, object value)
     cdef void c_remove(self, object name)
     cdef void c_clear(self)
-    cdef object c_request_host(self)
     cdef object c_request_indexed(self, Py_ssize_t index)
     cdef void c_parse_cookies(self, dict out) except *
 
