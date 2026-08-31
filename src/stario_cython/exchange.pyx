@@ -347,6 +347,12 @@ cdef bint _content_type_is_compressible(object content_type):
     return True
 
 
+cdef inline object _encoding_wire(int enc) noexcept:
+    if enc == ENCODING_BR:
+        return b"br"
+    return b"gzip"
+
+
 cdef inline bint _may_have_body(int status) noexcept:
     if status == 204 or status == 304:
         return False
@@ -1253,7 +1259,7 @@ cdef class RequestExchange:
             payload = b""
             nbytes = 0
         elif existing_ce is None and self._may_compress(body, content_type, False, nbytes):
-            encoding = b"br" if self._req_encoding == ENCODING_BR else b"gzip"
+            encoding = _encoding_wire(self._req_encoding)
             flat = self._body_as_bytes(body)
             try:
                 self._frame(flat, encoding, &native_out, &native_len)
@@ -1935,9 +1941,7 @@ cdef class RequestExchange:
             elif existing_ce is None:
                 encoding = None
                 if self._may_compress(body, content_type, False, nbytes):
-                    encoding = (
-                        b"br" if self._req_encoding == ENCODING_BR else b"gzip"
-                    )
+                    encoding = _encoding_wire(self._req_encoding)
                 if encoding is not None:
                     flat = self._body_as_bytes(body)
                     try:
@@ -2061,9 +2065,7 @@ cdef class RequestExchange:
                 if self._may_compress(
                     None, headers.c_get(b"content-type"), True, -1
                 ):
-                    encoding = (
-                        b"br" if self._req_encoding == ENCODING_BR else b"gzip"
-                    )
+                    encoding = _encoding_wire(self._req_encoding)
                 if encoding is not None:
                     if encoding == b"br":
                         self._ensure_brotli()
@@ -2557,19 +2559,11 @@ cdef class RequestExchange:
             self._maybe_recycle()
             return 0
         if self._consumed_as != CONSUMED_STREAM and self._cached is None:
-            if self._chunks is None or not self._chunks:
-                self._cached = b""
-            elif len(self._chunks) == 1:
-                self._cached = self._chunks[0]
-                self._chunks.clear()
-                self._buffered = 0
-            else:
-                self._cached = b"".join(self._chunks)
-                if PyErr_Occurred() or self._cached is None:
-                    PyErr_Clear()
-                    return -1
-                self._chunks.clear()
-                self._buffered = 0
+            try:
+                self._cached = self._body_to_bytes()
+            except Exception:
+                PyErr_Clear()
+                return -1
         self._wake()
         self._maybe_recycle()
         return 0

@@ -2053,21 +2053,14 @@ cdef class HttpProtocol:
     cdef int _h2_fill_nva(self, object pairs, nghttp2_nv* nvs, size_t maxn) except -1:
         cdef Py_ssize_t i, n, nn, vn
         cdef bytes name, value
-        cdef bint trim
         n = len(pairs)
         if n > <Py_ssize_t>maxn:
             n = <Py_ssize_t>maxn
         for i in range(n):
             name = pairs[i][0]
             value = pairs[i][1]
-            trim = len(pairs[i]) > 2 and pairs[i][2]
             nn = PyBytes_GET_SIZE(name)
             vn = PyBytes_GET_SIZE(value)
-            if trim:
-                if nn >= 2:
-                    nn -= 2
-                if vn >= 2:
-                    vn -= 2
             nvs[i].name = <uint8_t*>PyBytes_AS_STRING(name)
             nvs[i].namelen = <size_t>nn
             nvs[i].value = <uint8_t*>PyBytes_AS_STRING(value)
