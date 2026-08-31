@@ -478,6 +478,45 @@ cdef object _decode_query_component(const char* s, Py_ssize_t n):
     return _decode_latin1(s, n)
 
 
+cdef int _next_query_pair(
+    const char* s,
+    Py_ssize_t n,
+    Py_ssize_t* i,
+    Py_ssize_t* name_start,
+    Py_ssize_t* name_end,
+    Py_ssize_t* val_start,
+    Py_ssize_t* val_end,
+) noexcept:
+    """Advance ``i`` to the next ``name[=value]`` pair. 1 found, 0 done."""
+    cdef Py_ssize_t start
+    cdef Py_ssize_t eq
+    cdef Py_ssize_t end
+    while i[0] < n:
+        start = i[0]
+        eq = -1
+        while i[0] < n and s[i[0]] != 38:
+            if eq < 0 and s[i[0]] == 61:
+                eq = i[0]
+            i[0] += 1
+        end = i[0]
+        if i[0] < n and s[i[0]] == 38:
+            i[0] += 1
+        if start >= end:
+            continue
+        if eq < 0:
+            name_start[0] = start
+            name_end[0] = end
+            val_start[0] = end
+            val_end[0] = end
+        else:
+            name_start[0] = start
+            name_end[0] = eq
+            val_start[0] = eq + 1
+            val_end[0] = end
+        return 1
+    return 0
+
+
 cdef int _fill_query_arrays(
     const char* s,
     Py_ssize_t n,
@@ -486,31 +525,24 @@ cdef int _fill_query_arrays(
 ) except -1:
     """One pass: decoded keys and values, same order as the wire."""
     cdef Py_ssize_t i = 0
-    cdef Py_ssize_t start
-    cdef Py_ssize_t eq
-    cdef Py_ssize_t end
-    while i < n:
-        start = i
-        eq = -1
-        while i < n and s[i] != 38:
-            if eq < 0 and s[i] == 61:
-                eq = i
-            i += 1
-        end = i
-        if start < end:
-            if eq < 0:
-                keys.append(_decode_query_component(s + start, end - start))
-                values.append("")
-            else:
-                keys.append(_decode_query_component(s + start, eq - start))
-                values.append(_decode_query_component(s + eq + 1, end - eq - 1))
-        if i < n and s[i] == 38:
-            i += 1
+    cdef Py_ssize_t name_start
+    cdef Py_ssize_t name_end
+    cdef Py_ssize_t val_start
+    cdef Py_ssize_t val_end
+    while _next_query_pair(
+        s, n, &i, &name_start, &name_end, &val_start, &val_end
+    ):
+        keys.append(_decode_query_component(s + name_start, name_end - name_start))
+        values.append(_decode_query_component(s + val_start, val_end - val_start))
     return 0
 
 
 cdef class ParsedQuery:
-    """Two arrays after first read. Same API as ``stario.http.query.ParsedQuery``."""
+    """Query scan. ``get`` / ``getlist`` walk C pairs and decode only matches.
+
+    First ``name=`` wins for ``get``. Unused values stay untouched until
+    ``items`` / ``as_dict`` / ``as_lists`` ask for everything.
+    """
 
     cdef bytes _raw
     cdef object _owner
@@ -528,6 +560,9 @@ cdef class ParsedQuery:
         self._values = None
 
     def __init__(self, raw=b""):
+        self.bind_bytes(raw)
+
+    cdef void bind_bytes(self, object raw) noexcept:
         self._raw = raw if raw else b""
         self._owner = None
         self._off = 0
@@ -536,7 +571,7 @@ cdef class ParsedQuery:
         self._values = None
 
     cdef void bind_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
-        """Point at request-arena query bytes until the first read fills arrays."""
+        """Point at request-arena query bytes; ``get`` scans without a dict."""
         self._raw = None
         self._owner = owner
         self._off = off
@@ -544,26 +579,34 @@ cdef class ParsedQuery:
         self._keys = None
         self._values = None
 
+    cdef bint _resolve_span(self, const char** out, Py_ssize_t* n) noexcept:
+        cdef RequestExchange owner
+        n[0] = self._len
+        if n[0] <= 0:
+            out[0] = NULL
+            return False
+        if self._raw is not None:
+            out[0] = PyBytes_AS_STRING(self._raw)
+            return True
+        if self._owner is not None:
+            owner = <RequestExchange>self._owner
+            if owner._req_arena != NULL:
+                out[0] = owner._req_arena + self._off
+                return True
+        out[0] = NULL
+        return False
+
     cdef void _ensure(self) except *:
         cdef const char* s = NULL
-        cdef Py_ssize_t n
+        cdef Py_ssize_t n = 0
         cdef list keys
         cdef list values
-        cdef RequestExchange owner
         if self._keys is not None:
             return
         keys = []
         values = []
-        n = self._len
-        if n > 0:
-            if self._raw is not None:
-                s = PyBytes_AS_STRING(self._raw)
-            elif self._owner is not None:
-                owner = <RequestExchange>self._owner
-                if owner._req_arena != NULL:
-                    s = owner._req_arena + self._off
-            if s != NULL:
-                _fill_query_arrays(s, n, keys, values)
+        if self._resolve_span(&s, &n) and s != NULL:
+            _fill_query_arrays(s, n, keys, values)
         self._keys = keys
         self._values = values
         self._raw = None
@@ -571,12 +614,87 @@ cdef class ParsedQuery:
         self._off = 0
         self._len = 0
 
-    def get(self, key, default=None):
+    cdef object _scan_get(self, object key, object default):
+        cdef const char* s = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        if not self._resolve_span(&s, &n) or s == NULL:
+            return default
+        while _next_query_pair(
+            s, n, &i, &name_start, &name_end, &val_start, &val_end
+        ):
+            if _decode_query_component(
+                s + name_start, name_end - name_start
+            ) == key:
+                return _decode_query_component(s + val_start, val_end - val_start)
+        return default
+
+    cdef list _scan_getlist(self, object key):
+        cdef const char* s = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        cdef list out = []
+        if not self._resolve_span(&s, &n) or s == NULL:
+            return out
+        while _next_query_pair(
+            s, n, &i, &name_start, &name_end, &val_start, &val_end
+        ):
+            if _decode_query_component(
+                s + name_start, name_end - name_start
+            ) == key:
+                out.append(
+                    _decode_query_component(s + val_start, val_end - val_start)
+                )
+        return out
+
+    cdef bint _scan_contains(self, object key):
+        cdef const char* s = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        if not self._resolve_span(&s, &n) or s == NULL:
+            return False
+        while _next_query_pair(
+            s, n, &i, &name_start, &name_end, &val_start, &val_end
+        ):
+            if _decode_query_component(
+                s + name_start, name_end - name_start
+            ) == key:
+                return True
+        return False
+
+    cdef bint _has_any(self):
+        cdef const char* s = NULL
+        cdef Py_ssize_t n = 0
+        cdef Py_ssize_t i = 0
+        cdef Py_ssize_t name_start
+        cdef Py_ssize_t name_end
+        cdef Py_ssize_t val_start
+        cdef Py_ssize_t val_end
+        if self._keys is not None:
+            return PyList_GET_SIZE(self._keys) != 0
+        if not self._resolve_span(&s, &n) or s == NULL:
+            return False
+        return _next_query_pair(
+            s, n, &i, &name_start, &name_end, &val_start, &val_end
+        ) != 0
+
+    cdef object _list_get(self, object key, object default):
         cdef Py_ssize_t i
         cdef Py_ssize_t n
         cdef list keys
         cdef list values
-        self._ensure()
         keys = self._keys
         values = self._values
         n = PyList_GET_SIZE(keys)
@@ -585,13 +703,12 @@ cdef class ParsedQuery:
                 return <object>PyList_GET_ITEM(values, i)
         return default
 
-    def getlist(self, key):
+    cdef list _list_getlist(self, object key):
         cdef Py_ssize_t i
         cdef Py_ssize_t n
         cdef list keys
         cdef list values
         cdef list out = []
-        self._ensure()
         keys = self._keys
         values = self._values
         n = PyList_GET_SIZE(keys)
@@ -599,6 +716,20 @@ cdef class ParsedQuery:
             if <object>PyList_GET_ITEM(keys, i) == key:
                 out.append(<object>PyList_GET_ITEM(values, i))
         return out
+
+    def get(self, key, default=None):
+        if not isinstance(key, str):
+            return default
+        if self._keys is not None:
+            return self._list_get(key, default)
+        return self._scan_get(key, default)
+
+    def getlist(self, key):
+        if not isinstance(key, str):
+            return []
+        if self._keys is not None:
+            return self._list_getlist(key)
+        return self._scan_getlist(key)
 
     def items(self):
         cdef Py_ssize_t i
@@ -659,17 +790,19 @@ cdef class ParsedQuery:
         cdef Py_ssize_t i
         cdef Py_ssize_t n
         cdef list keys
-        self._ensure()
-        keys = self._keys
-        n = PyList_GET_SIZE(keys)
-        for i in range(n):
-            if <object>PyList_GET_ITEM(keys, i) == key:
-                return True
-        return False
+        if not isinstance(key, str):
+            return False
+        if self._keys is not None:
+            keys = self._keys
+            n = PyList_GET_SIZE(keys)
+            for i in range(n):
+                if <object>PyList_GET_ITEM(keys, i) == key:
+                    return True
+            return False
+        return self._scan_contains(key)
 
     def __bool__(self):
-        self._ensure()
-        return PyList_GET_SIZE(self._keys) != 0
+        return self._has_any()
 
     def __len__(self):
         cdef set seen = set()
@@ -1186,15 +1319,34 @@ cdef class Request:
         self._q_off = 0
         self._q_len = 0
         self._body = body
-        self._query = None
         self._cookies = None
         self._host = None
+        self._rebind_query(query_bytes)
+
+    cdef void _rebind_query(self, object query_bytes) noexcept:
+        cdef ParsedQuery parsed
+        if self._query is None:
+            parsed = ParsedQuery.__new__(ParsedQuery)
+            self._query = parsed
+        else:
+            parsed = <ParsedQuery>self._query
+        if query_bytes is not None:
+            parsed.bind_bytes(query_bytes)
+        else:
+            parsed.bind_span(None, 0, 0)
 
     cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
+        cdef ParsedQuery parsed
         self._q_owner = owner
         self._q_off = off
         self._q_len = n
         self._query_bytes = None
+        if self._query is None:
+            parsed = ParsedQuery.__new__(ParsedQuery)
+            self._query = parsed
+        else:
+            parsed = <ParsedQuery>self._query
+        parsed.bind_span(owner, off, n)
 
     cdef object _materialize_query(self):
         cdef RequestExchange owner
@@ -1237,16 +1389,8 @@ cdef class Request:
 
     @property
     def query(self):
-        cdef ParsedQuery parsed
         if self._query is None:
-            if self._query_bytes is not None:
-                self._query = ParsedQuery(self._query_bytes)
-            elif self._q_len > 0 and self._q_owner is not None:
-                parsed = ParsedQuery.__new__(ParsedQuery)
-                parsed.bind_span(self._q_owner, self._q_off, self._q_len)
-                self._query = parsed
-            else:
-                self._query = ParsedQuery(b"")
+            self._rebind_query(self._query_bytes)
         return self._query
 
     @property

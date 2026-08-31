@@ -96,6 +96,7 @@ cdef class Request:
         object body,
     )
     cdef object _materialize_query(self)
+    cdef void _rebind_query(self, object query_bytes) noexcept
     cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept
 
 cdef class RequestExchange:

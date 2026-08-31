@@ -38,6 +38,19 @@ def test_items_preserve_wire_order_and_duplicates() -> None:
     assert qp.as_lists() == {"b": ["2", "3"], "a": ["1"]}
 
 
+def test_get_scans_without_items() -> None:
+    qp = ParsedQuery(b"unused=1&target=ok&other=2&target=later")
+    assert qp.get("target") == "ok"
+    assert qp.get("missing") is None
+    assert qp.getlist("target") == ["ok", "later"]
+    assert "target" in qp
+    assert "unused" in qp
+    assert "missing" not in qp
+    assert bool(qp) is True
+    assert bool(ParsedQuery(b"")) is False
+    assert bool(ParsedQuery(b"&&")) is False
+
+
 def test_first_get_then_as_dict() -> None:
     qp = ParsedQuery(b"a=1&a=2")
     assert qp.get("a") == "1"
