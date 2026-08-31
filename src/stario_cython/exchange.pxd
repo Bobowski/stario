@@ -64,6 +64,11 @@ cdef class ParsedCookies:
     cdef list _lines
 
     cdef void bind_request_headers(self, object headers) noexcept
+    cdef void _extend_lines(self, object lines) except *
+    cdef list _cookie_lines(self)
+    cdef object _get_arena(self, const char* name, Py_ssize_t nlen)
+    cdef object _get_lines(self, const char* name, Py_ssize_t nlen)
+    cdef bint _has_any(self)
 
 cdef class Request:
     cdef public object method

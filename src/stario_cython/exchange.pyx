@@ -63,9 +63,6 @@ from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
 
 include "headers.pxi"
 
-cdef enum:
-    HEADER_NAME_STACK = NAME_STACK
-
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
@@ -913,9 +910,6 @@ cdef class ParsedCookies:
     starts at the last header so unused earlier cookies stay untouched.
     ``as_dict`` / ``items`` parse everything.
     """
-
-    cdef object _headers
-    cdef list _lines
 
     def __cinit__(self):
         self._headers = None
