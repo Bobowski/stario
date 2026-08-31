@@ -177,6 +177,55 @@ def benchmark_one(raw: bytes, keys: list[str], kind: str) -> tuple[float, float]
     return statistics.median(scan_samples), statistics.median(eager_samples)
 
 
+def spread_keys(names: list[str], reads: int) -> list[str]:
+    """``reads`` distinct names, spaced through the query (not the same key)."""
+    if reads <= 0:
+        return []
+    if reads >= len(names):
+        return list(names)
+    if reads == 1:
+        return [names[0]]
+    return [names[round(i * (len(names) - 1) / (reads - 1))] for i in range(reads)]
+
+
+def run_matrix() -> list[dict[str, object]]:
+    """Distinct keys read (K) vs pairs on the wire (N). Long queries included."""
+    pair_counts = (8, 16, 24, 32, 48)
+    read_counts = (1, 2, 3, 4, 6, 8, 12, 16, 24)
+    print(
+        "Distinct params read (K) on a query with N pairs. "
+        "Keys are spaced through the string.\n"
+    )
+    print("| N pairs \\ K reads | " + " | ".join(str(k) for k in read_counts) + " |")
+    print("|---:|" + "---:|" * len(read_counts))
+    rows: list[dict[str, object]] = []
+    for count in pair_counts:
+        raw, names = make_raw(count, encoded=False, key_at="spread")
+        cells: list[str] = []
+        for reads in read_counts:
+            if reads > count:
+                cells.append("—")
+                continue
+            keys = spread_keys(names, reads)
+            scan_ns, eager_ns = benchmark_one(raw, keys, "gets")
+            ratio = scan_ns / eager_ns if eager_ns else 0.0
+            rows.append(
+                {
+                    "pairs": count,
+                    "distinct_reads": reads,
+                    "scan_ns": scan_ns,
+                    "eager_ns": eager_ns,
+                    "ratio": ratio,
+                }
+            )
+            mark = "s" if ratio <= 1.05 else "e"
+            cells.append(f"{ratio:.2f}{mark}")
+        print(f"| {count} | " + " | ".join(cells) + " |")
+    print()
+    print("Cell is scan/eager. `s` = scan wins or tie (≤1.05). `e` = eager ahead.\n")
+    return rows
+
+
 def main() -> int:
     if ITERATIONS < 1 or REPEATS < 1:
         raise SystemExit("iterations and repeats must be positive")
@@ -185,6 +234,29 @@ def main() -> int:
         f"Query scan vs eager parse-all: {ITERATIONS:,} requests × {REPEATS} repeats"
     )
     print("Lower is better; median nanoseconds per request. Ratio < 1 means scan wins.\n")
+    print(
+        "`1-3 named reads` means 1-3 distinct parameter names on one query, "
+        "not the same name three times. Pair count is how long the query is.\n"
+    )
+
+    if "--matrix" in sys.argv or os.environ.get("QUERY_BENCH_MATRIX") == "1":
+        print("Distinct-reads × pair-count matrix\n")
+        matrix_rows = run_matrix()
+        if JSON_PATH:
+            path = Path(JSON_PATH)
+            path.write_text(
+                json.dumps(
+                    {
+                        "iterations": ITERATIONS,
+                        "repeats": REPEATS,
+                        "matrix": matrix_rows,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            print(f"Wrote {path}")
+        return 0
 
     rows: list[dict[str, object]] = []
     for workload in WORKLOADS:
