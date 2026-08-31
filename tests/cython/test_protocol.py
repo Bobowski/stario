@@ -8,6 +8,8 @@ from stario import App
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
+from stario.testing.tracer import TestTracer
+from tests.helpers import assert_status_span
 from tests.cython.http import free_port, read_response
 
 
@@ -19,6 +21,195 @@ class TrackingApp(App):
     def create_task(self, coro, **kwargs):
         self.eager_starts.append(kwargs.get("eager_start", False))
         return super().create_task(coro, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_trailing_slash_redirects_without_create_task() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+
+    async def search(_c, w):
+        responses.text(w, "hit")
+
+    app.get("/search", search)
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /search/?q=cats&page=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        await writer.drain()
+        first = await read_response(reader)
+        assert b"308" in first.split(b"\r\n", 1)[0]
+        assert b"location: /search?q=cats&page=2" in first.lower()
+        assert app.eager_starts == []
+
+        writer.write(b"GET //aftra.io/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        second = await read_response(reader)
+        assert b"308" in second.split(b"\r\n", 1)[0]
+        assert b"location: /aftra.io" in second.lower()
+        assert app.eager_starts == []
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_trailing_slash_redirect_finishes_span_without_fail() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    with TestTracer() as tracer:
+
+        def factory():
+            return HttpProtocol(
+                loop,
+                app,
+                tracer,
+                [date],
+                CompressionConfig(),
+                connections,
+            )
+
+        port = free_port()
+        server = await loop.create_server(factory, "127.0.0.1", port)
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(
+                b"GET /search/?q=cats&page=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            await writer.drain()
+            first = await read_response(reader)
+            assert b"308" in first.split(b"\r\n", 1)[0]
+            assert app.eager_starts == []
+            assert_status_span(tracer, 308, method="GET", path="/search/")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_not_found_and_method_not_allowed_use_handlers() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+    seen: list[str] = []
+
+    async def hello(_c, w):
+        responses.text(w, "hi")
+
+    async def custom_404(_c, w):
+        seen.append("404")
+        responses.text(w, "gone", 404)
+
+    def custom_405(allowed: frozenset[str]):
+        async def respond(_c, w):
+            seen.append("405")
+            w.headers.set("Allow", ", ".join(sorted(allowed)))
+            responses.text(w, "nope", 405)
+
+        return respond
+
+    app.get("/hello", hello)
+    app.not_found("/", custom_404)
+    app.method_not_allowed("/", custom_405)
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /missing HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        missing = await read_response(reader)
+        assert b"404" in missing.split(b"\r\n", 1)[0]
+        assert b"gone" in missing
+        assert seen == ["404"]
+        assert app.eager_starts == [True]
+
+        writer.write(b"POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        denied = await read_response(reader)
+        assert b"405" in denied.split(b"\r\n", 1)[0]
+        assert b"nope" in denied
+        assert b"allow: get" in denied.lower()
+        assert seen == ["404", "405"]
+        assert app.eager_starts == [True, True]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_writes_500() -> None:
+    loop = asyncio.get_running_loop()
+    app = TrackingApp()
+
+    async def boom(_c, _w):
+        raise RuntimeError("boom")
+
+    app.get("/boom", boom)
+    connections: set[HttpProtocol] = set()
+    date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+    def factory():
+        return HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [date],
+            CompressionConfig(),
+            connections,
+        )
+
+    port = free_port()
+    server = await loop.create_server(factory, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /boom HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await writer.drain()
+        response = await read_response(reader)
+        assert b"500" in response.split(b"\r\n", 1)[0]
+        assert b"Internal Server Error" in response
+        assert app.eager_starts == [True]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio
@@ -85,7 +276,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
 
 @pytest.mark.asyncio
 async def test_small_content_length_body_is_complete_when_handler_runs() -> None:
-    """Content-Length bodies <= 64KiB dispatch after llhttp finishes the message."""
+    """Content-Length bodies <= 256KiB dispatch after llhttp finishes the message."""
     loop = asyncio.get_running_loop()
     app = App()
 
@@ -759,11 +950,11 @@ async def test_exchange_pool_reuses_across_connections() -> None:
 
 @pytest.mark.asyncio
 async def test_handler_starts_before_content_length_body_arrives() -> None:
-    """Bodies larger than 64KiB still dispatch at headers-complete."""
+    """Bodies larger than 256KiB still dispatch at headers-complete."""
     loop = asyncio.get_running_loop()
     app = App()
     started = asyncio.Event()
-    payload = b"x" * (65 * 1024)
+    payload = b"x" * (257 * 1024)
 
     async def echo(c, w):
         started.set()
@@ -835,7 +1026,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        payload = b"abcdefghij" * 7000  # 70 KiB: above the small-body deferral cap
+        payload = b"abcdefghij" * 30000  # 300 KiB: above the 256 KiB deferral cap
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"
@@ -864,7 +1055,7 @@ async def test_content_length_body_survives_many_64k_segments() -> None:
     loop = asyncio.get_running_loop()
     app = App()
     started = asyncio.Event()
-    payload = bytes(range(256)) * 1024  # 256 KiB, not a multiple of one pattern
+    payload = bytes(range(256)) * 2048  # 512 KiB: above the 256 KiB deferral cap
 
     async def echo(c, w):
         started.set()
@@ -1022,7 +1213,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
 
     async def upload(c, w):
         try:
-            async for _ in c.req.stream(max_chunk=256 * 1024):
+            async for _ in c.req.stream(max_chunk=1024 * 1024):
                 pass
         except ValueError as exc:
             errors.append(exc)
@@ -1053,7 +1244,14 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
             b"x"
         )
         await writer.drain()
-        response = await read_response(reader)
+        try:
+            response = await read_response(reader)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+        ):
+            response = b""
         assert b"500" in response.split(b"\r\n", 1)[0]
         assert errors
         assert "stream chunk limit" in str(errors[0])
@@ -1106,6 +1304,100 @@ async def test_stream_respects_max_chunk_batches() -> None:
         assert sizes
         assert all(size <= 8 * 1024 for size in sizes)
         assert any(size == 8 * 1024 for size in sizes[:-1] or sizes)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_medium_content_length_body_is_complete_when_handler_runs() -> None:
+    """200 KiB is under the 256 KiB complete-before-dispatch cutoff."""
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def echo(c, w):
+        payload = await c.req.body()
+        assert payload == b"y" * (200 * 1024)
+        w.respond(payload, b"text/plain; charset=utf-8")
+
+    app.post("/echo", echo)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"y" * (200 * 1024)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /echo HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+        )
+        await writer.drain()
+        assert payload in await read_response(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stream_default_chunk_follows_content_length() -> None:
+    """Known Content-Length: default stream() yields min(length, 256 KiB)."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    sizes: list[int] = []
+
+    async def upload(c, w):
+        async for chunk in c.req.stream():
+            sizes.append(len(chunk))
+        w.respond(str(sum(sizes)).encode("ascii"), b"text/plain")
+
+    app.post("/upload", upload)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    payload = b"z" * (300 * 1024)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: "
+            + str(len(payload)).encode("ascii")
+            + b"\r\n\r\n"
+            + payload
+        )
+        await writer.drain()
+        assert str(len(payload)).encode("ascii") in await read_response(reader)
+        assert sizes == [256 * 1024, 44 * 1024]
         writer.close()
         await writer.wait_closed()
     finally:

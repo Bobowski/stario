@@ -58,6 +58,7 @@ def make_protocol(
     loop: asyncio.AbstractEventLoop,
     app,
     *,
+    tracer=None,
     connections: set[HttpProtocol] | None = None,
     date: bytes = DATE,
     compression: CompressionConfig | None = None,
@@ -73,7 +74,7 @@ def make_protocol(
     return HttpProtocol(
         loop,
         app,
-        NoOpTracer(),
+        NoOpTracer() if tracer is None else tracer,
         [date],
         CompressionConfig() if compression is None else compression,
         connections,

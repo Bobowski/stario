@@ -12,9 +12,10 @@ attach handlers on the trie branch walked for `pattern`. During a request, the d
 node along the host/path walk with a policy handler wins (prefix-scoped inheritance).
 """
 
+import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from types import MappingProxyType
 from typing import Literal, cast
 
@@ -36,6 +37,44 @@ type MatchStatus = Literal["found", "method_not_allowed", "not_found"]
 
 def _as_pattern(path: UrlPath | str) -> UrlPath:
     return path if isinstance(path, UrlPath) else UrlPath(path)
+
+
+def require_async_handler(handler: object, *, what: str = "Handler") -> None:
+    """Reject anything that is not an async callable (checked at registration)."""
+    if not callable(handler):
+        raise StarioError(
+            f"{what} must be callable",
+            context={"got": type(handler).__name__},
+            help_text="Register `async def handler(c, w):`.",
+        )
+
+    fn: object = handler
+    while isinstance(fn, partial):
+        fn = fn.func
+
+    if inspect.isasyncgenfunction(fn):
+        raise StarioError(
+            f"{what} cannot be an async generator",
+            help_text="Use `async def handler(c, w):` and write to the Writer, not `yield`.",
+        )
+    if inspect.iscoroutinefunction(fn):
+        return
+
+    call = getattr(fn, "__call__", None)
+    if call is not None and call is not fn:
+        if inspect.isasyncgenfunction(call):
+            raise StarioError(
+                f"{what} cannot be an async generator",
+                help_text="Use `async def __call__(self, c, w):` and write to the Writer, not `yield`.",
+            )
+        if inspect.iscoroutinefunction(call):
+            return
+
+    raise StarioError(
+        f"{what} must be async",
+        context={"got": type(handler).__name__},
+        help_text="Register `async def handler(c, w):`. Sync handlers are not supported.",
+    )
 
 
 @dataclass(slots=True)
@@ -460,6 +499,7 @@ class Router:
         self._clear_match_cache()
 
     def not_found(self, pattern: UrlPath | str, handler: Handler) -> None:
+        require_async_handler(handler, what="Not-found handler")
         self._policy_node(pattern).not_found_handler = handler
         self._clear_match_cache()
 
@@ -468,7 +508,12 @@ class Router:
         pattern: UrlPath | str,
         handler: MethodNotAllowedHandler,
     ) -> None:
-        self._policy_node(pattern).method_not_allowed_handler = handler
+        def checked(allowed: frozenset[str]) -> Handler:
+            resolved = handler(allowed)
+            require_async_handler(resolved, what="Method-not-allowed handler")
+            return resolved
+
+        self._policy_node(pattern).method_not_allowed_handler = checked
         self._clear_match_cache()
 
     def handle(
@@ -479,6 +524,7 @@ class Router:
         *,
         middleware: Sequence[Middleware] = (),
     ) -> None:
+        require_async_handler(handler)
         route = _as_pattern(path)
         method = method.upper()
         tree = self._registration_tree(route)
@@ -493,6 +539,8 @@ class Router:
         wrapped = handler
         for mw in reversed([*scoped_middleware, *middleware]):
             wrapped = mw(wrapped)
+        if wrapped is not handler:
+            require_async_handler(wrapped, what="Composed handler")
 
         existing = None if current.endpoints is None else current.endpoints.get(method)
         if existing is not None:

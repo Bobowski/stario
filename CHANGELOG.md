@@ -6,6 +6,44 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Breaking changes
+
+- `App.on_error` and exception-type mapping are gone. Uncaught handler
+  exceptions are logged. If the handler sent nothing, the framework writes
+  **500**; a response already on the wire is not rewritten. Handlers must
+  write a complete response (`respond` / `end`) or use
+  `stario.http.middleware.catch_errors` to map app exceptions.
+- **`HttpException` removed.** Body read failures raise `RequestBodyError`
+  (408/413). Map them with `catch_request_body_errors()` or custom middleware.
+- Route handlers must be `async def` (or a callable whose `__call__` is async).
+- The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
+  instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
+  the Cython protocol (no handler task).
+
+### Added
+
+- `stario.http.middleware.catch_errors` — wrap handlers so listed exceptions
+  become HTTP responses when nothing was sent yet. Presets:
+  `catch_request_body_errors()` and `respond_request_body_error`.
+
+### Changed
+
+- Handler-task finish is `stario.http.invoke.on_handler_done`: log, write 500
+  if nothing was sent, abort if a body was started but not finished, close
+  the span. No auto-`end()`. A write-then-raise still logs (`Handler failed`);
+  the response already on the wire is not rewritten.
+- Every request that writes an HTTP status gets a started-and-ended span:
+  handler responses, trailing-slash 308, and protocol 400 / 413 / 431 / 429
+  (Cython) / 503 (Python pipeline). Protocol outcomes are not `fail`ed.
+  `NoOpSpan` still skips start/end. Idle timeout and `connection_lost` with
+  no status still do not create a span.
+- Cython GET path: skip upload state when there is no body (`mark_nobody`),
+  and arm idle timeouts on the Date-tick sweeper instead of `loop.time()`
+  per keep-alive request.
+- Cython uploads: Content-Length bodies ≤ 256 KiB dispatch after the
+  message is complete (`body()` is already bytes). `stream()` with a known
+  Content-Length yields `min(length, 256 KiB)` instead of a fixed 64 KiB.
+
 ## 4.1.0 - 2026-08-17
 
 ### Added

@@ -1,0 +1,156 @@
+"""Handler-task finish: log and write 500 if nothing was sent."""
+
+import asyncio
+import logging
+
+import stario.responses as responses
+from stario.http.app import App
+from stario.http.context import Context
+from stario.http.invoke import finish_request_span, on_handler_done
+from stario.http.writer import Writer
+from stario.telemetry.noop import NoOpTracer
+from stario.testing.tracer import TestTracer
+from tests.helpers import DummyWriter, make_context
+
+
+def test_finish_request_span_records_status_without_fail() -> None:
+    with TestTracer() as tracer:
+        span = tracer.create("request")
+        finish_request_span(span, status=308, method="GET", path="/search/")
+        finished = tracer.get_span(span.id)
+        assert finished is not None
+        assert finished.attributes["response.status_code"] == 308
+        assert finished.attributes["request.method"] == "GET"
+        assert finished.attributes["request.path"] == "/search/"
+        assert finished.ok
+        assert not tracer.has_open_spans()
+
+
+def test_finish_request_span_skips_noop() -> None:
+    span = NoOpTracer().create("request")
+    finish_request_span(span, status=400)
+    finish_request_span(None, status=413)
+
+
+def test_find_handler_is_the_resolve_step() -> None:
+    async def run() -> None:
+        app = App()
+
+        async def hello(_c: Context, w: Writer) -> None:
+            responses.text(w, "ok")
+
+        app.get("/hello", hello)
+        ctx = make_context("/hello", app=app, loop=asyncio.get_running_loop())
+        handler, ctx.route = app.find_handler("", "/hello", "GET")
+        assert handler is hello
+        assert ctx.route.pattern == "/hello"
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_writes_500_on_exception(
+    caplog: logging.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+
+        async def boom() -> None:
+            raise RuntimeError("boom")
+
+        task = app.create_task(boom(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.completed
+        assert w.status == 500
+        assert w.body == "Internal Server Error"
+        assert "Handler failed" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_writes_500_when_handler_writes_nothing(
+    caplog: logging.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+
+        async def silent() -> None:
+            return None
+
+        task = app.create_task(silent(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.completed
+        assert w.status == 500
+        assert w.body == "Internal Server Error"
+        assert "without sending a response" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_aborts_if_headers_already_started(
+    caplog: logging.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        w.write_headers(200)
+
+        async def boom_after_headers() -> None:
+            raise RuntimeError("after headers")
+
+        task = app.create_task(boom_after_headers(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.status == 200
+        assert w.completed
+        assert not w.ended
+        assert "Handler failed" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_logs_exception_after_completed_response(
+    caplog: logging.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        w.respond(b"ok", b"text/plain", 200)
+
+        async def boom_after_write() -> None:
+            raise RuntimeError("after write")
+
+        task = app.create_task(boom_after_write(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.status == 200
+        assert w.body == "ok"
+        assert w.completed
+        assert "Handler failed" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_does_not_end_a_completed_response() -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        w.respond(b"ok", b"text/plain", 200)
+
+        async def already_done() -> None:
+            return None
+
+        task = app.create_task(already_done(), eager_start=True)
+        on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.status == 200
+        assert w.body == "ok"
+
+    asyncio.run(run())

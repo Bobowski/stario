@@ -25,6 +25,7 @@ from stario.http.config import (
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
+from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.request import DEFAULT_BODY_TIMEOUT
 from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
@@ -40,7 +41,10 @@ from stario_cython.timeouts import (
 cdef enum:
     URL_CACHE_CAP = 256
     URL_CACHE_MAX_KEY = 512
-    SMALL_BODY_COMPLETE_DISPATCH = 64 * 1024
+    # 256 KiB sits above API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
+    # body() is then already bytes when the handler starts. File uploads
+    # (MiB) still dispatch at headers-complete so stream() can start early.
+    SMALL_BODY_COMPLETE_DISPATCH = 256 * 1024
 
 cdef char* _UC_KEY[256]
 cdef Py_ssize_t _UC_LEN[256]
@@ -182,6 +186,7 @@ cdef tuple _split_request_target_n(const char* url, Py_ssize_t n):
         _url_store(url, n, h, path, query)
     return (path, query)
 
+cdef int F_CHUNKED = 0x8
 cdef int F_CONTENT_LENGTH = 0x20
 cdef int PAUSE_WRITE = 1
 cdef int PAUSE_PIPELINE = 2
@@ -404,6 +409,7 @@ cdef class HttpProtocol:
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
     cdef object _create_task
+    cdef object _find_handler
 
     def __cinit__(self):
         _bind_settings()
@@ -456,6 +462,7 @@ cdef class HttpProtocol:
         self.compression = compression
         self.connections = connections
         self._create_task = app.create_task
+        self._find_handler = app.find_handler
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -569,7 +576,9 @@ cdef class HttpProtocol:
         if transport is None or transport.is_closing() or seconds <= 0:
             return
         self.timeout_kind = kind
-        self.timeout_deadline = self.loop.time() + seconds
+        # Sweeper fills now+seconds on the next Date tick. Avoid loop.time()
+        # on the keep-alive hot path (every wrk GET).
+        self.timeout_deadline = 0.0
 
     cdef void _cancel_timeout(self):
         self.timeout_kind = TIMEOUT_NONE
@@ -846,20 +855,27 @@ cdef class HttpProtocol:
         if self.transport is None or self.transport.is_closing():
             return
         try:
-            exchange.reset_body(
-                exchange._req_expect_continue,
-                <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
-            )
-            # Small Content-Length bodies that fit in the current read complete
-            # before the handler runs, so body() hits the cached bytes instead
-            # of waiting on an Event during llhttp_execute. Expect: 100-continue
-            # and large/chunked bodies still dispatch at headers-complete.
             if (
-                not exchange._req_expect_continue
-                and (flags & F_CONTENT_LENGTH)
-                and 0 < content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                (flags & F_CHUNKED)
+                or (flags & F_CONTENT_LENGTH and content_length > 0)
+                or exchange._req_expect_continue
             ):
-                return
+                exchange.reset_body(
+                    exchange._req_expect_continue,
+                    <Py_ssize_t>content_length if flags & F_CONTENT_LENGTH else -1,
+                )
+                # Small Content-Length bodies that fit in the current read complete
+                # before the handler runs, so body() hits the cached bytes instead
+                # of waiting on an Event during llhttp_execute. Expect: 100-continue
+                # and large/chunked bodies still dispatch at headers-complete.
+                if (
+                    not exchange._req_expect_continue
+                    and (flags & F_CONTENT_LENGTH)
+                    and content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                ):
+                    return
+            else:
+                exchange.mark_nobody()
             self._dispatch(exchange, self._build_request(exchange, exchange))
         except Exception:
             self._close_error(400, "Invalid HTTP request")
@@ -948,22 +964,107 @@ cdef class HttpProtocol:
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
+        cdef object req
+        cdef object path
+        cdef object handler
+        cdef object route
         cdef object task
+        cdef object span
+        cdef object host
+        cdef object method
+        cdef const char* url
+        cdef Py_ssize_t n
+        cdef Py_ssize_t i
+        cdef Py_ssize_t path_end
+        cdef Py_ssize_t start
+        cdef Py_ssize_t end
         self.active_exchange = exchange
+        n = exchange._req_url_length
+        if n > 1:
+            url = exchange._req_arena + exchange._req_url_offset
+            path_end = n
+            for i in range(n):
+                if url[i] == 63:
+                    path_end = i
+                    break
+            if path_end > 1 and url[path_end - 1] == 47:
+                start = 0
+                end = path_end
+                while start < end and url[start] == 47:
+                    start += 1
+                while end > start and url[end - 1] == 47:
+                    end -= 1
+                exchange.start_response()
+                exchange._buf_bytes(_status_line(308))
+                exchange._buf_bytes(exchange._date_box[0])
+                exchange._buf_bytes(b"location: /")
+                if end > start:
+                    exchange._buf_add(url + start, end - start)
+                if path_end + 1 < n:
+                    exchange._buf_bytes(b"?")
+                    exchange._buf_add(url + path_end + 1, n - path_end - 1)
+                exchange._buf_bytes(b"\r\ncontent-length: 0\r\n\r\n")
+                exchange._flush()
+                exchange._status_code = 308
+                exchange._completed = True
+                if self.noop_span is None:
+                    req = exchange.req
+                    finish_request_span(
+                        exchange.span,
+                        status=308,
+                        method=req.method,
+                        path=req.path,
+                    )
+                exchange._done()
+                exchange.handler_finished()
+                return
         exchange.start_response()
+        req = exchange.req
+        path = req.path
+        method = req.method
+        span = exchange.span
+        if span is not None and self.noop_span is None:
+            span.start()
+            span.attrs({"request.method": method, "request.path": path})
+        host = req.host if self.app.host_routing else ""
+        handler, route = self._find_handler(host, path, method)
+        exchange.route = route
         task = self._create_task(
-            self.app(exchange, exchange),
+            handler(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
         )
         if task.done():
+            # Skip only a clean NoOp success. Write-then-raise / cancel / an
+            # incomplete response must still hit on_handler_done (log + abort).
+            if (
+                not exchange._completed
+                or self.noop_span is None
+                or task.cancelled()
+                or task.exception() is not None
+            ):
+                on_handler_done(exchange, exchange, task)
             exchange.handler_finished()
         else:
             task.add_done_callback(exchange.on_handler_done)
 
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
+        cdef object span
+        cdef object req
         for exchange in self.pending_exchanges:
+            if self.noop_span is None:
+                span = exchange.span
+                if span is not None:
+                    req = exchange.req
+                    try:
+                        finish_request_span(
+                            span,
+                            method=req.method if req is not None else None,
+                            path=req.path if req is not None else None,
+                        )
+                    except Exception:
+                        pass
             exchange.cancel_before_start()
         self.pending_exchanges.clear()
 
@@ -1005,22 +1106,64 @@ cdef class HttpProtocol:
         self._set_pause_reason(PAUSE_PIPELINE, False)
         self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
+    cdef void _finish_protocol_span(
+        self,
+        int status,
+        object span,
+        object method,
+        object path,
+    ) noexcept:
+        if self.noop_span is not None:
+            return
+        try:
+            if span is None and self.tracer is not None:
+                span = self.tracer.create("request")
+            finish_request_span(span, status=status, method=method, path=path)
+        except Exception:
+            pass
+
     cdef void _close_error(self, int status, object message) noexcept:
         cdef object transport
         cdef object body
         cdef object date
+        cdef object span
+        cdef object method
+        cdef object path
+        cdef tuple split
+        cdef RequestExchange exchange
         if self.rejected:
             return
         self.rejected = True
         self._cancel_timeout()
         transport = self.transport
+        exchange = self.reading_exchange
+        span = None
+        method = None
+        path = None
+        if exchange is not None:
+            span = exchange.span
+            try:
+                if exchange._req_url_length > 0:
+                    split = _split_request_target_n(
+                        exchange._req_arena + exchange._req_url_offset,
+                        exchange._req_url_length,
+                    )
+                    path = split[0]
+                    if self.parser != NULL:
+                        method = _method_str(<int>llhttp_get_method(self.parser))
+                elif self.request_dispatched and exchange.req is not None:
+                    method = exchange.req.method
+                    path = exchange.req.path
+            except Exception:
+                method = None
+                path = None
         try:
             if transport is None or transport.is_closing():
                 return
-            if self.reading_exchange is not None:
-                self.reading_exchange.c_abort()
-                if not self.reading_exchange.handler_started:
-                    self.reading_exchange.cancel_before_start()
+            if exchange is not None:
+                exchange.c_abort()
+                if not exchange.handler_started:
+                    exchange.cancel_before_start()
             self._drop_pending()
             body = message.encode("utf-8")
             date = self.date_box[0]
@@ -1035,6 +1178,7 @@ cdef class HttpProtocol:
                     body,
                 ))
             )
+            self._finish_protocol_span(status, span, method, path)
             transport.close()
         except Exception:
             try:

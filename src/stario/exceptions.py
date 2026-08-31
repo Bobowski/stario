@@ -2,33 +2,40 @@
 Failure types:
 
 - `StarioError` — invalid framework or API usage: wrong arguments, invalid
-  configuration, or calls that are wrong regardless of object state (uncaught in
-  `App` → 500). Examples: bad `UrlPath` params, duplicate route registration,
-  invalid bootstrap shape, unfilled `@baked` slots, invalid `Content-Length`.
+  configuration, or calls that are wrong regardless of object state. Uncaught
+  on the request path: logged and the writer is aborted. Examples: bad
+  `UrlPath` params, duplicate route registration, invalid bootstrap shape,
+  unfilled `@baked` slots, invalid `Content-Length`.
 
 - `StarioRuntime` — valid API call at the wrong lifecycle phase of a
   framework-managed object during request handling or async session work
-  (subclass of `StarioError`; uncaught → 500). The *what* may be fine; the
+  (subclass of `StarioError`). Uncaught on the request path: logged and
+  the writer is aborted. The *what* may be fine; the
   *when* is wrong — reorder control flow rather than change a parameter.
   Examples: handler returned without a response, `Writer` used after `end()`,
   request body read twice, SSE after a finalized response, `Relay` subscription
-  outside `async with`. Use `StarioRuntime` (not stdlib `RuntimeError`) on the
-  request path so `App` matches these in `on_error` via MRO and `str(exc)`
-  keeps structured context and help text.
+  outside `async with`. `str(exc)` keeps structured context and help text.
 
-  `on_error(StarioError, …)` matches `StarioRuntime` too unless a more specific
-  `on_error(StarioRuntime, …)` is registered.
-- `HttpException` / `RedirectException` — intentional HTTP outcomes; `App` maps
-  them with `responses.text` / `responses.redirect` in default `on_error` handlers.
-- `ClientDisconnected` — peer closed during request body read (`App` aborts the
-  connection without a response body).
+- `RequestBodyError` — request body read failed (413 payload too large or 408
+  upload stall). Raised by `BodyReader` / the Cython exchange. Not mapped to
+  HTTP by the protocol; use `stario.http.middleware.catch_errors` (or write the
+  response in the handler) to turn it into a client-facing status.
 
-`HttpException` and `RedirectException` are re-exported from the `stario` package
-root; prefer `from stario import HttpException, RedirectException` in application code.
+- `RedirectException` — optional handler shortcut for 3xx redirects. The
+  protocol does not map it; call `responses.redirect` (or catch and write).
 
-Wrong status codes on the HTTP exception constructors raise `StarioError` (a usage
-mistake), not an HTTP response. `RedirectException` validates `location` when the
-default handler calls `responses.redirect`, not at construction.
+- `ClientDisconnected` — peer closed during request body read. The protocol
+  logs the failure and aborts if the handler did not finish a response.
+
+Uncaught handler exceptions are logged. If nothing was sent, the framework
+writes **500**; bytes already on the wire are not rewritten.
+
+`RedirectException` is re-exported from the `stario` package root. Import
+`RequestBodyError` from `stario.exceptions` when catching body read failures.
+
+Wrong status codes on redirect constructors raise `StarioError` (a usage
+mistake), not an HTTP response. `RedirectException` validates `location` when
+`responses.redirect` runs, not at construction.
 
 On `StarioError`, `message` is the short summary; `str(exc)` adds context, help, and
 example lines for logs and telemetry.
@@ -78,37 +85,32 @@ class StarioRuntime(StarioError):
     Raised when a framework object is used in the wrong lifecycle phase.
 
     Unlike `StarioError`, the failure is about *when* you called, not *what*
-    you passed — reorder handler or session control flow to fix it. Register
-    `app.on_error(StarioRuntime, …)` to handle these separately from static
-    configuration mistakes raised as `StarioError`.
+    you passed — reorder handler or session control flow to fix it.
     """
 
 
-class HttpException(Exception):
+class RequestBodyError(StarioRuntime):
     """
-    Intentional HTTP response with a plain-text body (4xx/5xx only).
+    Request body read failed: payload too large (413) or upload stalled (408).
 
-    Registered on `App` so handlers can `raise` instead of branching on
-    `Writer` after partial output (still only safe before headers are sent).
-    Use `RedirectException` for 3xx redirects so URLs are not confused with
-    body text.
+    Raised while buffering or streaming the request body. Uncaught in a handler
+    becomes a framework **500**; map to the intended status with middleware:
 
-    The default `App` handler sends `detail` as `text/plain`, or `"Error"` when
-    `detail` is empty.
+    ```python
+    from stario.exceptions import RequestBodyError
+    from stario.http.middleware import catch_errors, respond_request_body_error
+
+    app.use("/", catch_errors(RequestBodyError, respond=respond_request_body_error))
+    ```
     """
 
     __slots__ = ("detail", "status_code")
 
     def __init__(self, status_code: int, detail: str = "") -> None:
-        # HttpException is for error bodies the client should read — not 1xx/2xx
-        # continuations and not 3xx redirects (use RedirectException).
-        if not 400 <= status_code < 600:
+        if status_code not in (408, 413):
             raise StarioError(
-                f"HttpException requires a 4xx or 5xx status code, got {status_code}",
-                help_text=(
-                    "Use RedirectException for redirects, or responses.text/json/html "
-                    "for successful (2xx) bodies."
-                ),
+                f"RequestBodyError requires status 408 or 413, got {status_code}",
+                help_text="Use 413 for oversize bodies and 408 for upload stalls.",
             )
         self.status_code = status_code
         self.detail = detail
@@ -119,9 +121,9 @@ class RedirectException(Exception):
     """
     Intentional HTTP redirect (3xx).
 
-    `location` is the `Location` URL or path. URL safety is checked when the
-    default `App` handler calls `responses.redirect`, not at construction. A
-    non-3xx `status_code` raises `StarioError` at construction time.
+    `location` is the `Location` URL or path. URL safety is checked when
+    `responses.redirect` runs, not at construction. A non-3xx `status_code`
+    raises `StarioError` at construction time.
     """
 
     __slots__ = ("location", "status_code")
@@ -130,7 +132,7 @@ class RedirectException(Exception):
         if not (300 <= status_code < 400):
             raise StarioError(
                 f"RedirectException requires a 3xx status_code, got {status_code}",
-                help_text="Use HttpException for response bodies (4xx/5xx).",
+                help_text="Use responses.text/json/html for response bodies (4xx/5xx).",
             )
         self.status_code = status_code
         self.location = location
@@ -141,9 +143,9 @@ class ClientDisconnected(Exception):
     """
     The peer closed the connection while the request body was still being read.
 
-    `App` registers a default handler that calls `Writer.abort()` (no response
-    body). For long-lived responses (SSE, chunked), prefer polling `c.disconnected`
-    or using `c.alive()` instead of relying on this exception.
+    If the handler does not finish a response, the protocol logs the failure
+    and aborts. For long-lived responses (SSE, chunked), prefer polling
+    `c.disconnected` or using `c.alive()` instead of relying on this exception.
     """
 
     def __init__(

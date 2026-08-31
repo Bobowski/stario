@@ -32,7 +32,7 @@ from cpython.unicode cimport PyUnicode_DecodeLatin1, PyUnicode_DecodeUTF8
 from stario import cookies as cookie_helpers
 from stario.exceptions import (
     ClientDisconnected,
-    HttpException,
+    RequestBodyError,
     StarioError,
     StarioRuntime,
 )
@@ -43,6 +43,7 @@ from stario.http.compression import (
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
+from stario.http.invoke import on_handler_done
 from stario.http.request import host_without_port
 from stario.http.writer import get_status_line
 
@@ -70,7 +71,8 @@ from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
-cdef int STREAM_CHUNK_LIMIT = 256 * 1024
+cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
+cdef int STREAM_CHUNK_CL = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
@@ -109,6 +111,7 @@ _bind_timeout_mode()
 cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
 cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
 cdef bytes STATUS_304 = b"HTTP/1.1 304 Not Modified\r\n"
+cdef bytes STATUS_308 = b"HTTP/1.1 308 Permanent Redirect\r\n"
 cdef bytes STATUS_400 = b"HTTP/1.1 400 Bad Request\r\n"
 cdef bytes STATUS_404 = b"HTTP/1.1 404 Not Found\r\n"
 cdef bytes STATUS_405 = b"HTTP/1.1 405 Method Not Allowed\r\n"
@@ -346,6 +349,8 @@ cdef object _status_line(int status):
         return STATUS_204
     if status == 304:
         return STATUS_304
+    if status == 308:
+        return STATUS_308
     if status == 400:
         return STATUS_400
     if status == 404:
@@ -824,7 +829,7 @@ cdef class Request:
             return b""
         if type(self._body) is bytes:
             if max_size is not None and len(self._body) > max_size:
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             return self._body
         return await self._body.read(max_size=max_size)
 
@@ -1473,7 +1478,8 @@ cdef class RequestExchange:
         self.reset_response(self._req_encoding)
 
     def on_handler_done(self, task):
-        """``Task.add_done_callback`` entry; recycles after ``App.__call__``."""
+        """Log/abort on failure, then recycle after the handler task."""
+        on_handler_done(self, self, task)
         self.handler_finished()
 
     cdef void handler_finished(self):
@@ -1574,8 +1580,8 @@ cdef class RequestExchange:
             nbytes = self._body_nbytes(body)
         self._declared_length = nbytes
         self._bytes_written = 0
-        # Empty headers + no compression: writelines of existing buffers (no join,
-        # no _out_buf churn — keeps tiny plaintext/json competitive).
+        # Empty headers + no compression: writelines of interned pieces
+        # (status, Date, type, length, body). No join, no cross-request cache.
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
@@ -1908,6 +1914,23 @@ cdef class RequestExchange:
         self._expected_size = expected_size
         self._stream_max_chunk = DEFAULT_STREAM_CHUNK
 
+    cdef void mark_nobody(self) noexcept:
+        """GET/HEAD/empty POST: no upload, body() is b'' without Event waits."""
+        self._clear_body_storage()
+        self._cached = b""
+        self._data_ready = None
+        self._cancel_stall_timer()
+        self._expect_continue = False
+        self._total_read = 0
+        self._read_max_size = -1
+        self._consumed_as = CONSUMED_NONE
+        self._abort_reason = ABORT_NONE
+        self._body_active = False
+        self._body_complete = True
+        self._waiting = False
+        self._discard_body = False
+        self._expected_size = 0
+
     cdef void _clear_body_storage(self) noexcept:
         if self._chunks is not None:
             self._chunks.clear()
@@ -1927,7 +1950,7 @@ cdef class RequestExchange:
         # does not b"".join ~32x64KiB tails. Do not wait for CONSUMED_BODY:
         # the first body bytes often win that race (same llhttp_execute as
         # headers-complete, or a pipelined request still queued). stream()
-        # sets CONSUMED_STREAM before feeding so it keeps 64KiB tails.
+        # sets CONSUMED_STREAM before feeding so it keeps stream-sized tails.
         if (
             self._consumed_as != CONSUMED_STREAM
             and self._expected_size > 0
@@ -1950,7 +1973,7 @@ cdef class RequestExchange:
         return 0
 
     cdef int _adopt_expected_body_buffer(self) noexcept:
-        """Compact already-fed 64KiB tails into one Content-Length buffer.
+        """Compact already-fed stream-sized tails into one Content-Length buffer.
 
         Used when body() starts after some bytes already landed in stream-sized
         pieces. Later c_feed memcpy's into this tail; complete skips join.
@@ -2043,9 +2066,9 @@ cdef class RequestExchange:
 
     cdef void _raise_abort(self):
         if self._abort_reason == ABORT_TOO_LARGE:
-            raise HttpException(413, "Request body too large")
+            raise RequestBodyError(413, "Request body too large")
         if self._abort_reason == ABORT_TIMEOUT:
-            raise HttpException(
+            raise RequestBodyError(
                 408,
                 "Request timeout: body upload too slow. "
                 "This may indicate a slowloris attack or very poor connection.",
@@ -2271,7 +2294,12 @@ cdef class RequestExchange:
                 help_text="Call stream() only once per request.",
             )
         if max_chunk is None:
-            chunk_size = DEFAULT_STREAM_CHUNK
+            if self._expected_size > 0:
+                chunk_size = self._expected_size
+                if chunk_size > STREAM_CHUNK_CL:
+                    chunk_size = STREAM_CHUNK_CL
+            else:
+                chunk_size = DEFAULT_STREAM_CHUNK
         else:
             chunk_size = <Py_ssize_t>max_chunk
             if chunk_size <= 0:
@@ -2335,7 +2363,7 @@ cdef class RequestExchange:
             )
         if self._cached is not None:
             if max_size is not None and len(self._cached) > max_size:
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             self._consumed_as = CONSUMED_BODY
             return self._cached
         self._consumed_as = CONSUMED_BODY
@@ -2350,7 +2378,7 @@ cdef class RequestExchange:
                 self._read_max_size >= 0
                 and self._total_read > self._read_max_size
             ):
-                raise HttpException(413, "Request body too large")
+                raise RequestBodyError(413, "Request body too large")
             if self._connection is not None:
                 self._connection.set_body_paused(self, False)
             if self._body_complete:
@@ -2363,7 +2391,7 @@ cdef class RequestExchange:
         if self._cached is None:
             self._cached = self._body_to_bytes()
         if max_size is not None and len(self._cached) > max_size:
-            raise HttpException(413, "Request body too large")
+            raise RequestBodyError(413, "Request body too large")
         return self._cached
 
 

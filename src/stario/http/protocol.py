@@ -2,8 +2,8 @@
 Per-connection HTTP/1.1: httptools parses bytes; handlers run as tasks so this layer never blocks the event loop.
 
 Shared `disconnect` futures tie body reads and long responses to the same socket lifetime. Pipelining and keep-alive
-follow RFC behavior even when common clients use parallel connections instead. App work is scheduled via `app.create_task`
-so shutdown can observe the same task set the app registered.
+follow RFC behavior even when common clients use parallel connections instead. Each request is
+`find_handler` then `create_task(handler(c, w))` so shutdown can observe the same task set.
 """
 
 import asyncio
@@ -18,13 +18,16 @@ from httptools import (  # pyright: ignore[reportMissingTypeStubs]
     parse_url,  # pyright: ignore[reportUnknownVariableType]
 )
 
+import stario.responses as responses
 from stario.telemetry.core import Tracer
+from stario.telemetry.spans import NoOpSpan
 
 from .app import App
 from .compression import CompressionConfig
 from .config import RequestPolicy
 from .context import Context
 from .headers import Headers
+from .invoke import finish_request_span, on_handler_done
 from .request import BodyReader, Request
 from .wire import decode_method, decode_path
 from .writer import (
@@ -252,6 +255,9 @@ class HttpProtocol(asyncio.Protocol):
         parsed_url = parse_url(url)
         if not self._validate_request_framing(headers):
             return
+        if parser.should_upgrade():
+            self._close_with_error(400, "Upgrade not supported")
+            return
 
         body_reader = self._reading_body
         content_length = headers.unsafe_get(b"content-length")
@@ -331,10 +337,7 @@ class HttpProtocol(asyncio.Protocol):
             self._active_context = context
             self._active_writer = writer
 
-            # Reuse the protocol loop here; this is one task per request.
-            self._active_task = self.app.create_task(
-                self.app(context, writer), loop=self.loop
-            )
+            self._start_handler(context, writer, eager_start=True)
 
         else:
             # Pipeline queue: must not run the next handler until bytes are fully written.
@@ -342,7 +345,13 @@ class HttpProtocol(asyncio.Protocol):
             if self._pipeline is None:
                 self._pipeline = deque()
             if len(self._pipeline) >= self._request_policy.max_pipelined_requests:
-                self._close_with_error(503, "Pipeline queue full")
+                self._close_with_error(
+                    503,
+                    "Pipeline queue full",
+                    span=context.span,
+                    method=context.req.method,
+                    path=context.req.path,
+                )
                 return
             self._pipeline.append((context, writer))
 
@@ -365,6 +374,51 @@ class HttpProtocol(asyncio.Protocol):
     # =========================================================================
     # Request Handling
     # =========================================================================
+
+    def _start_handler(
+        self,
+        context: Context,
+        writer: Writer,
+        *,
+        eager_start: bool,
+    ) -> None:
+        path = context.req.path
+        if path != "/" and path.endswith("/"):
+            target = "/" + path.strip("/")
+            if context.req.query_bytes:
+                target = f"{target}?{context.req.query_bytes.decode('latin-1')}"
+            responses.redirect(writer, target, 308)
+            finish_request_span(
+                context.span,
+                status=308,
+                method=context.req.method,
+                path=path,
+            )
+            self._active_task = None
+            return
+
+        host = context.req.host if self.app.host_routing else ""
+        handler, context.route = self.app.find_handler(
+            host, path, context.req.method
+        )
+        span = context.span
+        if type(span) is not NoOpSpan:
+            span.start()
+            span.attrs({"request.method": context.req.method, "request.path": path})
+
+        task = self.app.create_task(
+            handler(context, writer),
+            loop=self.loop,
+            eager_start=eager_start,
+        )
+        if task.done():
+            on_handler_done(context, writer, task)
+            self._active_task = None
+        else:
+            task.add_done_callback(
+                lambda done, c=context, w=writer: on_handler_done(c, w, done)
+            )
+            self._active_task = task
 
     def on_response_completed(self) -> None:
         t = self.transport
@@ -393,9 +447,7 @@ class HttpProtocol(asyncio.Protocol):
             next_c, next_w = self._pipeline.popleft()
             self._active_writer = next_w
             self._active_context = next_c
-            self._active_task = self.app.create_task(
-                self.app(next_c, next_w), loop=self.loop
-            )
+            self._start_handler(next_c, next_w, eager_start=False)
             t.resume_reading()
         else:
             self._active_context = None
@@ -457,10 +509,54 @@ class HttpProtocol(asyncio.Protocol):
         self._reading_headers = None
         self._reading_url_parts = []
 
-    def _close_with_error(self, status_code: int, message: str) -> None:
+    def _request_identity(self) -> tuple[str | None, str | None]:
+        """Best-effort method/path for a protocol error before `Request` exists."""
+        method: str | None = None
+        path: str | None = None
+        parser = self.parser
+        if parser is not None:
+            try:
+                raw = parser.get_method()
+                if raw:
+                    method = decode_method(raw)
+            except Exception:
+                # Partial/garbage requests; status is still recorded.
+                pass
+        if self._reading_url_parts:
+            try:
+                parsed = parse_url(b"".join(self._reading_url_parts))
+                if parsed.path:
+                    path = decode_path(parsed.path)
+            except Exception:
+                # Same: identity is optional on the error span.
+                pass
+        return method, path
+
+    def _close_with_error(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        span: object | None = None,
+        method: str | None = None,
+        path: str | None = None,
+    ) -> None:
         transport = self.transport
         if transport is None or transport.is_closing() or self._rejected:
             return
+
+        if span is None:
+            inferred_method, inferred_path = self._request_identity()
+            if method is None:
+                method = inferred_method
+            if path is None:
+                path = inferred_path
+            if self.tracer is not None:
+                span = self.tracer.create(method or "request")
+
+        abandoned: list[object] = []
+        if self._pipeline:
+            abandoned = [queued[0].span for queued in self._pipeline]
 
         self._rejected = True
         self._cancel_timeout()
@@ -477,3 +573,6 @@ class HttpProtocol(asyncio.Protocol):
         ]
         transport.write(b"".join(parts))
         transport.close()
+        finish_request_span(span, status=status_code, method=method, path=path)
+        for queued_span in abandoned:
+            finish_request_span(queued_span)
