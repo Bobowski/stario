@@ -35,7 +35,52 @@ DEFAULT_REUSE_ADDR = True
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
 DEFAULT_EVENT_LOOP = "asyncio"
 
-type EventLoopKind = Literal["asyncio", "uvloop"]
+type EventLoopKind = Literal[
+    "asyncio",
+    "uvloop",
+    "zuvloop",
+    "rloop",
+    "rsloop",
+    "uringcore",
+    "winloop",
+]
+
+EVENT_LOOP_KIND_NAMES: tuple[EventLoopKind, ...] = (
+    "asyncio",
+    "uvloop",
+    "zuvloop",
+    "rloop",
+    "rsloop",
+    "uringcore",
+    "winloop",
+)
+
+
+def event_loop_choices_text() -> str:
+    """Quoted loop names for error messages (`'a', 'b', or 'c'`)."""
+    *rest, last = EVENT_LOOP_KIND_NAMES
+    quoted = ", ".join(f"'{name}'" for name in rest)
+    return f"{quoted}, or '{last}'"
+
+
+def parse_event_loop_kind(value: str) -> EventLoopKind:
+    """Parse a loop name; comparison is case-insensitive."""
+    match value.lower():
+        case (
+            "asyncio"
+            | "uvloop"
+            | "zuvloop"
+            | "rloop"
+            | "rsloop"
+            | "uringcore"
+            | "winloop"
+        ) as kind:
+            return kind
+        case _:
+            raise StarioError(
+                f"event_loop must be {event_loop_choices_text()}",
+                help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
+            )
 
 
 class RequestPolicy:
@@ -199,12 +244,6 @@ class ServerConfig:
                 "host must be non-empty for TCP listen",
                 help_text="Set STARIO_HOST or pass a non-empty host to ServerConfig.",
             )
-        if event_loop not in ("asyncio", "uvloop"):
-            raise StarioError(
-                "event_loop must be 'asyncio' or 'uvloop'",
-                help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
-            )
-
         self.host = host
         self.port = port
         self.unix_socket = unix_socket
@@ -216,17 +255,18 @@ class ServerConfig:
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
         self.backlog = backlog
         self.reuse_addr = reuse_addr
-        self.event_loop: EventLoopKind = event_loop
+        self.event_loop: EventLoopKind = parse_event_loop_kind(event_loop)
 
 
 def _event_loop_from_env() -> EventLoopKind:
-    loop = env_str("STARIO_LOOP", DEFAULT_EVENT_LOOP).lower()
-    if loop not in ("asyncio", "uvloop"):
+    raw = env_str("STARIO_LOOP", DEFAULT_EVENT_LOOP)
+    try:
+        return parse_event_loop_kind(raw)
+    except StarioError as exc:
         raise StarioError(
-            "STARIO_LOOP must be 'asyncio' or 'uvloop'",
-            help_text="Set STARIO_LOOP to asyncio or uvloop.",
-        )
-    return loop
+            f"STARIO_LOOP must be {event_loop_choices_text()}",
+            help_text="Set STARIO_LOOP to a supported event loop name.",
+        ) from exc
 
 
 def server_config_from_env() -> ServerConfig:

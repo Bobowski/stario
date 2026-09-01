@@ -29,14 +29,16 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 Python 3.14 or newer is required. The package tracks current Python and the standard library (including APIs the framework builds on) rather than supporting older runtimes.
 
-**uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
+**Event loops (optional):** Stario defaults to the stdlib asyncio loop. Drop-in replacements are selected with `STARIO_LOOP` after installing the matching extra:
 
 ```bash
-uv add "stario[uvloop]"
-# or: pip install "stario[uvloop]"
+uv add "stario[uvloop]"      # MagicStack uvloop (libuv / Cython)
+uv add "stario[zuvloop]"     # Kludex zuvloop (libuv / Zig; Python 3.14+)
+uv add "stario[rloop]"       # rloop (Rust / mio; experimental, Unix)
+# also: stario[rsloop], stario[uringcore] (Linux io_uring), stario[winloop] (Windows)
 ```
 
-Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows.
+Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `zuvloop` / `rloop` / …). `uvloop`, `rloop`, and `uringcore` are not supported on Windows; `winloop` is Windows-only.
 
 ## Quick start
 
@@ -73,6 +75,7 @@ async def home(c: Context, w: Writer) -> None:
 
 
 HOME = Route.get("/")
+
 
 async def bootstrap(app: App, span: Span):
     span.attr("app.name", "example")

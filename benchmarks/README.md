@@ -1,11 +1,14 @@
 # Stario benchmarks
 
-Two suites, one per layer we care about:
+Two suites, one per layer we care about, plus an event-loop comparison:
 
 - `html/` — HTML generation speed: stario against other Python renderers, plus
   microbenchmarks for stario's own hot paths.
 - `server/` — end-to-end HTTP throughput: the current Stario checkout against a
   few Python framework/server combinations under `wrk`.
+- `loops/` — Stario 4.1 against itself on the HTTP suite, swapping only the
+  asyncio event loop (`asyncio`, `uvloop`, `zuvloop`, `rloop`, and other
+  drop-in loops that install on the machine).
 
 The goal is repeatable local signal, not lab-grade numbers. Run on a quiet
 machine and compare repeated runs before drawing conclusions.
@@ -153,3 +156,17 @@ wrk.method = "POST"
 wrk.body = '{"name":"Ada","age":42}'
 wrk.headers["Content-Type"] = "application/json"
 ```
+
+## Event loop comparison (`loops/`)
+
+Same Stario checkout and the same four HTTP cases as `server/`, with only
+`STARIO_LOOP` changing. HTML benches are omitted — they do not go through an
+event loop.
+
+```bash
+benchmarks/loops/run.sh
+```
+
+Defaults match the server suite (`DURATION=10s`, `THREADS=2`, `CONNECTIONS=128`)
+plus `RUNS=3` measured samples after one warmup. Results land in
+`benchmarks/loops/results/` and include host/CPU/memory details.

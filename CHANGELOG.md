@@ -6,6 +6,11 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- `STARIO_LOOP` — besides `asyncio` and `uvloop`, accept `zuvloop`, `rloop`, `rsloop`, `uringcore`, and `winloop`. The server uses `<loop>.run()` when present, otherwise `new_event_loop()` / `EventLoopPolicy` with `asyncio.run`.
+- `benchmarks/loops/` — Stario-only HTTP suite across those loops (plaintext, JSON, params, validate).
+
 ## 4.1.1 - 2026-08-31
 
 ### Fixed

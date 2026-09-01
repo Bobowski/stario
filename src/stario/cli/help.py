@@ -6,7 +6,7 @@ Server environment variables (Stario does not load .env files; use your shell or
 Listen:
   STARIO_HOST=127.0.0.1
   STARIO_PORT=8000
-  STARIO_LOOP=asyncio|uvloop
+  STARIO_LOOP=asyncio|uvloop|zuvloop|rloop|rsloop|uringcore|winloop
   STARIO_UNIX_SOCKET=          (empty = TCP)
   STARIO_UNIX_SOCKET_MODE=660  (octal; after bind on unix socket)
   STARIO_BACKLOG=2048

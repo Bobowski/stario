@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from types import FrameType
-from typing import Any, Literal
+from typing import Any, cast
 
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
@@ -29,7 +29,7 @@ from .bootstrap import (
     ShutdownTrigger,
     bootstrap_run,
 )
-from .config import ServerConfig
+from .config import EventLoopKind, ServerConfig
 from .protocol import HttpProtocol
 
 type SignalHandler = Callable[[int, FrameType | None], object]
@@ -43,30 +43,70 @@ _FORCE_CLOSE_CAP = 1.0
 # Yield to the event loop this many times while waiting for connection_made to register.
 _ACCEPT_REGISTER_YIELDS = 10
 
+_WINDOWS_UNSUPPORTED_LOOPS = frozenset({"uvloop", "rloop", "uringcore"})
 
-def resolve_loop_runner(event_loop: Literal["asyncio", "uvloop"]) -> LoopRun[Any]:
-    """Return `asyncio.run` or `uvloop.run` for the configured event loop."""
+
+def _run_with_loop_factory(
+    factory: Callable[[], asyncio.AbstractEventLoop],
+) -> LoopRun[Any]:
+    def run(coro: Coroutine[Any, Any, Any]) -> Any:
+        return asyncio.run(coro, loop_factory=factory)
+
+    return run
+
+
+def resolve_loop_runner(event_loop: EventLoopKind) -> LoopRun[Any]:
+    """Return a coroutine runner for the configured asyncio-compatible loop.
+
+    Prefers `<loop>.run()`, then `new_event_loop()` as `asyncio.run` loop
+    factory, then `EventLoopPolicy.new_event_loop`.
+    """
     if event_loop == "asyncio":
         return asyncio.run
-    if sys.platform == "win32":
+    if sys.platform == "win32" and event_loop in _WINDOWS_UNSUPPORTED_LOOPS:
         raise StarioError(
-            "uvloop is not supported on Windows",
+            f"{event_loop} is not supported on Windows",
+            help_text="Set event_loop to 'asyncio', 'zuvloop', 'rsloop', or 'winloop'.",
+        )
+    if event_loop == "winloop" and sys.platform != "win32":
+        raise StarioError(
+            "winloop is only supported on Windows",
+            help_text="Set event_loop='asyncio' in ServerConfig.",
+        )
+    if event_loop == "uringcore" and sys.platform != "linux":
+        raise StarioError(
+            "uringcore is only supported on Linux",
             help_text="Set event_loop='asyncio' in ServerConfig.",
         )
     try:
-        uvloop = importlib.import_module("uvloop")
+        module = importlib.import_module(event_loop)
     except ImportError as exc:
         raise StarioError(
-            "uvloop is not installed",
-            help_text="Install uvloop or set event_loop='asyncio' in ServerConfig.",
+            f"{event_loop} is not installed",
+            help_text=(
+                f"Install {event_loop} or set event_loop='asyncio' in ServerConfig."
+            ),
         ) from exc
-    run = getattr(uvloop, "run", None)
-    if run is None:
-        raise StarioError(
-            "uvloop does not expose run()",
-            help_text="Set event_loop='asyncio' in ServerConfig.",
+    run = getattr(module, "run", None)
+    if callable(run):
+        return cast(LoopRun[Any], run)
+    factory = getattr(module, "new_event_loop", None)
+    if callable(factory):
+        return _run_with_loop_factory(
+            cast(Callable[[], asyncio.AbstractEventLoop], factory)
         )
-    return run
+    policy_cls = getattr(module, "EventLoopPolicy", None)
+    if isinstance(policy_cls, type):
+        policy = policy_cls()
+        new_loop = getattr(policy, "new_event_loop", None)
+        if callable(new_loop):
+            return _run_with_loop_factory(
+                cast(Callable[[], asyncio.AbstractEventLoop], new_loop)
+            )
+    raise StarioError(
+        f"{event_loop} does not expose run(), new_event_loop(), or EventLoopPolicy",
+        help_text="Set event_loop='asyncio' in ServerConfig.",
+    )
 
 
 class Server:

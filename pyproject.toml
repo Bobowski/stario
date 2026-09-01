@@ -37,6 +37,11 @@ Issues = "https://github.com/bobowski/stario/issues"
 
 [project.optional-dependencies]
 uvloop = ["uvloop>=0.21.0,<1"]
+zuvloop = ["zuvloop>=0.0.13"]
+rloop = ["rloop>=0.5.0"]
+rsloop = ["rsloop>=0.1.46"]
+uringcore = ["uringcore>=0.9.1"]
+winloop = ["winloop>=0.1.0"]
 
 [project.scripts]
 stario = "stario.cli.main:main"

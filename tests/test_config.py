@@ -19,3 +19,8 @@ def test_server_config_rejects_blank_unix_socket() -> None:
 def test_server_config_rejects_blank_tcp_host() -> None:
     with pytest.raises(StarioError, match="host must be non-empty"):
         ServerConfig(host="   ")
+
+
+def test_server_config_rejects_unknown_event_loop() -> None:
+    with pytest.raises(StarioError, match="event_loop must be"):
+        ServerConfig(event_loop="nope")  # type: ignore[arg-type]

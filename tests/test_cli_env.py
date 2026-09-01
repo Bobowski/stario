@@ -4,6 +4,7 @@ import pytest
 
 from stario.cli.env import server_config_from_env
 from stario.cli.errors import CliError
+from stario.http.config import EVENT_LOOP_KIND_NAMES, parse_event_loop_kind
 
 
 def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
@@ -21,6 +22,13 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     assert config.unix_socket == "/tmp/stario.sock"
     assert config.graceful_shutdown_timeout == 12.5
     assert config.reuse_addr is False
+
+
+@pytest.mark.parametrize("loop", EVENT_LOOP_KIND_NAMES)
+def test_server_config_from_env_accepts_event_loops(monkeypatch, loop) -> None:
+    monkeypatch.setenv("STARIO_LOOP", loop)
+    assert server_config_from_env().event_loop == loop
+    assert parse_event_loop_kind(loop.upper()) == loop
 
 
 @pytest.mark.parametrize(
