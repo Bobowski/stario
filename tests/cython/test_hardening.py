@@ -208,6 +208,30 @@ async def test_header_total_over_limit_returns_431() -> None:
 
 
 @pytest.mark.asyncio
+async def test_keep_alive_431_does_not_keep_header_timer() -> None:
+    app = App()
+
+    async def handler(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(
+        app=app, max_header_bytes=512, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
+    )
+    try:
+        pad = b"x" * 544
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\nX-Pad: " + pad + b"\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 431
+        await asyncio.sleep(_WAIT)
+        assert not transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
 async def test_body_over_limit_returns_413() -> None:
     app = App()
     hits = 0
@@ -287,6 +311,106 @@ async def test_huge_declared_body_over_limit_closes() -> None:
         await _drain(app)
         assert response_status(transport.writes) == 413
         assert hits == 0
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_413_does_not_keep_header_timer() -> None:
+    app = App()
+
+    async def ignore_body(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.post("/", ignore_body)
+    proto, app, transport = _attach(
+        app=app, max_body_bytes=20, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
+    )
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n" + (b"y" * 100)
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
+        await asyncio.sleep(_WAIT)
+        assert not transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_413_idle_times_out() -> None:
+    app = App()
+
+    async def ignore_body(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.post("/", ignore_body)
+    proto, app, transport = _attach(
+        app=app, max_body_bytes=20, header_timeout=5.0, keep_alive_timeout=_TIMEOUT
+    )
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n" + (b"y" * 100)
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
+        assert not transport.is_closing()
+        await asyncio.sleep(_WAIT)
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_413_deferred_body_then_second_get() -> None:
+    app = App()
+    hits = 0
+
+    async def hello(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "ok")
+
+    app.get("/", hello)
+    proto, app, transport = _attach(app=app, max_body_bytes=20)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n"
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
+        assert not transport.is_closing()
+        proto.data_received(b"y" * 100)
+        await _drain(app)
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_statuses(transport.writes) == [413, 200]
+        assert hits == 1
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_declared_body_over_limit_with_connection_close() -> None:
+    app = App()
+    proto, app, transport = _attach(app=app, max_body_bytes=20)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+            b"Content-Length: 100\r\n\r\n" + (b"y" * 100)
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
         assert transport.is_closing()
     finally:
         if not transport.is_closing():

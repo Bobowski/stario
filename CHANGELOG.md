@@ -79,7 +79,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   connection. Declared oversize HTTP/2 bodies get **413** on that stream.
   HTTP/1 413 with a declared Content-Length at or under 256 KiB keeps
   the connection and discards the body; larger declared lengths still
-  close. HTTP/2 DATA that exceeds `max_body_bytes` after dispatch is a
+  close. Keep-alive 413/431 then arm the idle timer (they do not leave
+  the first-request header timer running). HTTP/2 DATA that exceeds
+  `max_body_bytes` after dispatch is a
   stream **413** (or `RequestBodyError` in the handler) and does not
   close the multiplexed connection. Incomplete HTTP/2 HEADERS time out
   per stream (RST CANCEL) without tearing down multiplexed neighbors.

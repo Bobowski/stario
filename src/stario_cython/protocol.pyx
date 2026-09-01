@@ -1082,19 +1082,34 @@ cdef class HttpProtocol:
             self._h2_send()
 
     cdef void _after_pump(self):
-        """Arm a header deadline only if this read left headers (or a deferred
-        small body) unfinished. Full wrk requests dispatch inside the pump,
-        so this is a no-op on the keep-alive hot path.
+        """Arm header or idle deadlines after this read.
+
+        Unfinished headers (or a keep-alive 413 drain) get HEADER. A pump
+        that left the HTTP/1 connection empty with no timer — protocol
+        413/431 never goes through ``response_completed`` — gets IDLE.
+        Full wrk requests dispatch inside the pump, so HEADER is a no-op
+        on that hot path.
         """
-        if not self.header_timeout_reset:
-            return
-        self.header_timeout_reset = False
+        if self.header_timeout_reset:
+            self.header_timeout_reset = False
+            if (
+                not self.rejected
+                and self.reading_exchange is not None
+                and (
+                    not self.request_dispatched
+                    or self.h1_headers_too_large
+                )
+            ):
+                self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
         if (
-            not self.rejected
-            and self.reading_exchange is not None
-            and not self.request_dispatched
+            self.timeout_kind == TIMEOUT_NONE
+            and self.parse_mode == PARSE_H1
+            and not self.rejected
+            and self.reading_exchange is None
+            and self.active_exchange is None
+            and not self.pending_exchanges
         ):
-            self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
+            self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
     cdef void _pump_data(self, object data, Py_ssize_t offset) noexcept:
         cdef const char* ptr = NULL
@@ -1359,10 +1374,23 @@ cdef class HttpProtocol:
             (flags & F_CHUNKED) != 0
             or ((flags & F_CONTENT_LENGTH) != 0 and content_length > 0)
         )
+        self.request_keep_alive = (
+            llhttp_should_keep_alive(self.parser) != 0
+            or (
+                llhttp_get_http_major(self.parser) == 1
+                and llhttp_get_http_minor(self.parser) == 1
+                and not exchange._req_connection_close
+            )
+        )
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
             # after oversize headers would be a read-DoS if we stayed open.
-            self._h1_protocol_status(431, "Request header fields too large", has_body, -1)
+            self._h1_protocol_status(
+                431,
+                "Request header fields too large",
+                has_body or not self.request_keep_alive,
+                -1,
+            )
             return
         if exchange.finish_request_header() != 0:
             self._close_error(400, "Invalid HTTP request")
@@ -1379,16 +1407,11 @@ cdef class HttpProtocol:
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             # Keep-alive only when the declared body is small enough to drain.
             # A huge or chunked upload after 413 would be a read-DoS.
-            if content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH:
+            if (
+                content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                and self.request_keep_alive
+            ):
                 self.h1_headers_too_large = True
-                self.request_keep_alive = (
-                    llhttp_should_keep_alive(self.parser) != 0
-                    or (
-                        llhttp_get_http_major(self.parser) == 1
-                        and llhttp_get_http_minor(self.parser) == 1
-                        and not exchange._req_connection_close
-                    )
-                )
                 self._h1_protocol_status(
                     413,
                     "Request body too large",
@@ -1399,14 +1422,6 @@ cdef class HttpProtocol:
                 self._close_error(413, "Request body too large")
             return
         exchange.cache_hot_request_headers()
-        self.request_keep_alive = (
-            llhttp_should_keep_alive(self.parser) != 0
-            or (
-                llhttp_get_http_major(self.parser) == 1
-                and llhttp_get_http_minor(self.parser) == 1
-                and not exchange._req_connection_close
-            )
-        )
         if self.request_dispatched or self.rejected:
             return
         if self.transport is None or self.transport.is_closing():
@@ -1445,6 +1460,7 @@ cdef class HttpProtocol:
 
     cdef void _on_message_complete(self) noexcept:
         cdef RequestExchange exchange
+        cdef object transport
         if self.rejected:
             return
         exchange = self.reading_exchange
@@ -1459,6 +1475,12 @@ cdef class HttpProtocol:
                 exchange.handler_finished()
             self.reading_exchange = None
             self.h1_headers_too_large = False
+            if self.timeout_kind == TIMEOUT_HEADER:
+                self._cancel_timeout()
+            if not self.request_keep_alive:
+                transport = self.transport
+                if transport is not None and not transport.is_closing():
+                    transport.close()
             return
         if exchange is not None and exchange._body_active:
             if exchange.c_complete() != 0:
@@ -1730,6 +1752,11 @@ cdef class HttpProtocol:
                 self.rejected = True
             return
         self.request_dispatched = True
+        if not close_conn and self.timeout_kind == TIMEOUT_HEADER:
+            # Same as _dispatch: this request is answered. _after_pump
+            # re-arms HEADER if a keep-alive 413 body still needs draining.
+            self.timeout_kind = TIMEOUT_NONE
+            self.timeout_deadline = 0.0
         exchange = self.reading_exchange
         method = None
         path = None
