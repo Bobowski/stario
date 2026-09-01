@@ -4,6 +4,7 @@ import pytest
 
 from stario.exceptions import RequestBodyError
 from stario.http.headers import Headers
+from stario.http.host import host_without_port
 from stario.http.request import Request
 from stario.testing.harness import TestRequest
 from tests.helpers import make_request as _make_request
@@ -84,6 +85,27 @@ class TestRequestHost:
     def test_host_strips_whitespace(self):
         req = _make_request(headers={"Host": "  Example.COM:8080  "})
         assert req.host == "example.com"
+
+    def test_cython_request_host_matches_python(self):
+        cases = (
+            "",
+            "  ",
+            "Example.COM:8080",
+            "  Example.COM:8080  ",
+            "[::1]:8000",
+            "[::1]",
+            "localhost",
+            "example.com:",
+            "[::1]foo",
+            "Example.COM:80a",
+            "EXAMPLE.COM",
+        )
+        for raw in cases:
+            hdrs = Headers()
+            if raw:
+                hdrs.set("Host", raw)
+            req = Request(method="GET", path="/", headers=hdrs, body=b"")
+            assert req.host == host_without_port(raw), raw
 
 
 class TestRequestBody:

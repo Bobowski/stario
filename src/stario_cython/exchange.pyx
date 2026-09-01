@@ -13,7 +13,7 @@ import http
 
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
-from libc.stdlib cimport free, realloc
+from libc.stdlib cimport free, malloc, realloc
 from libc.stdio cimport sprintf
 from libc.string cimport memcmp, memcpy
 from cpython.bytearray cimport (
@@ -50,7 +50,6 @@ from stario.http.compression import (
 )
 from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
 from stario.http.invoke import on_handler_done
-from stario.http.host import host_without_port
 
 from stario_cython.compression_buf cimport (
     StarioBrotli,
@@ -624,13 +623,14 @@ cdef bint _query_name_matches(
 
 
 cdef class ParsedQuery:
-    """Query index. First read copies the wire and fills C name/value spans.
+    """Query index. First read fills C name/value spans.
 
-    Names that are ASCII ``+`` / ``%XX`` are decoded in place (output never
-    grows; leftover tail is ignored via the stored length). ``get`` memcmps
-    typical ASCII names like headers, then decodes only that value. First
-    ``name=`` wins. ``items`` / ``as_dict`` / ``as_lists`` still decode
-    everything.
+    Plain ASCII names stay on the original bytes (arena or ``bytes``) with no
+    memcpy. Names that are ASCII ``+`` / ``%XX`` need a private copy so they
+    can decode in place (output never grows; leftover tail is ignored via the
+    stored length). ``get`` memcmps typical ASCII names like headers, then
+    decodes only that value. First ``name=`` wins. ``items`` / ``as_dict`` /
+    ``as_lists`` still decode everything.
     """
 
     cdef bytes _raw
@@ -682,7 +682,7 @@ cdef class ParsedQuery:
         self._reset_view()
 
     cdef void bind_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
-        """Point at request-arena query bytes until the first read copies them."""
+        """Point at request-arena query bytes. Copied only if a name needs unquote."""
         self._raw = None
         self._owner = owner
         self._off = off
@@ -743,6 +743,20 @@ cdef class ParsedQuery:
         self._copy_len = n
         return 0
 
+    cdef const char* _query_buf(self) noexcept:
+        cdef const char* src = NULL
+        cdef Py_ssize_t n = 0
+        if self._copy_len > 0:
+            return self._copy
+        if self._resolve_span(&src, &n):
+            return src
+        return NULL
+
+    cdef void _drop_query_owner(self) noexcept:
+        self._raw = None
+        self._owner = None
+        self._off = 0
+
     cdef void _ensure_index(self) except *:
         cdef const char* src = NULL
         cdef Py_ssize_t n = 0
@@ -752,44 +766,60 @@ cdef class ParsedQuery:
         cdef Py_ssize_t val_start
         cdef Py_ssize_t val_end
         cdef Py_ssize_t name_len
+        cdef Py_ssize_t p
+        cdef bint need_copy = False
         cdef char* buf
         cdef RawQueryParam* param
         if self._indexed:
             return
         self._pcount = 0
         if self._resolve_span(&src, &n) and src != NULL and n > 0:
-            self._ensure_copy(src, n)
-            buf = self._copy
             while _next_query_pair(
-                buf, n, &i, &name_start, &name_end, &val_start, &val_end
+                src, n, &i, &name_start, &name_end, &val_start, &val_end
             ):
                 self._grow_params(self._pcount + 1)
                 param = &self._params[self._pcount]
                 name_len = name_end - name_start
                 param.name_off = name_start
+                param.name_len = name_len
                 param.value_off = val_start
                 param.value_len = val_end - val_start
                 param.flags = 0
                 if (
                     name_len > 0
-                    and _span_needs_unquote(buf + name_start, name_len)
-                    and _span_all_ascii(buf + name_start, name_len)
+                    and _span_needs_unquote(src + name_start, name_len)
+                    and _span_all_ascii(src + name_start, name_len)
                 ):
-                    name_len = _query_unquote_ascii_inplace(
-                        buf + name_start, name_len
-                    )
-                    param.flags = QUERY_NAME_INPLACE
-                param.name_len = name_len
+                    need_copy = True
                 self._pcount += 1
-        self._raw = None
-        self._owner = None
-        self._off = 0
+            if need_copy:
+                self._ensure_copy(src, n)
+                buf = self._copy
+                for p in range(self._pcount):
+                    param = &self._params[p]
+                    name_len = param.name_len
+                    if (
+                        name_len > 0
+                        and _span_needs_unquote(buf + param.name_off, name_len)
+                        and _span_all_ascii(buf + param.name_off, name_len)
+                    ):
+                        param.name_len = _query_unquote_ascii_inplace(
+                            buf + param.name_off, name_len
+                        )
+                        param.flags = QUERY_NAME_INPLACE
+                self._drop_query_owner()
+        else:
+            self._drop_query_owner()
         self._indexed = True
 
     cdef object _decode_name_at(self, Py_ssize_t i):
         cdef RawQueryParam* param = &self._params[i]
-        cdef const char* name = self._copy + param.name_off
+        cdef const char* buf = self._query_buf()
+        cdef const char* name
         cdef Py_ssize_t nlen = param.name_len
+        if buf == NULL:
+            return ""
+        name = buf + param.name_off
         if param.flags & QUERY_NAME_INPLACE:
             if _span_all_ascii(name, nlen):
                 return _decode_latin1(name, nlen)
@@ -798,12 +828,18 @@ cdef class ParsedQuery:
 
     cdef object _decode_value_at(self, Py_ssize_t i):
         cdef RawQueryParam* param = &self._params[i]
+        cdef const char* buf = self._query_buf()
+        if buf == NULL:
+            return ""
         return _decode_query_component(
-            self._copy + param.value_off, param.value_len
+            buf + param.value_off, param.value_len
         )
 
     cdef bint _name_eq(self, Py_ssize_t i, const char* kbuf, Py_ssize_t klen, object key) except -1:
-        return _query_name_matches(self._copy, &self._params[i], kbuf, klen, key)
+        cdef const char* buf = self._query_buf()
+        if buf == NULL:
+            return False
+        return _query_name_matches(buf, &self._params[i], kbuf, klen, key)
 
     cdef object _index_get(self, object key, object default):
         cdef const char* kbuf
@@ -1375,6 +1411,96 @@ cdef void _raise_readonly_request_headers() except *:
     )
 
 
+cdef inline bint _is_host_ws(char c) noexcept:
+    return (
+        c == 32
+        or c == 9
+        or c == 10
+        or c == 13
+        or c == 11
+        or c == 12
+    )
+
+
+cdef inline bint _span_digits(const char* s, Py_ssize_t n) noexcept:
+    cdef Py_ssize_t i
+    if n <= 0:
+        return False
+    for i in range(n):
+        if <unsigned char>s[i] < 48 or <unsigned char>s[i] > 57:
+            return False
+    return True
+
+
+cdef object _ascii_lower_latin1(const char* s, Py_ssize_t n):
+    """Lowercased ASCII copy of ``s`` as a Latin-1 Unicode string."""
+    cdef char stack[512]
+    cdef char* buf
+    cdef bint heap = False
+    cdef Py_ssize_t i
+    cdef unsigned char c
+    cdef object out
+    if n <= 0:
+        return ""
+    if n <= 512:
+        buf = stack
+    else:
+        buf = <char*>malloc(<size_t>n)
+        if buf == NULL:
+            return ""
+        heap = True
+    for i in range(n):
+        c = <unsigned char>s[i]
+        if 65 <= c <= 90:
+            c += 32
+        buf[i] = <char>c
+    out = PyUnicode_DecodeLatin1(buf, n, NULL)
+    if heap:
+        free(buf)
+    return out
+
+
+cdef object _host_without_port_n(const char* s, Py_ssize_t n):
+    """Match ``stario.http.host.host_without_port`` on a wire Host value."""
+    cdef Py_ssize_t start = 0
+    cdef Py_ssize_t end = n
+    cdef Py_ssize_t i
+    cdef Py_ssize_t bracket_end
+    cdef Py_ssize_t colon
+    cdef Py_ssize_t rest
+    while start < end and _is_host_ws(s[start]):
+        start += 1
+    while end > start and _is_host_ws(s[end - 1]):
+        end -= 1
+    if start >= end:
+        return ""
+    if s[start] == 91:
+        bracket_end = -1
+        for i in range(start + 1, end):
+            if s[i] == 93:
+                bracket_end = i
+                break
+        if bracket_end < 0:
+            return _ascii_lower_latin1(s + start, end - start)
+        rest = bracket_end + 1
+        if rest < end and (
+            s[rest] != 58 or not _span_digits(s + rest + 1, end - rest - 1)
+        ):
+            return _ascii_lower_latin1(s + start, end - start)
+        return _ascii_lower_latin1(s + start, bracket_end - start + 1)
+    colon = -1
+    for i in range(end - 1, start - 1, -1):
+        if s[i] == 58:
+            colon = i
+            break
+    if (
+        colon > start
+        and _span_digits(s + colon + 1, end - colon - 1)
+    ):
+        return _ascii_lower_latin1(s + start, colon - start)
+    return _ascii_lower_latin1(s + start, end - start)
+
+
 cdef class Request:
     """Request view. Same handler API as stario.http.request.Request."""
 
@@ -1442,6 +1568,55 @@ cdef class Request:
             parsed = <ParsedQuery>self._query
         parsed.bind_span(owner, off, n)
 
+    cdef void prefetch_host(self) noexcept:
+        cdef RequestHeaders req_headers
+        cdef RequestExchange owner
+        cdef Headers hdrs
+        cdef RawHeader* header
+        cdef object host_wire
+        cdef object host_str
+        cdef const char* p
+        cdef Py_ssize_t n = 0
+        if self._host is not None:
+            return
+        if isinstance(self.headers, RequestHeaders):
+            req_headers = <RequestHeaders>self.headers
+            owner = <RequestExchange>req_headers._owner
+            if owner._req_host_index < 0 or owner._req_arena == NULL:
+                self._host = ""
+                return
+            header = &owner._req_raw_headers[owner._req_host_index]
+            self._host = _host_without_port_n(
+                owner._req_arena + header.value_offset,
+                <Py_ssize_t>header.value_length,
+            )
+            return
+        if isinstance(self.headers, Headers):
+            hdrs = <Headers>self.headers
+            host_wire = hdrs.c_get(b"host")
+            if host_wire is None:
+                self._host = ""
+                return
+            self._host = _host_without_port_n(
+                PyBytes_AS_STRING(host_wire),
+                PyBytes_GET_SIZE(host_wire),
+            )
+            return
+        host_str = ""
+        if self.headers is not None:
+            host_str = self.headers.get("host") or ""
+        if host_str is None:
+            self._host = ""
+            return
+        if not isinstance(host_str, str):
+            host_str = str(host_str)
+        p = PyUnicode_AsUTF8AndSize(host_str, &n)
+        if p == NULL:
+            PyErr_Clear()
+            self._host = ""
+            return
+        self._host = _host_without_port_n(p, n)
+
     cdef object _materialize_query(self):
         cdef RequestExchange owner
         if self._query_bytes is not None:
@@ -1462,26 +1637,10 @@ cdef class Request:
 
     @property
     def host(self):
-        cdef object host_str
-        cdef object host_wire
-        cdef RequestHeaders req_headers
-        if self._host is not None:
-            return self._host
-        if isinstance(self.headers, RequestHeaders):
-            req_headers = <RequestHeaders>self.headers
-            host_str = req_headers.c_value_str(
-                (<RequestExchange>req_headers._owner)._req_host_index
-            )
-            if host_str is None:
-                host_str = ""
-        elif isinstance(self.headers, Headers):
-            host_wire = (<Headers>self.headers).c_get(b"host")
-            host_str = (
-                host_wire.decode("latin-1") if host_wire is not None else ""
-            )
-        else:
-            host_str = self.headers.get("host") or ""
-        self._host = host_without_port(host_str)
+        if self._host is None:
+            self.prefetch_host()
+            if self._host is None:
+                self._host = ""
         return self._host
 
     @property
@@ -1552,6 +1711,9 @@ cdef class RequestExchange:
         self._h2_pending_off = 0
         self._h2_body_done = False
         self._h2_method = None
+        self._h2_got_method = False
+        self._h2_got_path = False
+        self._h2_got_authority = False
         self._h2_dispatched = False
         self._h2_headers_done = False
         self._h2_headers_sent = False
@@ -2034,6 +2196,7 @@ cdef class RequestExchange:
         size_t name_length,
         const char* value,
         size_t value_length,
+        bint names_already_lower,
     ) noexcept:
         """Complete header in one pass (H2 delivers name and value together)."""
         if name_length == 0 or name_length >= <size_t>REQUEST_NAME_MAX:
@@ -2043,7 +2206,10 @@ cdef class RequestExchange:
         if self._reserve_request_arena(<Py_ssize_t>(name_length + value_length)) != 0:
             return -1
         self._req_pending_name_offset = self._req_arena_len
-        _lower_copy(self._req_arena + self._req_arena_len, name, name_length)
+        if names_already_lower:
+            memcpy(self._req_arena + self._req_arena_len, name, name_length)
+        else:
+            _lower_copy(self._req_arena + self._req_arena_len, name, name_length)
         self._req_arena_len += <Py_ssize_t>name_length
         self._req_pending_name_length = <Py_ssize_t>name_length
         self._req_pending_value_offset = self._req_arena_len
@@ -2053,6 +2219,26 @@ cdef class RequestExchange:
         self._req_pending_value_length = <Py_ssize_t>value_length
         self._req_pending_header = True
         return self._commit_request_header()
+
+    cdef bint header_value_equals(
+        self,
+        Py_ssize_t index,
+        const char* value,
+        size_t n,
+    ) noexcept:
+        cdef RawHeader* header
+        if index < 0 or index >= self._req_raw_count:
+            return False
+        header = &self._req_raw_headers[index]
+        if <size_t>header.value_length != n:
+            return False
+        if n == 0:
+            return True
+        return memcmp(
+            self._req_arena + header.value_offset,
+            value,
+            n,
+        ) == 0
 
     cdef int finish_request_header(self) noexcept:
         if not self._req_pending_header:
@@ -2105,7 +2291,8 @@ cdef class RequestExchange:
                 return -1
             self._req_content_length = parsed
         elif name_length == 15 and memcmp(name, "accept-encoding", 15) == 0:
-            self._scan_request_accept_encoding(value, value_length)
+            if self._brotli_enabled or self._gzip_enabled:
+                self._scan_request_accept_encoding(value, value_length)
         self._req_raw_count += 1
         self._req_pending_header = False
         return 0
@@ -2252,6 +2439,9 @@ cdef class RequestExchange:
         self._h2_pending_off = 0
         self._h2_body_done = False
         self._h2_method = None
+        self._h2_got_method = False
+        self._h2_got_path = False
+        self._h2_got_authority = False
         self._h2_dispatched = False
         self._h2_headers_done = False
         self._h2_headers_sent = False
@@ -2259,6 +2449,9 @@ cdef class RequestExchange:
     cdef void bind_http2(self, int32_t stream_id) noexcept:
         self._http2 = True
         self._h2_stream_id = stream_id
+        self._h2_got_method = False
+        self._h2_got_path = False
+        self._h2_got_authority = False
 
     cdef void _clear_hot_request_headers(self) noexcept:
         self._req_encoding = ENCODING_NONE

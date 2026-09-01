@@ -40,3 +40,20 @@ def test_cython_query_cases() -> None:
             assert key in cy
             assert cy.get(key) == next(v for k, v in items if k == key)
             assert cy.getlist(key) == [v for k, v in items if k == key]
+
+
+def test_plaintext_query_get_does_not_require_encoded_names() -> None:
+    raw = b"k00=v00&k01=v01&k02=v02"
+    qp = CyQuery(raw)
+    assert qp.get("k01") == "v01"
+    assert qp.get("missing") is None
+    assert qp.getlist("k00") == ["v00"]
+    assert raw == b"k00=v00&k01=v01&k02=v02"
+
+
+def test_encoded_query_names_still_unquote() -> None:
+    raw = b"a+b=c&caf%C3%A9=1"
+    qp = CyQuery(raw)
+    assert qp.get("a b") == "c"
+    assert qp.get("café") == "1"
+    assert raw == b"a+b=c&caf%C3%A9=1"

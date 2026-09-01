@@ -260,6 +260,7 @@ cdef object _path_for_url(
     """Decoded path; query is a span inside the current URL (no copy)."""
     cdef Py_ssize_t question = -1
     cdef Py_ssize_t i
+    cdef Py_ssize_t path_end
     cdef uint32_t h = 0
     cdef int slot
     cdef object path
@@ -280,12 +281,18 @@ cdef object _path_for_url(
             break
     if question < 0:
         path = _decode_path_n(url, n)
+        path_end = n
     else:
+        path_end = question
         path = _decode_path_n(url, question)
         if question + 1 < n:
             qoff[0] = question + 1
             qlen[0] = n - question - 1
-    if n <= URL_CACHE_MAX_KEY:
+    # Trailing-slash requests 308; don't spend a URL-cache slot on them.
+    if (
+        n <= URL_CACHE_MAX_KEY
+        and not (path_end > 1 and url[path_end - 1] == 47)
+    ):
         _url_store(url, n, h, path, qoff[0], qlen[0])
     return path
 
@@ -405,14 +412,14 @@ cdef object _version_str(int major, int minor):
     return "%d.%d" % (major, minor)
 
 
-cdef inline bint _header_name_ok(const char* p, size_t n) noexcept nogil:
+cdef inline bint _h2_header_name_ok(const char* p, size_t n) noexcept nogil:
     cdef size_t i
     cdef unsigned char c
     if n == 0:
         return False
     for i in range(n):
         c = <unsigned char>p[i]
-        if c <= 32 or c >= 127:
+        if c <= 32 or c >= 127 or (65 <= c <= 90):
             return False
     return True
 
@@ -876,6 +883,12 @@ cdef class HttpProtocol:
         self.transport = None
 
     def recycle_exchange(self, RequestExchange exchange):
+        cdef int32_t stream_id
+        if exchange._http2 and self.h2 != NULL:
+            stream_id = exchange._h2_stream_id
+            if stream_id != 0:
+                nghttp2_session_set_stream_user_data(self.h2, stream_id, NULL)
+                self.h2_streams.pop(stream_id, None)
         exchange.park()
         if not self.closed and self.idle_exchange is None:
             self.idle_exchange = exchange
@@ -1426,6 +1439,8 @@ cdef class HttpProtocol:
                 exchange._req_url_offset + qoff,
                 qlen,
             )
+        if self.app.host_routing:
+            request.prefetch_host()
         return request
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
@@ -1865,21 +1880,40 @@ cdef class HttpProtocol:
     ) noexcept:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         cdef const char* hn = <const char*>name
+        cdef const char* hv = <const char*>value
         if ex is None or ex._h2_dispatched or ex._h2_headers_done:
             return
         if namelen > 0 and name[0] == 58:
             if namelen == 7 and memcmp(hn, ":method", 7) == 0:
-                if valuelen == 7 and memcmp(<const char*>value, "CONNECT", 7) == 0:
+                if ex._h2_got_method:
                     self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
                     return
-                ex._h2_method = _method_from_bytes(<const char*>value, valuelen)
+                if valuelen == 7 and memcmp(hv, "CONNECT", 7) == 0:
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    return
+                ex._h2_got_method = True
+                ex._h2_method = _method_from_bytes(hv, valuelen)
                 return
             if namelen == 5 and memcmp(hn, ":path", 5) == 0:
-                if ex.append_request_url(<const char*>value, valuelen) != 0:
+                if ex._h2_got_path:
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    return
+                ex._h2_got_path = True
+                if ex.append_request_url(hv, valuelen) != 0:
                     self._close_error(431, "Request header fields too large")
                 return
             if namelen == 10 and memcmp(hn, ":authority", 10) == 0:
-                if ex.append_request_header("host", 4, <const char*>value, valuelen) != 0:
+                if ex._h2_got_authority:
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    return
+                if ex._req_host_index >= 0:
+                    if not ex.header_value_equals(ex._req_host_index, hv, valuelen):
+                        self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    else:
+                        ex._h2_got_authority = True
+                    return
+                ex._h2_got_authority = True
+                if ex.append_request_header("host", 4, hv, valuelen, True) != 0:
                     self._close_error(400, "Invalid HTTP request")
                 return
             if namelen == 9 and memcmp(hn, ":protocol", 9) == 0:
@@ -1887,18 +1921,30 @@ cdef class HttpProtocol:
                 self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
                 return
             return
-        if not _header_name_ok(hn, namelen):
+        if not _h2_header_name_ok(hn, namelen):
             self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
             return
-        if ex.append_request_header(hn, namelen, <const char*>value, valuelen) != 0:
+        if namelen == 4 and memcmp(hn, "host", 4) == 0:
+            if ex._req_host_index >= 0:
+                if not ex.header_value_equals(ex._req_host_index, hv, valuelen):
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                return
+            if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
+                self._close_error(400, "Invalid HTTP request")
+            return
+        if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
             self._close_error(400, "Invalid HTTP request")
 
     cdef void _h2_on_data(self, int32_t stream_id, const uint8_t* data, size_t length) noexcept:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         if ex is None or length == 0:
             return
+        if ex.in_pool or ex._h2_stream_id != stream_id:
+            return
         if not ex._body_active:
-            ex.reset_body(False, -1)
+            if ex._h2_headers_done:
+                self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+            return
         if ex.c_feed(<const char*>data, length) != 0:
             nghttp2_submit_rst_stream(
                 self.h2, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_INTERNAL_ERROR
@@ -1915,6 +1961,7 @@ cdef class HttpProtocol:
     cdef void _h2_headers_frame(self, int32_t stream_id, bint end_stream):
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         cdef Py_ssize_t content_length
+        cdef bint expect
         if ex is None or self.rejected:
             return
         if ex._h2_dispatched or ex._h2_headers_done:
@@ -1929,13 +1976,21 @@ cdef class HttpProtocol:
             self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
             return
         try:
-            if ex._req_expect_continue or content_length > 0:
-                ex.reset_body(ex._req_expect_continue, content_length)
+            expect = ex._req_expect_continue
+            # H2 bodies are END_STREAM-delimited; Content-Length is optional.
+            # Arm upload state whenever DATA may still arrive (or 100-continue
+            # / a declared length). mark_nobody only when this HEADERS already
+            # ended the stream with nothing to read.
+            if (not end_stream) or expect or content_length > 0:
+                ex.reset_body(
+                    expect,
+                    content_length if content_length >= 0 else -1,
+                )
                 ex._h2_headers_done = True
                 if end_stream and ex._body_active:
                     ex.c_complete()
                 if (
-                    not ex._req_expect_continue
+                    not expect
                     and content_length > 0
                     and content_length <= SMALL_BODY_COMPLETE_DISPATCH
                     and not end_stream

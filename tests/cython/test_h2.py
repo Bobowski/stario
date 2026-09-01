@@ -13,7 +13,25 @@ import pytest
 import stario.responses as responses
 from stario import App
 from stario.http.tls import load_tls_context
+from stario.routing import UrlPath
 from stario_cython.protocol import HttpProtocol
+from tests.cython.h2wire import (
+    FLAG_END_HEADERS,
+    FLAG_END_STREAM,
+    NGHTTP2_PROTOCOL_ERROR,
+    TYPE_DATA,
+    TYPE_HEADERS,
+    encode_request,
+    h2_handshake,
+    has_goaway,
+    has_rst,
+    headers_duplicate_method,
+    headers_duplicate_path,
+    pack_frame,
+    read_stream,
+    rst_code,
+    stream_data,
+)
 from tests.cython.http import RecordingTransport, free_port, make_protocol
 
 
@@ -400,4 +418,276 @@ async def test_h2_preface_on_recording_transport_does_not_raise() -> None:
         assert sum(conn_updates) >= (4 * 1024 * 1024) - 65535
     finally:
         proto.connection_lost(None)
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_post_without_content_length_reads_data() -> None:
+    """HEADERS without END_STREAM and no Content-Length still arms the body."""
+    app = App()
+    seen: list[bytes] = []
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        seen.append(body)
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/echo", echo)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            payload = b"no-cl-body"
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    encode_request(method="POST", path="/echo"),
+                )
+                + pack_frame(TYPE_DATA, FLAG_END_STREAM, 1, payload)
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1)
+            assert not has_rst(frames, 1)
+            assert stream_data(frames, 1) == payload
+            assert seen == [payload]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_post_without_content_length_keep_alive_isolates_bodies() -> None:
+    """Recycled exchanges must not ingest DATA from a later stream."""
+    app = App()
+    seen: list[bytes] = []
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        seen.append(body)
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/echo", echo)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            for stream_id, payload in ((1, b"aaa"), (3, b"bbb")):
+                writer.write(
+                    pack_frame(
+                        TYPE_HEADERS,
+                        FLAG_END_HEADERS,
+                        stream_id,
+                        encode_request(method="POST", path="/echo"),
+                    )
+                    + pack_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, payload)
+                )
+                await writer.drain()
+                frames, buf = await read_stream(reader, buf, stream_id)
+                assert not has_rst(frames, stream_id)
+                assert stream_data(frames, stream_id) == payload
+            assert seen == [b"aaa", b"bbb"]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [headers_duplicate_path(), headers_duplicate_method()],
+    ids=["path", "method"],
+)
+async def test_h2_duplicate_pseudo_header_is_rejected(headers: bytes) -> None:
+    app = App()
+    seen: list[str] = []
+
+    async def boom(c, w) -> None:
+        seen.append(c.req.method)
+        responses.text(w, "nope")
+
+    app.get("/", boom)
+    app.get("/other", boom)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    headers,
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1)
+            assert has_rst(frames, 1) or has_goaway(frames)
+            code = rst_code(frames, 1)
+            if code is not None:
+                assert code == NGHTTP2_PROTOCOL_ERROR
+            assert seen == []
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_authority_host_mismatch_is_rejected() -> None:
+    app = App()
+    seen: list[str] = []
+
+    async def boom(c, w) -> None:
+        seen.append(c.req.host)
+        responses.text(w, "nope")
+
+    app.get("/", boom)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(
+                        path="/",
+                        authority="example.com",
+                        extra=[(b"host", b"other.com")],
+                    ),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1)
+            assert has_rst(frames, 1) or has_goaway(frames)
+            assert seen == []
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_authority_host_match_keeps_one_host() -> None:
+    app = App()
+    seen: list[tuple[str, list[str]]] = []
+
+    async def hello(c, w) -> None:
+        seen.append((c.req.host, c.req.headers.getlist("host")))
+        responses.text(w, c.req.host)
+
+    app.get("/", hello)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(
+                        path="/",
+                        authority="example.com",
+                        extra=[(b"host", b"example.com")],
+                    ),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1)
+            assert not has_rst(frames, 1)
+            assert stream_data(frames, 1) == b"example.com"
+            assert seen == [("example.com", ["example.com"])]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_host_routing_normalizes_authority() -> None:
+    app = App()
+
+    async def hello(c, w) -> None:
+        responses.text(w, f"host:{c.req.host}")
+
+    app.get(UrlPath("/", host="example.com"), hello)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(path="/", authority="Example.COM:80"),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1)
+            assert not has_rst(frames, 1)
+            assert stream_data(frames, 1) == b"host:example.com"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
         await app.drain_tasks()
