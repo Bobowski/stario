@@ -1,6 +1,7 @@
 """Tests for STARIO_LOOP resolution and third-party asyncio loop adapters."""
 
 import asyncio
+import importlib
 import sys
 import types
 from collections.abc import Coroutine
@@ -12,6 +13,18 @@ from stario.exceptions import StarioError
 from stario.http.server import resolve_loop_runner
 
 
+def _stub_loop_module(monkeypatch: pytest.MonkeyPatch, name: str, **attrs: Any) -> None:
+    real_import = importlib.import_module
+    stub = types.SimpleNamespace(**attrs)
+
+    def fake_import(module_name: str, package: str | None = None) -> Any:
+        if module_name == name:
+            return stub
+        return real_import(module_name, package)
+
+    monkeypatch.setattr("stario.http.server.importlib.import_module", fake_import)
+
+
 def test_resolve_loop_runner_asyncio() -> None:
     assert resolve_loop_runner("asyncio") is asyncio.run
 
@@ -20,10 +33,7 @@ def test_resolve_loop_runner_uses_module_run(monkeypatch: pytest.MonkeyPatch) ->
     def fake_run(coro: Coroutine[Any, Any, Any]) -> Any:
         return coro
 
-    monkeypatch.setattr(
-        "stario.http.server.importlib.import_module",
-        lambda name: types.SimpleNamespace(run=fake_run),
-    )
+    _stub_loop_module(monkeypatch, "zuvloop", run=fake_run)
     assert resolve_loop_runner("zuvloop") is fake_run
 
 
@@ -33,10 +43,7 @@ def test_resolve_loop_runner_falls_back_to_new_event_loop(
     def factory() -> asyncio.AbstractEventLoop:
         return asyncio.new_event_loop()
 
-    monkeypatch.setattr(
-        "stario.http.server.importlib.import_module",
-        lambda name: types.SimpleNamespace(new_event_loop=factory),
-    )
+    _stub_loop_module(monkeypatch, "rloop", new_event_loop=factory)
     seen: dict[str, Any] = {}
 
     def fake_asyncio_run(
@@ -61,10 +68,7 @@ def test_resolve_loop_runner_falls_back_to_event_loop_policy(
         def new_event_loop(self) -> asyncio.AbstractEventLoop:
             return asyncio.new_event_loop()
 
-    monkeypatch.setattr(
-        "stario.http.server.importlib.import_module",
-        lambda name: types.SimpleNamespace(EventLoopPolicy=Policy),
-    )
+    _stub_loop_module(monkeypatch, "uringcore", EventLoopPolicy=Policy)
     seen: dict[str, Any] = {}
 
     def fake_asyncio_run(
@@ -85,8 +89,10 @@ def test_resolve_loop_runner_falls_back_to_event_loop_policy(
 
 
 def test_resolve_loop_runner_missing_module(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_import(name: str) -> Any:
-        raise ImportError(name)
+    def fake_import(name: str, package: str | None = None) -> Any:
+        if name == "uvloop":
+            raise ImportError(name)
+        return importlib.import_module(name, package)
 
     monkeypatch.setattr("stario.http.server.importlib.import_module", fake_import)
     with pytest.raises(StarioError, match="uvloop is not installed"):
@@ -94,10 +100,7 @@ def test_resolve_loop_runner_missing_module(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_resolve_loop_runner_missing_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "stario.http.server.importlib.import_module",
-        lambda name: types.SimpleNamespace(),
-    )
+    _stub_loop_module(monkeypatch, "rloop")
     with pytest.raises(StarioError, match="does not expose"):
         resolve_loop_runner("rloop")
 
