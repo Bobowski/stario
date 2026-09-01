@@ -2,7 +2,6 @@
 
 from stario_cython.exchange import ParsedQuery as CyQuery
 
-
 CASES = [
     b"",
     b"a=1&a=2",

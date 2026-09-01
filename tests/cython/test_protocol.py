@@ -10,8 +10,8 @@ from stario.http.compression import CompressionConfig
 from stario.routing import UrlPath
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
-from tests.helpers import assert_status_span
 from tests.cython.http import free_port, read_response
+from tests.helpers import assert_status_span
 
 
 class TrackingApp(App):

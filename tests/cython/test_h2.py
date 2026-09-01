@@ -9,12 +9,12 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from stario_cython.protocol import HttpProtocol
 
 import stario.responses as responses
 from stario import App
 from stario.http.tls import load_tls_context
 from stario.routing import UrlPath
-from stario_cython.protocol import HttpProtocol
 from tests.cython.h2wire import (
     FLAG_END_HEADERS,
     FLAG_END_STREAM,
