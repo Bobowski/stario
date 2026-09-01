@@ -11,6 +11,11 @@ def test_request_policy_rejects_low_pipeline_cap() -> None:
         RequestPolicy(max_pipelined_requests=0)
 
 
+def test_request_policy_rejects_oversized_header_budget() -> None:
+    with pytest.raises(StarioError, match="2\\^31-1"):
+        RequestPolicy(max_header_bytes=2_147_483_648)
+
+
 def test_server_config_rejects_blank_unix_socket() -> None:
     with pytest.raises(StarioError, match="unix_socket must be a non-empty path"):
         ServerConfig(unix_socket="")

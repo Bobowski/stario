@@ -65,44 +65,60 @@ def set_cookie(
 
     For relative expiry, prefer `max_age` (seconds from now).
     """
+    if path and (";" in path or "," in path):
+        raise StarioError(
+            "Invalid cookie path",
+            context={"path": path},
+            help_text="Cookie Path must not contain ';' or ','.",
+        )
+    if domain and (";" in domain or "," in domain):
+        raise StarioError(
+            "Invalid cookie domain",
+            context={"domain": domain},
+            help_text="Cookie Domain must not contain ';' or ','.",
+        )
+    if isinstance(expires, str) and (";" in expires or "," in expires):
+        raise StarioError(
+            "Invalid cookie expires",
+            context={"expires": expires},
+            help_text="Cookie Expires must not contain ';' or ','.",
+        )
+
     cookie: http.cookies.BaseCookie[str] = http.cookies.SimpleCookie()
     try:
         cookie[name] = value
+        if max_age is not None:
+            cookie[name]["max-age"] = str(max_age)
+        if expires is not None:
+            if isinstance(expires, datetime):
+                cookie[name]["expires"] = format_datetime(expires, usegmt=True)
+            elif isinstance(expires, int):
+                cookie[name]["expires"] = format_datetime(
+                    datetime.fromtimestamp(expires, tz=UTC),
+                    usegmt=True,
+                )
+            else:
+                cookie[name]["expires"] = expires
+        if path:
+            cookie[name]["path"] = path
+        if domain:
+            cookie[name]["domain"] = domain
+        if httponly:
+            cookie[name]["httponly"] = True
+        if samesite:
+            cookie[name]["samesite"] = samesite
+        if secure or samesite == "none":
+            cookie[name]["secure"] = True
+        w.headers.unsafe_add(
+            b"set-cookie",
+            cookie.output(header="").strip().encode("latin-1"),
+        )
     except http.cookies.CookieError as exc:
         raise StarioError(
-            "Invalid cookie name or value",
+            "Invalid cookie name, value, or attribute",
             context={"name": name},
-            help_text="Cookie names and values must follow RFC 6265 rules.",
+            help_text="Cookie names, values, and attributes must follow RFC 6265 rules.",
         ) from exc
-
-    if max_age is not None:
-        cookie[name]["max-age"] = str(max_age)
-    if expires is not None:
-        if isinstance(expires, datetime):
-            cookie[name]["expires"] = format_datetime(expires, usegmt=True)
-        elif isinstance(expires, int):
-            cookie[name]["expires"] = format_datetime(
-                datetime.fromtimestamp(expires, tz=UTC),
-                usegmt=True,
-            )
-        else:
-            cookie[name]["expires"] = expires
-    if path:
-        cookie[name]["path"] = path
-    if domain:
-        cookie[name]["domain"] = domain
-    if httponly:
-        cookie[name]["httponly"] = True
-    if samesite:
-        cookie[name]["samesite"] = samesite
-    # Browsers require Secure when SameSite=None; apply to the cookie, not only a local flag.
-    if secure or samesite == "none":
-        cookie[name]["secure"] = True
-
-    w.headers.unsafe_add(
-        b"set-cookie",
-        cookie.output(header="").strip().encode("latin-1"),
-    )
     return w
 
 

@@ -84,7 +84,7 @@ def _format_host_value(
             context={"pattern": pattern, "parameter": name},
             help_text="Pass a non-empty value for each host placeholder.",
         )
-    if any(ch in text for ch in "/:@[]"):
+    if any(ch in text for ch in "/:@[]?#\\ \t\r\n"):
         raise StarioError(
             "UrlPath host parameter contains invalid character",
             context={"pattern": pattern, "parameter": name, "value": text},
