@@ -35,7 +35,22 @@ EMPTY_ROUTE_MATCH = RouteMatch(pattern="", params=MappingProxyType({}))
 
 
 class Context(Protocol):
-    """Per-request bundle passed to every handler and middleware."""
+    """Per-request bundle: inbound request, app, span, and this request's lifetime.
+
+    Every handler is ``async def handler(c: Context, w: Writer)``. ``c`` is
+    everything about *this request still being live work*: what they asked
+    (``req``, ``route``), the process (``app``), observability (``span``),
+    request-scoped ``state``, and whether the handler should keep running.
+
+    ``c.alive()`` / ``c.disconnected`` / ``c.closing`` live here — not on
+    ``Writer`` — because they answer “should this handler still run?”, not
+    “what HTTP bytes am I sending?”. That includes the client leaving *and*
+    the app draining. Shutdown is already ``c.app``; the inbound body already
+    surfaces peer-gone as ``ClientDisconnected`` on ``c.req``. ``Writer`` is
+    the outbound message (``started`` / ``completed`` / ``write``). After
+    ``w.end()`` the response is complete even if keep-alive is still open;
+    ``w.write()`` is a no-op if the transport is already gone.
+    """
 
     app: App
     req: Request
@@ -45,12 +60,12 @@ class Context(Protocol):
 
     @property
     def disconnect(self) -> asyncio.Future[None]:
-        """Completes when the client closes this request's connection."""
+        """Completes when the client is gone from this request."""
         ...
 
     @property
     def disconnected(self) -> bool:
-        """``True`` when the client closed this request's connection."""
+        """``True`` when the client is gone from this request."""
         ...
 
     @property
@@ -73,13 +88,23 @@ class Context(Protocol):
         self,
         source: AsyncIterable[T] | None = None,
     ) -> _Alive[T] | _Alive[None]:
-        """Watch client disconnect and app shutdown; cancel this task when either happens."""
+        """Keep this handler running until the client leaves or the app drains.
+
+        ``async with c.alive():`` cancels the current task when either happens,
+        then swallows that cancellation so the block exits normally (code after
+        the ``async with`` still runs). ``async for item in c.alive(source):``
+        does the same around an async iterable.
+
+        This is handler lifetime, not a write method: a long-lived loop can
+        wait here without sending, and ``SSE(w)`` still only needs ``Writer``
+        for the bytes.
+        """
         ...
 
 
 @dataclass(slots=True)
 class _Alive[T]:
-    """Connection lifecycle helper bound to a request context."""
+    """Handler-lifetime helper bound to a request context."""
 
     c: Context
     source: AsyncIterable[T] | None = None

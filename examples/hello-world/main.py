@@ -16,7 +16,7 @@ from stario import App, AssetManifest, Context, Span, StaticAssets, UrlPath, Wri
 from stario.datastar import SSE, at, data, read_signals
 from stario.markup import html as h
 
-# Core: Context (request + span), Writer (transport), App (routes + assets).
+# Core: Context (request, span, lifetime), Writer (response), App (routes + assets).
 # `stario.markup.html` holds tag constructors; imported as `h` so names like telemetry `Span` stay unambiguous.
 
 # Cheap at import time: scan + fingerprint only. Serving (compression, caching)

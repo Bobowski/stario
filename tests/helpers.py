@@ -79,10 +79,6 @@ class DummyWriter:
         self.ended = False
         self._completed = True
 
-    @property
-    def closing(self) -> bool:
-        return self._completed
-
 
 def make_request(
     *,

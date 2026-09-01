@@ -354,10 +354,18 @@ class TestWriterRaw:
 
     async def test_context_closing_combines_disconnect_and_shutdown(self):
         loop = asyncio.get_running_loop()
-        context = _make_context(loop=loop)
+        disconnect = loop.create_future()
+        context = _make_context(loop=loop, disconnect=disconnect)
 
         assert not context.closing
 
+        disconnect.set_result(None)
+
+        assert context.disconnected
+        assert context.closing
+        assert not context.shutting_down
+
+        context = _make_context(loop=loop)
         context.app.shutdown.set_result(None)
 
         assert context.shutting_down
@@ -416,17 +424,6 @@ class TestWriterRaw:
         w.end()
         assert w.status_code == 204
         assert w.body == b""
-
-    def test_closing_follows_disconnect(self):
-        loop = asyncio.new_event_loop()
-        try:
-            disconnect = loop.create_future()
-            w = TestWriter(disconnect=disconnect)
-            assert not w.closing
-            disconnect.set_result(None)
-            assert w.closing
-        finally:
-            loop.close()
 
     def test_write_after_204_raises(self):
         w = TestWriter()

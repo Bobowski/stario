@@ -665,7 +665,7 @@ class StaticAssets:
                 return
             w.write_headers(206)
             await self._write_file_range(
-                w, f.source, byte_range.start, byte_range.length
+                c, w, f.source, byte_range.start, byte_range.length
             )
             return
 
@@ -675,10 +675,11 @@ class StaticAssets:
             return
 
         w.write_headers(200)
-        await self._write_file_range(w, f.source, 0, f.size)
+        await self._write_file_range(c, w, f.source, 0, f.size)
 
     async def _write_file_range(
         self,
+        c: Context,
         w: Writer,
         path: Path,
         start: int,
@@ -693,7 +694,7 @@ class StaticAssets:
                 if not chunk:
                     break
                 remaining -= len(chunk)
-                if w.closing:
+                if c.closing:
                     return
                 w.write(chunk)
         w.end()

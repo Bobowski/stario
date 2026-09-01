@@ -144,8 +144,8 @@ class ClientDisconnected(Exception):
     The peer closed the connection while the request body was still being read.
 
     If the handler does not finish a response, the protocol logs the failure
-    and aborts. For long-lived responses (SSE, chunked), prefer polling
-    `c.disconnected` or using `c.alive()` instead of relying on this exception.
+    and aborts. For long-lived responses (SSE, chunked), prefer `c.alive()` or
+    polling `c.disconnected` / `c.closing` instead of relying on this exception.
     """
 
     def __init__(

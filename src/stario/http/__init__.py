@@ -4,7 +4,9 @@
 `App` subclasses it and tracks tasks. The protocol runs `find_handler` then
 the matched handler as a task.
 
-**Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
+**Message** — `Request` (on ``Context``) plus ``Writer`` for the outbound
+response. Client disconnect and ``alive()`` are on ``Context``, not
+``Writer``.
 
 **Process** — import submodules directly for embedding:
 

@@ -46,7 +46,7 @@ from stario.debug import debug_inspector
 from stario.markup import HtmlElement, baked, classes, styles
 from stario.markup import html as h
 
-# Stario apps center on: Context (per-request), Writer (transport), and plain Python
+# Stario apps center on: Context (per-request lifetime), Writer (response), and plain Python
 # instead of a template language. HTML tags live under `stario.markup.html`;
 # importing that catalog as `h` keeps tag names (`h.Div`, `h.Span`) separate from framework
 # symbols like telemetry `Span` (same name as <span>, different concept).

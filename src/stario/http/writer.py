@@ -13,10 +13,17 @@ if TYPE_CHECKING:
 
 
 class Writer(Protocol):
-    """Low-level HTTP response for one request.
+    """HTTP response for one request: status, headers, and body.
 
     Set headers on ``headers``, then ``respond`` for a whole body or
     ``write_headers`` followed by ``write`` / ``end`` for streaming.
+
+    This is the outbound message, not the connection. Client disconnect and
+    process drain live on ``Context`` (``c.alive``, ``c.disconnected``,
+    ``c.closing``). ``started`` / ``completed`` say whether *this response*
+    has been sent, not whether the socket is still open. After ``end()`` the
+    response is done even if keep-alive is still open; ``write()`` is a
+    no-op if the transport is already gone.
     """
 
     headers: Headers
@@ -34,11 +41,6 @@ class Writer(Protocol):
     @property
     def completed(self) -> bool:
         """``True`` after ``end`` / ``respond`` / ``abort`` finished the response."""
-        ...
-
-    @property
-    def closing(self) -> bool:
-        """Whether the connection is closing or closed."""
         ...
 
     def respond(self, body: bytes, content_type: bytes, status: int = 200) -> None:

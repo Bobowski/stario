@@ -107,11 +107,10 @@ class TestWriter:
 
     __test__ = False
 
-    def __init__(self, disconnect: asyncio.Future[None] | None = None) -> None:
+    def __init__(self) -> None:
         self.headers = Headers()
         self._status_code: int | None = None
         self._completed = False
-        self._disconnect = disconnect
         self._body = GrowingSink()
         self._headers_event = asyncio.Event()
 
@@ -126,12 +125,6 @@ class TestWriter:
     @property
     def completed(self) -> bool:
         return self._completed
-
-    @property
-    def closing(self) -> bool:
-        return self._completed or (
-            self._disconnect is not None and self._disconnect.done()
-        )
 
     @property
     def body(self) -> bytes:
