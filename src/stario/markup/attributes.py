@@ -39,7 +39,7 @@ def styles(declarations: StyleDeclarations) -> Attrs:
                 example='h.Div(styles({"color": "red"}))',
             )
 
-        if any(ch in key for ch in r":;{}\"):
+        if any(ch in key for ch in ":;{}\\"):
             raise StarioError(
                 f"Invalid CSS property name: {key!r}",
                 context={"property": key},

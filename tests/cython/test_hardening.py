@@ -1103,13 +1103,15 @@ async def test_close_error_does_not_splice_status_into_started_response() -> Non
             b"GET / HTTP/2.0\r\nHost: t\r\n\r\n"
         )
         await asyncio.wait_for(started, timeout=1)
-        await _drain(app)
         raw = b"".join(transport.writes)
         assert response_status(transport.writes) == 200
         assert b"HTTP/1.1 400" not in raw
         assert b"partial" in raw
         assert transport.is_closing()
     finally:
+        for task in list(app.tasks):
+            if not task.done():
+                task.cancel()
         if not transport.is_closing():
             transport.close()
         await _drain(app)
