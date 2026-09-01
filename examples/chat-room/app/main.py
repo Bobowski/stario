@@ -17,7 +17,7 @@ Start here, then open each layer:
 
 Per feature the pattern is the same:
 
-  urls.py      UrlPath constants (room/urls.py owns /rooms paths)
+  urls.py      Route endpoints (room/urls.py owns /rooms paths)
   models.py    domain dataclasses (room feature owns Room, Message, User)
   data.py      SCHEMA + query functions against the shared Database
   subjects.py  relay subject helpers (room.{id}.message, .presence, …)

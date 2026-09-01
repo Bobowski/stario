@@ -10,7 +10,7 @@ from app.common.identity import VisitorIdentity, identity_for_page, resolve_iden
 from app.db import Database
 from app.features.room import data as room_data
 from app.features.room import subjects as room_subjects
-from app.features.room.urls import ROOM, ROOMS
+from app.features.room.urls import CREATE, DELETE, ROOM
 from stario import App, Context, Relay, Writer
 from stario.datastar import SSE
 
@@ -119,7 +119,7 @@ def delete_room(db: Database, relay: Relay[str]):
 
 
 def register_lobby(app: App, db: Database, relay: Relay[str]) -> None:
-    app.get(LOBBY, show_lobby(db))
-    app.get(SUBSCRIBE, subscribe(db, relay))
-    app.post(ROOMS, create_room(db, relay))
-    app.delete(ROOM, delete_room(db, relay))
+    app.add(LOBBY, show_lobby(db))
+    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(CREATE, create_room(db, relay))
+    app.add(DELETE, delete_room(db, relay))

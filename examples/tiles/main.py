@@ -9,7 +9,7 @@ Run with: uv run stario watch main:bootstrap
 
 Read top to bottom:
 
-  1. URLs and assets — UrlPath routes, fingerprinted static files
+  1. URLs and assets — Route endpoints, fingerprinted static files
   2. State           — Game (board + presence); built in bootstrap
   3. Views           — pure HTML from Game
   4. Handlers        — queries (GET) and commands (POST)
@@ -36,9 +36,9 @@ from stario import (
     AssetManifest,
     Context,
     Relay,
+    Route,
     Span,
     StaticAssets,
-    UrlPath,
     Writer,
 )
 from stario.datastar import SSE, at, data, read_signals
@@ -68,10 +68,10 @@ ASSETS = AssetManifest(Path(__file__).parent / "static")
 STYLE_CSS = ASSETS.href("css/style.css")
 DATASTAR_JS = ASSETS.href("js/datastar.js")
 
-# One constant per route — used in app.get/post and in views that build URLs.
-HOME = UrlPath("/")
-SUBSCRIBE = UrlPath("/subscribe")
-CLICK = UrlPath("/click")
+# One Route per endpoint — register with app.add, link with href() or at.fetch.
+HOME = Route.get("/")
+SUBSCRIBE = Route.get("/subscribe")
+CLICK = Route.post("/click")
 
 # =============================================================================
 # 2. State
@@ -251,7 +251,7 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
             # if_missing=True: set defaults only when absent so reconnects don't clobber client state.
             data.signals({"user_id": user_id}, if_missing=True),
             # Mount opens GET /subscribe; retry="always" survives brief network blips.
-            data.init(at.get(SUBSCRIBE.href(), retry="always")),
+            data.init(at.fetch(SUBSCRIBE, retry="always")),
             # data.init runs once when the node mounts — here it opens the SSE stream (`@get`).
             h.H1("Tiles - Stario App"),
             h.P(
@@ -409,8 +409,8 @@ async def bootstrap(app: App, span: Span):
     static.register(app)
 
     # Queries — return or stream HTML
-    app.get(HOME, home(game))
-    app.get(SUBSCRIBE, subscribe(game, relay))
+    app.add(HOME, home(game))
+    app.add(SUBSCRIBE, subscribe(game, relay))
     # Commands — mutate Game, nudge relay; updates arrive on SSE
-    app.post(CLICK, click(game, relay))
+    app.add(CLICK, click(game, relay))
     yield

@@ -106,8 +106,7 @@ def online_users_view(users: list[User]) -> HtmlElement:
 
 
 def input_form_view(room_id: str) -> HtmlElement:
-    send_url = SEND.href(room_id=room_id)
-    typing_url = TYPING.href(room_id=room_id)
+    send = at.fetch(SEND, {"room_id": room_id})
     return h.Form(
         {"id": "input-form", "class": "input-form"},
         data.on("submit", "evt.preventDefault()"),
@@ -126,12 +125,12 @@ def input_form_view(room_id: str) -> HtmlElement:
                 f"""
                 if (evt.key === 'Enter' && !evt.shiftKey && $message.trim()) {{
                     evt.preventDefault();
-                    @post('{send_url}');
+                    {send};
                     $message = '';
                 }}
                 """,
             ),
-            data.on("input", at.post(typing_url)),
+            data.on("input", at.fetch(TYPING, {"room_id": room_id})),
         ),
         h.Button(
             {"type": "button", "class": "send-button"},
@@ -140,7 +139,7 @@ def input_form_view(room_id: str) -> HtmlElement:
                 "click",
                 f"""
                 if ($message.trim()) {{
-                    @post('{send_url}');
+                    {send};
                     $message = '';
                     document.getElementById('message-input').focus();
                 }}
@@ -197,7 +196,6 @@ def room_view(
     messages: list[Message],
     users: list[User],
 ) -> HtmlElement:
-    subscribe_url = SUBSCRIBE.href(room_id=room.id)
     return page(
         [
             debug_inspector(),
@@ -212,7 +210,9 @@ def room_view(
                     },
                     if_missing=True,
                 ),
-                data.init(f"{VISITOR_SESSION_INIT}\n{at.get(subscribe_url)}"),
+                data.init(
+                    f"{VISITOR_SESSION_INIT}\n{at.fetch(SUBSCRIBE, {'room_id': room.id})}"
+                ),
                 room_live_view(
                     room,
                     user_id,

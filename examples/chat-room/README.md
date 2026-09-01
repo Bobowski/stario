@@ -44,7 +44,7 @@ Each feature follows the same shape — every file optional:
 
 | File | Role |
 |------|------|
-| `urls.py` | `UrlPath` constants (`room/urls.py` defines `ROOMS` and `ROOM / "send"` etc.) |
+| `urls.py` | `Route` endpoints (`room/urls.py` pins GET/POST/DELETE on `/rooms` paths) |
 | `models.py` | domain dataclasses (`room/models.py` owns `Room`, `Message`, `User`) |
 | `data.py` | `SCHEMA` DDL + query functions taking the shared `Database` |
 | `subjects.py` | relay subject helpers — no typo-prone f-strings at call sites |
@@ -66,8 +66,8 @@ Each feature follows the same shape — every file optional:
 | `DELETE /rooms/{id}` | Delete a room and its messages/presence |
 | `GET /rooms/{id}` | First paint for a room (mint demo user) |
 | `GET /rooms/{id}/subscribe` | Long-lived SSE — patch HTML on relay events |
-| `POST /rooms/{id}/send` | Store message — 204, update via SSE |
-| `POST /rooms/{id}/typing` | Typing flag — 204, update via SSE |
+| `POST /rooms/{id}/send` | 204 first, then store and publish |
+| `POST /rooms/{id}/typing` | 204 first, then typing flag and publish |
 
 Relay subjects are per room (`room.{id}.presence`, `room.{id}.message`, …), built by `room/subjects.py` and subscribed with `room.{id}.*`. The lobby opens `GET /subscribe` and listens on `room.*` and `lobby.*` so online counts and the room list update when users join or leave, or when rooms are created or deleted. When a room is deleted mid-stream, the room subscribe handler calls `SSE(w).navigate(LOBBY.href())` so live tabs return to the lobby without a full page reload.
 

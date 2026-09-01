@@ -5,7 +5,7 @@ Runnable reference apps for Stario 4. Clone the [stario repository](https://gith
 | Example | Size | Start here? |
 |---------|------|-------------|
 | **[tiles](tiles/)** | Single `main.py` | Yes — collaborative board, SSE + Relay |
-| **[hello-world](hello-world/)** | Single `main.py` | Minimal counter |
+| **[hello-world](hello-world/)** | Single `main.py` | One route, one HTML page |
 | **[chat-room](chat-room/)** | Multi-file `app/features/*` | Larger layout with SQLite and tests |
 
 ## Quick start (tiles)

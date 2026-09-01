@@ -17,7 +17,7 @@
 
 ---
 
-Stario is a small Python framework for enjoyable realtime hypermedia apps. It helps you build web apps where HTTP, HTML, and streaming stay visible in your code. Handlers are plain async functions; routes are registered explicitly; responses go through a dedicated writer. When the UI needs live updates, you can add [Datastar](https://stario.dev/docs/reference/datastar) and [Relay](https://stario.dev/docs/reference/toolbox#relay) without throwing away the same request/response mental model. The [realtime tiles](https://stario.dev/docs/tutorials/realtime-tiles) tutorial walks through the full pattern end to end.
+Stario is a small Python framework for enjoyable realtime hypermedia apps. It helps you build web apps where HTTP, HTML, and streaming stay visible in your code. Handlers are plain async functions; routes are registered explicitly; responses go through a dedicated writer. When the UI needs live updates, you can add [Datastar](https://stario.dev/docs/how-tos/datastar-sdk) and [Relay](https://stario.dev/docs/reference/toolbox#relay) without throwing away the same request/response mental model. The idea is [Go-to architecture](https://stario.dev/docs/explanation/go-to-architecture). The [SDK](https://stario.dev/docs/how-tos/datastar-sdk) and [tiles tutorial](https://stario.dev/docs/tutorials/realtime-tiles) live here.
 
 Full guides, API reference, and tutorials live at [stario.dev](https://stario.dev). This page is a short orientation for people landing on the repository.
 
@@ -84,7 +84,7 @@ async def bootstrap(app: App, span: Span):
 uv run stario watch main:bootstrap
 ```
 
-Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment: Containers, TLS, and safe releases](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
+Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment, containers, and TLS](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
 
 ## What you get
 

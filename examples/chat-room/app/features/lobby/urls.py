@@ -1,6 +1,7 @@
-"""Lobby URL."""
+"""Lobby routes."""
 
-from stario.routing import UrlPath
+from stario import Route, UrlPath
 
-LOBBY = UrlPath("/")
-SUBSCRIBE = LOBBY / "subscribe"
+ROOT = UrlPath("/")
+LOBBY = Route.get(ROOT)
+SUBSCRIBE = Route.get(ROOT / "subscribe")

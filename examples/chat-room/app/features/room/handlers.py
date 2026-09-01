@@ -159,7 +159,7 @@ def subscribe(db: Database, relay: Relay[str]):
 
 
 def send_message(db: Database, relay: Relay[str]):
-    """POST /rooms/{room_id}/send — store a message, then 204."""
+    """POST /rooms/{room_id}/send — 204 first, then store and publish."""
 
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
@@ -174,8 +174,10 @@ def send_message(db: Database, relay: Relay[str]):
 
         text = signals.message.strip()[:MAX_MESSAGE_LENGTH]
         if not text:
-            responses.empty(w, 204)
+            responses.empty(w)
             return
+
+        responses.empty(w)
 
         c.span.attrs({"user_id": signals.user_id, "room_id": room.id})
 
@@ -196,7 +198,6 @@ def send_message(db: Database, relay: Relay[str]):
         )
 
         relay.publish(subjects.message(room.id), "new")
-        responses.empty(w, 204)
 
     return handler
 
@@ -207,25 +208,25 @@ def typing(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.empty(w, 204)
+            responses.empty(w)
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id or not data.user_exists(db, signals.user_id, room.id):
-            responses.empty(w, 204)
+            responses.empty(w)
             return
+
+        responses.empty(w)
 
         is_typing = bool(signals.message.strip())
         if data.set_user_typing(db, signals.user_id, room.id, is_typing):
             relay.publish(subjects.typing(room.id), "changed")
 
-        responses.empty(w, 204)
-
     return handler
 
 
 def register_room(app: App, db: Database, relay: Relay[str]) -> None:
-    app.get(ROOM, show_room(db))
-    app.get(SUBSCRIBE, subscribe(db, relay))
-    app.post(SEND, send_message(db, relay))
-    app.post(TYPING, typing(db, relay))
+    app.add(ROOM, show_room(db))
+    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(SEND, send_message(db, relay))
+    app.add(TYPING, typing(db, relay))
