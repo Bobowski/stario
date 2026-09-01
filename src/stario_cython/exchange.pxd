@@ -187,6 +187,8 @@ cdef class RequestExchange:
     cdef bint _h2_headers_sent
     cdef bint _h2_headers_too_large
     cdef Py_ssize_t _h2_head_bytes
+    cdef bint _h2_awaiting_headers
+    cdef double _h2_header_deadline
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef bint _expect_continue

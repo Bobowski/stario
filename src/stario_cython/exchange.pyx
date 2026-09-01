@@ -1719,6 +1719,8 @@ cdef class RequestExchange:
         self._h2_headers_sent = False
         self._h2_headers_too_large = False
         self._h2_head_bytes = 0
+        self._h2_awaiting_headers = False
+        self._h2_header_deadline = 0.0
         self._h2_date_line = None
         self._h2_date_bare = None
         self._req_content_length = -1
@@ -2449,6 +2451,8 @@ cdef class RequestExchange:
         self._h2_headers_sent = False
         self._h2_headers_too_large = False
         self._h2_head_bytes = 0
+        self._h2_awaiting_headers = False
+        self._h2_header_deadline = 0.0
 
     cdef void bind_http2(self, int32_t stream_id) noexcept:
         self._http2 = True
@@ -2458,6 +2462,8 @@ cdef class RequestExchange:
         self._h2_got_authority = False
         self._h2_headers_too_large = False
         self._h2_head_bytes = 0
+        self._h2_awaiting_headers = True
+        self._h2_header_deadline = 0.0
 
     cdef void _clear_hot_request_headers(self) noexcept:
         self._req_encoding = ENCODING_NONE

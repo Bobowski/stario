@@ -75,9 +75,15 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   normalized in C and prefetched when `host_routing`.
 - HTTP/2 applies the same `max_header_bytes` budget as HTTP/1 (name +
   value octets per stream). Oversize requests get **431** on that stream,
-  not a connection close. `SETTINGS_MAX_HEADER_LIST_SIZE` is advertised;
-  CONTINUATION frames are capped from that budget; closed streams are
-  not retained (`SETTINGS_NO_RFC7540_PRIORITIES`).
+  not a connection close. HTTP/1 431 on a GET (no body) keeps the
+  connection. Declared oversize HTTP/2 bodies get **413** on that stream.
+  Incomplete HTTP/2 HEADERS time out per stream (RST CANCEL) without
+  tearing down multiplexed neighbors. `SETTINGS_MAX_HEADER_LIST_SIZE` is
+  advertised; the HPACK dynamic table is disabled
+  (`SETTINGS_HEADER_TABLE_SIZE=0`); RST-stream flood is rate-limited
+  (burst 100 / 33 per second); CONTINUATION frames are capped from the
+  header budget; closed streams are not retained
+  (`SETTINGS_NO_RFC7540_PRIORITIES`).
 
 ## 4.1.0 - 2026-08-17
 

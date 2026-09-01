@@ -196,6 +196,11 @@ async def test_header_total_over_limit_returns_431() -> None:
         await _drain(app)
         assert response_status(transport.writes) == 431
         assert hits == 0
+        assert not transport.is_closing()
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_statuses(transport.writes) == [431, 200]
+        assert hits == 1
     finally:
         if not transport.is_closing():
             transport.close()
