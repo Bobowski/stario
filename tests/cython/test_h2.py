@@ -429,7 +429,7 @@ async def test_h2_preface_on_recording_transport_does_not_raise() -> None:
         settings = collected_settings(frames)
         assert settings.get(SETTINGS_MAX_HEADER_LIST_SIZE) == 64 * 1024
         assert settings.get(SETTINGS_NO_RFC7540_PRIORITIES) == 1
-        assert settings.get(SETTINGS_HEADER_TABLE_SIZE) == 0
+        assert settings.get(SETTINGS_HEADER_TABLE_SIZE) == 4096
     finally:
         proto.connection_lost(None)
         await app.drain_tasks()
@@ -457,7 +457,7 @@ async def test_h2_settings_advertise_header_budget() -> None:
         settings = collected_settings(frames)
         assert settings.get(SETTINGS_MAX_HEADER_LIST_SIZE) == 512
         assert settings.get(SETTINGS_NO_RFC7540_PRIORITIES) == 1
-        assert settings.get(SETTINGS_HEADER_TABLE_SIZE) == 0
+        assert settings.get(SETTINGS_HEADER_TABLE_SIZE) == 4096
     finally:
         proto.connection_lost(None)
         await app.drain_tasks()
@@ -741,6 +741,136 @@ async def test_h2_oversize_body_does_not_kill_connection() -> None:
             frames, _buf = await read_stream(reader, buf, 3)
             assert not has_rst(frames, 3)
             assert not has_goaway(frames)
+            assert stream_data(frames, 3) == b"ok"
+            assert hits == 1
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_no_cl_body_overflow_does_not_kill_connection() -> None:
+    """No-CL DATA over max_body_bytes is a stream 413; neighbors still run."""
+    app = App()
+    hits = 0
+
+    async def read_body(c, w) -> None:
+        await c.req.body()
+        responses.text(w, "should not run")
+
+    async def hello(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "ok")
+
+    app.post("/", read_body)
+    app.get("/", hello)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, max_body_bytes=20),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    encode_request(method="POST", path="/"),
+                )
+                + pack_frame(TYPE_DATA, FLAG_END_STREAM, 1, b"y" * 100)
+            )
+            await writer.drain()
+            frames, buf = await read_stream(reader, buf, 1)
+            assert not has_goaway(frames)
+            blob = stream_headers_blob(frames, 1)
+            assert b"413" in blob or has_rst(frames, 1)
+            assert stream_data(frames, 1) != b"should not run"
+
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    3,
+                    encode_request(path="/"),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 3)
+            assert not has_rst(frames, 3)
+            assert not has_goaway(frames)
+            assert stream_data(frames, 3) == b"ok"
+            assert hits == 1
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_discarded_oversize_data_does_not_kill_connection() -> None:
+    """Extra DATA after the handler finished must not close the connection."""
+    app = App()
+    hits = 0
+
+    async def ignore_body(_c, w) -> None:
+        responses.text(w, "ok")
+
+    async def hello(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "ok")
+
+    app.post("/", ignore_body)
+    app.get("/", hello)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, max_body_bytes=20),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    encode_request(method="POST", path="/"),
+                )
+            )
+            await writer.drain()
+            frames, buf = await read_stream(reader, buf, 1)
+            assert stream_data(frames, 1) == b"ok"
+            assert not has_goaway(frames)
+
+            writer.write(pack_frame(TYPE_DATA, FLAG_END_STREAM, 1, b"y" * 100))
+            await writer.drain()
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    3,
+                    encode_request(path="/"),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 3)
+            assert not has_goaway(frames)
+            assert not has_rst(frames, 3)
             assert stream_data(frames, 3) == b"ok"
             assert hits == 1
         finally:

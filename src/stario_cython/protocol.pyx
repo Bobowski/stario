@@ -45,6 +45,7 @@ from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport (
+    ABORT_TOO_LARGE,
     Headers,
     Request,
     RequestExchange,
@@ -144,6 +145,9 @@ cdef enum:
     # server is not a CDN — keep the refill, shrink the bucket.
     H2_RST_BURST = 100
     H2_RST_RATE = 33
+    # RFC 7541 / nghttp2 default. Advertising 0 is a HPACK-bomb hedge some
+    # intermediaries reject; 4KiB is the spec default.
+    H2_HEADER_TABLE_SIZE = 4096
 
 cdef char* _UC_KEY[256]
 cdef Py_ssize_t _UC_LEN[256]
@@ -1358,7 +1362,7 @@ cdef class HttpProtocol:
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
             # after oversize headers would be a read-DoS if we stayed open.
-            self._h1_protocol_status(431, "Request header fields too large", has_body)
+            self._h1_protocol_status(431, "Request header fields too large", has_body, -1)
             return
         if exchange.finish_request_header() != 0:
             self._close_error(400, "Invalid HTTP request")
@@ -1373,7 +1377,26 @@ cdef class HttpProtocol:
             self._close_error(400, "Invalid HTTP request")
             return
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
-            self._close_error(413, "Request body too large")
+            # Keep-alive only when the declared body is small enough to drain.
+            # A huge or chunked upload after 413 would be a read-DoS.
+            if content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH:
+                self.h1_headers_too_large = True
+                self.request_keep_alive = (
+                    llhttp_should_keep_alive(self.parser) != 0
+                    or (
+                        llhttp_get_http_major(self.parser) == 1
+                        and llhttp_get_http_minor(self.parser) == 1
+                        and not exchange._req_connection_close
+                    )
+                )
+                self._h1_protocol_status(
+                    413,
+                    "Request body too large",
+                    False,
+                    <Py_ssize_t>content_length,
+                )
+            else:
+                self._close_error(413, "Request body too large")
             return
         exchange.cache_hot_request_headers()
         self.request_keep_alive = (
@@ -1427,6 +1450,12 @@ cdef class HttpProtocol:
         exchange = self.reading_exchange
         if self.h1_headers_too_large:
             if exchange is not None:
+                if exchange._body_active and not exchange._body_complete:
+                    if exchange.c_complete() != 0:
+                        self._close_error(400, "Invalid HTTP request")
+                        self.reading_exchange = None
+                        self.h1_headers_too_large = False
+                        return
                 exchange.handler_finished()
             self.reading_exchange = None
             self.h1_headers_too_large = False
@@ -1678,8 +1707,13 @@ cdef class HttpProtocol:
         int status,
         object message,
         bint close_conn,
+        Py_ssize_t drain_len,
     ) noexcept:
-        """Write a protocol HTTP status without dispatch. Close only if asked."""
+        """Write a protocol HTTP status without dispatch. Close only if asked.
+
+        ``drain_len >= 0`` keeps the connection and discards that many body
+        bytes so llhttp stays synced (keep-alive 413 with a small CL).
+        """
         cdef RequestExchange exchange
         cdef object body
         cdef object date
@@ -1718,7 +1752,11 @@ cdef class HttpProtocol:
             body = message.encode("utf-8")
             transport = self.transport
             if exchange is not None:
-                exchange.mark_nobody()
+                if drain_len >= 0 and not close_conn:
+                    exchange.reset_body(False, drain_len)
+                    exchange._discard_body = True
+                else:
+                    exchange.mark_nobody()
                 exchange.start_response()
             self._finish_protocol_span(
                 status,
@@ -1890,9 +1928,8 @@ cdef class HttpProtocol:
         iv[3].value = <uint32_t>self.max_header_bytes
         iv[4].settings_id = NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES
         iv[4].value = 1
-        # Empty dynamic table: inbound HPACK bomb has nowhere to store.
         iv[5].settings_id = NGHTTP2_SETTINGS_HEADER_TABLE_SIZE
-        iv[5].value = 0
+        iv[5].value = <uint32_t>H2_HEADER_TABLE_SIZE
         nghttp2_submit_settings(self.h2, NGHTTP2_FLAG_NONE, iv, 6)
         nghttp2_session_set_local_window_size(
             self.h2, NGHTTP2_FLAG_NONE, 0, <int32_t>H2_CONN_WINDOW
@@ -2163,6 +2200,16 @@ cdef class HttpProtocol:
             )
             return
         self._h2_window_update(stream_id)
+        if ex._abort_reason == ABORT_TOO_LARGE and ex._status_code < 0:
+            # Stream 413; never close the multiplexed connection from c_feed.
+            if not ex.handler_started:
+                self._h2_protocol_status(ex, 413)
+            else:
+                try:
+                    ex.respond(b"", b"text/plain; charset=utf-8", 413)
+                except Exception:
+                    pass
+            return
         if (
             not ex._h2_dispatched
             and not self.rejected

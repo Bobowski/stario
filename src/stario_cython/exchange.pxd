@@ -18,6 +18,10 @@ cdef inline void _lower_copy(
 
 cdef enum:
     HEADER_NAME_STACK = 256
+    ABORT_NONE = 0
+    ABORT_TOO_LARGE = 1
+    ABORT_DISCONNECTED = 2
+    ABORT_TIMEOUT = 3
 
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
 cdef object _intern_name(const char* src, size_t n)

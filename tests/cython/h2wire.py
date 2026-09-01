@@ -97,9 +97,7 @@ def encode_request(
     authority: str = "127.0.0.1",
     extra: list[tuple[bytes, bytes]] | None = None,
 ) -> bytes:
-    # Server advertises SETTINGS_HEADER_TABLE_SIZE=0; the next header block
-    # must start with a size update (RFC 7541 §4.2 / RFC 9113 §6.5.2).
-    parts: list[bytes] = [hpack_table_size_update(0)]
+    parts: list[bytes] = []
     if method == "GET":
         parts.append(indexed(IDX_METHOD_GET))
     elif method == "POST":
@@ -124,8 +122,7 @@ def encode_request(
 
 def headers_duplicate_path() -> bytes:
     return (
-        hpack_table_size_update(0)
-        + indexed(IDX_METHOD_GET)
+        indexed(IDX_METHOD_GET)
         + indexed(IDX_SCHEME_HTTP)
         + indexed(IDX_PATH_SLASH)
         + literal_name(IDX_PATH_SLASH, b"/other")
@@ -135,8 +132,7 @@ def headers_duplicate_path() -> bytes:
 
 def headers_duplicate_method() -> bytes:
     return (
-        hpack_table_size_update(0)
-        + indexed(IDX_METHOD_GET)
+        indexed(IDX_METHOD_GET)
         + indexed(IDX_METHOD_POST)
         + indexed(IDX_SCHEME_HTTP)
         + indexed(IDX_PATH_SLASH)

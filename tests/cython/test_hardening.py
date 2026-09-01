@@ -210,12 +210,19 @@ async def test_header_total_over_limit_returns_431() -> None:
 @pytest.mark.asyncio
 async def test_body_over_limit_returns_413() -> None:
     app = App()
+    hits = 0
 
     async def read_body(c, w) -> None:
         await c.req.body()
         responses.text(w, "ok")
 
+    async def hello(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "ok")
+
     app.post("/", read_body)
+    app.get("/", hello)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
     try:
         proto.data_received(
@@ -223,6 +230,11 @@ async def test_body_over_limit_returns_413() -> None:
         )
         await _drain(app)
         assert response_status(transport.writes) == 413
+        assert not transport.is_closing()
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_statuses(transport.writes) == [413, 200]
+        assert hits == 1
     finally:
         if not transport.is_closing():
             transport.close()
@@ -248,6 +260,34 @@ async def test_declared_body_over_limit_fails_before_handler_runs() -> None:
         await _drain(app)
         assert response_status(transport.writes) == 413
         assert hits == 0
+        assert not transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_huge_declared_body_over_limit_closes() -> None:
+    """Declared CL above the 256 KiB drain cap still closes (read-DoS)."""
+    app = App()
+    hits = 0
+
+    async def ignore_body(_c, w) -> None:
+        nonlocal hits
+        hits += 1
+        responses.text(w, "ok")
+
+    app.post("/", ignore_body)
+    proto, app, transport = _attach(app=app, max_body_bytes=20)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 262145\r\n\r\n"
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 413
+        assert hits == 0
+        assert transport.is_closing()
     finally:
         if not transport.is_closing():
             transport.close()

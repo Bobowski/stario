@@ -72,6 +72,10 @@ cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
 cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
 cdef int STREAM_CHUNK_CL = 256 * 1024
+# Same bound as protocol SMALL_BODY_COMPLETE_DISPATCH: a declared oversize
+# body this small can be discarded on keep-alive; larger or unknown lengths
+# close the HTTP/1 connection (unbounded read-DoS).
+cdef int SMALL_BODY_DRAIN = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 cdef int POOL_MAX = 1024
@@ -91,10 +95,6 @@ cdef int ENCODING_NONE = 0
 cdef int ENCODING_BR = 1
 cdef int ENCODING_GZIP = 2
 
-cdef int ABORT_NONE = 0
-cdef int ABORT_TOO_LARGE = 1
-cdef int ABORT_DISCONNECTED = 2
-cdef int ABORT_TIMEOUT = 3
 cdef int _TIMEOUT_MODE = 1
 cdef int _TIMEOUT_OFF = 0
 
@@ -3201,6 +3201,19 @@ cdef class RequestExchange:
         if not self._body_active:
             self.reset_body(False, -1)
         new_total = self._total_read + <Py_ssize_t>length
+        # Discard leftover DATA on HTTP/2, or a bounded HTTP/1 body after a
+        # keep-alive 413, without closing the socket. Unknown-length HTTP/1
+        # overflow after the handler finished still closes (read-DoS).
+        if self._discard_body:
+            if (
+                self._http2
+                or (
+                    self._expected_size >= 0
+                    and self._expected_size <= SMALL_BODY_DRAIN
+                )
+            ):
+                self._total_read = new_total
+                return 0
         if new_total > self._max_size or (
             self._read_max_size >= 0 and new_total > self._read_max_size
         ):
@@ -3209,7 +3222,12 @@ cdef class RequestExchange:
             self._clear_body_storage()
             self._connection.set_body_paused(self, False)
             self._wake()
-            if self._discard_body and not self._transport.is_closing():
+            if (
+                not self._http2
+                and self._discard_body
+                and self._transport is not None
+                and not self._transport.is_closing()
+            ):
                 self._transport.close()
             return 0
         if self._discard_body:
