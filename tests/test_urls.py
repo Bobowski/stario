@@ -79,6 +79,11 @@ class TestUrlPath:
 
         assert path.href(tenant="ACME", user_id="42") == "//acme.example.com/users/42"
 
+    def test_rejects_question_mark_in_host_parameter(self):
+        path = UrlPath("/dash", host="{tenant}.example.com")
+        with pytest.raises(StarioError, match="invalid character"):
+            path.href(tenant="evil?")
+
     def test_rejects_dot_in_host_wildcard(self):
         path = UrlPath("/users", host="{tenant}.example.com")
 

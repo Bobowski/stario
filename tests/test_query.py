@@ -1,5 +1,7 @@
 """Unit tests for query string parsing."""
 
+import pytest
+
 from stario.http.query import ParsedQuery
 
 
@@ -17,6 +19,11 @@ def test_repeated_keys() -> None:
 
 def test_percent_decoding() -> None:
     assert ParsedQuery(b"q=100%25").get("q") == "100%"
+
+
+def test_nul_in_query_value_is_rejected() -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        ParsedQuery(b"file=foo%00.txt").get("file")
 
 
 def test_blank_and_bare_keys() -> None:

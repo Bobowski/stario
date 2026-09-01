@@ -39,12 +39,12 @@ def styles(declarations: StyleDeclarations) -> Attrs:
                 example='h.Div(styles({"color": "red"}))',
             )
 
-        if any(ch in key for ch in ":;{}"):
+        if any(ch in key for ch in r":;{}\"):
             raise StarioError(
                 f"Invalid CSS property name: {key!r}",
                 context={"property": key},
                 help_text=(
-                    "CSS property names must not contain ':', ';', '{', or '}' characters."
+                    "CSS property names must not contain ':', ';', '{', '}', or '\\' characters."
                 ),
                 example='h.Div(styles({"background-color": "red"}))',
             )
@@ -65,6 +65,16 @@ def styles(declarations: StyleDeclarations) -> Attrs:
         value_type = type(value)
         if value_type is str:
             rendered_value = escape_attribute_value(cast(str, value))
+            if any(ch in rendered_value for ch in ";{}\\"):
+                raise StarioError(
+                    f"Invalid CSS value for property '{rendered_key}'",
+                    context={"property": rendered_key, "value": rendered_value[:100]},
+                    help_text=(
+                        "CSS values in styles() must not contain ';', '{', '}', "
+                        "or '\\' so they cannot inject extra declarations."
+                    ),
+                    example='h.Div(styles({"color": "red"}))',
+                )
         elif value_type is int or value_type is float:
             rendered_value = str(value)
         else:
