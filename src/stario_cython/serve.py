@@ -25,35 +25,9 @@ import sys
 
 from stario.cli.imports import load_symbol
 from stario.http.bootstrap import Bootstrap
-from stario.http.config import RequestPolicy, ServerConfig, server_config_from_env
+from stario.http.config import ServerConfig, server_config_from_env
 from stario.http.server import Server
 from stario.telemetry.noop import NoOpTracer
-from stario_cython.protocol import HttpProtocol
-
-
-def _make_cython_protocol(
-    loop,
-    app,
-    tracer,
-    date_box,
-    compression,
-    connections,
-    requests: RequestPolicy,
-):
-    return HttpProtocol(
-        loop,
-        app,
-        tracer,
-        date_box,
-        compression,
-        connections,
-        max_header_bytes=requests.max_header_bytes,
-        max_body_bytes=requests.max_body_bytes,
-        header_timeout=requests.header_timeout,
-        keep_alive_timeout=requests.keep_alive_timeout,
-        body_timeout=requests.body_timeout,
-        max_pipelined_requests=requests.max_pipelined_requests,
-    )
 
 
 def _uvloop_config(
@@ -83,7 +57,6 @@ def _server(bootstrap: Bootstrap, config: ServerConfig) -> Server:
         bootstrap,
         NoOpTracer(),
         config=config,
-        make_protocol=_make_cython_protocol,
     )
 
 

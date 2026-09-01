@@ -1,8 +1,55 @@
 from libc.stddef cimport size_t
-from libc.stdint cimport int32_t, uint32_t, uint64_t
+from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
 
 from stario_cython.compression_buf cimport StarioBrotli, StarioGzip
-from stario_cython.headers cimport Headers
+
+cdef inline void _lower_copy(
+    char* dst,
+    const char* src,
+    size_t n,
+) noexcept:
+    cdef size_t i
+    cdef uint8_t ch
+    for i in range(n):
+        ch = <uint8_t>src[i]
+        if 65 <= ch <= 90:
+            ch += 32
+        dst[i] = <char>ch
+
+cdef enum:
+    HEADER_NAME_STACK = 256
+
+cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
+cdef object _intern_name(const char* src, size_t n)
+cdef object _encode_name(str name)
+
+cdef class Headers:
+    cdef list _names
+    cdef list _values
+    cdef Py_ssize_t _n
+
+    cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept
+    cdef Py_ssize_t _compact_except(self, const char* name, Py_ssize_t n) noexcept
+    cdef void _store_at(self, Py_ssize_t index, object wire, object line)
+    cdef object c_get(self, object name)
+    cdef void c_set(self, object name, object value)
+    cdef void c_add(self, object name, object value)
+    cdef void c_remove(self, object name)
+    cdef void c_clear(self)
+    cdef bint c_empty(self)
+    cdef bint c_vary_contains(self, object token)
+    cdef void c_merge_vary(self, object token)
+    cdef int _add_ba(self, object buf, Py_ssize_t* length, const char* src, Py_ssize_t n) except -1
+    cdef int _write_pair_at(self, object buf, Py_ssize_t* length, Py_ssize_t index) except -1
+    cdef int c_write_wire_ba(self, object buf, Py_ssize_t* length) except -1
+    cdef object c_scan_respond(self, object content_type)
+    cdef void c_require_respond_length(self, object existing_cl, object expected) except *
+    cdef int c_write_respond_pairs(
+        self,
+        object buf,
+        Py_ssize_t* length,
+        bint skip_ce,
+    ) except -1
 
 ctypedef struct RawHeader:
     uint32_t name_offset
@@ -11,6 +58,17 @@ ctypedef struct RawHeader:
     uint32_t value_length
 
 cdef object _status_line(int status)
+
+cdef class ParsedCookies:
+    cdef object _headers
+    cdef list _lines
+
+    cdef void bind_request_headers(self, object headers) noexcept
+    cdef void _extend_lines(self, object lines) except *
+    cdef list _cookie_lines(self)
+    cdef object _get_arena(self, const char* name, Py_ssize_t nlen)
+    cdef object _get_lines(self, const char* name, Py_ssize_t nlen)
+    cdef bint _has_any(self)
 
 cdef class Request:
     cdef public object method
@@ -38,6 +96,7 @@ cdef class Request:
         object body,
     )
     cdef object _materialize_query(self)
+    cdef void _rebind_query(self, object query_bytes) noexcept
     cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept
 
 cdef class RequestExchange:
@@ -218,17 +277,16 @@ cdef class RequestExchange:
 
 cdef class RequestHeaders(Headers):
     cdef object _owner
-    cdef bint _request_materialized
 
     cdef object c_get(self, object name)
+    cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept
+    cdef object c_value_str(self, Py_ssize_t index)
     cdef object c_get_n(self, const char* query, Py_ssize_t query_length)
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length)
     cdef void c_set(self, object name, object value)
     cdef void c_add(self, object name, object value)
     cdef void c_remove(self, object name)
     cdef void c_clear(self)
-    cdef void c_reset(self) noexcept
-    cdef object c_request_host(self)
     cdef object c_request_indexed(self, Py_ssize_t index)
     cdef void c_parse_cookies(self, dict out) except *
 

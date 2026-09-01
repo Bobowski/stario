@@ -1,29 +1,4 @@
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
-"""One Headers type: a retained pair list plus the intern table.
-
-Application ``get``/``set`` still see clean names and values. Internally each
-pair is stored already shaped for the writer: ``name: `` and ``value\\r\\n``.
-Lookup is a linear scan (typical maps are a handful of fields). ``Set-Cookie``
-stays repeated pairs. ``respond()`` walks the arrays once to validate owned
-names, then dumps them with two ``memcpy``s per pair.
-
-Request wire storage belongs to ``RequestExchange`` (arena + ``RequestHeaders``).
-"""
-
-from libc.stdint cimport uint8_t, uint32_t
-from libc.string cimport memcmp, memcpy
-from cpython.bytearray cimport (
-    PyByteArray_AS_STRING,
-    PyByteArray_GET_SIZE,
-    PyByteArray_Resize,
-)
-from cpython.bytes cimport (
-    PyBytes_AS_STRING,
-    PyBytes_FromStringAndSize,
-    PyBytes_GET_SIZE,
-)
-
-from stario.exceptions import StarioRuntime
+"""Headers pair list. Included into ``exchange.pyx`` (one extension)."""
 
 cdef bytes _VALID_VALUE = bytes(
     b for b in range(256) if b == 0x09 or (b >= 0x20 and b != 0x7F)
@@ -243,14 +218,6 @@ cdef object _intern_name(const char* src, size_t n):
     if n >= NAME_STACK:
         raise ValueError("Invalid header name: too long")
     _lower_copy(buf, src, n)
-    if n == 4 and memcmp(buf, "host", 4) == 0:
-        return _INTERN_PY[0]
-    if n == 10 and memcmp(buf, "connection", 10) == 0:
-        return _INTERN_PY[1]
-    if n == 15 and memcmp(buf, "accept-encoding", 15) == 0:
-        return _INTERN_PY[13]
-    if n == 6 and memcmp(buf, "expect", 6) == 0:
-        return _INTERN_PY[27]
     index = _intern_lookup(buf, n)
     if index < 0:
         return PyBytes_FromStringAndSize(buf, <Py_ssize_t>n)

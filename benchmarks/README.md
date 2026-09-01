@@ -8,6 +8,7 @@ Three suites, one per layer we care about:
   servers and ASGI framework stacks under `wrk`.
 - `headers_micro.py` — Cython request-header storage tradeoffs: eager dict,
   current-style lazy dict, direct arena scans, and adaptive promotion.
+- `query_micro.py` — Cython query `get` / `getlist` (production C-span index).
 
 The goal is repeatable local signal, not lab-grade numbers. Run on a quiet
 machine and compare repeated runs before drawing conclusions.
@@ -37,6 +38,19 @@ HEADERS_BENCH_REPEATS=9 \
 HEADERS_BENCH_JSON=/tmp/headers-micro.json \
 PYTHONPATH=src:. .venv/bin/python benchmarks/headers_micro.py
 ```
+
+## Query get (`query_micro.py`)
+
+Times production `ParsedQuery.get` / `getlist` (copy query, index C spans,
+memcmp names, decode the value). Pooled `ParsedQuery.__init__(raw)` per request.
+
+```bash
+PYTHONPATH=src:. .venv/bin/python benchmarks/query_micro.py
+```
+
+Defaults are 80,000 requests and seven repeats. Older comparison notes:
+[`query-micro-index-20260831.md`](query-micro-index-20260831.md) (index vs
+scan vs eager) and [`query-micro-20260831.md`](query-micro-20260831.md).
 
 ## HTML generation (`html/`)
 

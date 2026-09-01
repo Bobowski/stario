@@ -7,6 +7,8 @@ from stario.cli.errors import CliError
 
 
 def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("STARIO_SSL_CERTFILE", raising=False)
+    monkeypatch.delenv("STARIO_SSL_KEYFILE", raising=False)
     monkeypatch.setenv("STARIO_HOST", "0.0.0.0")
     monkeypatch.setenv("STARIO_PORT", "9000")
     monkeypatch.setenv("STARIO_LOOP", "uvloop")

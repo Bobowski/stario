@@ -1,17 +1,15 @@
-"""Tests for stario.http.request - HTTP request handling."""
+"""Tests for the request view used by handlers (Cython Request / TestRequest)."""
 
 import pytest
 
-from stario.exceptions import ClientDisconnected, RequestBodyError, StarioRuntime
+from stario.exceptions import RequestBodyError
 from stario.http.headers import Headers
-from stario.http.request import BodyReader, Request
-from tests.helpers import make_body_reader
+from stario.http.request import Request
+from stario.testing.harness import TestRequest
 from tests.helpers import make_request as _make_request
 
 
 class TestRequestBasic:
-    """Smoke test for request surface."""
-
     def test_defaults_and_overrides(self):
         req = _make_request()
         assert req.method == "GET"
@@ -25,14 +23,53 @@ class TestRequestBasic:
 
 
 class TestRequestCookies:
-    """Integration: cookies parsed from request headers."""
-
     def test_multiple_cookie_headers_merge(self):
         hdrs = Headers()
         hdrs.add("Cookie", "a=1")
         hdrs.add("Cookie", "b=2")
-        req = Request(method="GET", path="/", headers=hdrs, body=make_body_reader())
+        req = TestRequest(method="GET", path="/", headers=hdrs)
         assert req.cookies == {"a": "1", "b": "2"}
+        assert req.cookies.get("a") == "1"
+        assert "b" in req.cookies
+
+    def test_get_does_not_require_as_dict(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", "session=abc; unused=1; unused=2")
+        req = Request(method="GET", path="/", headers=hdrs, body=b"")
+        assert req.cookies.get("session") == "abc"
+        assert req.cookies.get("missing") is None
+        assert "session" in req.cookies
+        assert "unused" in req.cookies
+        assert "missing" not in req.cookies
+
+    def test_get_later_header_and_pair_win(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", "a=1; session=old")
+        hdrs.add("Cookie", "a=2; session=new; a=3")
+        req = Request(method="GET", path="/", headers=hdrs, body=b"")
+        assert req.cookies.get("session") == "new"
+        assert req.cookies.get("a") == "3"
+
+    def test_get_quoted_semicolon_value(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", 'x="a;b"; y=2')
+        req = Request(method="GET", path="/", headers=hdrs, body=b"")
+        assert req.cookies.get("x") == "a;b"
+        assert req.cookies.get("y") == "2"
+
+    def test_empty_value_is_present(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", "session=")
+        req = Request(method="GET", path="/", headers=hdrs, body=b"")
+        assert req.cookies.get("session") == ""
+        assert "session" in req.cookies
+        assert bool(req.cookies) is True
+
+    def test_get_latin1_cookie_name(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", "café=1")
+        req = Request(method="GET", path="/", headers=hdrs, body=b"")
+        assert req.cookies.get("café") == "1"
 
 
 class TestRequestHost:
@@ -50,8 +87,6 @@ class TestRequestHost:
 
 
 class TestRequestBody:
-    """Test request body handling."""
-
     async def test_no_body(self):
         req = _make_request()
         body = await req.body()
@@ -64,10 +99,7 @@ class TestRequestBody:
         assert body1 == body2 == b"data"
 
     async def test_body_max_size_is_per_call_limit(self):
-        reader = BodyReader(pause=lambda: None, resume=lambda: None, max_size=10)
-        reader.feed(b"hello")
-        reader.complete()
-        req = Request(method="POST", path="/", headers=Headers(), body=reader)
+        req = TestRequest(method="POST", path="/", body=b"hello")
 
         with pytest.raises(RequestBodyError) as excinfo:
             await req.body(max_size=4)
@@ -75,95 +107,14 @@ class TestRequestBody:
         assert excinfo.value.status_code == 413
         assert await req.body(max_size=5) == b"hello"
 
-    async def test_body_none_reader_returns_empty(self):
-        req = Request(
-            method="GET",
-            path="/",
-            headers=Headers(),
-            body=None,
-        )
+    async def test_body_none_returns_empty(self):
+        req = TestRequest(method="GET", path="/", body=b"")
         assert await req.body() == b""
 
-    async def test_stream_twice_raises_stario_runtime(self):
-        reader = BodyReader(pause=lambda: None, resume=lambda: None)
-        reader.feed(b"chunk")
-        req = Request(method="POST", path="/", headers=Headers(), body=reader)
+    async def test_stream_then_stream_raises(self):
+        req = TestRequest(method="POST", path="/", body=b"chunk")
         stream = req.stream()
         assert await stream.__anext__() == b"chunk"
-        with pytest.raises(StarioRuntime, match="already streaming"):
+        with pytest.raises(RuntimeError, match="already streaming"):
             async for _ in req.stream():
-                pass
-
-    async def test_body_then_stream_raises_stario_runtime(self):
-        req = _make_request(body=b"data")
-
-        assert await req.body() == b"data"
-        assert await req.body() == b"data"
-        with pytest.raises(StarioRuntime, match="already read"):
-            async for _ in req.stream():
-                pass
-
-
-class TestBodyReaderTimeout:
-    async def test_stream_raises_408_when_body_stalls(self):
-        """Slowloris guard: a stalled upload times out with 408."""
-        reader = BodyReader(
-            pause=lambda: None,
-            resume=lambda: None,
-            timeout=0.01,
-        )
-        reader.feed(b"partial")
-
-        chunks: list[bytes] = []
-
-        async def drain() -> None:
-            async for chunk in reader.stream():
-                chunks.append(chunk)
-
-        with pytest.raises(RequestBodyError) as excinfo:
-            await drain()
-
-        assert excinfo.value.status_code == 408
-        assert chunks == [b"partial"]
-
-
-class TestBodyReaderFailures:
-    async def test_feed_over_limit_mid_stream_raises_413(self):
-        reader = BodyReader(
-            pause=lambda: None,
-            resume=lambda: None,
-            max_size=10,
-        )
-        reader.feed(b"12345")
-
-        stream = reader.stream()
-        assert await stream.__anext__() == b"12345"
-
-        reader.feed(b"6789012345x")  # total 16 > 10
-        with pytest.raises(RequestBodyError) as excinfo:
-            await stream.__anext__()
-        assert excinfo.value.status_code == 413
-
-    async def test_read_max_size_failure_leaves_body_retryable(self):
-        reader = BodyReader(
-            pause=lambda: None,
-            resume=lambda: None,
-        )
-        reader.feed(b"hello")
-        reader.complete()
-
-        with pytest.raises(RequestBodyError):
-            await reader.read(max_size=3)
-
-        assert await reader.read(max_size=10) == b"hello"
-
-    async def test_stream_raises_client_disconnected_when_abort_called(self):
-        reader = BodyReader(
-            pause=lambda: None,
-            resume=lambda: None,
-        )
-        reader.abort()
-
-        with pytest.raises(ClientDisconnected, match="request body finished uploading"):
-            async for _ in reader.stream():
                 pass

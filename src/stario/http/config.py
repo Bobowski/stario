@@ -1,7 +1,7 @@
 """Process-level HTTP server configuration (listen, limits, compression, shutdown).
 
-Body and header size defaults for `RequestPolicy` are defined in `request.py`
-alongside `BodyReader`; this module re-exports them for env wiring.
+Body and header size defaults for `RequestPolicy` are defined in `request.py`;
+this module re-exports them for env wiring.
 """
 
 from collections.abc import Callable

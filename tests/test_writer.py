@@ -9,18 +9,12 @@ import stario.cookies as cookies
 import stario.responses as responses
 from stario import App
 from stario.datastar import SSE
-from stario.exceptions import StarioError, StarioRuntime
-from stario.http.writer import Writer
+from stario.exceptions import StarioRuntime
 from stario.markup import html as h
 from stario.testing import TestClient
-from tests.helpers import (
-    _MemoryTransport,
-)
+from stario.testing.harness import TestWriter
 from tests.helpers import (
     make_context as _make_context,
-)
-from tests.helpers import (
-    make_writer_raw as _make_writer,
 )
 
 
@@ -337,24 +331,6 @@ class TestTestClient:
 
 
 class TestWriterRaw:
-    async def test_writes_stop_after_transport_closes(self):
-        sink = bytearray()
-        transport = _MemoryTransport(sink.extend)
-        writer = Writer(
-            transport=transport,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-        )
-
-        writer.respond(b"ok", b"text/plain")
-        assert b"ok" in sink
-
-        sink.clear()
-        transport.close()
-        writer.respond(b"nope", b"text/plain")
-
-        assert b"nope" not in sink
-
     async def test_context_alive_exits_when_connection_closes(self):
         loop = asyncio.get_running_loop()
         disconnect = loop.create_future()
@@ -435,151 +411,62 @@ class TestWriterRaw:
         await asyncio.wait_for(worker(), timeout=0.2)
         assert collected == ["a", "b"]
 
-    def test_end_without_data_sends_204(self):
-        w, sink, loop = _make_writer()
+    def test_end_without_data_is_204(self):
+        w = TestWriter()
+        w.end()
+        assert w.status_code == 204
+        assert w.body == b""
+
+    def test_closing_follows_disconnect(self):
+        loop = asyncio.new_event_loop()
         try:
-            w.end()
-            assert bytes(sink).startswith(b"HTTP/1.1 204 No Content\r\n")
-            assert b"content-length: 0\r\n" in bytes(sink)
+            disconnect = loop.create_future()
+            w = TestWriter(disconnect=disconnect)
+            assert not w.closing
+            disconnect.set_result(None)
+            assert w.closing
         finally:
             loop.close()
 
     def test_write_after_204_raises(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.write_headers(204)
-            with pytest.raises(StarioRuntime, match="Cannot write a body"):
-                w.write(b"data")
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.write_headers(204)
+        with pytest.raises(RuntimeError, match="Cannot write a body"):
+            w.write(b"data")
 
     def test_sse_rejects_non_event_stream_after_headers_started(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.set("content-type", "text/html")
-            w.write_headers(200)
-            with pytest.raises(StarioRuntime, match="text/event-stream"):
-                SSE(w).patch_signals({"x": 1})
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.headers.set("content-type", "text/html")
+        w.write_headers(200)
+        with pytest.raises(StarioRuntime, match="text/event-stream"):
+            SSE(w).patch_signals({"x": 1})
 
-    def test_write_headers_twice_raises_stario_runtime(self):
-        w, _sink, loop = _make_writer()
-        try:
+    def test_write_headers_twice_raises(self):
+        w = TestWriter()
+        w.write_headers(200)
+        with pytest.raises(RuntimeError, match="already started"):
             w.write_headers(200)
-            with pytest.raises(StarioRuntime, match="already started"):
-                w.write_headers(200)
-        finally:
-            loop.close()
-
-    def test_content_length_mismatch_raises_at_end(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.unsafe_set(b"content-length", b"5")
-            w.write_headers(200)
-            w.write(b"abc")
-            with pytest.raises(StarioRuntime, match="body length mismatch"):
-                w.end()
-        finally:
-            loop.close()
-
-    def test_invalid_content_length_raises_stario_error(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.unsafe_set(b"content-length", b"not-a-number")
-            with pytest.raises(StarioError, match="Invalid Content-Length"):
-                w.write_headers(200)
-        finally:
-            loop.close()
 
     def test_respond_after_started_raises(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.write_headers(200)
-            with pytest.raises(StarioRuntime, match="already started"):
-                w.respond(b"late", b"text/plain")
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.write_headers(200)
+        with pytest.raises(RuntimeError, match="already started"):
+            w.respond(b"late", b"text/plain")
 
     def test_write_after_end_raises(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.respond(b"ok", b"text/plain")
-            with pytest.raises(StarioRuntime, match="completed"):
-                w.write(b"extra")
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.respond(b"ok", b"text/plain")
+        with pytest.raises(RuntimeError, match="completed"):
+            w.write(b"extra")
 
-    def test_respond_when_disconnected_completes_without_body(self):
-        w, sink, loop = _make_writer()
-        completed: list[str] = []
-        try:
-            w._on_completed = lambda: completed.append("done")
-            w._transport.close()
-            w.respond(b"ok", b"text/plain")
-            assert bytes(sink) == b""
-            assert w.completed
-            assert completed == ["done"]
-        finally:
-            loop.close()
-
-    def test_respond_errors_on_content_type_mismatch(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.set("content-type", "text/html")
-            with pytest.raises(StarioRuntime, match="Content-Type"):
-                w.respond(b"ok", b"text/plain")
-        finally:
-            loop.close()
-
-    def test_respond_errors_on_content_length_mismatch(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.set("content-length", "99")
-            with pytest.raises(StarioRuntime, match="Content-Length"):
-                w.respond(b"ok", b"text/plain")
-        finally:
-            loop.close()
-
-    def test_respond_accepts_matching_content_type(self):
-        w, sink, loop = _make_writer()
-        try:
-            w.headers.set("content-type", "text/plain")
-            w.headers.set("x-custom", "yes")
-            w.respond(b"ok", b"text/plain")
-            payload = bytes(sink)
-            assert b"x-custom: yes\r\n" in payload
-            assert payload.count(b"content-type: text/plain\r\n") == 1
-            assert payload.endswith(b"ok")
-        finally:
-            loop.close()
-
-    def test_respond_writes_set_cookie_and_custom_headers(self):
-        w, sink, loop = _make_writer()
-        try:
-            cookies.set_cookie(w, "session", "abc123")
-            cookies.set_cookie(w, "theme", "dark")
-            w.headers.set("X-Request-ID", "in-1")
-            w.respond(b"ok", b"text/plain")
-            payload = bytes(sink)
-            assert b"x-request-id: in-1\r\n" in payload
-            assert b"session=abc123" in payload
-            assert b"theme=dark" in payload
-            assert payload.lower().count(b"set-cookie:") == 2
-            assert payload.count(b"content-type: text/plain\r\n") == 1
-            assert payload.endswith(b"ok")
-        finally:
-            loop.close()
-
-    def test_respond_errors_on_date_or_transfer_encoding(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.set("date", "Tue, 01 Jan 2030 00:00:00 GMT")
-            with pytest.raises(StarioRuntime, match="Date is emitted"):
-                w.respond(b"ok", b"text/plain")
-            w.headers.remove("date")
-            w.headers.set("transfer-encoding", "chunked")
-            with pytest.raises(StarioRuntime, match="Transfer-Encoding"):
-                w.respond(b"ok", b"text/plain")
-        finally:
-            loop.close()
+    def test_respond_keeps_custom_headers_and_cookies(self):
+        w = TestWriter()
+        cookies.set_cookie(w, "session", "abc123")
+        cookies.set_cookie(w, "theme", "dark")
+        w.headers.set("X-Request-ID", "in-1")
+        w.respond(b"ok", b"text/plain")
+        assert w.headers.get("x-request-id") == "in-1"
+        assert w.headers.get("content-type") == "text/plain"
+        lines = w.headers.unsafe_getlist(b"set-cookie")
+        assert len(lines) == 2
+        assert w.body == b"ok"

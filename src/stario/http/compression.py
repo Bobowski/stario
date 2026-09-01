@@ -1,17 +1,21 @@
 """HTTP content-coding negotiation and compressor implementations."""
 
+from __future__ import annotations
+
 import zlib
 from collections.abc import Iterable
 from compression import zstd
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import brotli  # pyright: ignore[reportMissingTypeStubs]
 
 from stario._env import env_int, env_optional_int
 from stario.exceptions import StarioError
 
-from .headers import Headers
 from .wire import parse_accept_encoding
+
+if TYPE_CHECKING:
+    from .headers import Headers
 
 # brotli is an untyped C extension; alias as Any so strict pyright stays quiet
 # without vendoring or tracking third-party stub packages.

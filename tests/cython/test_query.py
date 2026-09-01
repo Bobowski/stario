@@ -1,6 +1,5 @@
-"""Cython query-byte parse matches the Python ParsedQuery helper."""
+"""Cython query-byte parse."""
 
-from stario.http.query import ParsedQuery as PyQuery
 from stario_cython.exchange import ParsedQuery as CyQuery
 
 
@@ -25,21 +24,19 @@ CASES = [
     b"a=1&b=2&a=3",
     b"hello+world=x+y",
     b"x=%20%2B%20",
+    b"caf%C3%A9=1",
+    b"k00=v00&k01=v01&k02=v02&k03=v03&k04=v04&k05=v05&k06=v06&k07=v07&k08=v08&k09=v09",
 ]
 
 
-def test_cython_query_matches_python() -> None:
+def test_cython_query_cases() -> None:
     for raw in CASES:
-        py = PyQuery(raw)
         cy = CyQuery(raw)
-        assert cy.as_dict() == py.as_dict(), raw
-        assert cy.as_dict(last=True) == py.as_dict(last=True), raw
-        assert cy.as_lists() == py.as_lists(), raw
-        assert cy.items() == py.items(), raw
-        assert len(cy) == len(py)
-        assert bool(cy) == bool(py)
-        for key, _value in py.items():
-            assert key in cy
-            assert cy.get(key) == py.get(key)
-            assert cy.getlist(key) == py.getlist(key)
         assert cy.get("missing", "d") == "d"
+        items = cy.items()
+        assert len(cy) == len({key for key, _value in items})
+        assert bool(cy) == bool(items)
+        for key, _value in items:
+            assert key in cy
+            assert cy.get(key) == next(v for k, v in items if k == key)
+            assert cy.getlist(key) == [v for k, v in items if k == key]

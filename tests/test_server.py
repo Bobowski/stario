@@ -204,7 +204,9 @@ class TestServerRunLifecycle:
         spans = [json.loads(line) for line in output.getvalue().splitlines()]
         names = [s["name"] for s in spans]
         assert "server.startup" in names
-        assert "GET" in names
+        assert "request" in names
+        request_span = next(s for s in spans if s["name"] == "request")
+        assert request_span["attributes"]["request.method"] == "GET"
         shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
         assert shutdown_span["attributes"]["server.shutdown.trigger"] == "expected_stop"
         assert shutdown_span["status"] == "ok"

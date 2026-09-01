@@ -1,8 +1,8 @@
 """Load ``stario`` before Cython extensions.
 
-Importing ``stario_cython.headers`` while ``stario.__init__`` is still running
-re-enters the partial module (App → Writer → Headers). Completing the package
-init first makes collection order-independent.
+Importing ``stario_cython.exchange`` while ``stario.__init__`` is still running
+can re-enter the package. Completing the package init first makes collection
+order-independent.
 """
 
 import os

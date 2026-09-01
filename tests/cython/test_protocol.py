@@ -1457,6 +1457,10 @@ async def test_lazy_cookies_and_query_from_arena() -> None:
 
     async def inspect(c, w):
         assert c.req.headers.materialized is False
+        assert c.req.cookies.get("a") == "2"
+        assert c.req.cookies.get("x") == "a;b"
+        assert c.req.cookies.get("b") == "3"
+        assert c.req.cookies.get("missing") is None
         assert dict(c.req.cookies) == {"a": "2", "b": "3", "x": "a;b"}
         assert c.req.query.get("q") == "hello world"
         assert c.req.query.getlist("tag") == ["a", "b"]

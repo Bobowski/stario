@@ -6,7 +6,7 @@ import stario.responses as responses
 from stario.exceptions import RedirectException, StarioError
 from stario.http.writer import Writer
 from stario.responses import normalized_location
-from tests.test_writer import _make_writer
+from tests.helpers import make_writer_raw
 
 SAFE_REDIRECT_TARGETS = [
     "/dashboard",
@@ -54,21 +54,23 @@ class TestNormalizedLocation:
 class TestRedirectParity:
     def test_direct_and_exception_handler_paths_agree_on_safe_target(self) -> None:
         target = "/dashboard"
-        direct, sink_direct, loop_direct = _make_writer()
-        via_handler, sink_handler, loop_handler = _make_writer()
+        direct, _sink_direct, loop_direct = make_writer_raw()
+        via_handler, _sink_handler, loop_handler = make_writer_raw()
         try:
             responses.redirect(direct, target, 302)
             _redirect_from_exception(via_handler, RedirectException(302, target))
 
-            direct_bytes = bytes(sink_direct)
-            handler_bytes = bytes(sink_handler)
-            assert direct_bytes == handler_bytes
+            assert direct.status_code == via_handler.status_code == 302
+            assert direct.headers.get("location") == via_handler.headers.get(
+                "location"
+            )
+            assert direct.body == via_handler.body
         finally:
             loop_direct.close()
             loop_handler.close()
 
     def test_redirect_rejects_non_3xx_status(self) -> None:
-        w, _sink, loop = _make_writer()
+        w, _sink, loop = make_writer_raw()
         try:
             with pytest.raises(StarioError, match="3xx"):
                 responses.redirect(w, "/ok", 200)

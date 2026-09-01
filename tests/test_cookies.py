@@ -6,24 +6,15 @@ from datetime import UTC, datetime
 import pytest
 
 import stario.cookies as cookies
-from stario.http.writer import Writer
-from tests.helpers import _MemoryTransport
+from stario.testing.harness import TestWriter
 
 
-def _writer() -> tuple[Writer, asyncio.AbstractEventLoop]:
+def _writer() -> tuple[TestWriter, asyncio.AbstractEventLoop]:
     loop = asyncio.new_event_loop()
-    sink = bytearray()
-
-    transport = _MemoryTransport(sink.extend)
-    w = Writer(
-        transport=transport,
-        get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-        on_completed=lambda: None,
-    )
-    return w, loop
+    return TestWriter(), loop
 
 
-def _cookie_header(w: Writer) -> str:
+def _cookie_header(w: TestWriter) -> str:
     lines = w.headers.unsafe_getlist(b"set-cookie")
     return b";".join(lines).decode("latin-1")
 

@@ -21,14 +21,12 @@ from stario.testing.dispatch import (
 )
 from stario.testing.encode import (
     decode_content_encoding,
-    parse_http_response,
     parse_response_cookies,
 )
 from stario.testing.load import aload_app
 from stario.testing.models import ClientRequest
 from stario.testing.response import TestResponse, TestStreamResponse
 from stario.testing.tracer import TestTracer
-from stario.testing.transport import GrowingSink, try_parse_http_head, wait_sink
 from stario.testing.types import (
     CookieMap,
     FileData,
@@ -99,7 +97,8 @@ class TestClient:
         - `cookies`: Initial cookie jar (`dict`-like).
         - `follow_redirects`: Default for buffered requests; ignored by `stream`.
         - `max_redirects`: Buffered redirect cap.
-        - `compression`: Passed to the synthetic `Writer`.
+        - `compression`: Kept for call-site compatibility; TestClient records
+          whatever the handler writes (no production writer compression).
         - `request_timeout`: Default seconds per request; `None` means no timeout.
         """
         if isinstance(app_or_bootstrap, App):
@@ -243,7 +242,6 @@ class TestClient:
             content=content,
         )
 
-        sink = GrowingSink()
         wired = wire_dispatch(
             app=self.app,
             tracer=self.tracer,
@@ -253,9 +251,8 @@ class TestClient:
             pqs=pqs,
             phdrs=phdrs,
             pbody=pbody,
-            compression=self.compression,
-            transport_write=sink.extend,
         )
+        writer = wired.writer
         disconnect = wired.disconnect
         timeout_secs = self.request_timeout if timeout is None else timeout
         loop = asyncio.get_running_loop()
@@ -268,38 +265,34 @@ class TestClient:
                 self.app,
                 wired,
                 deadline=timeout_secs,
-                on_finished=sink.mark_app_done,
+                on_finished=writer.sink.mark_app_done,
             )
 
         app_task = asyncio.create_task(run_stream(), name="stario.testclient.stream")
 
         try:
-            seen = sink.gen
-            parsed = try_parse_http_head(sink.buf)
-            while parsed is None:
-                if sink.app_done:
+            while not writer.headers_sent.is_set():
+                if writer.sink.app_done:
                     await app_task
                     raise RuntimeError(
                         "Application exited before response headers were sent."
                     )
-                await wait_sink(sink, seen, deadline=exchange_deadline)
-                seen = sink.gen
-                parsed = try_parse_http_head(sink.buf)
+                wait = asyncio.wait_for(
+                    writer.headers_sent.wait(),
+                    timeout=None
+                    if exchange_deadline is None
+                    else max(0.0, exchange_deadline - loop.time()),
+                )
+                try:
+                    await wait
+                except TimeoutError:
+                    raise TimeoutError("TestClient stream timed out waiting for headers.")
 
-            status_code, response_headers, body_start = parsed
+            status_code = writer.status_code if writer.status_code is not None else 500
+            response_headers = writer.headers
             response_cookies = parse_response_cookies(response_headers)
             merge_cookie_jar(self.cookies, response_headers)
             client_request = wired.client_request
-
-            te = (response_headers.get("transfer-encoding") or "").lower()
-            chunked = "chunked" in te
-            cl_raw = response_headers.get("content-length")
-            content_length: int | None = None
-            if cl_raw is not None:
-                try:
-                    content_length = int(cl_raw)
-                except ValueError:
-                    content_length = None
 
             st = TestStreamResponse(
                 status_code=status_code,
@@ -308,10 +301,7 @@ class TestClient:
                 request=client_request,
                 span_id=wired.root_span.id,
                 cookies=response_cookies,
-                sink=sink,
-                _body_start=body_start,
-                _chunked=chunked,
-                _content_length=content_length,
+                sink=writer.sink,
                 _disconnect_future=disconnect,
                 _app_task=app_task,
                 _deadline=exchange_deadline,
@@ -480,7 +470,6 @@ class TestClient:
             content=content,
         )
 
-        sink = bytearray()
         wired = wire_dispatch(
             app=self.app,
             tracer=self.tracer,
@@ -490,15 +479,15 @@ class TestClient:
             pqs=pqs,
             phdrs=phdrs,
             pbody=pbody,
-            compression=self.compression,
-            transport_write=sink.extend,
         )
         deadline = self.request_timeout if timeout is None else timeout
         await run_dispatch(self.app, wired, deadline=deadline)
 
-        status_code, response_headers, response_body = parse_http_response(bytes(sink))
+        writer = wired.writer
+        status_code = writer.status_code if writer.status_code is not None else 500
+        response_headers = writer.headers
         response_body = decode_content_encoding(
-            response_body,
+            writer.body,
             response_headers.get("content-encoding"),
         )
         response_cookies = parse_response_cookies(response_headers)

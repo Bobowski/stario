@@ -72,6 +72,7 @@ def test_public_exports(module_name: str, names: list[str]) -> None:
         "stario.http.staticassets",
         "stario.routing.trie",
         "stario.routing.pattern",
+        "stario.http.protocol",
     ],
 )
 def test_removed_shim_modules(removed_module: str) -> None:

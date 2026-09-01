@@ -26,7 +26,6 @@ import os
 MODE_OFF = 0
 MODE_SWEEP = 1
 
-_SWEEP_ATTR = "_stario_timeout_sweeps"
 # Keep in sync with ``stario.http.server._DATE_TICK_SWEEPS_TIMEOUTS``.
 DATE_TICK_SWEEP_ATTR = "_stario_date_tick_sweeps_timeouts"
 

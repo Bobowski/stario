@@ -1,6 +1,6 @@
 """Cookie parsing and `Set-Cookie` emission.
 
-Read inbound cookies via `req.cookies` (backed by `parse_cookie_headers`).
+Read inbound cookies via `req.cookies` (Cython ``ParsedCookies``, on demand).
 Write outbound cookies with `set_cookie` / `delete_cookie` on a `Writer`.
 """
 
