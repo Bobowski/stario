@@ -73,6 +73,11 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   308). Accept-Encoding is not scanned when brotli and gzip are both
   off. HTTP/2 header names are memcpy'd (RFC 9113 lowercase). Host is
   normalized in C and prefetched when `host_routing`.
+- HTTP/2 applies the same `max_header_bytes` budget as HTTP/1 (name +
+  value octets per stream). Oversize requests get **431** on that stream,
+  not a connection close. `SETTINGS_MAX_HEADER_LIST_SIZE` is advertised;
+  CONTINUATION frames are capped from that budget; closed streams are
+  not retained (`SETTINGS_NO_RFC7540_PRIORITIES`).
 
 ## 4.1.0 - 2026-08-17
 

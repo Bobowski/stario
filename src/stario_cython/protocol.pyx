@@ -64,12 +64,15 @@ from stario_cython.nghttp2 cimport (
     NGHTTP2_HEADERS,
     NGHTTP2_INTERNAL_ERROR,
     NGHTTP2_PROTOCOL_ERROR,
+    NGHTTP2_ENHANCE_YOUR_CALM,
     NGHTTP2_NV_FLAG_NONE,
     NGHTTP2_NV_FLAG_NO_COPY_NAME,
     NGHTTP2_NV_FLAG_NO_COPY_VALUE,
     NGHTTP2_SETTINGS_ENABLE_PUSH,
     NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
     NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+    NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+    NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES,
     nghttp2_data_provider,
     nghttp2_data_source,
     nghttp2_frame,
@@ -78,6 +81,8 @@ from stario_cython.nghttp2 cimport (
     nghttp2_option_del,
     nghttp2_option_new,
     nghttp2_option_set_no_auto_window_update,
+    nghttp2_option_set_no_closed_streams,
+    nghttp2_option_set_max_continuations,
     nghttp2_session,
     nghttp2_session_callbacks,
     nghttp2_session_callbacks_del,
@@ -1697,8 +1702,9 @@ cdef class HttpProtocol:
     cdef void _start_h2(self) noexcept:
         cdef nghttp2_session_callbacks* cbs = NULL
         cdef nghttp2_option* opt = NULL
-        cdef nghttp2_settings_entry iv[3]
+        cdef nghttp2_settings_entry iv[5]
         cdef int rv
+        cdef size_t max_cont
         if self.h2 != NULL:
             self.parse_mode = PARSE_H2
             return
@@ -1719,6 +1725,15 @@ cdef class HttpProtocol:
             self._close_error(500, "Internal Server Error")
             return
         nghttp2_option_set_no_auto_window_update(opt, 1)
+        nghttp2_option_set_no_closed_streams(opt, 1)
+        # HEADERS + CONTINUATION at 16KiB/frame. Cap at nghttp2's default 8 so
+        # a large max_header_bytes does not loosen the flood guard.
+        max_cont = <size_t>((self.max_header_bytes + 16383) // 16384) + 2
+        if max_cont < 1:
+            max_cont = 1
+        if max_cont > 8:
+            max_cont = 8
+        nghttp2_option_set_max_continuations(opt, max_cont)
         rv = nghttp2_session_server_new2(&self.h2, cbs, <void*>self, opt)
         nghttp2_option_del(opt)
         nghttp2_session_callbacks_del(cbs)
@@ -1732,7 +1747,11 @@ cdef class HttpProtocol:
         iv[1].value = <uint32_t>H2_MAX_CONCURRENT
         iv[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH
         iv[2].value = 0
-        nghttp2_submit_settings(self.h2, NGHTTP2_FLAG_NONE, iv, 3)
+        iv[3].settings_id = NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE
+        iv[3].value = <uint32_t>self.max_header_bytes
+        iv[4].settings_id = NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES
+        iv[4].value = 1
+        nghttp2_submit_settings(self.h2, NGHTTP2_FLAG_NONE, iv, 5)
         nghttp2_session_set_local_window_size(
             self.h2, NGHTTP2_FLAG_NONE, 0, <int32_t>H2_CONN_WINDOW
         )
@@ -1870,6 +1889,47 @@ cdef class HttpProtocol:
         if self.h2 != NULL:
             nghttp2_session_set_stream_user_data(self.h2, stream_id, <void*>ex)
 
+    cdef bint _h2_header_oversize(
+        self,
+        RequestExchange ex,
+        size_t namelen,
+        size_t valuelen,
+    ) noexcept:
+        """True when this field would exceed ``max_header_bytes`` (H1 ``head_bytes``)."""
+        cdef Py_ssize_t add
+        cdef Py_ssize_t limit
+        if ex is None:
+            return True
+        add = <Py_ssize_t>namelen + <Py_ssize_t>valuelen
+        if add < 0:
+            return True
+        limit = <Py_ssize_t>self.max_header_bytes
+        if ex._h2_head_bytes > limit - add:
+            return True
+        ex._h2_head_bytes += add
+        return False
+
+    cdef void _h2_protocol_status(self, RequestExchange ex, int status) noexcept:
+        """Write a protocol HTTP status on this stream (431 / similar). No handler."""
+        cdef object req
+        cdef object method
+        cdef object path
+        if ex is None or self.rejected:
+            return
+        try:
+            ex._h2_dispatched = True
+            ex._h2_headers_done = True
+            ex.mark_nobody()
+            ex.start_response()
+            req = ex.req
+            method = ex._h2_method
+            path = req.path if req is not None else None
+            self._finish_protocol_span(status, ex.span, method, path)
+            ex.respond(b"", b"text/plain; charset=utf-8", status)
+            ex.handler_finished()
+        except Exception:
+            self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_ENHANCE_YOUR_CALM)
+
     cdef void _h2_on_header(
         self,
         int32_t stream_id,
@@ -1882,6 +1942,11 @@ cdef class HttpProtocol:
         cdef const char* hn = <const char*>name
         cdef const char* hv = <const char*>value
         if ex is None or ex._h2_dispatched or ex._h2_headers_done:
+            return
+        if ex._h2_headers_too_large:
+            return
+        if self._h2_header_oversize(ex, namelen, valuelen):
+            ex._h2_headers_too_large = True
             return
         if namelen > 0 and name[0] == 58:
             if namelen == 7 and memcmp(hn, ":method", 7) == 0:
@@ -1900,7 +1965,7 @@ cdef class HttpProtocol:
                     return
                 ex._h2_got_path = True
                 if ex.append_request_url(hv, valuelen) != 0:
-                    self._close_error(431, "Request header fields too large")
+                    ex._h2_headers_too_large = True
                 return
             if namelen == 10 and memcmp(hn, ":authority", 10) == 0:
                 if ex._h2_got_authority:
@@ -1914,7 +1979,7 @@ cdef class HttpProtocol:
                     return
                 ex._h2_got_authority = True
                 if ex.append_request_header("host", 4, hv, valuelen, True) != 0:
-                    self._close_error(400, "Invalid HTTP request")
+                    ex._h2_headers_too_large = True
                 return
             if namelen == 9 and memcmp(hn, ":protocol", 9) == 0:
                 # Extended CONNECT / WebSocket — not supported.
@@ -1930,10 +1995,10 @@ cdef class HttpProtocol:
                     self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
                 return
             if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
-                self._close_error(400, "Invalid HTTP request")
+                ex._h2_headers_too_large = True
             return
         if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            ex._h2_headers_too_large = True
 
     cdef void _h2_on_data(self, int32_t stream_id, const uint8_t* data, size_t length) noexcept:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
@@ -1968,6 +2033,9 @@ cdef class HttpProtocol:
             # Trailers (or a later HEADERS) with END_STREAM finish the body.
             if end_stream:
                 self._h2_end_stream(stream_id)
+            return
+        if ex._h2_headers_too_large:
+            self._h2_protocol_status(ex, 431)
             return
         ex.finish_request_header()
         ex.cache_hot_request_headers()

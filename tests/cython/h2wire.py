@@ -20,6 +20,9 @@ FLAG_END_HEADERS = 0x4
 
 NGHTTP2_PROTOCOL_ERROR = 1
 
+SETTINGS_MAX_HEADER_LIST_SIZE = 0x6
+SETTINGS_NO_RFC7540_PRIORITIES = 0x9
+
 IDX_AUTHORITY = 1
 IDX_METHOD_GET = 2
 IDX_METHOD_POST = 3
@@ -174,11 +177,31 @@ async def h2_handshake(
                 return reader, writer, buf
 
 
+def collected_settings(frames: list[H2Frame]) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for frame in frames:
+        if frame.type != TYPE_SETTINGS or (frame.flags & FLAG_ACK):
+            continue
+        payload = frame.payload
+        for i in range(0, len(payload) - 5, 6):
+            sid = int.from_bytes(payload[i : i + 2], "big")
+            out[sid] = int.from_bytes(payload[i + 2 : i + 6], "big")
+    return out
+
+
 def stream_data(frames: list[H2Frame], stream_id: int) -> bytes:
     return b"".join(
         frame.payload
         for frame in frames
         if frame.type == TYPE_DATA and frame.stream_id == stream_id
+    )
+
+
+def stream_headers_blob(frames: list[H2Frame], stream_id: int) -> bytes:
+    return b"".join(
+        frame.payload
+        for frame in frames
+        if frame.type == TYPE_HEADERS and frame.stream_id == stream_id
     )
 
 
