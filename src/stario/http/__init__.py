@@ -5,8 +5,8 @@
 the matched handler as a task.
 
 **Message** — `Request` (on ``Context``) plus ``Writer`` for the outbound
-response. Client disconnect and ``alive()`` are on ``Context``, not
-``Writer``.
+response. ``Writer.closing`` is the send path; ``c.alive()`` is handler
+lifetime (client gone or app draining).
 
 **Process** — import submodules directly for embedding:
 

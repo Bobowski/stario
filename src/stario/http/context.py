@@ -35,21 +35,18 @@ EMPTY_ROUTE_MATCH = RouteMatch(pattern="", params=MappingProxyType({}))
 
 
 class Context(Protocol):
-    """Per-request bundle: inbound request, app, span, and this request's lifetime.
+    """Per-request bundle: inbound request, app, span, and handler lifetime.
 
     Every handler is ``async def handler(c: Context, w: Writer)``. ``c`` is
-    everything about *this request still being live work*: what they asked
-    (``req``, ``route``), the process (``app``), observability (``span``),
-    request-scoped ``state``, and whether the handler should keep running.
+    what they asked (``req``, ``route``), the process (``app``),
+    observability (``span``), request-scoped ``state``, and whether this
+    *task* should keep running.
 
-    ``c.alive()`` / ``c.disconnected`` / ``c.closing`` live here — not on
-    ``Writer`` — because they answer “should this handler still run?”, not
-    “what HTTP bytes am I sending?”. That includes the client leaving *and*
-    the app draining. Shutdown is already ``c.app``; the inbound body already
-    surfaces peer-gone as ``ClientDisconnected`` on ``c.req``. ``Writer`` is
-    the outbound message (``started`` / ``completed`` / ``write``). After
-    ``w.end()`` the response is complete even if keep-alive is still open;
-    ``w.write()`` is a no-op if the transport is already gone.
+    ``c.alive()`` lives here because it cancels the handler — including
+    work that is not a write — when the client leaves or the app drains.
+    ``Writer.closing`` is the send path: stop putting bytes on this
+    response. After ``w.end()`` the response is complete even if keep-alive
+    is still open; ``w.closing`` is not a synonym of ``completed``.
     """
 
     app: App
@@ -73,11 +70,6 @@ class Context(Protocol):
         """``True`` when the server is draining this app."""
         ...
 
-    @property
-    def closing(self) -> bool:
-        """``True`` when handler work should stop (client left or app draining)."""
-        ...
-
     @overload
     def alive(self, source: None = None) -> _Alive[None]: ...
 
@@ -95,9 +87,9 @@ class Context(Protocol):
         the ``async with`` still runs). ``async for item in c.alive(source):``
         does the same around an async iterable.
 
-        This is handler lifetime, not a write method: a long-lived loop can
-        wait here without sending, and ``SSE(w)`` still only needs ``Writer``
-        for the bytes.
+        This is handler lifetime, not send-path status. A long-lived loop
+        can wait here without sending. Whether further ``w.write()`` calls
+        are still worth issuing is ``w.closing``.
         """
         ...
 

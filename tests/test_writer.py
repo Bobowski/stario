@@ -352,24 +352,22 @@ class TestWriterRaw:
         await asyncio.wait_for(stopped.wait(), timeout=0.1)
         await task
 
-    async def test_context_closing_combines_disconnect_and_shutdown(self):
+    async def test_context_disconnected_and_shutting_down_are_separate(self):
         loop = asyncio.get_running_loop()
         disconnect = loop.create_future()
         context = _make_context(loop=loop, disconnect=disconnect)
 
-        assert not context.closing
+        assert not context.disconnected
+        assert not context.shutting_down
 
         disconnect.set_result(None)
-
         assert context.disconnected
-        assert context.closing
         assert not context.shutting_down
 
         context = _make_context(loop=loop)
         context.app.shutdown.set_result(None)
-
         assert context.shutting_down
-        assert context.closing
+        assert not context.disconnected
 
     async def test_context_alive_does_not_swallow_unrelated_cancellation(self):
         loop = asyncio.get_running_loop()
@@ -424,6 +422,30 @@ class TestWriterRaw:
         w.end()
         assert w.status_code == 204
         assert w.body == b""
+        assert w.completed
+        assert not w.closing
+
+    def test_closing_follows_disconnect(self):
+        loop = asyncio.new_event_loop()
+        try:
+            disconnect = loop.create_future()
+            w = TestWriter(disconnect=disconnect)
+            assert not w.closing
+            disconnect.set_result(None)
+            assert w.closing
+        finally:
+            loop.close()
+
+    def test_closing_follows_shutdown(self):
+        loop = asyncio.new_event_loop()
+        try:
+            shutdown = loop.create_future()
+            w = TestWriter(shutdown=shutdown)
+            assert not w.closing
+            shutdown.set_result(None)
+            assert w.closing
+        finally:
+            loop.close()
 
     def test_write_after_204_raises(self):
         w = TestWriter()

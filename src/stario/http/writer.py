@@ -18,12 +18,16 @@ class Writer(Protocol):
     Set headers on ``headers``, then ``respond`` for a whole body or
     ``write_headers`` followed by ``write`` / ``end`` for streaming.
 
-    This is the outbound message, not the connection. Client disconnect and
-    process drain live on ``Context`` (``c.alive``, ``c.disconnected``,
-    ``c.closing``). ``started`` / ``completed`` say whether *this response*
-    has been sent, not whether the socket is still open. After ``end()`` the
-    response is done even if keep-alive is still open; ``write()`` is a
-    no-op if the transport is already gone.
+    ``started`` / ``completed`` are this *response*. ``closing`` is the
+    send path: the client is gone, or the app is draining, so further
+    writes will not reach an interested peer. After ``end()`` the
+    response is complete even if keep-alive is still open (``completed``
+    is true, ``closing`` is not). ``write()`` is a no-op if the
+    transport is already gone.
+
+    Waiting until the client leaves or the process drains is
+    ``c.alive()`` — that cancels the handler task, including work that
+    is not a write.
     """
 
     headers: Headers
@@ -41,6 +45,11 @@ class Writer(Protocol):
     @property
     def completed(self) -> bool:
         """``True`` after ``end`` / ``respond`` / ``abort`` finished the response."""
+        ...
+
+    @property
+    def closing(self) -> bool:
+        """``True`` when further writes will not reach an interested client."""
         ...
 
     def respond(self, body: bytes, content_type: bytes, status: int = 200) -> None:

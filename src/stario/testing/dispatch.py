@@ -53,7 +53,7 @@ def wire_dispatch(
         headers=phdrs,
         body=pbody,
     )
-    writer = TestWriter()
+    writer = TestWriter(disconnect=disconnect, shutdown=app.shutdown)
     ctx = TestContext(
         app=app,
         req=request,

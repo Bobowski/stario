@@ -2953,7 +2953,7 @@ cdef class RequestExchange:
 
     @property
     def closing(self):
-        """Context: stop handler work (client gone or app draining)."""
+        """Writer: further writes will not reach an interested client."""
         return self.disconnected or self.shutting_down
 
     def alive(self, source=None):

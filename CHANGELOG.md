@@ -19,10 +19,12 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
   instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
   the Cython protocol (no handler task).
-- **`Writer.closing` removed.** Request lifetime (client gone or app draining)
-  is on `Context`: `c.alive()`, `c.disconnected`, `c.closing`. `Writer` is the
-  outbound HTTP message (`started` / `completed` / `write`), not the
-  connection. `w.write()` is already a no-op if the transport is gone.
+- **`Context.closing` removed.** `closing` is the send path, so it lives on
+  `Writer`: `w.closing` is true when further writes will not reach an
+  interested client (peer gone or app draining). It is not `w.completed`
+  (keep-alive can still be open after `end()`). Handler lifetime — cancel
+  this task, including work that is not a write — stays `c.alive()` /
+  `c.disconnected`.
 
 ### Added
 

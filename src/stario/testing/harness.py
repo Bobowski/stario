@@ -107,10 +107,16 @@ class TestWriter:
 
     __test__ = False
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        disconnect: asyncio.Future[None] | None = None,
+        shutdown: asyncio.Future[None] | None = None,
+    ) -> None:
         self.headers = Headers()
         self._status_code: int | None = None
         self._completed = False
+        self._disconnect = disconnect
+        self._shutdown = shutdown
         self._body = GrowingSink()
         self._headers_event = asyncio.Event()
 
@@ -125,6 +131,12 @@ class TestWriter:
     @property
     def completed(self) -> bool:
         return self._completed
+
+    @property
+    def closing(self) -> bool:
+        return (self._disconnect is not None and self._disconnect.done()) or (
+            self._shutdown is not None and self._shutdown.done()
+        )
 
     @property
     def body(self) -> bytes:
@@ -237,10 +249,6 @@ class TestContext:
     @property
     def shutting_down(self) -> bool:
         return self.app.shutting_down
-
-    @property
-    def closing(self) -> bool:
-        return self.disconnected or self.shutting_down
 
     def alive(
         self,
