@@ -23,6 +23,7 @@ from tests.cython.h2wire import (
     SETTINGS_HEADER_TABLE_SIZE,
     SETTINGS_MAX_HEADER_LIST_SIZE,
     SETTINGS_NO_RFC7540_PRIORITIES,
+    TYPE_CONTINUATION,
     TYPE_DATA,
     TYPE_HEADERS,
     collected_settings,
@@ -767,9 +768,7 @@ async def test_h2_incomplete_headers_timeout_does_not_kill_connection() -> None:
     connections: set[HttpProtocol] = set()
     port = free_port()
     server = await loop.create_server(
-        lambda: make_protocol(
-            loop, app, connections=connections, header_timeout=0.15
-        ),
+        lambda: make_protocol(loop, app, connections=connections, header_timeout=0.15),
         "127.0.0.1",
         port,
     )
@@ -793,8 +792,11 @@ async def test_h2_incomplete_headers_timeout_does_not_kill_connection() -> None:
             if code is not None:
                 assert code == NGHTTP2_CANCEL
 
+            # Header block is still open until END_HEADERS (RFC 9113). RST
+            # does not end it; a CONTINUATION must follow before stream 3.
             writer.write(
-                pack_frame(
+                pack_frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1)
+                + pack_frame(
                     TYPE_HEADERS,
                     FLAG_END_HEADERS | FLAG_END_STREAM,
                     3,

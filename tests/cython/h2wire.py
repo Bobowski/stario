@@ -13,6 +13,7 @@ TYPE_RST_STREAM = 0x3
 TYPE_SETTINGS = 0x4
 TYPE_GOAWAY = 0x7
 TYPE_WINDOW_UPDATE = 0x8
+TYPE_CONTINUATION = 0x9
 
 FLAG_END_STREAM = 0x1
 FLAG_ACK = 0x1
@@ -84,6 +85,11 @@ def literal_new(name: bytes, value: bytes) -> bytes:
     return b"\x00" + hpack_string(name) + hpack_string(value)
 
 
+def hpack_table_size_update(size: int) -> bytes:
+    """HPACK dynamic table size update (RFC 7541 §6.3). Prefix 001."""
+    return hpack_int(size, 5, 0x20)
+
+
 def encode_request(
     *,
     method: str = "GET",
@@ -91,7 +97,9 @@ def encode_request(
     authority: str = "127.0.0.1",
     extra: list[tuple[bytes, bytes]] | None = None,
 ) -> bytes:
-    parts: list[bytes] = []
+    # Server advertises SETTINGS_HEADER_TABLE_SIZE=0; the next header block
+    # must start with a size update (RFC 7541 §4.2 / RFC 9113 §6.5.2).
+    parts: list[bytes] = [hpack_table_size_update(0)]
     if method == "GET":
         parts.append(indexed(IDX_METHOD_GET))
     elif method == "POST":
@@ -116,7 +124,8 @@ def encode_request(
 
 def headers_duplicate_path() -> bytes:
     return (
-        indexed(IDX_METHOD_GET)
+        hpack_table_size_update(0)
+        + indexed(IDX_METHOD_GET)
         + indexed(IDX_SCHEME_HTTP)
         + indexed(IDX_PATH_SLASH)
         + literal_name(IDX_PATH_SLASH, b"/other")
@@ -126,7 +135,8 @@ def headers_duplicate_path() -> bytes:
 
 def headers_duplicate_method() -> bytes:
     return (
-        indexed(IDX_METHOD_GET)
+        hpack_table_size_update(0)
+        + indexed(IDX_METHOD_GET)
         + indexed(IDX_METHOD_POST)
         + indexed(IDX_SCHEME_HTTP)
         + indexed(IDX_PATH_SLASH)
