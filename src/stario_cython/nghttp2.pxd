@@ -1,5 +1,5 @@
 from libc.stddef cimport size_t
-from libc.stdint cimport int32_t, uint8_t, uint32_t
+from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
 
 cdef extern from *:
     ctypedef long ssize_t
@@ -19,6 +19,8 @@ cdef extern from "nghttp2/nghttp2.h":
         NGHTTP2_NO_ERROR
         NGHTTP2_PROTOCOL_ERROR
         NGHTTP2_INTERNAL_ERROR
+        NGHTTP2_CANCEL
+        NGHTTP2_ENHANCE_YOUR_CALM
         NGHTTP2_ERR_CALLBACK_FAILURE
         NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
         NGHTTP2_ERR_DEFERRED
@@ -30,9 +32,12 @@ cdef extern from "nghttp2/nghttp2.h":
         NGHTTP2_NV_FLAG_NO_INDEX
         NGHTTP2_NV_FLAG_NO_COPY_NAME
         NGHTTP2_NV_FLAG_NO_COPY_VALUE
+        NGHTTP2_SETTINGS_HEADER_TABLE_SIZE
         NGHTTP2_SETTINGS_ENABLE_PUSH
         NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
         NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE
+        NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE
+        NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES
         NGHTTP2_HCAT_REQUEST
 
     ctypedef struct nghttp2_option:
@@ -166,6 +171,13 @@ cdef extern from "nghttp2/nghttp2.h":
     int nghttp2_option_new(nghttp2_option** option_ptr)
     void nghttp2_option_del(nghttp2_option* option)
     void nghttp2_option_set_no_auto_window_update(nghttp2_option* option, int val)
+    void nghttp2_option_set_no_closed_streams(nghttp2_option* option, int val)
+    void nghttp2_option_set_max_continuations(nghttp2_option* option, size_t val)
+    void nghttp2_option_set_stream_reset_rate_limit(
+        nghttp2_option* option,
+        uint64_t burst,
+        uint64_t rate,
+    )
 
     int nghttp2_session_server_new(
         nghttp2_session** session_ptr,

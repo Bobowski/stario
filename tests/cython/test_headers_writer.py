@@ -232,6 +232,43 @@ async def test_native_compression_qvalue_negotiation(
             await writer.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_compression_disabled_still_serves_with_accept_encoding() -> None:
+    app = App()
+    body = b"plain body " * 64
+
+    async def hello(_c, w):
+        w.respond(body, b"text/plain")
+
+    app.get("/", hello)
+    async with running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            min_size=0,
+            brotli_level=-1,
+            zstd_level=-1,
+            gzip_level=-1,
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: gzip, br\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await read_response(reader)
+            header, resp_body = payload.split(b"\r\n\r\n", 1)
+            assert b"content-encoding:" not in header.lower()
+            assert resp_body == body
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 @pytest.mark.parametrize(
     ("content_type", "compressed"),
     [

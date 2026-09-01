@@ -45,8 +45,51 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - Cython uploads: Content-Length bodies ≤ 256 KiB dispatch after the
   message is complete (`body()` is already bytes). `stream()` with a known
   Content-Length yields `min(length, 256 KiB)` instead of a fixed 64 KiB.
-- `ParsedQuery` first read copies the query and fills a C name/value span table (like request headers). Typical ASCII names compare with `memcmp`; values decode on `get`. `as_dict` / `as_lists` still materialize everything for forms / Pydantic. HTTP/1 stays on [llhttp](https://github.com/nodejs/llhttp): picohttpparser was tried on the same `HttpProtocol` and is ~2.5× in a parser-only microbench, but not noticeably faster end-to-end (GET ~even, small POST behind). llhttp is also the same incremental-callback model as nghttp2.
-- HTTP/1 and HTTP/2 share the core dispatch rule (empty GET / `mark_nobody` at headers; small POST ≤256KiB waits for complete). HTTP/2 receive window is 1MiB per stream / 4MiB per connection. Recv credit is submitted as `WINDOW_UPDATE` when a stream ends and after each `mem_recv` — nghttp2 `consume()` only emits a frame at 50% of the window, which stalls keep-alive small POSTs. Mid-body updates are still batched. Outbound DATA uses nghttp2 `NO_COPY` into `h2_out`; responses queued during `mem_recv` flush once.
+- HTTP/2 POST without Content-Length is END_STREAM-delimited (like H1
+  chunked): the exchange stays armed for DATA. `mark_nobody` is only for
+  HEADERS that already ended the stream with no body. Recycle clears
+  nghttp2 stream user_data so a pooled exchange cannot ingest another
+  stream's DATA. Duplicate `:method` / `:path` / `:authority` are RST;
+  `:authority` and `Host` must be equal (the second copy is not stored).
+- `ParsedQuery` first read fills a C name/value span table (like request
+  headers). Plain ASCII names stay on the original bytes (no memcpy);
+  names that need `+` / `%XX` unquote still copy. Typical ASCII names
+  compare with `memcmp`; values decode on `get`. `as_dict` / `as_lists`
+  still materialize everything for forms / Pydantic. HTTP/1 stays on
+  [llhttp](https://github.com/nodejs/llhttp): picohttpparser was tried on
+  the same `HttpProtocol` and is ~2.5× in a parser-only microbench, but
+  not noticeably faster end-to-end (GET ~even, small POST behind). llhttp
+  is also the same incremental-callback model as nghttp2.
+- HTTP/1 and HTTP/2 share the core dispatch rule (empty GET /
+  `mark_nobody` at headers; small POST ≤256KiB waits for complete; H2
+  no-CL POST dispatches at headers so `stream()` can start). HTTP/2
+  receive window is 1MiB per stream / 4MiB per connection. Recv credit is
+  submitted as `WINDOW_UPDATE` when a stream ends and after each
+  `mem_recv` — nghttp2 `consume()` only emits a frame at 50% of the
+  window, which stalls keep-alive small POSTs. Mid-body updates are still
+  batched. Outbound DATA uses nghttp2 `NO_COPY` into `h2_out`; responses
+  queued during `mem_recv` flush once.
+- Trailing-slash URLs are not stored in the 256-slot path cache (they
+  308). Accept-Encoding is not scanned when brotli and gzip are both
+  off. HTTP/2 header names are memcpy'd (RFC 9113 lowercase). Host is
+  normalized in C and prefetched when `host_routing`.
+- HTTP/2 applies the same `max_header_bytes` budget as HTTP/1 (name +
+  value octets per stream). Oversize requests get **431** on that stream,
+  not a connection close. HTTP/1 431 on a GET (no body) keeps the
+  connection. Declared oversize HTTP/2 bodies get **413** on that stream.
+  HTTP/1 413 with a declared Content-Length at or under 256 KiB keeps
+  the connection and discards the body; larger declared lengths still
+  close. Keep-alive 413/431 then arm the idle timer (they do not leave
+  the first-request header timer running). HTTP/2 DATA that exceeds
+  `max_body_bytes` after dispatch is a
+  stream **413** (or `RequestBodyError` in the handler) and does not
+  close the multiplexed connection. Incomplete HTTP/2 HEADERS time out
+  per stream (RST CANCEL) without tearing down multiplexed neighbors.
+  `SETTINGS_MAX_HEADER_LIST_SIZE` is advertised; the HPACK table size is
+  the 4KiB spec default (`SETTINGS_HEADER_TABLE_SIZE=4096`); RST-stream
+  flood is rate-limited (burst 100 / 33 per second); CONTINUATION frames
+  are capped from the header budget; closed streams are not retained
+  (`SETTINGS_NO_RFC7540_PRIORITIES`).
 
 ## 4.1.0 - 2026-08-17
 

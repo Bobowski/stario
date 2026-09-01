@@ -18,6 +18,10 @@ cdef inline void _lower_copy(
 
 cdef enum:
     HEADER_NAME_STACK = 256
+    ABORT_NONE = 0
+    ABORT_TOO_LARGE = 1
+    ABORT_DISCONNECTED = 2
+    ABORT_TIMEOUT = 3
 
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
 cdef object _intern_name(const char* src, size_t n)
@@ -98,6 +102,7 @@ cdef class Request:
     cdef object _materialize_query(self)
     cdef void _rebind_query(self, object query_bytes) noexcept
     cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept
+    cdef void prefetch_host(self) noexcept
 
 cdef class RequestExchange:
     cdef object _transport
@@ -178,9 +183,16 @@ cdef class RequestExchange:
     cdef Py_ssize_t _h2_pending_off
     cdef bint _h2_body_done
     cdef object _h2_method
+    cdef bint _h2_got_method
+    cdef bint _h2_got_path
+    cdef bint _h2_got_authority
     cdef bint _h2_dispatched
     cdef bint _h2_headers_done
     cdef bint _h2_headers_sent
+    cdef bint _h2_headers_too_large
+    cdef Py_ssize_t _h2_head_bytes
+    cdef bint _h2_awaiting_headers
+    cdef double _h2_header_deadline
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef bint _expect_continue
@@ -224,6 +236,13 @@ cdef class RequestExchange:
         size_t name_length,
         const char* value,
         size_t value_length,
+        bint names_already_lower,
+    ) noexcept
+    cdef bint header_value_equals(
+        self,
+        Py_ssize_t index,
+        const char* value,
+        size_t n,
     ) noexcept
     cdef int finish_request_header(self) noexcept
     cdef int _commit_request_header(self) noexcept

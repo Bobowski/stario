@@ -7,10 +7,11 @@ import stario.responses as responses
 from stario import App
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
+from stario.routing import UrlPath
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
-from tests.helpers import assert_status_span
 from tests.cython.http import free_port, read_response
+from tests.helpers import assert_status_span
 
 
 class TrackingApp(App):
@@ -1547,6 +1548,45 @@ async def test_cookies_do_not_leak_across_keepalive() -> None:
         await writer.drain()
         assert b"ok" in await read_response(reader)
         assert seen == [{"sid": "one"}, {"sid": "two"}]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_host_routing_normalizes_host_header() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def hello(c, w):
+        responses.text(w, f"host:{c.req.host}")
+
+    app.get(UrlPath("/", host="example.com"), hello)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: Example.COM:80\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        assert b"host:example.com" in await read_response(reader)
         writer.close()
         await writer.wait_closed()
     finally:

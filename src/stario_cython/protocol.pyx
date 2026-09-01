@@ -45,6 +45,7 @@ from stario.http.wire import decode_path
 from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport (
+    ABORT_TOO_LARGE,
     Headers,
     Request,
     RequestExchange,
@@ -64,12 +65,17 @@ from stario_cython.nghttp2 cimport (
     NGHTTP2_HEADERS,
     NGHTTP2_INTERNAL_ERROR,
     NGHTTP2_PROTOCOL_ERROR,
+    NGHTTP2_CANCEL,
+    NGHTTP2_ENHANCE_YOUR_CALM,
     NGHTTP2_NV_FLAG_NONE,
     NGHTTP2_NV_FLAG_NO_COPY_NAME,
     NGHTTP2_NV_FLAG_NO_COPY_VALUE,
     NGHTTP2_SETTINGS_ENABLE_PUSH,
+    NGHTTP2_SETTINGS_HEADER_TABLE_SIZE,
     NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
     NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+    NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+    NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES,
     nghttp2_data_provider,
     nghttp2_data_source,
     nghttp2_frame,
@@ -78,6 +84,9 @@ from stario_cython.nghttp2 cimport (
     nghttp2_option_del,
     nghttp2_option_new,
     nghttp2_option_set_no_auto_window_update,
+    nghttp2_option_set_no_closed_streams,
+    nghttp2_option_set_max_continuations,
+    nghttp2_option_set_stream_reset_rate_limit,
     nghttp2_session,
     nghttp2_session_callbacks,
     nghttp2_session_callbacks_del,
@@ -132,6 +141,13 @@ cdef enum:
     H2_STREAM_UPDATE_THRESH = 256 * 1024
     H2_CONN_UPDATE_THRESH = 512 * 1024
     H2_MAX_CONCURRENT = 256
+    # Rapid-reset: nghttp2 defaults 1000 burst / 33 per second. An app
+    # server is not a CDN — keep the refill, shrink the bucket.
+    H2_RST_BURST = 100
+    H2_RST_RATE = 33
+    # RFC 7541 / nghttp2 default. Advertising 0 is a HPACK-bomb hedge some
+    # intermediaries reject; 4KiB is the spec default.
+    H2_HEADER_TABLE_SIZE = 4096
 
 cdef char* _UC_KEY[256]
 cdef Py_ssize_t _UC_LEN[256]
@@ -260,6 +276,7 @@ cdef object _path_for_url(
     """Decoded path; query is a span inside the current URL (no copy)."""
     cdef Py_ssize_t question = -1
     cdef Py_ssize_t i
+    cdef Py_ssize_t path_end
     cdef uint32_t h = 0
     cdef int slot
     cdef object path
@@ -280,12 +297,18 @@ cdef object _path_for_url(
             break
     if question < 0:
         path = _decode_path_n(url, n)
+        path_end = n
     else:
+        path_end = question
         path = _decode_path_n(url, question)
         if question + 1 < n:
             qoff[0] = question + 1
             qlen[0] = n - question - 1
-    if n <= URL_CACHE_MAX_KEY:
+    # Trailing-slash requests 308; don't spend a URL-cache slot on them.
+    if (
+        n <= URL_CACHE_MAX_KEY
+        and not (path_end > 1 and url[path_end - 1] == 47)
+    ):
         _url_store(url, n, h, path, qoff[0], qlen[0])
     return path
 
@@ -405,14 +428,14 @@ cdef object _version_str(int major, int minor):
     return "%d.%d" % (major, minor)
 
 
-cdef inline bint _header_name_ok(const char* p, size_t n) noexcept nogil:
+cdef inline bint _h2_header_name_ok(const char* p, size_t n) noexcept nogil:
     cdef size_t i
     cdef unsigned char c
     if n == 0:
         return False
     for i in range(n):
         c = <unsigned char>p[i]
-        if c <= 32 or c >= 127:
+        if c <= 32 or c >= 127 or (65 <= c <= 90):
             return False
     return True
 
@@ -724,6 +747,7 @@ cdef class HttpProtocol:
     cdef object h2_out
     cdef Py_ssize_t h2_out_used
     cdef bint h2_in_recv
+    cdef bint h1_headers_too_large
 
     def __cinit__(self):
         _bind_settings()
@@ -752,6 +776,7 @@ cdef class HttpProtocol:
         self.h2_out = bytearray()
         self.h2_out_used = 0
         self.h2_in_recv = False
+        self.h1_headers_too_large = False
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -802,6 +827,7 @@ cdef class HttpProtocol:
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
         self.header_timeout_reset = False
+        self.h1_headers_too_large = False
 
     def connection_made(self, transport):
         cdef object ssl_object
@@ -819,6 +845,7 @@ cdef class HttpProtocol:
         self.timeout_deadline = 0.0
         self.parse_mode = PARSE_NONE
         self.preface_hold.clear()
+        self.h1_headers_too_large = False
         self.connections.add(self)
         ssl_object = transport.get_extra_info("ssl_object")
         if ssl_object is not None:
@@ -876,6 +903,12 @@ cdef class HttpProtocol:
         self.transport = None
 
     def recycle_exchange(self, RequestExchange exchange):
+        cdef int32_t stream_id
+        if exchange._http2 and self.h2 != NULL:
+            stream_id = exchange._h2_stream_id
+            if stream_id != 0:
+                nghttp2_session_set_stream_user_data(self.h2, stream_id, NULL)
+                self.h2_streams.pop(stream_id, None)
         exchange.park()
         if not self.closed and self.idle_exchange is None:
             self.idle_exchange = exchange
@@ -1023,24 +1056,60 @@ cdef class HttpProtocol:
         if active is not None and active is not reading:
             self._check_body_stall(active, now)
         if self.parse_mode == PARSE_H2:
-            for exchange in self.h2_streams.values():
-                if exchange is not reading and exchange is not active:
+            for exchange in list(self.h2_streams.values()):
+                if exchange.in_pool:
+                    continue
+                self._check_h2_header_timeout(exchange, now)
+                if not exchange.in_pool:
                     self._check_body_stall(exchange, now)
 
-    cdef void _after_pump(self):
-        """Arm a header deadline only if this read left headers (or a deferred
-        small body) unfinished. Full wrk requests dispatch inside the pump,
-        so this is a no-op on the keep-alive hot path.
-        """
-        if not self.header_timeout_reset:
-            return
-        self.header_timeout_reset = False
+    cdef void _check_h2_header_timeout(self, RequestExchange ex, double now) noexcept:
+        """Reset one stalled HEADERS stream; other streams keep running."""
         if (
-            not self.rejected
-            and self.reading_exchange is not None
-            and not self.request_dispatched
+            ex is None
+            or not ex._h2_awaiting_headers
+            or self.header_timeout <= 0.0
+            or TIMEOUT_MODE == CLEANUP_OFF
         ):
-            self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
+            return
+        if ex._h2_header_deadline <= 0.0:
+            ex._h2_header_deadline = now + self.header_timeout
+            return
+        if now >= ex._h2_header_deadline:
+            ex._h2_awaiting_headers = False
+            # Header block is unfinished — cannot send 408 HEADERS. RST only.
+            self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_CANCEL)
+            self._h2_send()
+
+    cdef void _after_pump(self):
+        """Arm header or idle deadlines after this read.
+
+        Unfinished headers (or a keep-alive 413 drain) get HEADER. A pump
+        that left the HTTP/1 connection empty with no timer — protocol
+        413/431 never goes through ``response_completed`` — gets IDLE.
+        Full wrk requests dispatch inside the pump, so HEADER is a no-op
+        on that hot path.
+        """
+        if self.header_timeout_reset:
+            self.header_timeout_reset = False
+            if (
+                not self.rejected
+                and self.reading_exchange is not None
+                and (
+                    not self.request_dispatched
+                    or self.h1_headers_too_large
+                )
+            ):
+                self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
+        if (
+            self.timeout_kind == TIMEOUT_NONE
+            and self.parse_mode == PARSE_H1
+            and not self.rejected
+            and self.reading_exchange is None
+            and self.active_exchange is None
+            and not self.pending_exchanges
+        ):
+            self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
     cdef void _pump_data(self, object data, Py_ssize_t offset) noexcept:
         cdef const char* ptr = NULL
@@ -1215,7 +1284,7 @@ cdef class HttpProtocol:
     cdef bint _header_too_large(self, size_t length) noexcept:
         self.head_bytes += <int>length
         if self.head_bytes > self.max_header_bytes:
-            self._close_error(431, "Request header fields too large")
+            self.h1_headers_too_large = True
             return True
         return False
 
@@ -1258,19 +1327,20 @@ cdef class HttpProtocol:
         self.request_dispatched = False
         self.request_keep_alive = True
         self.header_timeout_reset = True
+        self.h1_headers_too_large = False
 
     cdef void _on_url(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
-        if self._header_too_large(length):
+        if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_url(at, length) != 0:
-            self._close_error(431, "Request header fields too large")
+            self.h1_headers_too_large = True
 
     cdef void _on_header_field(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
-        if self._header_too_large(length):
+        if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_header_name(at, length) != 0:
             self._close_error(400, "Invalid HTTP request")
@@ -1278,12 +1348,14 @@ cdef class HttpProtocol:
     cdef void _on_header_value(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
-        if self._header_too_large(length):
+        if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_header_value(at, length) != 0:
             self._close_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value_complete(self) noexcept:
+        if self.h1_headers_too_large or self.rejected:
+            return
         if self.reading_exchange is not None:
             if self.reading_exchange.finish_request_header() != 0:
                 self._close_error(400, "Invalid HTTP request")
@@ -1292,27 +1364,16 @@ cdef class HttpProtocol:
         cdef RequestExchange exchange
         cdef uint16_t flags
         cdef uint64_t content_length
+        cdef bint has_body
         if self.rejected or self.reading_exchange is None:
             return
         exchange = self.reading_exchange
-        if exchange.finish_request_header() != 0:
-            self._close_error(400, "Invalid HTTP request")
-            return
-        if llhttp_get_upgrade(self.parser):
-            self._close_error(400, "Upgrade not supported")
-            return
         flags = stario_parser_flags(self.parser)
-        # RFC 7230 3.3.3: TE without chunked as the final coding — body
-        # length is undefined. Reject before dispatch (llhttp errors after
-        # on_headers_complete, which would otherwise 404 then 400).
-        if (flags & F_TRANSFER_ENCODING) and not (flags & F_CHUNKED):
-            self._close_error(400, "Invalid HTTP request")
-            return
         content_length = stario_parser_content_length(self.parser)
-        if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
-            self._close_error(413, "Request body too large")
-            return
-        exchange.cache_hot_request_headers()
+        has_body = (
+            (flags & F_CHUNKED) != 0
+            or ((flags & F_CONTENT_LENGTH) != 0 and content_length > 0)
+        )
         self.request_keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
             or (
@@ -1321,6 +1382,46 @@ cdef class HttpProtocol:
                 and not exchange._req_connection_close
             )
         )
+        if self.h1_headers_too_large:
+            # Keep-alive only when there is no body to drain. A huge POST
+            # after oversize headers would be a read-DoS if we stayed open.
+            self._h1_protocol_status(
+                431,
+                "Request header fields too large",
+                has_body or not self.request_keep_alive,
+                -1,
+            )
+            return
+        if exchange.finish_request_header() != 0:
+            self._close_error(400, "Invalid HTTP request")
+            return
+        if llhttp_get_upgrade(self.parser):
+            self._close_error(400, "Upgrade not supported")
+            return
+        # RFC 7230 3.3.3: TE without chunked as the final coding — body
+        # length is undefined. Reject before dispatch (llhttp errors after
+        # on_headers_complete, which would otherwise 404 then 400).
+        if (flags & F_TRANSFER_ENCODING) and not (flags & F_CHUNKED):
+            self._close_error(400, "Invalid HTTP request")
+            return
+        if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
+            # Keep-alive only when the declared body is small enough to drain.
+            # A huge or chunked upload after 413 would be a read-DoS.
+            if (
+                content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                and self.request_keep_alive
+            ):
+                self.h1_headers_too_large = True
+                self._h1_protocol_status(
+                    413,
+                    "Request body too large",
+                    False,
+                    <Py_ssize_t>content_length,
+                )
+            else:
+                self._close_error(413, "Request body too large")
+            return
+        exchange.cache_hot_request_headers()
         if self.request_dispatched or self.rejected:
             return
         if self.transport is None or self.transport.is_closing():
@@ -1359,9 +1460,28 @@ cdef class HttpProtocol:
 
     cdef void _on_message_complete(self) noexcept:
         cdef RequestExchange exchange
+        cdef object transport
         if self.rejected:
             return
         exchange = self.reading_exchange
+        if self.h1_headers_too_large:
+            if exchange is not None:
+                if exchange._body_active and not exchange._body_complete:
+                    if exchange.c_complete() != 0:
+                        self._close_error(400, "Invalid HTTP request")
+                        self.reading_exchange = None
+                        self.h1_headers_too_large = False
+                        return
+                exchange.handler_finished()
+            self.reading_exchange = None
+            self.h1_headers_too_large = False
+            if self.timeout_kind == TIMEOUT_HEADER:
+                self._cancel_timeout()
+            if not self.request_keep_alive:
+                transport = self.transport
+                if transport is not None and not transport.is_closing():
+                    transport.close()
+            return
         if exchange is not None and exchange._body_active:
             if exchange.c_complete() != 0:
                 self._close_error(400, "Invalid HTTP request")
@@ -1426,6 +1546,8 @@ cdef class HttpProtocol:
                 exchange._req_url_offset + qoff,
                 qlen,
             )
+        if self.app.host_routing:
+            request.prefetch_host()
         return request
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
@@ -1602,6 +1724,105 @@ cdef class HttpProtocol:
         except Exception:
             pass
 
+    cdef void _h1_protocol_status(
+        self,
+        int status,
+        object message,
+        bint close_conn,
+        Py_ssize_t drain_len,
+    ) noexcept:
+        """Write a protocol HTTP status without dispatch. Close only if asked.
+
+        ``drain_len >= 0`` keeps the connection and discards that many body
+        bytes so llhttp stays synced (keep-alive 413 with a small CL).
+        """
+        cdef RequestExchange exchange
+        cdef object body
+        cdef object date
+        cdef object method
+        cdef object path
+        cdef Py_ssize_t qoff
+        cdef Py_ssize_t qlen
+        cdef object transport
+        if self.request_dispatched or self.rejected:
+            if close_conn:
+                transport = self.transport
+                if transport is not None and not transport.is_closing():
+                    transport.close()
+                self.rejected = True
+            return
+        self.request_dispatched = True
+        if not close_conn and self.timeout_kind == TIMEOUT_HEADER:
+            # Same as _dispatch: this request is answered. _after_pump
+            # re-arms HEADER if a keep-alive 413 body still needs draining.
+            self.timeout_kind = TIMEOUT_NONE
+            self.timeout_deadline = 0.0
+        exchange = self.reading_exchange
+        method = None
+        path = None
+        qoff = 0
+        qlen = 0
+        try:
+            if exchange is not None and exchange._req_url_length > 0:
+                path = _path_for_url(
+                    exchange._req_arena + exchange._req_url_offset,
+                    exchange._req_url_length,
+                    &qoff,
+                    &qlen,
+                )
+                if self.parser != NULL:
+                    method = _method_str(<int>llhttp_get_method(self.parser))
+        except Exception:
+            method = None
+            path = None
+        try:
+            body = message.encode("utf-8")
+            transport = self.transport
+            if exchange is not None:
+                if drain_len >= 0 and not close_conn:
+                    exchange.reset_body(False, drain_len)
+                    exchange._discard_body = True
+                else:
+                    exchange.mark_nobody()
+                exchange.start_response()
+            self._finish_protocol_span(
+                status,
+                exchange.span if exchange is not None else None,
+                method,
+                path,
+            )
+            if close_conn:
+                date = self.date_box[0]
+                if transport is not None and not transport.is_closing():
+                    transport.write(
+                        b"".join((
+                            _status_line(status),
+                            date,
+                            b"content-type: text/plain; charset=utf-8\r\n",
+                            b"content-length: %d\r\n" % len(body),
+                            b"connection: close\r\n",
+                            b"\r\n",
+                            body,
+                        ))
+                    )
+                self.rejected = True
+                if exchange is not None:
+                    exchange._completed = True
+                    exchange.handler_finished()
+                self.reading_exchange = None
+                if transport is not None and not transport.is_closing():
+                    transport.close()
+            elif exchange is not None:
+                exchange.respond(body, b"text/plain; charset=utf-8", status)
+        except Exception:
+            self.rejected = True
+            transport = self.transport
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+
     cdef void _close_error(self, int status, object message) noexcept:
         cdef object transport
         cdef object body
@@ -1682,8 +1903,9 @@ cdef class HttpProtocol:
     cdef void _start_h2(self) noexcept:
         cdef nghttp2_session_callbacks* cbs = NULL
         cdef nghttp2_option* opt = NULL
-        cdef nghttp2_settings_entry iv[3]
+        cdef nghttp2_settings_entry iv[6]
         cdef int rv
+        cdef size_t max_cont
         if self.h2 != NULL:
             self.parse_mode = PARSE_H2
             return
@@ -1704,6 +1926,18 @@ cdef class HttpProtocol:
             self._close_error(500, "Internal Server Error")
             return
         nghttp2_option_set_no_auto_window_update(opt, 1)
+        nghttp2_option_set_no_closed_streams(opt, 1)
+        nghttp2_option_set_stream_reset_rate_limit(
+            opt, <uint64_t>H2_RST_BURST, <uint64_t>H2_RST_RATE
+        )
+        # HEADERS + CONTINUATION at 16KiB/frame. Cap at nghttp2's default 8 so
+        # a large max_header_bytes does not loosen the flood guard.
+        max_cont = <size_t>((self.max_header_bytes + 16383) // 16384) + 2
+        if max_cont < 1:
+            max_cont = 1
+        if max_cont > 8:
+            max_cont = 8
+        nghttp2_option_set_max_continuations(opt, max_cont)
         rv = nghttp2_session_server_new2(&self.h2, cbs, <void*>self, opt)
         nghttp2_option_del(opt)
         nghttp2_session_callbacks_del(cbs)
@@ -1717,7 +1951,13 @@ cdef class HttpProtocol:
         iv[1].value = <uint32_t>H2_MAX_CONCURRENT
         iv[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH
         iv[2].value = 0
-        nghttp2_submit_settings(self.h2, NGHTTP2_FLAG_NONE, iv, 3)
+        iv[3].settings_id = NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE
+        iv[3].value = <uint32_t>self.max_header_bytes
+        iv[4].settings_id = NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES
+        iv[4].value = 1
+        iv[5].settings_id = NGHTTP2_SETTINGS_HEADER_TABLE_SIZE
+        iv[5].value = <uint32_t>H2_HEADER_TABLE_SIZE
+        nghttp2_submit_settings(self.h2, NGHTTP2_FLAG_NONE, iv, 6)
         nghttp2_session_set_local_window_size(
             self.h2, NGHTTP2_FLAG_NONE, 0, <int32_t>H2_CONN_WINDOW
         )
@@ -1854,6 +2094,52 @@ cdef class HttpProtocol:
         self.h2_streams[stream_id] = ex
         if self.h2 != NULL:
             nghttp2_session_set_stream_user_data(self.h2, stream_id, <void*>ex)
+        # Per-stream header deadline from here; do not close the connection
+        # because the first request's connection-level HEADER timer fired.
+        if self.timeout_kind == TIMEOUT_HEADER:
+            self._cancel_timeout()
+
+    cdef bint _h2_header_oversize(
+        self,
+        RequestExchange ex,
+        size_t namelen,
+        size_t valuelen,
+    ) noexcept:
+        """True when this field would exceed ``max_header_bytes`` (H1 ``head_bytes``)."""
+        cdef Py_ssize_t add
+        cdef Py_ssize_t limit
+        if ex is None:
+            return True
+        add = <Py_ssize_t>namelen + <Py_ssize_t>valuelen
+        if add < 0:
+            return True
+        limit = <Py_ssize_t>self.max_header_bytes
+        if ex._h2_head_bytes > limit - add:
+            return True
+        ex._h2_head_bytes += add
+        return False
+
+    cdef void _h2_protocol_status(self, RequestExchange ex, int status) noexcept:
+        """Write a protocol HTTP status on this stream (431 / similar). No handler."""
+        cdef object req
+        cdef object method
+        cdef object path
+        if ex is None or self.rejected:
+            return
+        ex._h2_awaiting_headers = False
+        try:
+            ex._h2_dispatched = True
+            ex._h2_headers_done = True
+            ex.mark_nobody()
+            ex.start_response()
+            req = ex.req
+            method = ex._h2_method
+            path = req.path if req is not None else None
+            self._finish_protocol_span(status, ex.span, method, path)
+            ex.respond(b"", b"text/plain; charset=utf-8", status)
+            ex.handler_finished()
+        except Exception:
+            self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_ENHANCE_YOUR_CALM)
 
     cdef void _h2_on_header(
         self,
@@ -1865,46 +2151,92 @@ cdef class HttpProtocol:
     ) noexcept:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         cdef const char* hn = <const char*>name
+        cdef const char* hv = <const char*>value
         if ex is None or ex._h2_dispatched or ex._h2_headers_done:
+            return
+        if ex._h2_headers_too_large:
+            return
+        if self._h2_header_oversize(ex, namelen, valuelen):
+            ex._h2_headers_too_large = True
             return
         if namelen > 0 and name[0] == 58:
             if namelen == 7 and memcmp(hn, ":method", 7) == 0:
-                if valuelen == 7 and memcmp(<const char*>value, "CONNECT", 7) == 0:
+                if ex._h2_got_method:
                     self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
                     return
-                ex._h2_method = _method_from_bytes(<const char*>value, valuelen)
+                if valuelen == 7 and memcmp(hv, "CONNECT", 7) == 0:
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    return
+                ex._h2_got_method = True
+                ex._h2_method = _method_from_bytes(hv, valuelen)
                 return
             if namelen == 5 and memcmp(hn, ":path", 5) == 0:
-                if ex.append_request_url(<const char*>value, valuelen) != 0:
-                    self._close_error(431, "Request header fields too large")
+                if ex._h2_got_path:
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    return
+                ex._h2_got_path = True
+                if ex.append_request_url(hv, valuelen) != 0:
+                    ex._h2_headers_too_large = True
                 return
             if namelen == 10 and memcmp(hn, ":authority", 10) == 0:
-                if ex.append_request_header("host", 4, <const char*>value, valuelen) != 0:
-                    self._close_error(400, "Invalid HTTP request")
+                if ex._h2_got_authority:
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    return
+                if ex._req_host_index >= 0:
+                    if not ex.header_value_equals(ex._req_host_index, hv, valuelen):
+                        self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                    else:
+                        ex._h2_got_authority = True
+                    return
+                ex._h2_got_authority = True
+                if ex.append_request_header("host", 4, hv, valuelen, True) != 0:
+                    ex._h2_headers_too_large = True
                 return
             if namelen == 9 and memcmp(hn, ":protocol", 9) == 0:
                 # Extended CONNECT / WebSocket — not supported.
                 self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
                 return
             return
-        if not _header_name_ok(hn, namelen):
+        if not _h2_header_name_ok(hn, namelen):
             self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
             return
-        if ex.append_request_header(hn, namelen, <const char*>value, valuelen) != 0:
-            self._close_error(400, "Invalid HTTP request")
+        if namelen == 4 and memcmp(hn, "host", 4) == 0:
+            if ex._req_host_index >= 0:
+                if not ex.header_value_equals(ex._req_host_index, hv, valuelen):
+                    self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+                return
+            if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
+                ex._h2_headers_too_large = True
+            return
+        if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
+            ex._h2_headers_too_large = True
 
     cdef void _h2_on_data(self, int32_t stream_id, const uint8_t* data, size_t length) noexcept:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         if ex is None or length == 0:
             return
+        if ex.in_pool or ex._h2_stream_id != stream_id:
+            return
         if not ex._body_active:
-            ex.reset_body(False, -1)
+            if ex._h2_headers_done and not ex._h2_dispatched:
+                self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+            return
         if ex.c_feed(<const char*>data, length) != 0:
             nghttp2_submit_rst_stream(
                 self.h2, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_INTERNAL_ERROR
             )
             return
         self._h2_window_update(stream_id)
+        if ex._abort_reason == ABORT_TOO_LARGE and ex._status_code < 0:
+            # Stream 413; never close the multiplexed connection from c_feed.
+            if not ex.handler_started:
+                self._h2_protocol_status(ex, 413)
+            else:
+                try:
+                    ex.respond(b"", b"text/plain; charset=utf-8", 413)
+                except Exception:
+                    pass
+            return
         if (
             not ex._h2_dispatched
             and not self.rejected
@@ -1915,6 +2247,7 @@ cdef class HttpProtocol:
     cdef void _h2_headers_frame(self, int32_t stream_id, bint end_stream):
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         cdef Py_ssize_t content_length
+        cdef bint expect
         if ex is None or self.rejected:
             return
         if ex._h2_dispatched or ex._h2_headers_done:
@@ -1922,20 +2255,32 @@ cdef class HttpProtocol:
             if end_stream:
                 self._h2_end_stream(stream_id)
             return
+        ex._h2_awaiting_headers = False
+        if ex._h2_headers_too_large:
+            self._h2_protocol_status(ex, 431)
+            return
         ex.finish_request_header()
         ex.cache_hot_request_headers()
         content_length = ex._req_content_length
         if content_length > self.max_body_bytes:
-            self._h2_reject_stream(stream_id, NGHTTP2_PROTOCOL_ERROR)
+            self._h2_protocol_status(ex, 413)
             return
         try:
-            if ex._req_expect_continue or content_length > 0:
-                ex.reset_body(ex._req_expect_continue, content_length)
+            expect = ex._req_expect_continue
+            # H2 bodies are END_STREAM-delimited; Content-Length is optional.
+            # Arm upload state whenever DATA may still arrive (or 100-continue
+            # / a declared length). mark_nobody only when this HEADERS already
+            # ended the stream with nothing to read.
+            if (not end_stream) or expect or content_length > 0:
+                ex.reset_body(
+                    expect,
+                    content_length if content_length >= 0 else -1,
+                )
                 ex._h2_headers_done = True
                 if end_stream and ex._body_active:
                     ex.c_complete()
                 if (
-                    not ex._req_expect_continue
+                    not expect
                     and content_length > 0
                     and content_length <= SMALL_BODY_COMPLETE_DISPATCH
                     and not end_stream
