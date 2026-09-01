@@ -169,4 +169,6 @@ benchmarks/loops/run.sh
 
 Defaults match the server suite (`DURATION=10s`, `THREADS=2`, `CONNECTIONS=128`)
 plus `RUNS=3` measured samples after one warmup. Results land in
-`benchmarks/loops/results/` and include host/CPU/memory details.
+`benchmarks/loops/results/` and include host/CPU/memory details. A checked-in
+snapshot from this repo's cloud runner is in
+[`loops/RESULTS.md`](loops/RESULTS.md).

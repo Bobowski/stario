@@ -19,6 +19,8 @@ Loops this harness tries:
 that does not install or fails to serve is recorded as skipped/failed; the rest
 of the suite still runs.
 
+**Results from this machine:** [RESULTS.md](RESULTS.md)
+
 ```bash
 benchmarks/loops/run.sh
 DURATION=30s RUNS=5 WARMUP=1 THREADS=2 CONNECTIONS=128 benchmarks/loops/run.sh
