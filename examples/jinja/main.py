@@ -25,18 +25,28 @@ templates = Environment(
 )
 
 
-async def bootstrap(app: App, span: Span):
-    span.attr("app.name", "jinja")
-    count = 0
-    relay = Relay[None]()
+class Counter:
+    """In-memory counter state for this demo process."""
 
-    def counter_view() -> str:
-        return templates.get_template("counter.html.jinja").render(count=count)
+    def __init__(self, count: int = 0) -> None:
+        self.count = count
 
-    async def home(c: Context, w: Writer) -> None:
+    def increment(self) -> None:
+        self.count += 1
+
+    def reset(self) -> None:
+        self.count = 0
+
+
+def counter_view(counter: Counter) -> str:
+    return templates.get_template("counter.html.jinja").render(count=counter.count)
+
+
+def home(counter: Counter):
+    async def handler(c: Context, w: Writer) -> None:
         page = templates.get_template("home.html.jinja").render(
             title="Shared counter",
-            count=count,
+            count=counter.count,
             datastar_url=DATASTAR_CDN_URL,
             subscribe_url=SUBSCRIBE.href(),
             increment_url=INCREMENT.href(),
@@ -44,28 +54,46 @@ async def bootstrap(app: App, span: Span):
         )
         responses.html(w, page)
 
-    async def subscribe(c: Context, w: Writer) -> None:
+    return handler
+
+
+def subscribe(counter: Counter, relay: Relay[None]):
+    async def handler(c: Context, w: Writer) -> None:
         # Subscribe before the first render so updates cannot fall into a gap.
         async with relay.subscribe("counter") as live:
             sse = SSE(w)
-            sse.patch_elements(counter_view())
+            sse.patch_elements(counter_view(counter))
             async for _ in c.alive(live):
-                sse.patch_elements(counter_view())
+                sse.patch_elements(counter_view(counter))
 
-    async def increment(c: Context, w: Writer) -> None:
-        nonlocal count
-        count += 1
+    return handler
+
+
+def increment(counter: Counter, relay: Relay[None]):
+    async def handler(c: Context, w: Writer) -> None:
+        counter.increment()
         relay.publish("counter", None)
         responses.empty(w)
 
-    async def reset(c: Context, w: Writer) -> None:
-        nonlocal count
-        count = 0
+    return handler
+
+
+def reset(counter: Counter, relay: Relay[None]):
+    async def handler(c: Context, w: Writer) -> None:
+        counter.reset()
         relay.publish("counter", None)
         responses.empty(w)
 
-    app.add(HOME, home)
-    app.add(SUBSCRIBE, subscribe)
-    app.add(INCREMENT, increment)
-    app.add(RESET, reset)
+    return handler
+
+
+async def bootstrap(app: App, span: Span):
+    span.attr("app.name", "jinja")
+    counter = Counter()
+    relay = Relay[None]()
+
+    app.add(HOME, home(counter))
+    app.add(SUBSCRIBE, subscribe(counter, relay))
+    app.add(INCREMENT, increment(counter, relay))
+    app.add(RESET, reset(counter, relay))
     yield
