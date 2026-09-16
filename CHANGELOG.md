@@ -6,6 +6,13 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Fixed
+
+- TTY tracer live footer — skip terminal writes when the text and width do not
+  change. Cap the live block to `terminal_rows - 2` so cursor-up erase cannot
+  clear scrollback. Tall trees keep the root header and the newest lines.
+  The footer is removed when no roots are open.
+
 ### Added
 
 - `stario.json` — one process-wide codec for JSON responses, Datastar signals,
