@@ -9,6 +9,7 @@ def test_core_modules_import() -> None:
     import stario
     import stario.datastar
     import stario.http
+    import stario.json
     import stario.markup
     import stario.routing
     import stario.staticassets
@@ -55,6 +56,17 @@ def test_core_modules_import() -> None:
         (
             "stario.staticassets",
             ["AssetManifest", "StaticAssets", "fingerprint"],
+        ),
+        (
+            "stario.json",
+            [
+                "JsonCodec",
+                "StdlibJsonCodec",
+                "dumps",
+                "dumps_bytes",
+                "loads",
+                "set_codec",
+            ],
         ),
     ],
 )

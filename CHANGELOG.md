@@ -6,6 +6,14 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- `stario.json` — one process-wide codec for JSON responses, Datastar signals,
+  telemetry, and the test client. `dumps()` and `dumps_bytes()` preserve fast
+  text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
+  standard-library default emits strict compact JSON. Replace it explicitly
+  with `set_codec()`.
+
 ## 4.1.1 - 2026-08-31
 
 ### Fixed

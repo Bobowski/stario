@@ -1,10 +1,10 @@
 """Read Datastar request signals."""
 
-import json
 from typing import Any, TypedDict, cast
 
 from stario.exceptions import StarioError
 from stario.http.request import Request
+from stario.json import loads as json_loads
 
 
 class FileSignal(TypedDict):
@@ -53,11 +53,11 @@ async def read_signals(req: Request) -> dict[str, Any]:
         return {}
 
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        value = json_loads(raw)
+    except ValueError as exc:
         raise StarioError(
             "Signals must be valid JSON",
-            context={"json_error": exc.msg, "json_position": str(exc.pos)},
+            context={"json_error": str(exc)},
             help_text="Datastar signals must be encoded as one JSON object.",
         ) from exc
     if not isinstance(value, dict):

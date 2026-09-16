@@ -22,11 +22,11 @@ h.Div(star.text("$title"))
 Reference: https://data-star.dev/reference/attributes
 """
 
-import json
 from collections.abc import Mapping
 from typing import Literal
 
 from stario.exceptions import StarioError
+from stario.json import dumps as json_dumps
 from stario.markup.escape import escape_attribute_value as escape_attr
 from stario.markup.escape import escape_sq_attribute_value
 from stario.markup.types import Attrs
@@ -562,11 +562,7 @@ class DatastarAttributes:
         ```
         """
         value = escape_sq_attribute_value(
-            json.dumps(
-                dict(require_mapping("signals", payload)),
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
+            json_dumps(dict(require_mapping("signals", payload)))
         )
         if if_missing:
             return Attrs(f" {self.prefix}signals__ifmissing='{value}'")

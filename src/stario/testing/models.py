@@ -1,11 +1,11 @@
 """Request/response and telemetry snapshot types for the test client."""
 
-import json as json_module
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
 from stario.http.headers import Headers
+from stario.json import loads as json_loads
 
 
 @dataclass(slots=True, frozen=True)
@@ -59,4 +59,4 @@ class ClientRequest:
         return self.content.decode("utf-8")
 
     def json(self) -> Any:
-        return json_module.loads(self.content)
+        return json_loads(self.content)

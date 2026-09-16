@@ -5,11 +5,10 @@ Each helper writes headers and finalizes the response in one step, so handlers c
 stay focused on payload shape rather than framing details.
 """
 
-from json import dumps as json_dumps
-
 from stario.exceptions import StarioError
 from stario.http.redirect import normalized_location
 from stario.http.writer import Writer
+from stario.json import dumps_bytes as json_dumps_bytes
 from stario.markup import render
 from stario.markup.types import HtmlElement
 
@@ -54,10 +53,8 @@ def json(w: Writer, value: JsonValue, status: int = 200) -> None:
     Not for NDJSON or streaming; use `Writer.write` for line-delimited output.
     """
     try:
-        payload = json_dumps(value, separators=(",", ":"), ensure_ascii=False).encode(
-            "utf-8"
-        )
-    except TypeError as exc:
+        payload = json_dumps_bytes(value)
+    except (TypeError, ValueError) as exc:
         raise StarioError(
             "JSON response value is not serializable",
             context={"value": value},

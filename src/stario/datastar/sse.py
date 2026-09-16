@@ -4,13 +4,14 @@ Create one `SSE` per response: `sse = SSE(w)`. The stream opens when you call
 `sse.open()` or when the first event is written.
 """
 
-import json
 from collections.abc import Mapping
 from typing import Any, Literal
 
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.redirect import normalized_location
 from stario.http.writer import Writer
+from stario.json import dumps as json_dumps
+from stario.json import dumps_bytes as json_dumps_bytes
 from stario.markup.render import render
 from stario.responses import JsonValue
 
@@ -135,9 +136,7 @@ class SSE:
         data = dict(require_mapping("patch_signals", payload))
         for key in data:
             validate_signal_name(key)
-        json_bytes = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode(
-            "utf-8"
-        )
+        json_bytes = json_dumps_bytes(data)
         lines = [_EVENT_PATCH_SIGNALS]
         if only_if_missing:
             lines.append(b"data: onlyIfMissing true")
@@ -148,7 +147,7 @@ class SSE:
 
     def navigate(self, url: str) -> None:
         """Navigate the browser from an SSE response; not an HTTP redirect."""
-        safe_url = json.dumps(normalized_location(url))
+        safe_url = json_dumps(normalized_location(url))
         self.execute_script(f"setTimeout(() => window.location = {safe_url});")
 
     def execute_script(self, code: str, *, auto_remove: bool = True) -> None:

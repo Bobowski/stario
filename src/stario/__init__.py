@@ -6,6 +6,7 @@ HTTP apps as explicit routes + plain HTML trees; wire protocol and rendering sta
 - `stario` (this module) — daily handler primitives re-exported below.
 - `stario.routing` — compile-time URL language (`UrlPath`, `normalize_path`, …).
 - `stario.http` — request/response wire, dispatch (`Router`), and server embedding.
+- `stario.json` — process-wide JSON codec used by framework JSON operations.
 - `stario.staticassets` — fingerprinted static files (`AssetManifest`, `StaticAssets`).
 - `stario.responses` / `stario.cookies` — thin helpers on `Writer`.
 
