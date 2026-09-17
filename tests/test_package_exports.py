@@ -8,6 +8,7 @@ import pytest
 def test_core_modules_import() -> None:
     import stario
     import stario.datastar
+    import stario.filesystem
     import stario.http
     import stario.json
     import stario.markup
@@ -30,12 +31,22 @@ def test_core_modules_import() -> None:
             [
                 "App",
                 "AssetManifest",
+                "Assets",
                 "Context",
+                "Files",
                 "Route",
                 "StaticAssets",
                 "UrlPath",
                 "Writer",
             ],
+        ),
+        (
+            "stario.filesystem",
+            ["Assets", "Files"],
+        ),
+        (
+            "stario.staticassets",
+            ["AssetManifest", "StaticAssets", "fingerprint"],
         ),
         (
             "stario.routing",
@@ -52,10 +63,6 @@ def test_core_modules_import() -> None:
                 "normalized_location",
                 "default_not_found",
             ],
-        ),
-        (
-            "stario.staticassets",
-            ["AssetManifest", "StaticAssets", "fingerprint"],
         ),
         (
             "stario.json",
@@ -76,10 +83,40 @@ def test_public_exports(module_name: str, names: list[str]) -> None:
         assert hasattr(module, name), f"{module_name} missing {name!r}"
 
 
+def test_filesystem_all_is_exact() -> None:
+    import stario.filesystem
+
+    assert stario.filesystem.__all__ == ["Assets", "Files"]
+    assert stario.Assets is stario.filesystem.Assets
+    assert stario.Files is stario.filesystem.Files
+
+
+def test_obsolete_staticassets_still_exported() -> None:
+    import stario
+    import stario.staticassets
+
+    assert stario.StaticAssets is stario.staticassets.StaticAssets
+    assert stario.AssetManifest is stario.staticassets.AssetManifest
+
+
+def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
+    from stario.staticassets import AssetManifest, StaticAssets
+
+    (tmp_path / "app.js").write_text("ok")
+    with pytest.warns(DeprecationWarning, match="obsolete and will be removed"):
+        manifest = AssetManifest(tmp_path)
+    with pytest.warns(DeprecationWarning, match="obsolete and will be removed"):
+        StaticAssets(manifest)
+
+
 @pytest.mark.parametrize(
     "removed_module",
     [
         "stario.urls",
+        "stario.files",
+        "stario.filesystem.assets",
+        "stario.filesystem.files",
+        "stario.filesystem.live",
         "stario.http.router",
         "stario.http.staticassets",
         "stario.routing.trie",

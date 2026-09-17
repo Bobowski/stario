@@ -11,6 +11,10 @@ from stario.http.compression import CompressionConfig
 from stario.staticassets import AssetManifest, StaticAssets, fingerprint
 from stario.testing import TestClient
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:stario.staticassets is obsolete:DeprecationWarning"
+)
+
 
 class TestFingerprint:
     """Test file fingerprinting function."""

@@ -15,11 +15,30 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Added
 
+- `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
+  is lazy. `await attach(app)` registers GET/HEAD and loads the tree
+  (`register()` and `load()` stay available). `Assets` hashes names and
+  307s logical paths. Both send strong ETags, 304, and
+  `X-Content-Type-Options: nosniff`. Pass `content_types=` at
+  construction to add or override MIME types.
 - `stario.json` — one process-wide codec for JSON responses, Datastar signals,
   telemetry, and the test client. `dumps()` and `dumps_bytes()` preserve fast
   text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
   standard-library default emits strict compact JSON. Replace it explicitly
   with `set_codec()`.
+
+### Changed
+
+- File serving lives in `stario.Assets` and `stario.Files`. `stario.staticassets`
+  (`AssetManifest`, `StaticAssets`) is obsolete and kept only for existing
+  apps. `load()` keeps the identity body when a compressed variant does not
+  fit the byte budget. `image/svg+xml` is compressible. Migrate with
+  `Assets(...)` and `await attach(app)` in place of `AssetManifest` plus
+  `StaticAssets(...).register(app)`.
+- Removed the `aiofiles` dependency. File streaming (`Assets`, `Files`, and the
+  obsolete `stario.staticassets`) now reads already-open file descriptors
+  with `os.pread` in a worker thread instead of a second `open()` per
+  streamed response.
 
 ## 4.1.1 - 2026-08-31
 
@@ -122,7 +141,7 @@ Major release from 3.4. Delete old `stario-traces.sqlite3` files before upgradin
 ### Added
 
 - `ServerConfig` and `RequestPolicy` — listen, compression, shutdown, and request limits (`stario.http.config`).
-- `AssetManifest`, `Asset`, and `StaticAssets.stats`.
+- `AssetManifest` and `StaticAssets.stats`.
 - Static serving — `precompress=` codec selection, per-instance `content_types=` overrides, and `Range: bytes=…` on large streamed files (206 / 416; one range per request).
 - `STARIO_REUSE_ADDR` — TCP `SO_REUSEADDR` (default `1`).
 - `normalized_location` — shared redirect URL safety for `responses.redirect` and SSE navigation.

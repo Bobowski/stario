@@ -11,6 +11,7 @@ from stario.http.compression import CompressionConfig
 from stario.http.context import Context
 from stario.http.headers import Headers
 from stario.http.request import BodyReader, Request
+from stario.http.wire import decode_path
 from stario.http.writer import Writer
 from stario.telemetry.core import Span
 from stario.testing.cookies import serialize_cookie_header
@@ -119,7 +120,7 @@ def prepare_request(
         raise ValueError("Use `files` with optional form `data`, not raw `content`.")
 
     parsed = urlsplit(urljoin(base_url + "/", url.lstrip("/")))
-    path = parsed.path or "/"
+    path = decode_path((parsed.path or "/").encode("ascii"))
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
     if params is not None:
         query_items.extend(expand_pairs(params))

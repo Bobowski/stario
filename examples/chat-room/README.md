@@ -29,7 +29,7 @@ Tests use `TestClient(app.main.bootstrap)` — same bootstrap the CLI loads. One
 app/
   main.py           bootstrap (composition root) — start here
   config.py         env-first Config, read once in bootstrap
-  assets.py         AssetManifest + fingerprinted URLs
+  assets.py         Assets + fingerprinted URLs
   db.py             thin SQLite core (connection + transactions)
   common/           page shell, demo identity — cross-feature, no owner
   features/

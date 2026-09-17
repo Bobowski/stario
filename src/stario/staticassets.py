@@ -1,24 +1,22 @@
-"""
-Fingerprinted static assets in two explicit halves:
+"""Obsolete. Use `stario.Assets` instead.
 
-`AssetManifest` scans a directory once and maps logical paths to fingerprinted URLs. It is cheap
-(hashing only), so build it at module level and resolve URLs with `href("path/to/file")`.
-Symlinked files are skipped by default; symlinked directories are never followed. Resolved
-paths must stay inside the static root. Pass `follow_symlinks=True` when your static tree
-intentionally uses file symlinks (still contained under the root).
+This module is unchanged so existing apps keep working. Do not use it in
+new code.
 
-`StaticAssets` is the route handler: it takes a manifest and pays the serving costs — loading small
-files into memory, pre-compressing them, streaming large files from disk. Build it during bootstrap
-and call `register(app)`.
+Was: `AssetManifest` hashes at import; `StaticAssets` serves during
+bootstrap. New code uses `Assets` for fingerprinted files and `Files`
+for live paths.
 """
 
+import asyncio
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal
+from warnings import deprecated
 
-import aiofiles
 import xxhash
 
 import stario.responses as responses
@@ -174,6 +172,13 @@ def _normalize_precompress(
 
 
 _CACHED_ENCODINGS: Final = ((b"br", "brotli"), (b"zstd", "zstd"), (b"gzip", "gzip"))
+if hasattr(os, "pread"):
+    _pread = os.pread
+else:  # Windows has no os.pread; each fd here is exclusive to one response.
+
+    def _pread(fd: int, size: int, offset: int, /) -> bytes:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, size)
 
 
 @dataclass(slots=True, frozen=True)
@@ -243,6 +248,10 @@ class Asset:
     """Filesystem mtime (nanoseconds) recorded when the manifest was built."""
 
 
+@deprecated(
+    "stario.staticassets is obsolete and will be removed in a future version. "
+    "Use stario.Assets instead."
+)
 class AssetManifest:
     """
     Scan a directory once: fingerprint every public file and map logical paths to public URLs.
@@ -364,6 +373,10 @@ class CachedFile:
     gzip: bytes | None = None
 
 
+@deprecated(
+    "stario.staticassets is obsolete and will be removed in a future version. "
+    "Use stario.Assets and await attach(app) instead."
+)
 class StaticAssets:
     """
     Serve an `AssetManifest`: cache small files (with pre-compression), stream large files.
@@ -409,7 +422,7 @@ class StaticAssets:
 
     def __init__(
         self,
-        manifest: AssetManifest,
+        manifest: AssetManifest,  # pyright: ignore[reportDeprecated]
         *,
         cache_control: str = "public, max-age=31536000, immutable",
         cache_max_size: int = 1 << 20,
@@ -683,17 +696,22 @@ class StaticAssets:
         length: int,
     ) -> None:
         remaining = length
-        async with aiofiles.open(path, "rb") as fp:
-            if start:
-                await fp.seek(start)
+        offset = start
+        fd = await asyncio.to_thread(os.open, path, os.O_RDONLY)
+        try:
             while remaining > 0:
-                chunk = await fp.read(min(self.filesystem_chunk_size, remaining))
+                chunk = await asyncio.to_thread(
+                    _pread, fd, min(self.filesystem_chunk_size, remaining), offset
+                )
                 if not chunk:
                     break
+                offset += len(chunk)
                 remaining -= len(chunk)
                 if w.closing:
                     return
                 w.write(chunk)
+        finally:
+            os.close(fd)
         w.end()
 
     async def __call__(self, c: Context, w: Writer) -> None:

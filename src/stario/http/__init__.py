@@ -16,7 +16,7 @@ from stario.http.server import Server
 ```
 
 Route patterns and link building live in `stario.routing`, not here.
-Static file serving lives in `stario.staticassets`.
+Filesystem serving lives in `stario.filesystem` (`Files`).
 
 For tests, `aload_app` is re-exported from `stario.testing`.
 """

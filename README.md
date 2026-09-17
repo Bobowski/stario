@@ -149,11 +149,38 @@ uv run stario watch main:bootstrap
 
 Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment, containers, and TLS](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
 
+### Filesystem URLs
+
+Build `Assets` or `Files` at module level. Call `href()` there. Call
+`await attach(app)` in bootstrap (register + load). `Assets` precompresses
+by default; `Files` does not unless you pass `precompress=`:
+
+```python
+from stario import App, Assets, Files, Span
+
+ASSETS = Assets("./static", "/static")
+UPLOADS = Files("./uploads", "/data")
+STYLE_CSS = ASSETS.href("css/style.css")
+
+
+async def bootstrap(app: App, span: Span):
+    span.attrs(await ASSETS.attach(app))
+    await UPLOADS.attach(app, precompress=("br", "gzip"))
+    yield
+```
+
+`Assets` hashes names and 307s the logical path. Both send strong ETags
+and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
+
 ## What you get
 
 - Explicit wiring: async-generator `bootstrap(app, span)` with a single `yield`, `Route` endpoints, no hidden registration.
 - Sharp primitives: `Context` for the request, `Writer` for the response, HTML/SVG trees via `stario.markup`, telemetry via `span`.
-- Static assets: `AssetManifest` for fingerprinted URLs, `StaticAssets(manifest).register(app)` in bootstrap.
+- Files: `Assets` and `Files` expose a directory at a URL prefix.
+  `attach(app)` registers GET/HEAD and loads the tree. `Assets`
+  hashes names and 307s the logical path. Both use strong ETags and 304.
+  Import from `stario` or `stario.filesystem`. `stario.staticassets` is
+  obsolete.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.
 - Observable runs: spans for startup and requests are part of how you structure apps, not an afterthought.
 

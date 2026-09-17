@@ -33,12 +33,11 @@ from pathlib import Path
 import stario.responses as responses
 from stario import (
     App,
-    AssetManifest,
+    Assets,
     Context,
     Relay,
     Route,
     Span,
-    StaticAssets,
     Writer,
 )
 from stario.datastar import SSE, at, data, read_signals
@@ -61,9 +60,8 @@ from stario.markup import html as h
 # =============================================================================
 
 
-# Cheap at import time: scan + fingerprint only. Serving (compression, caching)
-# is paid in bootstrap when StaticAssets wraps the manifest.
-ASSETS = AssetManifest(Path(__file__).parent / "static")
+# href() is cheap. attach(app) in bootstrap registers routes and loads files.
+ASSETS = Assets(Path(__file__).parent / "static", "/static")
 # Fingerprinted once at import — links stay stable across deploys that hash files.
 STYLE_CSS = ASSETS.href("css/style.css")
 DATASTAR_JS = ASSETS.href("js/datastar.js")
@@ -404,9 +402,7 @@ async def bootstrap(app: App, span: Span):
 
     # Compression + caching cost is paid here; stats land on the startup trace.
     with span.step("static_assets") as s:
-        static = StaticAssets(ASSETS)
-        s.attrs(static.stats)
-    static.register(app)
+        s.attrs(await ASSETS.attach(app))
 
     # Queries — return or stream HTML
     app.add(HOME, home(game))

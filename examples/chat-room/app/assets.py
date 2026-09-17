@@ -2,11 +2,10 @@
 
 from pathlib import Path
 
-from stario import AssetManifest
+from stario import Assets
 
-# Cheap at import time: scan + fingerprint only. Serving (compression, caching)
-# is paid in bootstrap when StaticAssets wraps the manifest.
+# href() is cheap. attach(app) in bootstrap registers routes and loads files.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ASSETS = AssetManifest(PROJECT_ROOT / "static")
+ASSETS = Assets(PROJECT_ROOT / "static", "/static")
 STYLE_CSS = ASSETS.href("css/style.css")
 DATASTAR_JS = ASSETS.href("js/datastar.js")

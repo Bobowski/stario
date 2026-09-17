@@ -483,6 +483,18 @@ class TestWriterRaw:
         finally:
             loop.close()
 
+    def test_head_content_length_does_not_require_a_body(self):
+        w, sink, loop = _make_writer()
+        try:
+            w.headers.unsafe_set(b"content-length", b"5")
+            w.write_headers(200, body=False)
+            w.end()
+        finally:
+            loop.close()
+        wire = bytes(sink)
+        assert b"content-length: 5\r\n" in wire
+        assert wire.endswith(b"\r\n\r\n")
+
     def test_invalid_content_length_raises_stario_error(self):
         w, _sink, loop = _make_writer()
         try:

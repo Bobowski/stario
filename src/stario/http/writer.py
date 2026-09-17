@@ -231,10 +231,12 @@ class Writer:
         self._transport.close()
         self._on_completed()
 
-    def write_headers(self, status_code: int) -> Self:
+    def write_headers(self, status_code: int, *, body: bool = True) -> Self:
         """Send the status line and all current `headers` (must be called at most once).
 
         - `status_code`: HTTP status for this response.
+        - `body`: When False (HEAD), send `Content-Length` as the entity size
+          but do not require those bytes before `end()`.
 
         `self` for chaining.
 
@@ -270,13 +272,14 @@ class Writer:
             self._known_length = True
             raw_length = headers.unsafe_get(b"content-length")
             try:
-                self._bind_declared_length(int(raw_length))  # type: ignore[arg-type]
+                declared = int(raw_length)  # type: ignore[arg-type]
             except (TypeError, ValueError) as exc:
                 raise StarioError(
                     "Invalid Content-Length header",
                     context={"content-length": raw_length},
                     help_text="Set Content-Length to a non-negative integer before write_headers().",
                 ) from exc
+            self._bind_declared_length(declared if body else 0)
 
         else:
             headers.unsafe_set(b"transfer-encoding", b"chunked")

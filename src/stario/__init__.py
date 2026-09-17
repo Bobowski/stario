@@ -7,7 +7,8 @@ HTTP apps as explicit routes + plain HTML trees; wire protocol and rendering sta
 - `stario.routing` — compile-time URL language (`UrlPath`, `normalize_path`, …).
 - `stario.http` — request/response wire, dispatch (`Router`), and server embedding.
 - `stario.json` — process-wide JSON codec used by framework JSON operations.
-- `stario.staticassets` — fingerprinted static files (`AssetManifest`, `StaticAssets`).
+- `stario.filesystem` — a directory as HTTP URLs (`Assets`, `Files`).
+- `stario.staticassets` — obsolete fingerprinted assets (`AssetManifest`, `StaticAssets`).
 - `stario.responses` / `stario.cookies` — thin helpers on `Writer`.
 
 Import feature areas from their modules: `import stario.responses as responses`,
@@ -18,7 +19,7 @@ Prefer `from stario import …` for:
 
 - **Per-handler:** `App`, `Context`, `Writer`, `Route`, `UrlPath`
 - **Control flow:** `HttpException`, `RedirectException`
-- **Bootstrap / assets:** `AssetManifest`, `StaticAssets`, `Span`
+- **Bootstrap / filesystem:** `Assets`, `Files`, `Span`
 - **Middleware / realtime:** `Handler`, `Middleware`, `Relay`
 
 Register endpoints on `App` with `app.add(Route.get("/"), home)`. Scope middleware
@@ -32,18 +33,24 @@ from importlib.metadata import version as _package_version
 __version__ = _package_version("stario")
 
 from stario.exceptions import HttpException, RedirectException
+from stario.filesystem import Assets, Files
 from stario.http.app import App
 from stario.http.context import Context, Handler, Middleware
 from stario.http.writer import Writer
 from stario.relay import Relay
 from stario.routing import Route, UrlPath
-from stario.staticassets import AssetManifest, StaticAssets
+from stario.staticassets import (
+    AssetManifest,  # pyright: ignore[reportDeprecated]
+    StaticAssets,  # pyright: ignore[reportDeprecated]
+)
 from stario.telemetry import Span
 
 __all__ = [
     "App",
     "AssetManifest",
+    "Assets",
     "Context",
+    "Files",
     "Handler",
     "HttpException",
     "Middleware",
