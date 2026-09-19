@@ -70,7 +70,9 @@ async def test_lobby_subscribe(client):
     lobby = await client.get("/")
     user_id = _signal_value(lobby.text, "user_id")
     assert user_id
-    signals = json.dumps({"user_id": user_id, "username": "HappyFox", "color": "#e74c3c"})
+    signals = json.dumps(
+        {"user_id": user_id, "username": "HappyFox", "color": "#e74c3c"}
+    )
     saw_patch = False
     async with client.stream(
         "GET",

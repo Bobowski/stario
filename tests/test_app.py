@@ -5,12 +5,12 @@ import logging
 import pytest
 
 import stario.responses as responses
+from stario import Route
 from stario.exceptions import StarioError
 from stario.http.app import App
 from stario.http.context import Context
 from stario.http.middleware import catch_errors
 from stario.http.writer import Writer
-from stario.routing import UrlPath
 from stario.testing import TestClient
 from tests.helpers import run_with_app
 
@@ -37,17 +37,17 @@ class TestHostRouting:
         seen: list[tuple[str, str]] = []
 
         async def handler(c: Context, w: Writer) -> None:
-            seen.append((c.route.params["subhost"], c.route.pattern))
+            seen.append((c.match.params["subhost"], c.match.pattern))
             w.end()
 
         def setup(app: App) -> None:
-            app.get(UrlPath("/dashboard", host="{subhost}.example.com"), handler)
+            app.add(Route("GET //{subhost}.example.com/dashboard"), handler)
 
         context, _writer = run_with_app(setup, "/dashboard", host="acme.example.com")
 
-        assert dict(context.route.params) == {"subhost": "acme"}
-        assert context.route.pattern == "{subhost}.example.com/dashboard"
-        assert seen == [("acme", "{subhost}.example.com/dashboard")]
+        assert dict(context.match.params) == {"subhost": "acme"}
+        assert context.match.pattern == "GET //{subhost}.example.com/dashboard"
+        assert seen == [("acme", "GET //{subhost}.example.com/dashboard")]
 
     def test_trailing_slash_redirect_preserves_query_string(self):
         _context, writer = run_with_app(
@@ -64,7 +64,7 @@ class TestHostRouting:
         async def search(_c: Context, w: Writer) -> None:
             w.respond(b"ok", b"text/plain", 200)
 
-        app.get("/search", search)
+        app.add(Route("GET /search"), search)
         async with TestClient(app) as client:
             response = await client.get("/search/?q=cats", follow_redirects=False)
             assert response.status_code == 308
@@ -83,7 +83,7 @@ class TestAppErrorSurface:
             raise RuntimeError("boom")
 
         def setup(app: App) -> None:
-            app.get("/boom", boom)
+            app.add(Route("GET /boom"), boom)
 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             _context, writer = run_with_app(setup, "/boom")
@@ -100,7 +100,7 @@ class TestAppErrorSurface:
         async def boom(_c: Context, _w: Writer) -> None:
             raise RuntimeError("boom")
 
-        app.get("/boom", boom)
+        app.add(Route("GET /boom"), boom)
         async with TestClient(app) as client:
             response = await client.get("/boom")
             assert response.status_code == 500
@@ -116,7 +116,7 @@ class TestAppErrorSurface:
             return None
 
         def setup(app: App) -> None:
-            app.get("/missing", missing_response)
+            app.add(Route("GET /missing"), missing_response)
 
         _context, writer = run_with_app(setup, "/missing")
 
@@ -132,7 +132,7 @@ class TestAppErrorSurface:
             raise RuntimeError("after write")
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET /x"), handler)
 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             _context, writer = run_with_app(setup, "/x")
@@ -150,7 +150,7 @@ class TestAppErrorSurface:
             raise AppError("nope")
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET /x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -169,7 +169,7 @@ class TestAppErrorSurface:
 
         def setup(app: App) -> None:
             app.use("/", catch_errors(AppError, respond=respond))
-            app.get("/x", handler)
+            app.add(Route("GET /x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -183,7 +183,7 @@ class TestAppErrorSurface:
             w.respond(b"ok", b"text/plain", 200)
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET /x"), handler)
             original = app.find_handler
 
             def wrapped(host: str, path: str, method: str):
@@ -201,3 +201,42 @@ class TestAppErrorSurface:
     def test_app_requires_running_loop(self):
         with pytest.raises(StarioError, match="requires a running event loop"):
             App()
+
+
+class TestRequestSpanName:
+    async def test_matched_route_renames_span(self):
+        async def ok(c: Context, w: Writer) -> None:
+            responses.empty(w, 204)
+
+        app = App()
+        app.add(Route("GET /users/{user_id}"), ok)
+        async with TestClient(app) as client:
+            response = await client.get("/users/7")
+
+        root = client.tracer.get_span(response.span_id)
+        assert root is not None
+        assert root.name == "GET /users/{user_id}"
+        assert root.attributes["http.route"] == "/users/{user_id}"
+
+    async def test_trailing_slash_uses_canonical_route_name(self):
+        async def ok(c: Context, w: Writer) -> None:
+            responses.empty(w, 204)
+
+        app = App()
+        app.add(Route("GET /search"), ok)
+        async with TestClient(app) as client:
+            response = await client.get("/search/", follow_redirects=False)
+
+        assert response.status_code == 308
+        root = client.tracer.get_span(response.span_id)
+        assert root is not None
+        assert root.name == "GET /search"
+
+    async def test_not_found_keeps_method_name(self):
+        async with TestClient(App()) as client:
+            response = await client.get("/missing")
+
+        root = client.tracer.get_span(response.span_id)
+        assert root is not None
+        assert root.name == "GET"
+        assert "http.route" not in root.attributes

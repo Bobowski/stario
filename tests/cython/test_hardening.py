@@ -462,7 +462,7 @@ async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
     seen: list[str] = []
 
     async def wildcard(c, w) -> None:
-        seen.append(c.route.params["name"])
+        seen.append(c.match.params["name"])
         responses.text(w, "wildcard")
 
     async def nested(_c, w) -> None:

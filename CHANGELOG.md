@@ -8,6 +8,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Breaking changes
 
+- Cython llhttp/nghttp2 is the production HTTP runtime. The Python httptools
+  protocol is gone. `stario serve` uses the compiled protocol.
 - `App.on_error` and exception-type mapping are gone. Uncaught handler
   exceptions are logged. If the handler sent nothing, the framework writes
   **500**; a response already on the wire is not rewritten. Handlers must
@@ -19,9 +21,31 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
   instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
   the Cython protocol (no handler task).
+- `c.route` (`RouteMatch`) is gone. Use `c.match` (`Match`).
+- `stario.routing` is gone. Import `Route` and `UrlPath` from `stario` or
+  `stario.http`.
+
+### Fixed
+
+- TTY tracer live footer — skip terminal writes when the text and width do not
+  change. Cap the live block to `terminal_rows - 2` so cursor-up erase cannot
+  clear scrollback. Tall trees keep the root header and the newest lines.
+  The footer is removed when no roots are open.
 
 ### Added
 
+- `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
+  is lazy. `await attach(app)` registers GET/HEAD and loads the tree
+  (`register()` and `load()` stay available). A later `attach()` on a
+  new `App` re-adds GET/HEAD and reuses the loaded tree. `load()` still
+  runs once. `Assets` hashes names and 307s logical paths. Both send
+  strong ETags, 304, and `X-Content-Type-Options: nosniff`. Pass
+  `content_types=` at construction to add or override MIME types.
+- `stario.json` — one process-wide codec for JSON responses, Datastar signals,
+  telemetry, and the test client. `dumps()` and `dumps_bytes()` preserve fast
+  text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
+  standard-library default emits strict compact JSON. Replace it explicitly
+  with `set_codec()`.
 - `stario.http.middleware.catch_errors` — wrap handlers so listed exceptions
   become HTTP responses when nothing was sent yet. Presets:
   `catch_request_body_errors()` and `respond_request_body_error`.
@@ -30,15 +54,22 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Changed
 
+- `find_handler` has no LRU. Static `(host, path, method)` hits an exact
+  map and reuses that `Match`. Exact hosts have their own path trie.
+  Exact-only path chains are radix-compressed. One cursor walks the
+  trie. The matcher does not lowercase `host` — pass `Request.host`
+  (already folded).
+- File streaming (`Assets`, `Files`, and `stario.staticassets`) reads
+  already-open file descriptors with `os.pread` in a worker thread.
+  The `aiofiles` dependency is gone.
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, write 500
   if nothing was sent, abort if a body was started but not finished, close
   the span. No auto-`end()`. A write-then-raise still logs (`Handler failed`);
   the response already on the wire is not rewritten.
 - Every request that writes an HTTP status gets a started-and-ended span:
   handler responses, trailing-slash 308, and protocol 400 / 413 / 431 / 429
-  (Cython) / 503 (Python pipeline). Protocol outcomes are not `fail`ed.
-  `NoOpSpan` still skips start/end. Idle timeout and `connection_lost` with
-  no status still do not create a span.
+  / 503. Protocol outcomes are not `fail`ed. `NoOpSpan` still skips start/end.
+  Matched routes rename the span to `Route.pattern` and set `http.route`.
 - Cython GET path: skip upload state when there is no body (`mark_nobody`),
   and arm idle timeouts on the Date-tick sweeper instead of `loop.time()`
   per keep-alive request.
@@ -46,50 +77,45 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   message is complete (`body()` is already bytes). `stream()` with a known
   Content-Length yields `min(length, 256 KiB)` instead of a fixed 64 KiB.
 - HTTP/2 POST without Content-Length is END_STREAM-delimited (like H1
-  chunked): the exchange stays armed for DATA. `mark_nobody` is only for
-  HEADERS that already ended the stream with no body. Recycle clears
-  nghttp2 stream user_data so a pooled exchange cannot ingest another
-  stream's DATA. Duplicate `:method` / `:path` / `:authority` are RST;
-  `:authority` and `Host` must be equal (the second copy is not stored).
-- `ParsedQuery` first read fills a C name/value span table (like request
-  headers). Plain ASCII names stay on the original bytes (no memcpy);
-  names that need `+` / `%XX` unquote still copy. Typical ASCII names
-  compare with `memcmp`; values decode on `get`. `as_dict` / `as_lists`
-  still materialize everything for forms / Pydantic. HTTP/1 stays on
-  [llhttp](https://github.com/nodejs/llhttp): picohttpparser was tried on
-  the same `HttpProtocol` and is ~2.5× in a parser-only microbench, but
-  not noticeably faster end-to-end (GET ~even, small POST behind). llhttp
-  is also the same incremental-callback model as nghttp2.
-- HTTP/1 and HTTP/2 share the core dispatch rule (empty GET /
-  `mark_nobody` at headers; small POST ≤256KiB waits for complete; H2
-  no-CL POST dispatches at headers so `stream()` can start). HTTP/2
-  receive window is 1MiB per stream / 4MiB per connection. Recv credit is
-  submitted as `WINDOW_UPDATE` when a stream ends and after each
-  `mem_recv` — nghttp2 `consume()` only emits a frame at 50% of the
-  window, which stalls keep-alive small POSTs. Mid-body updates are still
-  batched. Outbound DATA uses nghttp2 `NO_COPY` into `h2_out`; responses
-  queued during `mem_recv` flush once.
-- Trailing-slash URLs are not stored in the 256-slot path cache (they
-  308). Accept-Encoding is not scanned when brotli and gzip are both
-  off. HTTP/2 header names are memcpy'd (RFC 9113 lowercase). Host is
-  normalized in C and prefetched when `host_routing`.
-- HTTP/2 applies the same `max_header_bytes` budget as HTTP/1 (name +
-  value octets per stream). Oversize requests get **431** on that stream,
-  not a connection close. HTTP/1 431 on a GET (no body) keeps the
-  connection. Declared oversize HTTP/2 bodies get **413** on that stream.
-  HTTP/1 413 with a declared Content-Length at or under 256 KiB keeps
-  the connection and discards the body; larger declared lengths still
-  close. Keep-alive 413/431 then arm the idle timer (they do not leave
-  the first-request header timer running). HTTP/2 DATA that exceeds
-  `max_body_bytes` after dispatch is a
-  stream **413** (or `RequestBodyError` in the handler) and does not
-  close the multiplexed connection. Incomplete HTTP/2 HEADERS time out
-  per stream (RST CANCEL) without tearing down multiplexed neighbors.
-  `SETTINGS_MAX_HEADER_LIST_SIZE` is advertised; the HPACK table size is
-  the 4KiB spec default (`SETTINGS_HEADER_TABLE_SIZE=4096`); RST-stream
-  flood is rate-limited (burst 100 / 33 per second); CONTINUATION frames
-  are capped from the header budget; closed streams are not retained
-  (`SETTINGS_NO_RFC7540_PRIORITIES`).
+  chunked). Recycle clears nghttp2 stream user_data. Duplicate `:method` /
+  `:path` / `:authority` are RST; `:authority` and `Host` must be equal.
+- `ParsedQuery` first read fills a C name/value span table. HTTP/1 stays on
+  [llhttp](https://github.com/nodejs/llhttp).
+- HTTP/2 receive window is 1MiB per stream / 4MiB per connection. RST-stream
+  flood is rate-limited. Header budget 431 / body 413 apply per stream.
+
+### Deprecated
+
+These still work. They will be removed in 5.0.
+
+Prefer `Route("GET /home")` or `Route("POST", ROOM + "/send")` and
+`app.add(route, handler)`. Host is `//host/path` or `host=`. Paths
+start with `/` or `//`. `{name}` and `{name...}` must be a whole path
+segment or host label. `{{name}}` is a literal `{name}`. Query and
+fragment go to `href()` only. After a match, read `c.match`.
+
+- `UrlPath` — prefer `Route` or a `/` / `//` string. `href()` and `/`
+  composition still work. `app.use`, `not_found`, `Files`, and `Assets`
+  take strings.
+- `app.get` / `app.post` / `app.handle` and `Route.get` / `Route.post`
+  / … — register with `app.add(Route("GET /"), handler)`.
+  `Route.query(path)` stays as the HTTP QUERY factory until 5.0;
+  `Route("QUERY /feed")` is the replacement.
+- `at.fetch` — build the URL with `route.href()` and name the verb at
+  the call site (`at.get(...)`, `at.post(...)`).
+- `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use
+  `Assets(...)` or `Files(...)` and `await attach(app)`.
+
+## 4.1.1 - 2026-08-31
+
+### Fixed
+
+- `data.bind()` with `prop` or `event` — emit a key-only attribute. Datastar bind is exclusive (signal in the key or the value, not both); the previous form also set the value and Datastar raised `KeyAndValueProvided`.
+- `data.persist(session=True)` — emit `data-persist__session` when `storage_key` is omitted.
+
+### Added
+
+- `data.on_intersect(..., view_transition=True)` — Datastar `__viewtransition` modifier.
 
 ## 4.1.0 - 2026-08-17
 

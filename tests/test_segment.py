@@ -3,11 +3,12 @@
 import pytest
 
 from stario.exceptions import StarioError
-from stario.routing.segment import (
+from stario.http.segment import (
     Segment,
     host_pattern_labels,
     parse_host_segments,
     parse_path_segments,
+    parse_route,
 )
 
 
@@ -36,19 +37,32 @@ class TestSegmentParse:
     def test_rejects_partial_placeholder(self):
         with pytest.raises(StarioError, match="placeholder must fill the segment"):
             Segment.parse("/items", "{id}-edit")
+        with pytest.raises(StarioError, match="placeholder must fill the segment"):
+            Segment.parse("/items", "pre{id}")
+        with pytest.raises(StarioError, match="placeholder must fill the segment"):
+            Segment.parse("/files", "{path...}.txt")
+        with pytest.raises(StarioError, match="placeholder must fill the segment"):
+            Segment.parse("/users", "{id}{other}")
 
     def test_rejects_unclosed_placeholder(self):
         with pytest.raises(StarioError, match="placeholder must fill the segment"):
             Segment.parse("/items", "{broken")
+        with pytest.raises(StarioError, match="placeholder must fill the segment"):
+            Segment.parse("/items", "id}")
 
     def test_rejects_empty_parameter_name(self):
         with pytest.raises(StarioError, match="parameter name is empty"):
             Segment.parse("/items", "{}")
 
+    @pytest.mark.parametrize("name", ["query", "fragment"])
+    def test_rejects_reserved_href_names(self, name: str):
+        with pytest.raises(StarioError, match="reserved"):
+            Segment.parse(f"/{{{name}}}", f"{{{name}}}")
+
     def test_is_frozen(self):
         segment = Segment.parse("/users", "users")
 
-        with pytest.raises(AttributeError):
+        with pytest.raises(AttributeError, match="immutable"):
             segment.name = "other"  # type: ignore[misc]
 
 
@@ -74,12 +88,41 @@ class TestParseHostSegments:
 
         assert [segment.name for segment in segments] == ["api", "example", "com"]
 
+    def test_unescapes_then_lowers_exact_braces(self):
+        segments = parse_host_segments("{{API}}.Example.COM")
+
+        assert segments[0].kind == "exact"
+        assert segments[0].name == "{api}"
+        assert [segment.pattern for segment in segments] == [
+            "{api}",
+            "example",
+            "com",
+        ]
+
+    def test_parses_wildcard_and_catchall_labels(self):
+        wild = parse_host_segments("{tenant}.example.com")
+        rest = parse_host_segments("{tenant...}.example.com")
+
+        assert wild[0].kind == "wildcard"
+        assert wild[0].name == "tenant"
+        assert rest[0].kind == "catchall"
+        assert rest[0].name == "tenant"
+        assert [segment.kind for segment in rest[1:]] == ["exact", "exact"]
+
+    def test_rejects_partial_placeholder_label(self):
+        with pytest.raises(StarioError, match="placeholder must fill the segment"):
+            parse_host_segments("api-{tenant}.example.com")
+        with pytest.raises(StarioError, match="placeholder must fill the segment"):
+            parse_host_segments("{tenant...}extra.example.com")
+
     def test_rejects_empty_label(self):
         with pytest.raises(StarioError, match="empty host label"):
             parse_host_segments("api..example.com")
 
     def test_rejects_catchall_after_first_label(self):
-        with pytest.raises(StarioError, match="Catchall host param in invalid position"):
+        with pytest.raises(
+            StarioError, match="Catchall host param in invalid position"
+        ):
             parse_host_segments("example.{tenant...}.com")
 
 
@@ -98,6 +141,20 @@ class TestParsePathSegments:
         with pytest.raises(StarioError, match="empty path segment"):
             parse_path_segments("/users//profile")
 
+    def test_unescapes_doubled_braces_as_exact(self):
+        segments = parse_path_segments("/curly/{{id}}")
+
+        assert segments[1].kind == "exact"
+        assert segments[1].name == "{id}"
+
+    def test_parse_route_rejects_duplicate_names(self):
+        with pytest.raises(StarioError, match="Duplicate route parameter"):
+            parse_route(None, "/teams/{id}/users/{id}")
+        with pytest.raises(StarioError, match="Duplicate route parameter"):
+            parse_route("{id}.example.com", "/users/{id}")
+
     def test_rejects_catchall_before_last_segment(self):
-        with pytest.raises(StarioError, match="Catchall path param in invalid position"):
+        with pytest.raises(
+            StarioError, match="Catchall path param in invalid position"
+        ):
             parse_path_segments("/files/{path...}/download")

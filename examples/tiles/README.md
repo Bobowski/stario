@@ -15,6 +15,6 @@ Open http://127.0.0.1:8000 — paint in two tabs to see live sync.
 
 ## Next steps
 
-- [Realtime tiles tutorial](https://stario.dev/docs/tutorials/realtime-tiles) walks through the code
-- [hello-world](../hello-world/) — smaller counter if you want less surface area first
+- [Realtime tiles](https://stario.dev/docs/tutorials/realtime-tiles) walks through the three routes
+- [hello-world](../hello-world/) — one route and one HTML page, no Datastar
 - [chat-room](../chat-room/) — multi-file `app/features/*` layout when you outgrow one file

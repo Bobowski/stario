@@ -6,20 +6,22 @@ Use the exported `at` instance:
 from stario import Route
 from stario.datastar import at, data
 
-REFRESH = Route.get("/items")
-h.Button(data.on("click", at.fetch(REFRESH)), "Refresh")
+REFRESH = Route("GET /items")
+h.Button(data.on("click", at.get(REFRESH.href())), "Refresh")
 ```
 
 The methods return strings such as `@get('/items')` for use inside Datastar
-attributes like `data.on(...)`. Prefer `at.fetch(route)` when the URL is a `Route`.
+attributes like `data.on(...)`. Build the URL with `route.href()`, then
+pick `at.get` / `at.post` / … at the call site.
 """
 
 from collections.abc import Mapping
 from typing import Any, Literal
 from urllib.parse import urlencode
+from warnings import deprecated
 
 from stario.exceptions import StarioError
-from stario.routing import Route
+from stario.http.route import Route
 
 from .format import FilterValue, filter_js, js_object, string_literal
 
@@ -352,11 +354,10 @@ class DatastarActions:
             request_cancellation=request_cancellation,
         )
 
+    @deprecated("Use at.get(route.href()) or at.post(route.href()).")
     def fetch(
         self,
         route: Route,
-        params: Mapping[str, object] | None = None,
-        /,
         *,
         query: Mapping[str, object] | None = None,
         fragment: str | None = None,
@@ -376,32 +377,18 @@ class DatastarActions:
     ) -> str:
         """Build `@get` / `@post` / `@put` / `@patch` / `@delete` from a `Route`.
 
-        Path params, `query=`, and `fragment=` match `href()`. Datastar fetch
-        options stay keyword-only so they do not collide with path names.
-
-        ```python
-        data.init(at.fetch(SUBSCRIBE, {"room_id": room.id}, retry="always"))
-        h.Button(data.on("click", at.fetch(SEND, {"room_id": room.id})), "Send")
-        ```
+        Deprecated. Name the verb at the call site:
+        `at.get(route.href())` or `at.post(route.href())`.
         """
-        if not isinstance(route, Route):
-            raise StarioError(
-                "at.fetch() takes a Route",
-                context={"got": type(route).__name__},
-                help_text=(
-                    "Declare the endpoint with Route.get/post/... and pass that object. "
-                    "Use at.get(url) or at.post(url) for a raw URL."
-                ),
-            )
         if route.method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise StarioError(
                 "at.fetch() has no Datastar action for this method",
-                context={"method": route.method, "path": route.path.text},
+                context={"method": route.method, "path": route.path},
                 help_text="at.fetch() emits @get, @post, @put, @patch, or @delete.",
             )
         return self._fetch(
             route.method.lower(),
-            route.href(params, query=query, fragment=fragment),
+            route.href(query=query, fragment=fragment),
             content_type=content_type,
             include=include,
             exclude=exclude,

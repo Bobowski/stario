@@ -15,6 +15,7 @@ import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
+from stario.http.route import normalize_path
 from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
@@ -121,8 +122,12 @@ class App(Router):
         honest without a shared helper.
         """
         path = c.req.path
+        host = c.req.host if self.host_routing else ""
         if path != "/" and path.endswith("/"):
-            target = "/" + path.strip("/")
+            target = normalize_path(path)
+            _, _, hit = self.find_handler(host, target, c.req.method)
+            if type(c.span) is not NoOpSpan and hit.pattern:
+                c.span.rename(hit.pattern)
             if c.req.query_bytes:
                 target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
             responses.redirect(w, target, 308)
@@ -131,12 +136,14 @@ class App(Router):
             )
             return
 
-        host = c.req.host if self.host_routing else ""
-        handler, c.route = self.find_handler(host, path, c.req.method)
+        handler, route, c.match = self.find_handler(host, path, c.req.method)
         span = c.span
         if type(span) is not NoOpSpan:
             span.start()
             span.attrs({"request.method": c.req.method, "request.path": path})
+            if c.match.pattern:
+                span.rename(c.match.pattern)
+                span.attr("http.route", route.path)
 
         task = self.create_task(handler(c, w), eager_start=True)
         try:

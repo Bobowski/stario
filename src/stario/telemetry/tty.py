@@ -1,8 +1,10 @@
 """TTY span tree for interactive development (stdlib + ANSI).
 
 Not a production log format. Finished roots scroll into history; open roots
-repaint in a live footer (`_LiveRegion` uses cursor-up + clear). Nothing else
-should write to the same output stream while the tracer is active.
+repaint in a live footer (`_LiveRegion` uses cursor-up + clear). The live
+block stays within the terminal height so erase cannot reach scrollback.
+Unchanged text and width skip terminal writes. Nothing else should write to
+the same output stream while the tracer is active.
 
 `TTYRenderer` is the pure span→string layer and the unit-test seam: no locks,
 threads, or I/O.
@@ -27,10 +29,18 @@ from .core import Attributes, Span, TelemetryStats
 from .spans import RecordedEvent, RecordedLink, RecordingSpan
 
 _REFRESH_INTERVAL_S = 0.125
+_LIVE_ROW_RESERVE = 2
 _TIME_COL = 14
-# Single-cell live placeholder so `splitlines()` still counts as one row.
-_IDLE_LIVE = " "
 _ELLIPSIS = "…"
+
+
+def _terminal_size() -> tuple[int, int]:
+    try:
+        size = shutil.get_terminal_size((80, 24))
+        # One-column margin so a full-width line does not wrap.
+        return max(1, size.columns - 1), max(1, size.lines)
+    except OSError:
+        return 79, 24
 
 
 def _styled(text: str, style: str) -> str:
@@ -52,6 +62,8 @@ def _ansi_sequence_end(text: str, index: int) -> int | None:
 
 
 def _cell_width(ch: str) -> int:
+    if ch.isascii():
+        return 1
     if combining(ch):
         return 0
     return 2 if east_asian_width(ch) in {"F", "W"} else 1
@@ -183,38 +195,36 @@ def _build_status_trailer(span: RecordingSpan, max_len: int) -> str:
 class _LiveRegion:
     """Bottom-of-terminal live block: erase previous lines, then caller prints history, then write."""
 
-    __slots__ = ("_lines", "_lock", "_out")
+    __slots__ = ("_lines", "_lock", "_out", "_text", "_width")
 
-    def __init__(self, out: Any, lock: threading.Lock) -> None:
+    def __init__(self, out: TextIO, lock: threading.Lock) -> None:
         self._out = out
         self._lock = lock
         self._lines = 0
+        self._text: str | None = None
+        self._width: int | None = None
 
-    def _erase_unlocked(self) -> None:
-        self._clear_written_lines()
-        self._out.flush()
-        self._lines = 0
+    def matches(self, content: str, width: int) -> bool:
+        return content == self._text and width == self._width
 
     def erase(self) -> None:
         """Move cursor up and clear the last live block (must be directly above current position)."""
         with self._lock:
-            self._erase_unlocked()
+            if self._lines:
+                self._out.write("\x1b[1A\x1b[2K\r" * self._lines)
+                self._out.flush()
+            self._lines = 0
+            self._text = None
+            self._width = None
 
-    def write(self, content: str) -> None:
+    def write(self, content: str, width: int) -> None:
         with self._lock:
             written = content if content.endswith("\n") else content + "\n"
             self._out.write(written)
             self._out.flush()
-            # `" ".splitlines()` is [] — still one screen row for the idle placeholder.
-            self._lines = max(1, len(written.splitlines())) if written else 1
-
-    def _clear_written_lines(self) -> None:
-        for _ in range(self._lines):
-            self._out.write("\x1b[1A\x1b[2K\r")
-
-    def stop(self) -> None:
-        with self._lock:
-            self._erase_unlocked()
+            self._lines = max(1, len(written.splitlines()))
+            self._text = content
+            self._width = width
 
 
 class TTYRenderer:
@@ -241,13 +251,38 @@ class TTYRenderer:
             + self.span_tree(span, parent_start_ns=None, indent_level=0)
         )
 
-    def live_text(self, open_roots: list[RecordingSpan]) -> str:
+    def live_text(self, open_roots: list[RecordingSpan], *, max_rows: int) -> str:
         if not open_roots:
-            return _IDLE_LIVE
+            return ""
+        n = len(open_roots)
         parts: list[str] = []
-        for span in open_roots:
-            parts.append(self.root_block(span))
+        leftover = max_rows
+        for i, span in enumerate(open_roots):
+            if leftover <= 0:
+                break
+            share = leftover if i == n - 1 else max(2, leftover // (n - i))
+            part = self._limit_live_rows(self.root_block(span), min(share, leftover))
+            parts.append(part)
+            leftover -= max(1, len(part.splitlines()))
         return "\n".join(parts)
+
+    def _limit_live_rows(self, text: str, max_rows: int) -> str:
+        # Header = separator + root span line. Drop the middle; keep the newest.
+        if max_rows <= 0:
+            return ""
+        lines = text.splitlines()
+        if len(lines) <= max_rows:
+            return text
+        header_n = min(2, len(lines))
+        if max_rows <= header_n:
+            return "\n".join(lines[:max_rows])
+        tail_n = max_rows - header_n - 1
+        omitted = len(lines) - header_n - tail_n
+        noun = "line" if omitted == 1 else "lines"
+        marker = self._fit_line(_styled(f"  … {omitted} {noun} omitted", "dim"))
+        if tail_n <= 0:
+            return "\n".join([*lines[:header_n], marker])
+        return "\n".join([*lines[:header_n], marker, *lines[-tail_n:]])
 
     def root_separator_line(self, span: RecordingSpan) -> str:
         style = _span_status_style(span)
@@ -399,9 +434,7 @@ class TTYRenderer:
         rel = f"+{_fmt_duration(event.time_ns - parent_start)}"
         cw = self._width
         name_w = max(1, cw - indent_level * 2 - _TIME_COL - 1 - 2)
-        ev_name = event.name
-        if len(ev_name) > name_w:
-            ev_name = ev_name[: max(0, name_w - 1)] + "…"
+        ev_name = _clip_visible(event.name, name_w)
         name_part = ev_name.ljust(name_w) if not event.attributes else ev_name
         style = "red" if is_exception else "white"
         line = (
@@ -413,29 +446,26 @@ class TTYRenderer:
         if event.attributes:
             line += "  "
             for i, (k, v) in enumerate(event.attributes.items()):
-                if i > 0:
+                if i:
                     line += " "
                 line += _styled(f"{k}: ", "dim") + _styled(str(v), "white")
         line = self._fit_line(line)
         if body is None:
             return line
 
+        src = body.rstrip("\n") if is_exception else body
         parts: list[str] = [line]
-        if is_exception:
-            for ln in body.rstrip("\n").splitlines():
-                parts.append(self._fit_line(cont + _styled(ln, "dim")))
-        else:
-            for ln in body.splitlines():
-                parts.append(self._fit_line(cont + _styled(ln, "dim")))
+        for ln in src.splitlines():
+            parts.append(self._fit_line(cont + _styled(ln, "dim")))
         return "\n".join(parts)
 
 
 class TTYTracer:
     """Live span tree on a TTY while `with tracer` is active.
 
-    A background thread repaints open roots on a timer so in-flight attributes
-    and events appear without hooking every mutation. `stats()` is always zero
-    (dev-only sink).
+    A background thread polls open roots on a timer so in-flight attributes
+    and events appear without hooking every mutation. Unchanged live text
+    skips terminal writes. `stats()` is always zero (dev-only sink).
     """
 
     __slots__ = (
@@ -445,7 +475,6 @@ class TTYTracer:
         "_lock",
         "_open_span_ids",
         "_out",
-        "_rendered_width",
         "_roots",
         "_running",
         "_thread",
@@ -463,13 +492,6 @@ class TTYTracer:
         self._running = False
         self._closed_blocks: list[str] = []
         self._live: _LiveRegion | None = None
-        self._rendered_width: int | None = None
-
-    def _terminal_width(self) -> int:
-        try:
-            return max(1, shutil.get_terminal_size((80, 24)).columns - 1)
-        except OSError:
-            return 79
 
     def __enter__(self) -> TTYTracer:
         self._start()
@@ -526,7 +548,7 @@ class TTYTracer:
         with self._lock:
             self._open_span_ids.discard(span.id)
             if span.parent_id is None:
-                width = self._terminal_width()
+                width, _ = _terminal_size()
                 self._closed_blocks.append(
                     TTYRenderer(width, self._children).root_block(span)
                 )
@@ -555,8 +577,7 @@ class TTYTracer:
 
     def flush(self) -> None:
         with self._lock:
-            width = self._terminal_width()
-            self._rendered_width = width
+            width, _ = _terminal_size()
             remaining = [span for span in self._roots.values() if span.started]
             renderer = TTYRenderer(width, self._children)
             # Roots that finished after the last repaint tick are still queued; drain them
@@ -572,18 +593,11 @@ class TTYTracer:
         self._print_blocks(blocks)
 
     def _should_render_locked(self) -> bool:
-        if self._closed_blocks:
-            return True
-        current_width = self._terminal_width()
-        if self._rendered_width is not None and current_width != self._rendered_width:
-            return True
-        if self._live is not None:
+        if self._closed_blocks or self._live is not None:
             return True
         return any(span.started and span.in_progress for span in self._roots.values())
 
     def _loop(self) -> None:
-        # Timer repaints open roots so live attributes/events appear without mutation hooks.
-        # Timer-driven so in-flight spans repaint even without new attribute mutations.
         while True:
             started_at = time.perf_counter()
             with self._lock:
@@ -600,43 +614,50 @@ class TTYTracer:
 
     def _render(self) -> None:
         with self._lock:
-            closed_blocks, live_text = self._render_plan_locked()
-        self._write_render_plan(closed_blocks, live_text)
+            closed_blocks, live_text, width = self._render_plan_locked()
+        self._write_render_plan(closed_blocks, live_text, width)
 
-    def _render_plan_locked(self) -> tuple[list[str], str | None]:
+    def _render_plan_locked(self) -> tuple[list[str], str | None, int]:
         open_roots = [
             span for span in self._roots.values() if span.started and span.in_progress
         ]
-        width = self._terminal_width()
-        self._rendered_width = width
+        width, rows = _terminal_size()
         renderer = TTYRenderer(width, self._children)
 
         closed_blocks = self._closed_blocks
         self._closed_blocks = []
         live_text = (
-            renderer.live_text(open_roots)
-            if open_roots or closed_blocks or self._live is not None
+            renderer.live_text(open_roots, max_rows=max(1, rows - _LIVE_ROW_RESERVE))
+            if open_roots
             else None
         )
-        return closed_blocks, live_text
+        return closed_blocks, live_text, width
 
     def _write_render_plan(
-        self, closed_blocks: list[str], live_text: str | None
+        self, closed_blocks: list[str], live_text: str | None, width: int
     ) -> None:
         # Cursor must sit immediately after the previous live block when we erase.
         # So: erase live → print finished roots into scrollback → redraw live at the bottom.
+        if (
+            not closed_blocks
+            and live_text is not None
+            and self._live is not None
+            and self._live.matches(live_text, width)
+        ):
+            return
         if self._live is not None:
             self._live.erase()
         self._print_blocks(closed_blocks)
         if live_text is None:
+            self._live = None
             return
         if self._live is None:
             self._live = _LiveRegion(self._out, self._write_lock)
-        self._live.write(live_text)
+        self._live.write(live_text, width)
 
     def _stop_live(self) -> None:
         if self._live is not None:
-            self._live.stop()
+            self._live.erase()
             self._live = None
 
     def _print_blocks(self, blocks: list[str]) -> None:

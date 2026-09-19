@@ -1,8 +1,9 @@
 # Hello world
 
-Minimal counter with Datastar signals — the smallest runnable Stario example.
+One route, one handler, one HTML page — the smallest runnable Stario app.
 
-For the full realtime pattern (SSE, Relay, multiplayer), start with [tiles](../tiles/) instead.
+This example is Stario only. It does not load Datastar. For the live board
+(SSE, Relay, multiplayer), start with [tiles](../tiles/).
 
 ## Run
 

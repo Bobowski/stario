@@ -61,15 +61,14 @@ def tracer_from_env() -> Tracer:
 
 def _custom_tracer_from_spec(spec: str) -> Tracer:
     """Load a custom tracer from `module` (`make_tracer`) or `module:callable`."""
-    if ":" in spec:
-        factory_spec = spec
-    else:
-        factory_spec = f"{spec}:{_CUSTOM_TRACER_FACTORY}"
+    factory_spec = spec if ":" in spec else f"{spec}:{_CUSTOM_TRACER_FACTORY}"
 
     try:
         loaded = load_symbol(factory_spec, label="telemetry output")
     except CliError as exc:
-        if ":" not in spec and f"has no attribute '{_CUSTOM_TRACER_FACTORY}'" in str(exc):
+        if ":" not in spec and f"has no attribute '{_CUSTOM_TRACER_FACTORY}'" in str(
+            exc
+        ):
             raise CliError(
                 f"Telemetry output '{spec}' has no {_CUSTOM_TRACER_FACTORY}(). "
                 f"Add def {_CUSTOM_TRACER_FACTORY}() -> Tracer, "

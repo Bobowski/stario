@@ -5,20 +5,15 @@ Span attributes are encoded with `dumps_json` (`default=str` for unknown
 types); event bodies are stricter — see `serialize_event_body`.
 """
 
-import json
 from functools import lru_cache
 from pathlib import Path
 from traceback import StackSummary, format_exception_only, format_list
 from types import TracebackType
 from typing import Any
 
-from .core import EventBody
+from stario.json import dumps as json_dumps
 
-_JSON_ENCODER = json.JSONEncoder(
-    default=str,
-    separators=(",", ":"),
-    ensure_ascii=False,
-)
+from .core import EventBody
 
 
 @lru_cache(maxsize=1)
@@ -75,7 +70,7 @@ def format_exception_for_telemetry(exc: BaseException) -> str:
 
 def dumps_json(value: Any) -> str:
     """Compact JSON for span export; unknown value types become strings."""
-    return _JSON_ENCODER.encode(value)
+    return json_dumps(value, default=str)
 
 
 def serialize_event_body(body: EventBody) -> str | None:

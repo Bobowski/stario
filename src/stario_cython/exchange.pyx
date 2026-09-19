@@ -48,7 +48,7 @@ from stario.http.compression import (
     DEFAULT_MIN_SIZE,
     content_type_is_compressible,
 )
-from stario.http.context import EMPTY_ROUTE_MATCH, _Alive
+from stario.http.context import EMPTY_MATCH, _Alive
 from stario.http.invoke import on_handler_done
 
 from stario_cython.compression_buf cimport (
@@ -2477,7 +2477,7 @@ cdef class RequestExchange:
         self._max_size = max_body_size
         self._timeout = body_timeout
         self.span = None
-        self.route = EMPTY_ROUTE_MATCH
+        self.match = EMPTY_MATCH
         self._state = None
         self._clear_request_headers()
         self.handler_done = False
@@ -2628,7 +2628,7 @@ cdef class RequestExchange:
         self._clear_request_headers()
         self.req.reset("GET", "/", b"", "1.1", True, None, None)
         self.span = None
-        self.route = EMPTY_ROUTE_MATCH
+        self.match = EMPTY_MATCH
         self._state = None
         self.app = None
         self._connection = None
@@ -2821,7 +2821,7 @@ cdef class RequestExchange:
             self._transport.close()
         self._done()
 
-    def write_headers(self, int status_code):
+    def write_headers(self, int status_code, bint body=True):
         cdef Headers headers = self.headers
         cdef object raw_length
         cdef object parsed_length
@@ -2837,6 +2837,8 @@ cdef class RequestExchange:
                     "then write()/end()."
                 ),
             )
+        if not body:
+            self._head_request = True
         if not _may_have_body(status_code):
             headers.c_remove(b"transfer-encoding")
             headers.c_set(b"content-length", b"0")

@@ -1,6 +1,6 @@
 """Tests for URL path normalization and query/fragment helpers."""
 
-from stario.routing.locations import append_query_fragment, normalize_path
+from stario.http.route import append_query_fragment, normalize_path
 
 
 class TestNormalizePath:
@@ -41,11 +41,14 @@ class TestAppendQueryFragment:
         )
 
     def test_appends_query_and_fragment(self):
-        assert append_query_fragment(
-            "/docs",
-            query={"q": "routes"},
-            fragment="section/one?tab=api",
-        ) == "/docs?q=routes#section/one?tab=api"
+        assert (
+            append_query_fragment(
+                "/docs",
+                query={"q": "routes"},
+                fragment="section/one?tab=api",
+            )
+            == "/docs?q=routes#section/one?tab=api"
+        )
 
     def test_empty_fragment(self):
         assert append_query_fragment("/docs", fragment="") == "/docs#"

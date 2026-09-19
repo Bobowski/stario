@@ -5,11 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from stario import App, UrlPath
+from stario import App
 from stario.exceptions import StarioError
 from stario.http.compression import CompressionConfig
 from stario.staticassets import AssetManifest, StaticAssets, fingerprint
 from stario.testing import TestClient
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:stario.staticassets is obsolete:DeprecationWarning"
+)
 
 
 class TestFingerprint:
@@ -146,7 +150,7 @@ class TestAssetManifest:
     def test_rejects_url_prefix_without_leading_slash(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
-            pytest.raises(StarioError, match="path must start with '/'"),
+            pytest.raises(StarioError, match="must start with '/'"),
         ):
             AssetManifest(tmpdir, url_prefix="static")
 
@@ -173,7 +177,7 @@ class TestAssetManifest:
 
             manifest = AssetManifest(
                 tmpdir,
-                url_prefix=UrlPath("/static", host="cdn.example.com"),
+                url_prefix="//cdn.example.com/static",
             )
 
             url = manifest.href("style.css")
@@ -246,9 +250,7 @@ class TestStaticAssetsCaching:
     def test_host_prefixed_manifest_cannot_be_served_locally(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "style.css").write_text("body {}")
-            manifest = AssetManifest(
-                tmpdir, url_prefix=UrlPath("/static", host="cdn.example.com")
-            )
+            manifest = AssetManifest(tmpdir, url_prefix="//cdn.example.com/static")
 
             with pytest.raises(StarioError, match="app-relative manifests"):
                 StaticAssets(manifest)

@@ -102,7 +102,7 @@ def prepare_request(
         raise ValueError("Use `files` with optional form `data`, not raw `content`.")
 
     parsed = urlsplit(urljoin(base_url + "/", url.lstrip("/")))
-    path = parsed.path or "/"
+    path = decode_path((parsed.path or "/").encode("ascii"))
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
     if params is not None:
         query_items.extend(expand_pairs(params))

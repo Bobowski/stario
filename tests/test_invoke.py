@@ -7,6 +7,7 @@ import stario.responses as responses
 from stario.http.app import App
 from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
+from stario.http.route import Route
 from stario.http.writer import Writer
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
@@ -39,11 +40,11 @@ def test_find_handler_is_the_resolve_step() -> None:
         async def hello(_c: Context, w: Writer) -> None:
             responses.text(w, "ok")
 
-        app.get("/hello", hello)
+        app.add(Route("GET /hello"), hello)
         ctx = make_context("/hello", app=app, loop=asyncio.get_running_loop())
-        handler, ctx.route = app.find_handler("", "/hello", "GET")
+        handler, _route, ctx.match = app.find_handler("", "/hello", "GET")
         assert handler is hello
-        assert ctx.route.pattern == "/hello"
+        assert ctx.match.pattern == "GET /hello"
 
     asyncio.run(run())
 

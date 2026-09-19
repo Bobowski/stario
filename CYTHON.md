@@ -1,26 +1,22 @@
-# Cython protocol (cython-core)
+# Cython HTTP protocol
 
-This worktree is `projects/stario` on branch `cython-core`. uvloop owns the
-socket. HTTP/1 is [llhttp](https://github.com/nodejs/llhttp);
-HTTP/2 is nghttp2. Both live in one `HttpProtocol` and share
-`RequestExchange`. The protocol lives in `src/stario_cython`.
-
-`projects/stario` stays on `main` and stays a workspace member. Do not
-`uv sync` this folder from the monorepo root. Use an isolated venv:
-
-```bash
-cd projects/stario-cython
-# macOS
-brew install pkg-config brotli
-uv venv --python 3.14
-uv pip install --python .venv/bin/python -e ".[uvloop]" cython setuptools wheel pytest pytest-asyncio
-.venv/bin/python setup.py
-PYTHONPATH=src:. .venv/bin/python -m stario_cython examples.cython.hello:bootstrap
-```
+HTTP/1 is [llhttp](https://github.com/nodejs/llhttp); HTTP/2 is nghttp2.
+Both live in one `HttpProtocol` and share `RequestExchange` in
+`src/stario_cython`. `stario serve` uses this protocol. uvloop is optional
+(`STARIO_LOOP=uvloop`).
 
 Linux builds need `pkg-config`, the Brotli development package, and
 `libnghttp2-dev`. Gzip links system zlib (`-lz`). The native protocol
-offers `br` and `gzip` only. Python Stario still negotiates zstd.
+offers `br` and `gzip` only; Python response helpers still negotiate zstd
+for non-native writers.
+
+```bash
+uv venv --python 3.14
+uv pip install --python .venv/bin/python -e ".[uvloop]" cython setuptools wheel pytest pytest-asyncio
+.venv/bin/python setup.py
+PYTHONPATH=src:. .venv/bin/python -m stario.cli serve examples.cython.hello:bootstrap
+# or: PYTHONPATH=src:. .venv/bin/python -m stario_cython examples.cython.hello:bootstrap
+```
 
 Direct TLS: `STARIO_SSL_CERTFILE` / `STARIO_SSL_KEYFILE` (or
 `ServerConfig(ssl=…)`). ALPN advertises `h2` then `http/1.1`.

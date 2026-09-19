@@ -45,6 +45,8 @@ def test_merge_vary_appends_and_skips_duplicates() -> None:
 
 def test_content_type_is_compressible_skips_images() -> None:
     assert content_type_is_compressible(b"image/png") is False
+    assert content_type_is_compressible(b"image/svg+xml") is True
+    assert content_type_is_compressible(b"image/svg+xml; charset=utf-8") is True
     assert content_type_is_compressible(b"text/html; charset=utf-8") is True
     assert content_type_is_compressible(b"") is False
     assert content_type_is_compressible(b"; charset=utf-8") is False

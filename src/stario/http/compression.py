@@ -134,6 +134,8 @@ def content_type_is_compressible(content_type: bytes) -> bool:
 
     if media_type in _NONCOMPRESSIBLE_CONTENT_TYPES:
         return False
+    if media_type == b"image/svg+xml":
+        return True
 
     return not media_type.startswith(_NONCOMPRESSIBLE_CONTENT_TYPE_PREFIXES)
 

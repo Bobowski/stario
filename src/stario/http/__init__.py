@@ -1,8 +1,8 @@
 """HTTP stack for Stario apps and servers.
 
-**Dispatch** — `Router` in `stario.http.dispatch` matches requests to handlers.
-`App` subclasses it and tracks tasks. The protocol runs `find_handler` then
-the matched handler as a task.
+**Address and table** — `Route`, `Match`, and `Router`. `App` subclasses
+`Router` and tracks tasks. The protocol runs `find_handler` then the
+matched handler as a task.
 
 **Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
 
@@ -16,14 +16,12 @@ from stario.http.redirect import normalized_location
 from stario.http.server import Server
 ```
 
-Route patterns and link building live in `stario.routing`, not here.
-Static file serving lives in `stario.staticassets`.
-
-For tests, `aload_app` is re-exported from `stario.testing`.
+Filesystem serving lives in `stario.filesystem` (`Files`).
+For tests, import `aload_app` from `stario.testing`.
 """
 
 from stario.http.app import App
-from stario.http.context import Context, Handler, Middleware, RouteMatch
+from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
 from stario.http.headers import Headers
 from stario.http.middleware import (
@@ -34,6 +32,7 @@ from stario.http.middleware import (
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
 from stario.http.request import ParsedCookies, Request
+from stario.http.route import Route, UrlPath
 from stario.http.writer import Writer
 
 __all__ = [
@@ -41,12 +40,14 @@ __all__ = [
     "Context",
     "Handler",
     "Headers",
+    "Match",
     "Middleware",
     "ParsedCookies",
     "ParsedQuery",
     "Request",
-    "RouteMatch",
+    "Route",
     "Router",
+    "UrlPath",
     "Writer",
     "catch_errors",
     "catch_request_body_errors",

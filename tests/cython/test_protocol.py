@@ -7,7 +7,7 @@ import stario.responses as responses
 from stario import App
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
-from stario.routing import UrlPath
+from stario.http.route import UrlPath
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
 from tests.cython.http import free_port, read_response

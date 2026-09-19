@@ -154,7 +154,7 @@ cdef class RequestExchange:
 
     cdef public object app
     cdef public object span
-    cdef public object route
+    cdef public object match
     cdef object _connection
     cdef object _state
     cdef public object request_headers

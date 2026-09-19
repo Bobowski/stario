@@ -1,5 +1,5 @@
 import stario.responses as responses
-from stario import App, Span
+from stario import App, Route, Span
 
 
 async def plaintext(_c, w):
@@ -7,5 +7,5 @@ async def plaintext(_c, w):
 
 
 async def bootstrap(app: App, span: Span):
-    app.get("/plaintext", plaintext)
+    app.add(Route("GET /plaintext"), plaintext)
     yield

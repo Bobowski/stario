@@ -49,8 +49,12 @@ class Writer(Protocol):
         """Close without framing a failed started response as complete."""
         ...
 
-    def write_headers(self, status_code: int) -> Self:
-        """Send the status line and current ``headers`` (at most once)."""
+    def write_headers(self, status_code: int, *, body: bool = True) -> Self:
+        """Send the status line and current ``headers`` (at most once).
+
+        ``body=False`` is for HEAD (and equivalent): keep ``Content-Length`` as
+        the entity size without requiring those bytes before ``end()``.
+        """
         ...
 
     def write(self, data: bytes) -> Self:

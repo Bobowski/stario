@@ -9,7 +9,7 @@ Run with: uv run stario watch main:bootstrap
 
 Read top to bottom:
 
-  1. URLs and assets — UrlPath routes, fingerprinted static files
+  1. URLs and assets — Route endpoints, fingerprinted static files
   2. State           — Game (board + presence); built in bootstrap
   3. Views           — pure HTML from Game
   4. Handlers        — queries (GET) and commands (POST)
@@ -33,12 +33,11 @@ from pathlib import Path
 import stario.responses as responses
 from stario import (
     App,
-    AssetManifest,
+    Assets,
     Context,
     Relay,
+    Route,
     Span,
-    StaticAssets,
-    UrlPath,
     Writer,
 )
 from stario.datastar import SSE, at, data, read_signals
@@ -61,17 +60,16 @@ from stario.markup import html as h
 # =============================================================================
 
 
-# Cheap at import time: scan + fingerprint only. Serving (compression, caching)
-# is paid in bootstrap when StaticAssets wraps the manifest.
-ASSETS = AssetManifest(Path(__file__).parent / "static")
+# href() is cheap. attach(app) in bootstrap registers routes and loads files.
+ASSETS = Assets(Path(__file__).parent / "static", "/static")
 # Fingerprinted once at import — links stay stable across deploys that hash files.
 STYLE_CSS = ASSETS.href("css/style.css")
 DATASTAR_JS = ASSETS.href("js/datastar.js")
 
-# One constant per route — used in app.get/post and in views that build URLs.
-HOME = UrlPath("/")
-SUBSCRIBE = UrlPath("/subscribe")
-CLICK = UrlPath("/click")
+# One Route per endpoint — register with app.add, link with href() or at.get / at.post.
+HOME = Route("GET", "/")
+SUBSCRIBE = Route("GET", "/subscribe")
+CLICK = Route("POST", "/click")
 
 # =============================================================================
 # 2. State
@@ -404,13 +402,11 @@ async def bootstrap(app: App, span: Span):
 
     # Compression + caching cost is paid here; stats land on the startup trace.
     with span.step("static_assets") as s:
-        static = StaticAssets(ASSETS)
-        s.attrs(static.stats)
-    static.register(app)
+        s.attrs(await ASSETS.attach(app))
 
     # Queries — return or stream HTML
-    app.get(HOME, home(game))
-    app.get(SUBSCRIBE, subscribe(game, relay))
+    app.add(HOME, home(game))
+    app.add(SUBSCRIBE, subscribe(game, relay))
     # Commands — mutate Game, nudge relay; updates arrive on SSE
-    app.post(CLICK, click(game, relay))
+    app.add(CLICK, click(game, relay))
     yield

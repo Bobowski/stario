@@ -1,7 +1,7 @@
 """Request-scoped handler bundle: Protocol plus route match and ``alive()``.
 
 Production ``c`` is the Cython ``RequestExchange``. TestClient supplies its own
-context. ``RouteMatch`` and ``_Alive`` stay as small Python helpers.
+context. ``Match`` and ``_Alive`` stay as small Python helpers.
 """
 
 from __future__ import annotations
@@ -15,23 +15,50 @@ from typing import TYPE_CHECKING, Any, Protocol, overload
 
 from stario.telemetry.core import Span
 
+_NO_PARAMS: MappingProxyType[str, str] = MappingProxyType({})
+
+
+class Match:
+    """Immutable hit: pattern plus this request's captures."""
+
+    __slots__ = ("params", "pattern")
+
+    def __init__(
+        self,
+        pattern: str,
+        params: Mapping[str, str] = _NO_PARAMS,
+    ) -> None:
+        object.__setattr__(self, "pattern", pattern)
+        if not params:
+            frozen: Mapping[str, str] = _NO_PARAMS
+        elif isinstance(params, MappingProxyType):
+            frozen = params
+        else:
+            frozen = MappingProxyType(params)
+        object.__setattr__(self, "params", frozen)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Match is immutable")
+
+    def __repr__(self) -> str:
+        if not self.pattern:
+            return "Match.empty"
+        return f"Match({self.pattern!r})"
+
+    @classmethod
+    def empty(cls) -> Match:
+        """Unmatched 404 / 405 sentinel."""
+        return EMPTY_MATCH
+
+
+EMPTY_MATCH = Match.__new__(Match)
+object.__setattr__(EMPTY_MATCH, "pattern", "")
+object.__setattr__(EMPTY_MATCH, "params", _NO_PARAMS)
+
 if TYPE_CHECKING:
     from stario.http.app import App
     from stario.http.request import Request
     from stario.http.writer import Writer
-
-
-@dataclass(slots=True, frozen=True)
-class RouteMatch:
-    """Result of routing: a canonical pattern string plus captured path/host segments."""
-
-    pattern: str
-    """Matched route template (useful for logs), including host part when present."""
-    params: Mapping[str, str]
-    """Map from `{param}` / `{rest...}` names to decoded segment text."""
-
-
-EMPTY_ROUTE_MATCH = RouteMatch(pattern="", params=MappingProxyType({}))
 
 
 class Context(Protocol):
@@ -41,7 +68,7 @@ class Context(Protocol):
     req: Request
     span: Span
     state: dict[str, Any]
-    route: RouteMatch
+    match: Match
 
     @property
     def disconnect(self) -> asyncio.Future[None]:

@@ -20,11 +20,11 @@ BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
 TARGETS=(
   stario stario-cython
   socketify robyn granian-rsgi sanic django-bolt
-  blacksheep-granian blacksheep-uvicorn fastapi
+  blacksheep-granian blacksheep-uvicorn fastapi falcon
 )
 TARGET_LABELS=(
-  "stario|Stario (Python httptools)"
-  "stario-cython|Stario (Cython llhttp/nghttp2)"
+  "stario|Stario (Cython, CLI)"
+  "stario-cython|Stario (Cython, native entry)"
   "socketify|Socketify (uWebSockets/libuv)"
   "robyn|Robyn (Rust/Actix)"
   "granian-rsgi|Granian RSGI (Rust, no framework)"
@@ -33,11 +33,12 @@ TARGET_LABELS=(
   "blacksheep-granian|BlackSheep + Granian ASGI"
   "blacksheep-uvicorn|BlackSheep + Uvicorn ASGI"
   "fastapi|FastAPI + Uvicorn ASGI"
+  "falcon|Falcon ASGI + Uvicorn"
 )
 SUMMARY_GROUPS=(
   "Stario (this checkout)|stario stario-cython"
   "Native HTTP servers|socketify robyn granian-rsgi sanic django-bolt"
-  "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi"
+  "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi falcon"
 )
 READ_ENDPOINTS=(plaintext json params)
 UPLOAD_ENDPOINTS=(validate post-form post-json-1k post-octet-64k post-octet-2m post-stream-2m multipart-2m)
@@ -75,7 +76,7 @@ Usage: benchmarks/server/run.sh [target ...]
 Targets (default: all):
   Stario:              stario, stario-cython
   Native HTTP servers: socketify, robyn, granian-rsgi, sanic, django-bolt
-  ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi
+  ASGI stacks:         blacksheep-granian, blacksheep-uvicorn, fastapi, falcon
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 UPLOAD_CONNECTIONS=32
              RUNS=7 WARMUP=2 HOST=127.0.0.1 PORT=3000 PYTHON=3.14
@@ -297,7 +298,10 @@ target_label() {
 
 ensure_target() {
   case "$1" in
-    stario) ensure_env stario "stario @ file://$ROOT" uvloop ujson ;;
+    stario)
+      ensure_env stario "stario @ file://$ROOT" uvloop ujson cython setuptools wheel
+      build_stario_cython "$(python_for stario)"
+      ;;
     stario-cython)
       ensure_env stario-cython "stario @ file://$ROOT" uvloop ujson cython setuptools wheel
       build_stario_cython "$(python_for stario-cython)"
@@ -310,6 +314,7 @@ ensure_target() {
     fastapi) ensure_env fastapi fastapi 'uvicorn[standard]' ujson ;;
     blacksheep-uvicorn) ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson ;;
     blacksheep-granian) ensure_env blacksheep-granian blacksheep granian uvloop ujson ;;
+    falcon) ensure_env falcon falcon 'uvicorn[standard]' ujson ;;
   esac
 }
 
@@ -405,6 +410,9 @@ command_for() {
         "$(python_for django-bolt)" "$BENCHMARK_DIR/apps/django_bolt/manage.py"
         runbolt --host "$HOST" --port "$SERVER_PORT" --processes 1
       )
+      ;;
+    falcon)
+      uvicorn_cmd falcon apps.falcon_app:app
       ;;
   esac
 }

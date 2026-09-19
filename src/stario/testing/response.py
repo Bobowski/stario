@@ -1,7 +1,6 @@
 """Buffered and streaming HTTP test responses."""
 
 import asyncio
-import json as json_module
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -9,6 +8,7 @@ from typing import Any, Self
 from uuid import UUID
 
 from stario.http.headers import Headers
+from stario.json import loads as json_loads
 from stario.testing.models import ClientRequest
 from stario.testing.transport import GrowingSink, wait_sink
 
@@ -49,7 +49,7 @@ class TestResponse:
         return self.content.decode(charset, errors="replace")
 
     def json(self) -> Any:
-        return json_module.loads(self.content)
+        return json_loads(self.content)
 
     @property
     def ok(self) -> bool:

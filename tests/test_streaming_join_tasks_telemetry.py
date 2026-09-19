@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 import stario.responses as responses
-from stario import App
+from stario import App, Route
 from stario.testing import TestClient
 
 
@@ -38,7 +38,7 @@ async def test_empty_response_then_background_child_span_finished_on_client_exit
         c.app.create_task(bg())
         responses.empty(w, 204)
 
-    app.post("/action", handler)
+    app.add(Route("POST", "/action"), handler)
 
     async with TestClient(app) as client:
         r = await client.post("/action")
@@ -75,7 +75,7 @@ async def test_stream_exit_signals_disconnect_and_finishes_handler() -> None:
             sent += 1
             await asyncio.sleep(0)
 
-    app.get("/live", handler)
+    app.add(Route("GET", "/live"), handler)
 
     async with TestClient(app) as client:
         async with client.stream(

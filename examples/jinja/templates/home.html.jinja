@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <script type="module" src="{{ datastar_url }}"></script>
+  </head>
+  <body style="font-family: system-ui; padding: 2rem; max-width: 36rem; margin: 0 auto;">
+    <main data-signals:details="false"
+          data-init='@get({{ subscribe_url | tojson }}, {retry: "always"})'>
+      <h1>{{ title }}</h1>
+      <p>Open this page in two tabs. Every click updates both counters.</p>
+
+      {% include "counter.html.jinja" %}
+
+      <p>
+        <button type="button" data-on:click='@post({{ increment_url | tojson }})'>Add one</button>
+        <button type="button" data-on:click='@post({{ reset_url | tojson }})'>Reset</button>
+      </p>
+
+      <label>
+        <input type="checkbox" data-bind:details>
+        Show how it works
+      </label>
+      <div data-show="$details" style="display: none;">
+        <p>Buttons send requests to Stario. Jinja renders the updated counter,
+          and Datastar patches it into every open tab over SSE.</p>
+        <p>This checkbox uses a local signal. Changing it only affects this tab.</p>
+      </div>
+      <noscript>Enable JavaScript to use the counter buttons and live updates.</noscript>
+    </main>
+  </body>
+</html>

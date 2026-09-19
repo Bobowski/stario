@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 
+from stario import Route
 from stario.datastar import (
     DATASTAR_CDN_URL,
     SSE,
@@ -24,8 +25,17 @@ from stario.markup import html as h
 from stario.markup import render
 from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
 from stario.markup.types import Attrs
-from stario.routing import Route
 from stario.testing.harness import TestWriter
+
+
+class _ClosedLoop:
+    def close(self) -> None:
+        return None
+
+
+def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
+    writer = TestWriter()
+    return writer, writer.sink.buf, _ClosedLoop()
 
 
 class _ClosedLoop:
@@ -40,6 +50,7 @@ def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
 
 def _sse_body(writer: TestWriter) -> bytes:
     return writer.body
+
 
 Div = h.Div
 
@@ -406,6 +417,18 @@ class TestDatastarAttributeMatrix:
             ),
             (data.signals({"count": 0}), {"data-signals": '{"count":0}'}),
             (data.bind("email"), {"data-bind": "email"}),
+            (
+                data.bind("is_checked", prop="checked"),
+                {"data-bind:is-checked__case.snake__prop.checked": True},
+            ),
+            (
+                data.bind("query", event="input.change"),
+                {"data-bind:query__case.snake__event.input.change": True},
+            ),
+            (
+                data.bind("is_checked", prop="checked", event="change"),
+                {"data-bind:is-checked__case.snake__prop.checked__event.change": True},
+            ),
             (data.show("$visible"), {"data-show": "$visible"}),
             (
                 data.on("submit", "go()", prevent=True, stop=True),
@@ -424,8 +447,17 @@ class TestDatastarAttributeMatrix:
                 {"data-on-intersect__half": "seen()"},
             ),
             (
+                data.on_intersect("seen()", view_transition=True),
+                {"data-on-intersect__viewtransition": "seen()"},
+            ),
+            (
                 data.persist(include=["draft", "settings"]),
                 {"data-persist": "{'include':'draft|settings'}"},
+            ),
+            (data.persist(session=True), {"data-persist__session": True}),
+            (
+                data.persist(storage_key="prefs", session=True),
+                {"data-persist:prefs__session": True},
             ),
             (
                 DatastarAttributes("data-star-").text("$title"),
@@ -570,27 +602,34 @@ class TestDatastarActions:
         assert action == "@setAll(null, {'include':'draft','exclude':'tmp.*'})"
 
     def test_fetch_uses_route_method_and_href(self):
-        subscribe = Route.get("/rooms/{room_id}/subscribe")
-        send = Route.post("/rooms/{room_id}/send")
-        remove = Route.delete("/rooms/{room_id}")
+        subscribe = Route("GET /rooms/7/subscribe")
+        send = Route("POST /rooms/7/send")
+        remove = Route("DELETE /rooms/7")
 
-        assert at.fetch(subscribe, {"room_id": "7"}, retry="always") == (
-            "@get('/rooms/7/subscribe', {retry: 'always'})"
-        )
-        assert at.fetch(send, {"room_id": "7"}) == "@post('/rooms/7/send')"
-        assert at.fetch(remove, {"room_id": "7"}) == "@delete('/rooms/7')"
-        assert (
-            at.fetch(send, {"room_id": "7"}, query={"src": "btn"}, fragment="latest")
-            == "@post('/rooms/7/send?src=btn#latest')"
-        )
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(subscribe, retry="always") == (
+                "@get('/rooms/7/subscribe', {retry: 'always'})"
+            )
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(send) == "@post('/rooms/7/send')"
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(remove) == "@delete('/rooms/7')"
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(
+                send, query={"src": "btn"}, fragment="latest"
+            ) == "@post('/rooms/7/send?src=btn#latest')"
 
-    def test_fetch_rejects_non_route_and_unknown_methods(self):
-        with pytest.raises(StarioError, match="takes a Route"):
-            at.fetch("/save")  # type: ignore[arg-type]
-        with pytest.raises(StarioError, match="no Datastar action"):
-            at.fetch(Route.head("/page"))
-        with pytest.raises(StarioError, match="no Datastar action"):
-            at.fetch(Route.query("/feed"))
+    def test_fetch_rejects_unknown_methods(self):
+        with (
+            pytest.warns(DeprecationWarning, match="at.get"),
+            pytest.raises(StarioError, match="no Datastar action"),
+        ):
+            at.fetch(Route("HEAD", "/page"))
+        with (
+            pytest.warns(DeprecationWarning, match="at.get"),
+            pytest.raises(StarioError, match="no Datastar action"),
+        ):
+            at.fetch(Route("QUERY", "/feed"))
 
 
 class TestDatastarScriptTag:

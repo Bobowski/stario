@@ -107,6 +107,10 @@ class TestRequestHost:
             req = Request(method="GET", path="/", headers=hdrs, body=b"")
             assert req.host == host_without_port(raw), raw
 
+    def test_host_is_lowercased_before_routing(self):
+        req = _make_request(headers={"Host": "API.Example.COM"})
+        assert req.host == "api.example.com"
+
 
 class TestRequestBody:
     async def test_no_body(self):

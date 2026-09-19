@@ -1629,6 +1629,7 @@ cdef class HttpProtocol:
         cdef object path
         cdef object handler
         cdef object route
+        cdef object match
         cdef object task
         cdef object span
         cdef object host
@@ -1668,8 +1669,11 @@ cdef class HttpProtocol:
             span.start()
             span.attrs({"request.method": method, "request.path": path})
         host = req.host if self.app.host_routing else ""
-        handler, route = self._find_handler(host, path, method)
-        exchange.route = route
+        handler, route, match = self._find_handler(host, path, method)
+        exchange.match = match
+        if span is not None and self.noop_span is None and match.pattern:
+            span.rename(match.pattern)
+            span.attr("http.route", route.path)
         task = self._create_task(
             handler(exchange, exchange),
             loop=self.loop,

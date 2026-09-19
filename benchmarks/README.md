@@ -106,8 +106,8 @@ server cannot be reused by accident.
 
 | Target | Server |
 | --- | --- |
-| `stario` | Python httptools protocol |
-| `stario-cython` | Cython llhttp protocol (`cython-core`) |
+| `stario` | Cython llhttp/nghttp2 via `stario serve` |
+| `stario-cython` | Same protocol via `python -m stario_cython` |
 
 **Native HTTP servers**
 
@@ -126,6 +126,7 @@ server cannot be reused by accident.
 | `blacksheep-granian` | BlackSheep + Granian ASGI |
 | `blacksheep-uvicorn` | BlackSheep + Uvicorn |
 | `fastapi` | FastAPI + Uvicorn + Pydantic |
+| `falcon` | Falcon ASGI + Uvicorn |
 
 ### Benchmark shape
 

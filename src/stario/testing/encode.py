@@ -1,6 +1,5 @@
 """Request body encoding and response parsing for TestClient."""
 
-import json as json_module
 import zlib
 from collections.abc import Mapping, Sequence
 from compression import zstd
@@ -12,6 +11,7 @@ from uuid import uuid7
 
 from stario.http.compression import brotli_decompress
 from stario.http.headers import Headers
+from stario.json import dumps_bytes as json_dumps_bytes
 from stario.testing.cookies import parse_set_cookie_headers
 from stario.testing.transport import decode_chunked, try_parse_http_head
 from stario.testing.types import FileData, FormData, QueryParamInput
@@ -102,9 +102,7 @@ def encode_request_body(
 ) -> tuple[bytes, str | None]:
     if json is not None:
         return (
-            json_module.dumps(json, separators=(",", ":"), ensure_ascii=False).encode(
-                "utf-8"
-            ),
+            json_dumps_bytes(json),
             "application/json; charset=utf-8",
         )
     if files is not None:

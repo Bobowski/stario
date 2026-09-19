@@ -10,7 +10,7 @@ from app.common.identity import VisitorIdentity, identity_for_page, resolve_iden
 from app.db import Database
 from app.features.room import data as room_data
 from app.features.room import subjects as room_subjects
-from app.features.room.urls import ROOM, ROOMS
+from app.features.room.urls import CREATE, DELETE, ROOM
 from stario import App, Context, Relay, Writer
 from stario.datastar import SSE
 
@@ -71,7 +71,9 @@ def subscribe(db: Database, relay: Relay[str]):
 
             async for subject, _ in c.alive(live):
                 c.span.event("relay", {"subject": subject})
-                if subject.startswith("lobby.") or any(subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES):
+                if subject.startswith("lobby.") or any(
+                    subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES
+                ):
                     patch_lobby(sse, db, identity)
 
     return handler
@@ -106,7 +108,7 @@ def delete_room(db: Database, relay: Relay[str]):
     """
 
     async def handler(c: Context, w: Writer) -> None:
-        room_id = c.route.params.get("room_id", "")
+        room_id = c.match.params.get("room_id", "")
         if room_data.delete_room(db, room_id):
             c.span.event("Room deleted", {"room_id": room_id})
             relay.publish(room_subjects.deleted(room_id), "deleted")
@@ -117,7 +119,7 @@ def delete_room(db: Database, relay: Relay[str]):
 
 
 def register_lobby(app: App, db: Database, relay: Relay[str]) -> None:
-    app.get(LOBBY, show_lobby(db))
-    app.get(SUBSCRIBE, subscribe(db, relay))
-    app.post(ROOMS, create_room(db, relay))
-    app.delete(ROOM, delete_room(db, relay))
+    app.add(LOBBY, show_lobby(db))
+    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(CREATE, create_room(db, relay))
+    app.add(DELETE, delete_room(db, relay))

@@ -4,7 +4,7 @@ import ujson
 
 import stario.responses as responses
 from apps.common import JSON_CONTENT_TYPE, validate_fields
-from stario import App, Span
+from stario import App, Route, Span
 
 HELLO = "Hello, World!"
 
@@ -22,7 +22,7 @@ async def json_endpoint(c, w):
 
 
 async def get_user(c, w):
-    user_id = c.route.params["user_id"]
+    user_id = c.match.params["user_id"]
     json_response(w, {"id": user_id, "name": f"User {user_id}"})
 
 
@@ -60,14 +60,14 @@ async def upload(c, w):
 
 
 async def bootstrap(app: App, span: Span) -> None:
-    app.get("/plaintext", plaintext)
-    app.get("/json", json_endpoint)
-    app.get("/user/{user_id}", get_user)
-    app.post("/validate", validate)
-    app.post("/form", post_form)
-    app.post("/echo/json", post_echo_json)
-    app.post("/ingest/64k", ingest_buffer)
-    app.post("/ingest/2m", ingest_buffer)
-    app.post("/ingest/stream/2m", ingest_stream)
-    app.post("/upload", upload)
+    app.add(Route("GET /plaintext"), plaintext)
+    app.add(Route("GET /json"), json_endpoint)
+    app.add(Route("GET /user/{user_id}"), get_user)
+    app.add(Route("POST /validate"), validate)
+    app.add(Route("POST /form"), post_form)
+    app.add(Route("POST /echo/json"), post_echo_json)
+    app.add(Route("POST /ingest/64k"), ingest_buffer)
+    app.add(Route("POST /ingest/2m"), ingest_buffer)
+    app.add(Route("POST /ingest/stream/2m"), ingest_stream)
+    app.add(Route("POST /upload"), upload)
     yield

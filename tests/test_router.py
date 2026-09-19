@@ -1,15 +1,12 @@
 """Tests for the trie-based HTTP router."""
 
-from functools import partial
-
 import pytest
 
 from stario.exceptions import StarioError
 from stario.http import Router, default_not_found, method_not_allowed_handler
-from stario.http.context import EMPTY_ROUTE_MATCH, Context, Handler
-from stario.http.dispatch import require_async_handler
+from stario.http.context import EMPTY_MATCH, Context, Handler, Match
+from stario.http.route import EMPTY_ROUTE, Route
 from stario.http.writer import Writer
-from stario.routing import Route, UrlPath
 from tests.helpers import DummyWriter, run_handler, run_with_app
 
 
@@ -17,28 +14,69 @@ async def noop_handler(c: Context, w: Writer) -> None:
     return None
 
 
-def sync_noop(c: Context, w: Writer) -> None:
-    return None
-
-
 class TestFindHandler:
+    def test_static_find_reuses_the_same_match(self):
+        router = Router()
+        home = Route("GET /health")
+        router.add(home, noop_handler)
+
+        _, _, first = router.find_handler("", "/health", "GET")
+        _, _, second = router.find_handler("", "/health", "GET")
+
+        assert first is second
+        assert first.pattern == "GET /health"
+        assert dict(first.params) == {}
+        with pytest.raises(AttributeError, match="immutable"):
+            first.pattern = "GET /other"
+
     def test_matches_path_params(self):
         router = Router()
-        router.get("/users/{user_id}/posts/{post_id}", noop_handler)
+        router.add(Route("GET", "/users/{user_id}/posts/{post_id}"), noop_handler)
 
-        _, match = router.find_handler("", "/users/42/posts/7", "GET")
+        _, route, hit = router.find_handler("", "/users/42/posts/7", "GET")
 
-        assert match.pattern == "/users/{user_id}/posts/{post_id}"
-        assert dict(match.params) == {"user_id": "42", "post_id": "7"}
+        assert route.target == "/users/{user_id}/posts/{post_id}"
+        assert dict(hit.params) == {"user_id": "42", "post_id": "7"}
+        assert hit.pattern == "GET /users/{user_id}/posts/{post_id}"
+        with pytest.raises(TypeError):
+            hit.params["user_id"] = "9"  # type: ignore[index]
+
+    def test_escaped_braces_register_and_match(self):
+        router = Router()
+        curly = Route("GET /curly/{{id}}")
+        router.add(curly, noop_handler)
+
+        _, route, hit = router.find_handler("", "/curly/{id}", "GET")
+
+        assert route is curly
+        assert hit.pattern == "GET /curly/{id}"
+        assert curly.href() == "/curly/{id}"
+
+    def test_radix_exact_chain_and_split(self):
+        router = Router()
+        deep = Route("GET /a/b/c/d/e")
+        other = Route("GET /a/b/c/d/f")
+        prefix = Route("GET /a/b")
+        router.add(deep, noop_handler)
+        router.add(other, noop_handler)
+        router.add(prefix, noop_handler)
+
+        _, route_e, _ = router.find_handler("", "/a/b/c/d/e", "GET")
+        _, route_f, _ = router.find_handler("", "/a/b/c/d/f", "GET")
+        _, route_b, _ = router.find_handler("", "/a/b", "GET")
+
+        assert route_e is deep
+        assert route_f is other
+        assert route_b is prefix
 
     def test_matches_catchall_params(self):
         router = Router()
-        router.get("/files/{path...}", noop_handler)
+        router.add(Route("GET", "/files/{path...}"), noop_handler)
 
-        _, match = router.find_handler("", "/files/docs/readme.txt", "GET")
+        _, route, hit = router.find_handler("", "/files/docs/readme.txt", "GET")
 
-        assert match.pattern == "/files/{path...}"
-        assert dict(match.params) == {"path": "docs/readme.txt"}
+        assert route.target == "/files/{path...}"
+        assert dict(hit.params) == {"path": "docs/readme.txt"}
 
     def test_rejects_non_terminal_catchall(self):
         router = Router()
@@ -46,15 +84,15 @@ class TestFindHandler:
         with pytest.raises(
             StarioError, match="Catchall path param in invalid position"
         ):
-            router.get("/files/{path...}/edit", noop_handler)
+            router.add(Route("GET", "/files/{path...}/edit"), noop_handler)
 
     def test_method_not_allowed_allowed_methods_sorted_in_allow_header(self):
         router = Router()
-        router.get("/r", noop_handler)
-        router.post("/r", noop_handler)
-        router.patch("/r", noop_handler)
+        router.add(Route("GET", "/r"), noop_handler)
+        router.add(Route("POST", "/r"), noop_handler)
+        router.add(Route("PATCH", "/r"), noop_handler)
 
-        handler, _ = router.find_handler("", "/r", "DELETE")
+        handler, _, _ = router.find_handler("", "/r", "DELETE")
 
         w = DummyWriter()
         run_handler(handler, "/r", method="DELETE", writer=w)
@@ -62,85 +100,154 @@ class TestFindHandler:
 
     def test_literal_http_verb_segment_is_not_false_405(self):
         router = Router()
-        router.get("/foo/POST", noop_handler)
+        router.add(Route("GET", "/foo/POST"), noop_handler)
 
-        handler, match = router.find_handler("", "/foo", "GET")
+        handler, route, hit = router.find_handler("", "/foo", "GET")
 
         assert handler is default_not_found
-        assert match is EMPTY_ROUTE_MATCH
+        assert route is EMPTY_ROUTE
+        assert hit is EMPTY_MATCH
+        assert hit is Match.empty()
+        assert hit.pattern == ""
 
     def test_matches_host_pattern_case_insensitively(self):
         router = Router()
-        router.get(UrlPath("/users", host="API.Example.Com"), noop_handler)
+        router.add(Route("GET //API.Example.Com/users"), noop_handler)
 
-        _, match = router.find_handler("api.example.com", "/users", "GET")
+        _, route, hit = router.find_handler("api.example.com", "/users", "GET")
 
-        assert match.pattern == "api.example.com/users"
+        assert route.target == "//api.example.com/users"
+        assert hit.pattern == "GET //api.example.com/users"
+
+    def test_matches_host_wildcard_and_catchall(self):
+        router = Router()
+        dash = Route("GET /dashboard", host="{tenant}.example.com")
+        files = Route("GET /files/{path...}", host="{tenant...}.cdn.example.com")
+        router.add(dash, noop_handler)
+        router.add(files, noop_handler)
+
+        _, route, hit = router.find_handler("acme.example.com", "/dashboard", "GET")
+        _, nested, nested_hit = router.find_handler(
+            "eu.acme.cdn.example.com", "/files/docs/a.txt", "GET"
+        )
+
+        assert route is dash
+        assert dict(hit.params) == {"tenant": "acme"}
+        assert nested is files
+        assert dict(nested_hit.params) == {
+            "tenant": "eu.acme",
+            "path": "docs/a.txt",
+        }
+
+    def test_escaped_host_braces_register_and_match(self):
+        router = Router()
+        curly = Route("GET /", host="{{API}}.example.com")
+        router.add(curly, noop_handler)
+
+        _, route, hit = router.find_handler("{api}.example.com", "/", "GET")
+
+        assert route is curly
+        assert hit.pattern == "GET //{api}.example.com/"
+        assert curly.href() == "//{api}.example.com/"
 
     def test_hostless_routes_fallback_when_no_host_branch_matches(self):
         router = Router()
-        router.get("/health", noop_handler)
-        router.get(UrlPath("/users", host="api.example.com"), noop_handler)
+        router.add(Route("GET", "/health"), noop_handler)
+        router.add(Route("GET //api.example.com/users"), noop_handler)
 
-        _, match = router.find_handler("www.example.org", "/health", "GET")
+        _, route, _ = router.find_handler("www.example.org", "/health", "GET")
 
-        assert match.pattern == "/health"
+        assert route.target == "/health"
 
     def test_rejects_duplicate_route_registration(self):
         router = Router()
-        router.get("/hello", noop_handler)
+        router.add(Route("GET", "/hello"), noop_handler)
 
         with pytest.raises(StarioError, match="Route already registered"):
-            router.get("/hello", noop_handler)
+            router.add(Route("GET", "/hello"), noop_handler)
+
+    def test_rejects_prefix_registration(self):
+        router = Router()
+
+        with pytest.raises(StarioError, match="prefix route"):
+            router.add(Route("/api"), noop_handler)
 
     def test_add_registers_route_method_and_path(self):
-        send = Route.post("/rooms/{room_id}/send")
+        send = Route("POST", "/rooms/{room_id}/send")
         router = Router()
         router.add(send, noop_handler)
 
-        _, match = router.find_handler("", "/rooms/7/send", "POST")
+        _, route, hit = router.find_handler("", "/rooms/7/send", "POST")
 
-        assert match.pattern == "/rooms/{room_id}/send"
-        assert dict(match.params) == {"room_id": "7"}
+        assert route.target == "/rooms/{room_id}/send"
+        assert route.pattern == "POST /rooms/{room_id}/send"
+        assert dict(hit.params) == {"room_id": "7"}
+        assert hit.pattern == send.pattern
 
-        handler, _ = router.find_handler("", "/rooms/7/send", "GET")
+        handler, _, _ = router.find_handler("", "/rooms/7/send", "GET")
         assert handler is method_not_allowed_handler(frozenset({"POST"}))
+
+    def test_add_registers_more_specific_route(self):
+        users = Route("GET", "/t/{tenant}/users/{id}")
+        acme_users = Route("GET", "/t/acme/users/{id}")
+        router = Router()
+        router.add(acme_users, noop_handler)
+        router.add(users, noop_handler)
+
+        _, acme, acme_hit = router.find_handler("", "/t/acme/users/1", "GET")
+        _, other, other_hit = router.find_handler("", "/t/beta/users/1", "GET")
+
+        assert acme.target == "/t/acme/users/{id}"
+        assert acme.pattern == "GET /t/acme/users/{id}"
+        assert dict(acme_hit.params) == {"id": "1"}
+        assert other.target == "/t/{tenant}/users/{id}"
+        assert dict(other_hit.params) == {"tenant": "beta", "id": "1"}
+
+    def test_verb_helpers_are_deprecated(self):
+        router = Router()
+        with pytest.warns(DeprecationWarning, match=r"add\(Route\('GET'"):
+            router.get("/x", noop_handler)
+
+        _, route, _ = router.find_handler("", "/x", "GET")
+        assert route.target == "/x"
+
+    def test_handle_is_deprecated(self):
+        router = Router()
+        with pytest.warns(DeprecationWarning, match=r"add\(Route"):
+            router.handle("GET", "/y", noop_handler)
+
+        _, route, _ = router.find_handler("", "/y", "GET")
+        assert route.target == "/y"
 
     def test_query_registers_rfc_query_method(self):
         router = Router()
-        router.query("/feed", noop_handler)
-        router.add(Route.query("/search"), noop_handler)
+        router.add(Route("QUERY", "/feed"), noop_handler)
+        router.add(Route("QUERY", "/search"), noop_handler)
 
-        _, feed = router.find_handler("", "/feed", "QUERY")
-        _, search = router.find_handler("", "/search", "QUERY")
+        _, feed, _ = router.find_handler("", "/feed", "QUERY")
+        _, search, _ = router.find_handler("", "/search", "QUERY")
 
-        assert feed.pattern == "/feed"
-        assert search.pattern == "/search"
-
-    def test_add_rejects_non_route(self):
-        router = Router()
-
-        with pytest.raises(StarioError, match="takes a Route"):
-            router.add("/health", noop_handler)  # type: ignore[arg-type]
+        assert feed.target == "/feed"
+        assert search.target == "/search"
 
     def test_hostless_method_wins_over_host_405(self):
         router = Router()
-        router.get(UrlPath("/api", host="api.example.com"), noop_handler)
-        router.post("/api", noop_handler)
+        router.add(Route("GET //api.example.com/api"), noop_handler)
+        router.add(Route("POST", "/api"), noop_handler)
 
-        handler, match = router.find_handler("api.example.com", "/api", "POST")
+        handler, route, _ = router.find_handler("api.example.com", "/api", "POST")
 
-        assert match.pattern == "/api"
+        assert route.target == "/api"
         assert handler is not method_not_allowed_handler(frozenset({"GET"}))
 
     def test_host_405_when_only_host_tree_knows_path(self):
         router = Router()
-        router.get(UrlPath("/api", host="api.example.com"), noop_handler)
+        router.add(Route("GET //api.example.com/api"), noop_handler)
 
-        handler, match = router.find_handler("api.example.com", "/api", "POST")
+        handler, route, _ = router.find_handler("api.example.com", "/api", "POST")
 
         assert handler is method_not_allowed_handler(frozenset({"GET"}))
-        assert match is EMPTY_ROUTE_MATCH
+        assert route is EMPTY_ROUTE
 
 
 class TestRouterUse:
@@ -156,16 +263,16 @@ class TestRouterUse:
 
         router = Router()
         router.use("/", scope_middleware)
-        router.get("/users", noop_handler)
+        router.add(Route("GET", "/users"), noop_handler)
 
-        handler, _ = router.find_handler("", "/users", "GET")
+        handler, _, _ = router.find_handler("", "/users", "GET")
         run_handler(handler, "/users")
 
         assert calls == ["scope"]
 
     def test_use_rejects_middleware_after_routes(self):
         router = Router()
-        router.get("/users", noop_handler)
+        router.add(Route("GET", "/users"), noop_handler)
 
         with pytest.raises(
             StarioError, match="Middleware must be registered before matching routes"
@@ -187,8 +294,8 @@ class TestRouterUse:
 
         router = Router()
         router.use("/", track("mw1"), track("mw2"))
-        router.get("/", noop_handler)
-        handler, _ = router.find_handler("", "/", "GET")
+        router.add(Route("GET", "/"), noop_handler)
+        handler, _, _ = router.find_handler("", "/", "GET")
         run_handler(handler, "/")
         assert calls == ["mw1", "mw2"]
 
@@ -208,8 +315,8 @@ class TestRouterUse:
         router = Router()
         router.use("/", track("root"))
         router.use("/users", track("users"))
-        router.get("/users/panel", noop_handler)
-        handler, _ = router.find_handler("", "/users/panel", "GET")
+        router.add(Route("GET", "/users/panel"), noop_handler)
+        handler, _, _ = router.find_handler("", "/users/panel", "GET")
         run_handler(handler, "/users/panel")
         assert calls == ["root", "users"]
 
@@ -228,12 +335,12 @@ class TestRouterUse:
 
         router = Router()
         router.use("/", track("scope"))
-        router.get(
-            "/",
+        router.add(
+            Route("GET", "/"),
             noop_handler,
             middleware=[track("route")],
         )
-        handler, _ = router.find_handler("", "/", "GET")
+        handler, _, _ = router.find_handler("", "/", "GET")
         run_handler(handler, "/")
         assert calls == ["scope", "route"]
 
@@ -253,9 +360,9 @@ class TestRouterUse:
         router = Router()
         router.use("/", track("root"))
         router.use("/users", track("users"))
-        router.get(UrlPath("/users", host="api.example.com"), noop_handler)
+        router.add(Route("GET //api.example.com/users"), noop_handler)
 
-        handler, _ = router.find_handler("api.example.com", "/users", "GET")
+        handler, _, _ = router.find_handler("api.example.com", "/users", "GET")
         run_handler(handler, "/users", host="api.example.com")
         assert calls == ["root", "users"]
 
@@ -266,52 +373,14 @@ class TestRouterUse:
             calls.append("host-404")
 
         router = Router()
-        router.not_found(UrlPath("/", host="api.example.com"), host_not_found)
-        router.get("/health", noop_handler)
+        router.not_found("//api.example.com/", host_not_found)
+        router.add(Route("GET", "/health"), noop_handler)
 
-        handler, match = router.find_handler("api.example.com", "/missing", "GET")
-        assert match is EMPTY_ROUTE_MATCH
+        handler, route, hit = router.find_handler("api.example.com", "/missing", "GET")
+        assert route is EMPTY_ROUTE
+        assert hit.pattern == ""
         run_handler(handler, "/missing", host="api.example.com")
         assert calls == ["host-404"]
-
-
-class TestAsyncHandlers:
-    def test_get_rejects_sync_handler(self):
-        router = Router()
-        with pytest.raises(StarioError, match="must be async"):
-            router.get("/x", sync_noop)
-
-    def test_get_rejects_non_callable(self):
-        router = Router()
-        with pytest.raises(StarioError, match="must be callable"):
-            router.get("/x", "nope")  # type: ignore[arg-type]
-
-    def test_get_rejects_async_generator(self):
-        async def stream(c: Context, w: Writer):
-            yield None
-
-        router = Router()
-        with pytest.raises(StarioError, match="async generator"):
-            router.get("/x", stream)
-
-    def test_accepts_partial_of_async_and_callable_object(self):
-        async def takes_flag(c: Context, w: Writer, _flag: int) -> None:
-            w.end()
-
-        class Home:
-            async def __call__(self, c: Context, w: Writer) -> None:
-                w.end()
-
-        router = Router()
-        router.get("/partial", partial(takes_flag, _flag=1))
-        router.post("/obj", Home())
-        require_async_handler(Home())
-        require_async_handler(partial(takes_flag, _flag=1))
-
-    def test_not_found_rejects_sync_handler(self):
-        router = Router()
-        with pytest.raises(StarioError, match="must be async"):
-            router.not_found("/", sync_noop)
 
 
 class TestRouterDispatch:

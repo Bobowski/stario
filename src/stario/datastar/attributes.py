@@ -22,14 +22,13 @@ h.Div(star.text("$title"))
 Reference: https://data-star.dev/reference/attributes
 """
 
-import json
 from collections.abc import Mapping
 from typing import Literal
 
 from stario.exceptions import StarioError
+from stario.json import dumps as json_dumps
 from stario.markup.escape import escape_attribute_value as escape_attr
 from stario.markup.escape import escape_sq_attribute_value
-from stario.markup.escape import validate_attribute_key
 from stario.markup.types import Attrs
 
 from ._jsevents import JSEvent
@@ -82,7 +81,6 @@ class DatastarAttributes:
         # Attrs(' data-attr:title="$item.label"')
         ```
         """
-        validate_attribute_key(key)
         return Attrs(f' {self.prefix}attr:{key}="{escape_attr(expression)}"')
 
     def attrs(self, mapping: dict[str, str]) -> Attrs:
@@ -109,32 +107,19 @@ class DatastarAttributes:
         # Attrs(' data-bind="email"')
 
         data.bind("is_checked", prop="checked", event="change")
-        # Attrs(' data-bind:is-checked__case.snake__prop.checked__event.change="is_checked"')
+        # Attrs(' data-bind:is-checked__case.snake__prop.checked__event.change')
         ```
         """
         validate_signal_path(signal_name)
-        if prop is not None:
-            validate_attribute_key(prop)
-        if event is not None:
-            validate_attribute_key(event)
         if prop is None and event is None:
             return Attrs(f' {self.prefix}bind="{escape_attr(signal_name)}"')
 
         key_suffix = signal_path_key(signal_name)
         if prop is None:
-            return Attrs(
-                f' {self.prefix}bind:{key_suffix}__event.{event}="'
-                f'{escape_attr(signal_name)}"'
-            )
+            return Attrs(f" {self.prefix}bind:{key_suffix}__event.{event}")
         if event is None:
-            return Attrs(
-                f' {self.prefix}bind:{key_suffix}__prop.{prop}="'
-                f'{escape_attr(signal_name)}"'
-            )
-        return Attrs(
-            f' {self.prefix}bind:{key_suffix}__prop.{prop}__event.{event}="'
-            f'{escape_attr(signal_name)}"'
-        )
+            return Attrs(f" {self.prefix}bind:{key_suffix}__prop.{prop}")
+        return Attrs(f" {self.prefix}bind:{key_suffix}__prop.{prop}__event.{event}")
 
     def class_(self, name: str, expression: str) -> Attrs:
         """Toggle one CSS class from a reactive expression.
@@ -144,7 +129,6 @@ class DatastarAttributes:
         # Attrs(' data-class:hidden="!$expanded"')
         ```
         """
-        validate_attribute_key(name)
         return Attrs(f' {self.prefix}class:{name}="{escape_attr(expression)}"')
 
     def classes(self, mapping: dict[str, str]) -> Attrs:
@@ -324,8 +308,6 @@ class DatastarAttributes:
                 ),
             )
 
-        validate_attribute_key(event)
-
         if (
             not once
             and not passive
@@ -386,12 +368,13 @@ class DatastarAttributes:
         delay: TimeValue | None = None,
         debounce: Debounce | None = None,
         throttle: Throttle | None = None,
+        view_transition: bool = False,
     ) -> Attrs:
         """React to viewport intersection.
 
         ```python
-        data.on_intersect("load()", threshold=0.25, once=True)
-        # Attrs(' data-on-intersect__threshold.25__once="load()"')
+        data.on_intersect("load()", threshold=0.25, once=True, view_transition=True)
+        # Attrs(' data-on-intersect__threshold.25__once__viewtransition="load()"')
         ```
         """
         modifiers: list[str] = []
@@ -426,6 +409,8 @@ class DatastarAttributes:
             modifiers.append(debounce_to_string(debounce))
         if throttle is not None:
             modifiers.append(throttle_to_string(throttle))
+        if view_transition:
+            modifiers.append("viewtransition")
 
         if modifiers:
             return Attrs(
@@ -577,11 +562,7 @@ class DatastarAttributes:
         ```
         """
         value = escape_sq_attribute_value(
-            json.dumps(
-                dict(require_mapping("signals", payload)),
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
+            json_dumps(dict(require_mapping("signals", payload)))
         )
         if if_missing:
             return Attrs(f" {self.prefix}signals__ifmissing='{value}'")
@@ -595,7 +576,6 @@ class DatastarAttributes:
         # Attrs(' data-style:width="$pct + '%'"')
         ```
         """
-        validate_attribute_key(prop)
         return Attrs(f' {self.prefix}style:{prop}="{escape_attr(expression)}"')
 
     def styles(self, mapping: dict[str, str]) -> Attrs:
@@ -715,14 +695,13 @@ class DatastarAttributes:
         """
         filters = filter_js(include, exclude)
         value: str | bool = filters if filters is not None else True
-        if storage_key is not None:
-            validate_attribute_key(storage_key)
-        if storage_key is None:
-            key = self.prefix + "persist"
-        elif session:
-            key = f"{self.prefix}persist:{storage_key}__session"
-        else:
-            key = f"{self.prefix}persist:{storage_key}"
+        key = (
+            self.prefix + "persist"
+            if storage_key is None
+            else f"{self.prefix}persist:{storage_key}"
+        )
+        if session:
+            key += "__session"
         if value is True:
             return Attrs(f" {key}")
         return Attrs(f' {key}="{escape_attr(value)}"')

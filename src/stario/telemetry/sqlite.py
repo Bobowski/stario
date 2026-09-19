@@ -33,6 +33,8 @@ _SCHEMA_SQL = """
 
     CREATE INDEX IF NOT EXISTS spans_trace_id_idx
         ON spans (trace_id);
+    CREATE INDEX IF NOT EXISTS spans_end_ns_idx
+        ON spans (end_ns);
     CREATE INDEX IF NOT EXISTS spans_error_end_ns_idx
         ON spans (end_ns)
         WHERE status = 'error';

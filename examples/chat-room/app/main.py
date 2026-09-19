@@ -17,7 +17,7 @@ Start here, then open each layer:
 
 Per feature the pattern is the same:
 
-  urls.py      UrlPath constants (room/urls.py owns /rooms paths)
+  urls.py      Route endpoints (room/urls.py owns /rooms paths)
   models.py    domain dataclasses (room feature owns Room, Message, User)
   data.py      SCHEMA + query functions against the shared Database
   subjects.py  relay subject helpers (room.{id}.message, .presence, …)
@@ -38,7 +38,7 @@ from app.db import Database
 from app.features.lobby.handlers import register_lobby
 from app.features.room import data as room_data
 from app.features.room.handlers import register_room
-from stario import App, Relay, Span, StaticAssets
+from stario import App, Relay, Span
 
 
 async def bootstrap(app: App, span: Span):
@@ -58,9 +58,7 @@ async def bootstrap(app: App, span: Span):
     )
 
     with span.step("static_assets") as s:
-        static = StaticAssets(ASSETS)
-        s.attrs(static.stats)
-    static.register(app)
+        s.attrs(await ASSETS.attach(app))
 
     register_lobby(app, db, relay)
     register_room(app, db, relay)

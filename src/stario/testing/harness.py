@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
 
 from stario.exceptions import RequestBodyError
-from stario.http.context import EMPTY_ROUTE_MATCH, RouteMatch, _Alive
+from stario.http.context import EMPTY_MATCH, Match, _Alive
 from stario.http.headers import Headers
 from stario.http.host import host_without_port
 from stario.http.query import ParsedQuery
@@ -174,7 +174,7 @@ class TestWriter:
         self._completed = True
         self._body.mark_app_done()
 
-    def write_headers(self, status_code: int) -> Self:
+    def write_headers(self, status_code: int, *, body: bool = True) -> Self:
         if self._status_code is not None:
             raise RuntimeError(
                 "Response already started (headers sent). "
@@ -231,7 +231,7 @@ class TestContext:
     span: Span
     _disconnect: asyncio.Future[None] = field(repr=False)
     state: dict[str, Any] = field(default_factory=dict)
-    route: RouteMatch = field(default=EMPTY_ROUTE_MATCH)
+    match: Match = field(default=EMPTY_MATCH)
 
     @property
     def disconnect(self) -> asyncio.Future[None]:

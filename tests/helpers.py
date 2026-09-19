@@ -57,7 +57,7 @@ class DummyWriter:
         self.ended = True
         self._completed = True
 
-    def write_headers(self, status: int):
+    def write_headers(self, status: int, *, body: bool = True):
         self.status = status
         self.started = True
         self._status_code = status

@@ -2,8 +2,9 @@
 
 import pytest
 
+from stario import Route, UrlPath
 from stario.exceptions import StarioError
-from stario.routing import UrlPath, normalize_path
+from stario.http.route import normalize_path
 
 
 class TestNormalizePath:
@@ -98,7 +99,7 @@ class TestUrlPath:
     def test_href_without_kwargs_raises_for_templated_path(self):
         path = UrlPath("/h/{house_id}")
 
-        with pytest.raises(StarioError, match="UrlPath parameter missing"):
+        with pytest.raises(StarioError, match="parameter missing"):
             path.href()
         assert repr(path) == "UrlPath('/h/{house_id}')"
 
@@ -112,6 +113,8 @@ class TestUrlPath:
             UrlPath(f"/items/{{{name}}}")
 
     def test_duplicate_placeholder_raises(self):
+        with pytest.raises(StarioError, match="Duplicate route parameter"):
+            Route("GET", "/teams/{id}/users/{id}")
         with pytest.raises(StarioError, match="Duplicate route parameter"):
             UrlPath("/teams/{id}/users/{id}")
 
@@ -127,17 +130,23 @@ class TestUrlPath:
         with pytest.raises(StarioError, match="unknown parameter"):
             home.href(typo="oops")
 
-    def test_href_accepts_positional_param_mapping(self):
+    def test_href_accepts_positional_params(self):
         path = UrlPath("/h/{house_id}")
 
-        assert path.href({"house_id": "abc"}) == "/h/abc"
+        assert path.href("abc") == "/h/abc"
+        with pytest.raises(StarioError, match="must not be a mapping"):
+            path.href({"house_id": "abc"})
 
-    def test_href_mapping_allows_reserved_param_names(self):
-        path = UrlPath("/{query}/{fragment}")
+    def test_href_positionals_follow_host_then_path(self):
+        path = UrlPath("/users/{user_id}", host="{tenant}.example.com")
 
-        assert path.href({"query": "q", "fragment": "top"}, query={"page": 2}) == (
-            "/q/top?page=2"
-        )
+        assert path.href("acme", "42") == "//acme.example.com/users/42"
+        assert path.href("acme", user_id="42") == "//acme.example.com/users/42"
+
+    @pytest.mark.parametrize("name", ["query", "fragment"])
+    def test_rejects_reserved_href_param_names(self, name: str):
+        with pytest.raises(StarioError, match="reserved"):
+            UrlPath(f"/{{{name}}}")
 
     def test_truediv_joins_paths(self):
         api = UrlPath("/api/v1")
@@ -158,12 +167,3 @@ class TestUrlPath:
 
         assert (house / "command").href(house_id="abc") == "/h/abc/command"
         assert (house / "{list_id}").href(house_id="abc", list_id="7") == "/h/abc/7"
-
-    def test_request_splitting(self):
-        assert UrlPath.request_host("api.example.com") == (
-            "com",
-            "example",
-            "api",
-        )
-        assert UrlPath.request_path("/users/42") == ("users", "42")
-        assert UrlPath.request_path("/") == ()

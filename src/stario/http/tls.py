@@ -1,8 +1,7 @@
 """TLS context for hosting Stario directly (not behind a reverse proxy).
 
 ALPN advertises ``h2`` then ``http/1.1`` so one listener can switch once
-per connection. HTTP/2 still needs the Cython protocol; the Python
-httptools path stays HTTP/1.1 even when the socket is TLS.
+per connection. HTTP/2 and HTTP/1.1 share the Cython protocol.
 """
 
 from __future__ import annotations

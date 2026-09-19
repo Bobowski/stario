@@ -22,9 +22,7 @@ UNSAFE_REDIRECT_TARGETS = [
     "ftp://example.com/file",
 ]
 
-UNSAFE_REDIRECT_MATCH = (
-    "control characters|backslashes|app-relative path or absolute"
-)
+UNSAFE_REDIRECT_MATCH = "control characters|backslashes|app-relative path or absolute"
 
 
 def _redirect_from_exception(w: Writer, exc: RedirectException) -> None:
@@ -38,7 +36,7 @@ class TestNormalizedLocation:
         assert normalized_location(target)
 
     def test_accepts_url_path_host_href(self) -> None:
-        from stario.routing import UrlPath
+        from stario import UrlPath
 
         target = UrlPath("/users/{user_id}", host="{tenant}.example.com").href(
             tenant="acme", user_id="42"

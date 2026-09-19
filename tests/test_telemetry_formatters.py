@@ -39,7 +39,9 @@ class TestFormatExceptionForTelemetry:
         def app_caller() -> None:
             render(object())  # type: ignore[arg-type]
 
-        with pytest.raises(StarioError, match="Cannot render element of type object") as exc_info:
+        with pytest.raises(
+            StarioError, match="Cannot render element of type object"
+        ) as exc_info:
             app_caller()
         text = format_exception_for_telemetry(exc_info.value)
 
