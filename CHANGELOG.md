@@ -6,6 +6,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 4.2.0 - 2026-09-19
+
 ### Fixed
 
 - TTY tracer live footer — skip terminal writes when the text and width do not
@@ -30,6 +32,11 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Changed
 
+- `Route` is the HTTP address: one method, one host, one path.
+  `Route("GET /home")` or `Route("POST", ROOM + "/send")`. `href()`
+  compiles a join of literals and placeholder names. Names must be
+  unique across host and path. After a match, read `c.match`.
+  Matching lives in `stario.http`.
 - `find_handler` has no LRU. Static `(host, path, method)` hits an exact
   map and reuses that `Match`. Exact hosts have their own path trie.
   Exact-only path chains are radix-compressed. One cursor walks the

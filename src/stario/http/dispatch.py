@@ -88,11 +88,7 @@ def _compress(node: Node, sep: str) -> None:
         _compress(node.wildcard, sep)
     if node.catchall is not None:
         _compress(node.catchall, sep)
-    while (
-        node.wildcard is None
-        and node.catchall is None
-        and len(node.exact) == 1
-    ):
+    while node.wildcard is None and node.catchall is None and len(node.exact) == 1:
         key, child = next(iter(node.exact.items()))
         if (
             child.endpoints
@@ -105,7 +101,9 @@ def _compress(node: Node, sep: str) -> None:
         ):
             break
         ck, grandchild = next(iter(child.exact.items()))
-        extra = sep.join(p for p in (_edge_rest(node, key), ck, _edge_rest(child, ck)) if p)
+        extra = sep.join(
+            p for p in (_edge_rest(node, key), ck, _edge_rest(child, ck)) if p
+        )
         node.exact[key] = grandchild
         _set_rest(node, key, extra)
 
@@ -322,7 +320,9 @@ def _open_param(current: Node, segment: Segment) -> Node:
     other = current.wildcard if catchall else current.catchall
     if taken is not None:
         raise StarioError(
-            "Catchall parameter conflict" if catchall else "Wildcard parameter conflict",
+            "Catchall parameter conflict"
+            if catchall
+            else "Wildcard parameter conflict",
             context={
                 "existing": taken,
                 "new": segment.name,
@@ -333,7 +333,9 @@ def _open_param(current: Node, segment: Segment) -> Node:
         raise StarioError(
             "Ambiguous route parameter branch",
             context={
-                "existing": current.wildcard_name if catchall else current.catchall_name,
+                "existing": current.wildcard_name
+                if catchall
+                else current.catchall_name,
                 "new": segment.name,
             },
         )
