@@ -225,12 +225,14 @@ cdef object _intern_name(const char* src, size_t n):
 
 
 cdef object _intern_wire_name(const char* src, size_t n):
+    cdef char buf[NAME_STACK]
     cdef int index
     if n >= NAME_STACK - 2:
         raise ValueError("Invalid header name: too long")
-    index = _intern_lookup(src, n)
+    _lower_copy(buf, src, n)
+    index = _intern_lookup(buf, n)
     if index < 0:
-        return _make_wire_name(src, n)
+        return _make_wire_name(buf, n)
     return _INTERN_WIRE[index]
 
 
@@ -299,6 +301,18 @@ cdef object _encode_value(str value):
     return raw
 
 
+cdef object _encode_value_bytes(object value):
+    cdef bytes raw
+    if isinstance(value, str):
+        return _encode_value(value)
+    if not isinstance(value, bytes):
+        raise ValueError("Invalid header value")
+    raw = <bytes>value
+    if raw.translate(None, _VALID_VALUE):
+        raise ValueError("Invalid header value")
+    return raw
+
+
 def encode_header_value(str value):
     """Validate and return wire bytes for a header value."""
     return _encode_value(value)
@@ -321,17 +335,25 @@ cdef class Headers:
                     self.c_set(key, value)
 
     cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept:
+        cdef char buf[NAME_STACK]
         cdef Py_ssize_t i
+        if n >= NAME_STACK:
+            return -1
+        _lower_copy(buf, name, <size_t>n)
         for i in range(self._n):
-            if _wire_is(self._names[i], name, n):
+            if _wire_is(self._names[i], buf, n):
                 return i
         return -1
 
     cdef Py_ssize_t _compact_except(self, const char* name, Py_ssize_t n) noexcept:
+        cdef char buf[NAME_STACK]
         cdef Py_ssize_t i
         cdef Py_ssize_t w = 0
+        if n >= NAME_STACK:
+            return self._n
+        _lower_copy(buf, name, <size_t>n)
         for i in range(self._n):
-            if _wire_is(self._names[i], name, n):
+            if _wire_is(self._names[i], buf, n):
                 continue
             if w != i:
                 self._names[w] = self._names[i]
@@ -605,12 +627,16 @@ cdef class Headers:
 
     def unsafe_getlist(self, name):
         cdef bytes key = <bytes>name
+        cdef char buf[NAME_STACK]
         cdef const char* src = PyBytes_AS_STRING(key)
         cdef Py_ssize_t n = PyBytes_GET_SIZE(key)
         cdef list result = []
         cdef Py_ssize_t i
+        if n >= NAME_STACK:
+            return result
+        _lower_copy(buf, src, <size_t>n)
         for i in range(self._n):
-            if _wire_is(self._names[i], src, n):
+            if _wire_is(self._names[i], buf, n):
                 result.append(_bare_bytes(self._values[i], 2))
         return result
 

@@ -26,6 +26,7 @@ cdef enum:
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
 cdef object _intern_name(const char* src, size_t n)
 cdef object _encode_name(str name)
+cdef bint host_value_ok(const char* value, size_t n) noexcept
 
 cdef class Headers:
     cdef list _names
@@ -193,8 +194,11 @@ cdef class RequestExchange:
     cdef Py_ssize_t _h2_head_bytes
     cdef bint _h2_awaiting_headers
     cdef double _h2_header_deadline
+    cdef bint _h2_outbound
     cdef object _h2_date_line
     cdef object _h2_date_bare
+    cdef object _handler_task
+    cdef bint _head_request
     cdef bint _expect_continue
     cdef bint _waiting
     cdef bint _discard_body

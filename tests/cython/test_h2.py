@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from stario_cython.protocol import HttpProtocol
@@ -18,6 +19,7 @@ from stario.routing import UrlPath
 from tests.cython.h2wire import (
     FLAG_END_HEADERS,
     FLAG_END_STREAM,
+    H2_PREFACE,
     NGHTTP2_CANCEL,
     NGHTTP2_PROTOCOL_ERROR,
     SETTINGS_HEADER_TABLE_SIZE,
@@ -26,6 +28,7 @@ from tests.cython.h2wire import (
     TYPE_CONTINUATION,
     TYPE_DATA,
     TYPE_HEADERS,
+    TYPE_SETTINGS,
     collected_settings,
     encode_request,
     h2_handshake,
@@ -41,7 +44,7 @@ from tests.cython.h2wire import (
     stream_ended,
     stream_headers_blob,
 )
-from tests.cython.http import RecordingTransport, free_port, make_protocol
+from tests.cython.http import RecordingTransport, free_port, make_protocol, response_status
 
 
 async def _curl(*args: str) -> subprocess.CompletedProcess[str]:
@@ -1216,4 +1219,170 @@ async def test_h2_host_routing_normalizes_authority() -> None:
     finally:
         server.close()
         await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_coalesced_posts_keep_bodies_on_correct_streams() -> None:
+    app = App()
+    seen: list[bytes] = []
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        seen.append(body)
+        w.respond(body, b"text/plain; charset=utf-8", 200)
+
+    app.post("/", echo)
+    loop = asyncio.get_running_loop()
+    proto = make_protocol(loop, app)
+    transport = RecordingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(H2_PREFACE + pack_frame(TYPE_SETTINGS, 0, 0))
+        extra = [(b"content-length", b"3")]
+        proto.data_received(
+            pack_frame(
+                TYPE_HEADERS,
+                FLAG_END_HEADERS,
+                1,
+                encode_request(method="POST", extra=extra),
+            )
+            + pack_frame(TYPE_DATA, FLAG_END_STREAM, 1, b"aaa")
+            + pack_frame(
+                TYPE_HEADERS,
+                FLAG_END_HEADERS,
+                3,
+                encode_request(method="POST", extra=extra),
+            )
+            + pack_frame(TYPE_DATA, FLAG_END_STREAM, 3, b"bbb")
+        )
+        await app.drain_tasks()
+        frames, _rest = parse_frames(b"".join(transport.writes))
+        assert stream_data(frames, 1) == b"aaa"
+        assert stream_data(frames, 3) == b"bbb"
+        assert seen == [b"aaa", b"bbb"]
+    finally:
+        proto.connection_lost(None)
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_head_omits_data_payload() -> None:
+    app = App()
+
+    async def hello(_c, w) -> None:
+        responses.text(w, "hello")
+
+    app.head("/", hello)
+    loop = asyncio.get_running_loop()
+    proto = make_protocol(loop, app)
+    transport = RecordingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(H2_PREFACE + pack_frame(TYPE_SETTINGS, 0, 0))
+        proto.data_received(
+            pack_frame(
+                TYPE_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                encode_request(method="HEAD", path="/"),
+            )
+        )
+        await app.drain_tasks()
+        frames, _rest = parse_frames(b"".join(transport.writes))
+        assert stream_data(frames, 1) == b""
+        assert stream_ended(frames, 1)
+        assert not has_rst(frames, 1)
+    finally:
+        proto.connection_lost(None)
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_tls_http11_alpn_does_not_sniff_h2_preface() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    proto = make_protocol(loop, app)
+
+    class _AlpnTransport(RecordingTransport):
+        def get_extra_info(self, name, default=None):
+            if name == "ssl_object":
+                return SimpleNamespace(selected_alpn_protocol=lambda: "http/1.1")
+            return default
+
+    transport = _AlpnTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(H2_PREFACE)
+        await app.drain_tasks()
+        assert proto.parse_mode == 1
+        assert response_status(transport.writes) == 400
+    finally:
+        proto.connection_lost(None)
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_skips_connection_specific_response_headers() -> None:
+    app = App()
+
+    async def hello(_c, w) -> None:
+        w.headers.set("connection", "close")
+        w.headers.set("keep-alive", "timeout=5")
+        responses.text(w, "ok")
+
+    app.get("/", hello)
+    loop = asyncio.get_running_loop()
+    proto = make_protocol(loop, app)
+    transport = RecordingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(H2_PREFACE + pack_frame(TYPE_SETTINGS, 0, 0))
+        proto.data_received(
+            pack_frame(
+                TYPE_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                encode_request(path="/"),
+            )
+        )
+        await app.drain_tasks()
+        frames, _rest = parse_frames(b"".join(transport.writes))
+        assert stream_data(frames, 1) == b"ok"
+        blob = stream_headers_blob(frames, 1)
+        assert b"keep-alive" not in blob
+        assert b"connection" not in blob
+    finally:
+        proto.connection_lost(None)
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_authority_with_question_mark_is_rejected() -> None:
+    app = App()
+
+    async def boom(_c, w) -> None:
+        responses.text(w, "nope")
+
+    app.get("/", boom)
+    loop = asyncio.get_running_loop()
+    proto = make_protocol(loop, app)
+    transport = RecordingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(H2_PREFACE + pack_frame(TYPE_SETTINGS, 0, 0))
+        proto.data_received(
+            pack_frame(
+                TYPE_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                encode_request(path="/", authority="evil?.example.com"),
+            )
+        )
+        await app.drain_tasks()
+        frames, _rest = parse_frames(b"".join(transport.writes))
+        assert has_rst(frames, 1) or has_goaway(frames)
+        assert stream_data(frames, 1) != b"nope"
+    finally:
+        proto.connection_lost(None)
         await app.drain_tasks()

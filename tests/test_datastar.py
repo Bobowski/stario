@@ -252,6 +252,19 @@ class TestSseWireFormat:
         finally:
             loop.close()
 
+    def test_bare_cr_in_patch_elements_becomes_data_line(self):
+        w, sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements("<div>\revil")
+            result = _sse_body(w)
+            assert b"event: datastar-patch-elements\n" in result
+            assert b"\revil" not in result
+            assert b"data: elements <div>\n" in result
+            assert b"data: elements evil" in result
+            assert b"event: evil" not in result
+        finally:
+            loop.close()
+
     def test_patch_signals_rejects_raw_json_text(self):
         w, sink, loop = _make_writer()
         try:
@@ -355,6 +368,14 @@ class TestDatastarAttributeValidation:
     def test_bind_rejects_non_snake_signal_path_segment(self):
         with pytest.raises(StarioError, match="snake_case"):
             data.bind("crane.selectedCrane")
+
+    def test_attr_rejects_quote_breakout_key(self):
+        with pytest.raises(StarioError, match="Invalid attribute name"):
+            data.attr('x" onfocus="alert(1)', "$x")
+
+    def test_on_rejects_breakout_event_name(self):
+        with pytest.raises(StarioError, match="Invalid attribute name"):
+            data.on('click" onfocus="alert(1)', "go()")
 
     @pytest.mark.parametrize(
         "time",
