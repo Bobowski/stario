@@ -7,7 +7,7 @@ import pytest
 
 import stario.cookies as cookies
 import stario.responses as responses
-from stario import App
+from stario import App, Route
 from stario.datastar import SSE
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.writer import Writer
@@ -85,20 +85,20 @@ def _make_app() -> App:
     async def error_route(c, w):
         responses.text(w, "teapot", 418)
 
-    app.get("/", text_route)
-    app.get("/html", html_route)
-    app.get("/json", json_route)
-    app.get("/redirect", redirect_route)
-    app.get("/final", final_route)
-    app.get("/redirect-cookie", redirect_cookie_route)
-    app.get("/redirect-cookie/final", redirect_cookie_final)
-    app.post("/json-echo", json_echo)
-    app.post("/form-echo", form_echo)
-    app.post("/upload", upload_echo)
-    app.get("/login", login)
-    app.get("/me", me)
-    app.get("/telemetry", telemetry_route)
-    app.get("/error", error_route)
+    app.add(Route("GET", "/"), text_route)
+    app.add(Route("GET", "/html"), html_route)
+    app.add(Route("GET", "/json"), json_route)
+    app.add(Route("GET", "/redirect"), redirect_route)
+    app.add(Route("GET", "/final"), final_route)
+    app.add(Route("GET", "/redirect-cookie"), redirect_cookie_route)
+    app.add(Route("GET", "/redirect-cookie/final"), redirect_cookie_final)
+    app.add(Route("POST", "/json-echo"), json_echo)
+    app.add(Route("POST", "/form-echo"), form_echo)
+    app.add(Route("POST", "/upload"), upload_echo)
+    app.add(Route("GET", "/login"), login)
+    app.add(Route("GET", "/me"), me)
+    app.add(Route("GET", "/telemetry"), telemetry_route)
+    app.add(Route("GET", "/error"), error_route)
     return app
 
 
@@ -190,8 +190,10 @@ class TestClientBasics:
         rid = response.span_id
         root = client.tracer.get_span(rid)
         assert root is not None
+        assert root.name == "GET /telemetry"
         assert root.attributes["request.method"] == "GET"
         assert root.attributes["request.path"] == "/telemetry"
+        assert root.attributes["http.route"] == "/telemetry"
         assert root.attributes["response.status_code"] == 200
         ev = client.tracer.get_event(rid, "handler.hit")
         assert ev is not None
@@ -214,7 +216,7 @@ class TestClientBasics:
             c.app.create_task(bg())
             responses.text(w, "ok")
 
-        app.get("/", handler)
+        app.add(Route("GET", "/"), handler)
         async with TestClient(app) as client:
             await client.get("/")
             assert state["n"] == 0
@@ -232,7 +234,7 @@ class TestClientBasics:
             c.app.create_task(bg())
             responses.text(w, "ok")
 
-        app.get("/", handler)
+        app.add(Route("GET", "/"), handler)
         async with asyncio.timeout(0.5):
             async with TestClient(app) as client:
                 await client.get("/")
@@ -245,7 +247,7 @@ class TestClientBasics:
         async def loop_route(c, w):
             responses.redirect(w, "/loop", 302)
 
-        app.get("/loop", loop_route)
+        app.add(Route("GET", "/loop"), loop_route)
         async with TestClient(app, max_redirects=3) as client:
             with pytest.raises(RuntimeError, match="Too many redirects"):
                 await client.get("/loop")
@@ -266,7 +268,7 @@ class TestClientBasics:
             await asyncio.sleep(10)
             responses.text(w, "late")
 
-        app.get("/slow", slow)
+        app.add(Route("GET", "/slow"), slow)
         async with TestClient(app, request_timeout=client_timeout) as client:
             with pytest.raises(TimeoutError):
                 await client.get("/slow", timeout=request_timeout)
@@ -287,7 +289,7 @@ class TestClientBasics:
             w.write(b"lo")
             w.end()
 
-        app.get("/s", handler)
+        app.add(Route("GET", "/s"), handler)
         async with (
             TestClient(app) as client,
             client.stream("GET", "/s", headers={"Accept-Encoding": "identity"}) as r,
@@ -305,7 +307,7 @@ class TestClientBasics:
             w.write(b"event: ping\ndata: hello\n\n")
             w.end()
 
-        app.get("/e", handler)
+        app.add(Route("GET", "/e"), handler)
         async with (
             TestClient(app) as client,
             client.stream("GET", "/e", headers={"Accept-Encoding": "identity"}) as r,
@@ -328,7 +330,7 @@ class TestTestClient:
             c.app.create_task(watch())
             responses.text(w, "ok")
 
-        app.get("/", handler)
+        app.add(Route("GET", "/"), handler)
         async with TestClient(app) as client:
             r = await client.get("/")
             assert r.status_code == 200

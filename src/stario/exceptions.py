@@ -3,7 +3,7 @@ Failure types:
 
 - `StarioError` — invalid framework or API usage: wrong arguments, invalid
   configuration, or calls that are wrong regardless of object state (uncaught in
-  `App` → 500). Examples: bad `UrlPath` params, duplicate route registration,
+  `App` → 500). Examples: bad Route params, duplicate route registration,
   invalid bootstrap shape, unfilled `@baked` slots, invalid `Content-Length`.
 
 - `StarioRuntime` — valid API call at the wrong lifecycle phase of a

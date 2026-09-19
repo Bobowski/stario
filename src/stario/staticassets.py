@@ -30,8 +30,14 @@ from stario.http.compression import (
 )
 from stario.http.context import Context
 from stario.http.headers import encode_header_value
+from stario.http.route import (
+    Route,
+    UrlPath,
+    append_query_fragment,
+    as_target,
+    public_prefix,
+)
 from stario.http.writer import Writer
-from stario.routing import UrlPath, append_query_fragment
 
 type CompressionCodec = Literal["br", "zstd", "gzip"]
 
@@ -264,7 +270,7 @@ class AssetManifest:
     self-contained.
     """
 
-    __slots__ = ("assets", "directory", "prefix")
+    __slots__ = ("_route", "assets", "directory", "prefix")
 
     def __init__(
         self,
@@ -285,8 +291,10 @@ class AssetManifest:
                 },
                 help_text="Create the directory or check the path before building AssetManifest.",
             )
-        self.prefix = (
-            url_prefix if isinstance(url_prefix, UrlPath) else UrlPath(url_prefix)
+        self.prefix = public_prefix(as_target(url_prefix))
+        self._route = Route(
+            "GET",
+            "/{path...}" if self.prefix == "/" else f"{self.prefix}/{{path...}}",
         )
 
         assets: dict[str, Asset] = {}
@@ -322,7 +330,7 @@ class AssetManifest:
             assets[logical_path] = Asset(
                 logical_path=logical_path,
                 hashed_path=hashed_path,
-                url=(self.prefix / hashed_path).href(),
+                url=self._route.href(hashed_path),
                 source=resolved,
                 size=after.st_size,
                 modified_ns=after.st_mtime_ns,
@@ -431,10 +439,10 @@ class StaticAssets:
         content_types: Mapping[str, str | bytes] | None = None,
         compression: CompressionConfig = _STATIC_ASSET_COMPRESSION,
     ) -> None:
-        if manifest.prefix.host:
+        if manifest.prefix.startswith("//"):
             raise StarioError(
                 "StaticAssets can only serve app-relative manifests",
-                context={"url_prefix": manifest.prefix.text},
+                context={"url_prefix": manifest.prefix},
                 help_text=(
                     "Use an app-relative AssetManifest prefix such as '/static' when "
                     "serving locally. Host-prefixed manifests are for URL generation, "
@@ -442,7 +450,7 @@ class StaticAssets:
                 ),
             )
         self.manifest = manifest
-        self._route = manifest.prefix / "{path...}"
+        self._route = manifest._route
         if cache_max_size <= 0:
             raise StarioError(
                 "StaticAssets numeric limits must be positive",
@@ -545,8 +553,8 @@ class StaticAssets:
 
     def register(self, app: App) -> None:
         """Register GET/HEAD catch-all routes on the application."""
-        app.get(self._route, self)
-        app.head(self._route, self)
+        app.add(self._route, self)
+        app.add(Route("HEAD", self._route.target), self)
 
     def href(
         self,
@@ -716,7 +724,8 @@ class StaticAssets:
 
     async def __call__(self, c: Context, w: Writer) -> None:
         """GET/HEAD handler: resolve `{path...}` against the manifest, redirect, 404, or send bytes from memory or disk."""
-        path = c.route.params.get("path", "").strip("/")
+        captured = c.match.params.get("path", "")
+        path = captured.strip("/") if isinstance(captured, str) else ""
 
         # Path traversal is prevented by serving only keys from the manifest-built cache.
         f = self._cache.get(path)

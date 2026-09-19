@@ -13,10 +13,10 @@ import stario.responses as responses
 from stario import App, Context, Relay, Route, Span, Writer
 from stario.datastar import DATASTAR_CDN_URL, SSE
 
-HOME = Route.get("/")
-SUBSCRIBE = Route.get("/subscribe")
-INCREMENT = Route.post("/increment")
-RESET = Route.post("/reset")
+HOME = Route("GET", "/")
+SUBSCRIBE = Route("GET", "/subscribe")
+INCREMENT = Route("POST", "/increment")
+RESET = Route("POST", "/reset")
 
 templates = Environment(
     loader=FileSystemLoader(Path(__file__).parent / "templates"),

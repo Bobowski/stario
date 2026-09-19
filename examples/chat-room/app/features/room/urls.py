@@ -1,12 +1,12 @@
 """Room routes — `ROOMS` is the collection; paths below are per `{room_id}`."""
 
-from stario import Route, UrlPath
+from stario import Route
 
-ROOMS = UrlPath("/rooms")
-ROOM_PATH = ROOMS / "{room_id}"
-ROOM = Route.get(ROOM_PATH)
-SUBSCRIBE = Route.get(ROOM_PATH / "subscribe")
-SEND = Route.post(ROOM_PATH / "send")
-TYPING = Route.post(ROOM_PATH / "typing")
-CREATE = Route.post(ROOMS)
-DELETE = Route.delete(ROOM_PATH)
+ROOMS = "/rooms"
+ROOM_PATH = ROOMS + "/{room_id}"
+ROOM = Route("GET", ROOM_PATH)
+SUBSCRIBE = Route("GET", ROOM_PATH + "/subscribe")
+SEND = Route("POST", ROOM_PATH + "/send")
+TYPING = Route("POST", ROOM_PATH + "/typing")
+CREATE = Route("POST", ROOMS)
+DELETE = Route("DELETE", ROOM_PATH)

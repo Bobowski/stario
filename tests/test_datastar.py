@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 
+from stario import Route
 from stario.datastar import (
     DATASTAR_CDN_URL,
     SSE,
@@ -24,7 +25,6 @@ from stario.markup import html as h
 from stario.markup import render
 from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
 from stario.markup.types import Attrs
-from stario.routing import Route
 from stario.testing.transport import decode_chunked as _decode_chunked
 from tests.helpers import (
     make_writer_raw as _make_writer,
@@ -574,25 +574,34 @@ class TestDatastarActions:
         assert action == "@setAll(null, {'include':'draft','exclude':'tmp.*'})"
 
     def test_fetch_uses_route_method_and_href(self):
-        subscribe = Route.get("/rooms/{room_id}/subscribe")
-        send = Route.post("/rooms/{room_id}/send")
-        remove = Route.delete("/rooms/{room_id}")
+        subscribe = Route("GET /rooms/7/subscribe")
+        send = Route("POST /rooms/7/send")
+        remove = Route("DELETE /rooms/7")
 
-        assert at.fetch(subscribe, {"room_id": "7"}, retry="always") == (
-            "@get('/rooms/7/subscribe', {retry: 'always'})"
-        )
-        assert at.fetch(send, {"room_id": "7"}) == "@post('/rooms/7/send')"
-        assert at.fetch(remove, {"room_id": "7"}) == "@delete('/rooms/7')"
-        assert (
-            at.fetch(send, {"room_id": "7"}, query={"src": "btn"}, fragment="latest")
-            == "@post('/rooms/7/send?src=btn#latest')"
-        )
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(subscribe, retry="always") == (
+                "@get('/rooms/7/subscribe', {retry: 'always'})"
+            )
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(send) == "@post('/rooms/7/send')"
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(remove) == "@delete('/rooms/7')"
+        with pytest.warns(DeprecationWarning, match="at.get"):
+            assert at.fetch(
+                send, query={"src": "btn"}, fragment="latest"
+            ) == "@post('/rooms/7/send?src=btn#latest')"
 
     def test_fetch_rejects_unknown_methods(self):
-        with pytest.raises(StarioError, match="no Datastar action"):
-            at.fetch(Route.head("/page"))
-        with pytest.raises(StarioError, match="no Datastar action"):
-            at.fetch(Route.query("/feed"))
+        with (
+            pytest.warns(DeprecationWarning, match="at.get"),
+            pytest.raises(StarioError, match="no Datastar action"),
+        ):
+            at.fetch(Route("HEAD", "/page"))
+        with (
+            pytest.warns(DeprecationWarning, match="at.get"),
+            pytest.raises(StarioError, match="no Datastar action"),
+        ):
+            at.fetch(Route("QUERY", "/feed"))
 
 
 class TestDatastarScriptTag:

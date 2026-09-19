@@ -1,7 +1,7 @@
 """HTTP stack for Stario apps and servers.
 
-**Dispatch** — `Router` in `stario.http.dispatch` matches requests to handlers.
-`App` subclasses it and adds error handling plus the protocol entrypoint.
+**Address and table** — `Route`, `Match`, and `Router`. `App` subclasses
+`Router` and adds error handling plus the protocol entrypoint.
 
 **Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
 
@@ -15,19 +15,18 @@ from stario.http.redirect import normalized_location
 from stario.http.server import Server
 ```
 
-Route patterns and link building live in `stario.routing`, not here.
 Filesystem serving lives in `stario.filesystem` (`Files`).
-
-For tests, `aload_app` is re-exported from `stario.testing`.
+For tests, import `aload_app` from `stario.testing`.
 """
 
 from stario.http.app import App
-from stario.http.context import Context, Handler, Middleware, RouteMatch
+from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
 from stario.http.headers import Headers
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
 from stario.http.request import Request
+from stario.http.route import Route, UrlPath
 from stario.http.writer import Writer
 
 __all__ = [
@@ -35,11 +34,13 @@ __all__ = [
     "Context",
     "Handler",
     "Headers",
+    "Match",
     "Middleware",
     "ParsedQuery",
     "Request",
-    "RouteMatch",
+    "Route",
     "Router",
+    "UrlPath",
     "Writer",
     "default_not_found",
     "method_not_allowed_handler",

@@ -53,6 +53,12 @@ class TestFiles:
             == "/media/file.txt?download=1#top"
         )
 
+    def test_rejects_urlpath_prefix(self, tmp_path: Path) -> None:
+        with pytest.raises(StarioError, match="must be a string"):
+            Files(tmp_path, UrlPath("/media"))
+        with pytest.raises(StarioError, match="must be a string"):
+            Assets(tmp_path, UrlPath("/static"))
+
     @pytest.mark.parametrize(
         "path",
         ["", "/file.txt", "a\\file.txt", "a//file.txt", "./file.txt", "../file.txt"],
@@ -89,7 +95,7 @@ class TestFiles:
 
     def test_host_prefix_can_generate_urls(self, tmp_path: Path) -> None:
         (tmp_path / "file.txt").write_text("ready")
-        files = Files(tmp_path, UrlPath("/media", host="cdn.example.com"))
+        files = Files(tmp_path, "//cdn.example.com/media")
 
         assert files.href("file.txt") == "//cdn.example.com/media/file.txt"
 
@@ -468,9 +474,7 @@ class TestServing:
         assert files.stats["compressed_files"] == 1
 
     async def test_svg_is_precompressed(self, tmp_path: Path) -> None:
-        payload = (
-            b'<svg xmlns="http://www.w3.org/2000/svg">' + b"<g/>" * 80 + b"</svg>"
-        )
+        payload = b'<svg xmlns="http://www.w3.org/2000/svg">' + b"<g/>" * 80 + b"</svg>"
         (tmp_path / "icon.svg").write_bytes(payload)
         files = Files(tmp_path)
 
@@ -662,7 +666,7 @@ class TestServing:
 @pytest.mark.asyncio
 class TestConfiguration:
     async def test_rejects_host_prefix(self, tmp_path: Path) -> None:
-        files = Files(tmp_path, UrlPath("/data", host="cdn.example.com"))
+        files = Files(tmp_path, "//cdn.example.com/data")
         with pytest.raises(StarioError, match="app-relative"):
             files.register(App())
 
@@ -722,6 +726,17 @@ class TestConfiguration:
         await files.load()
         with pytest.raises(StarioError, match="already loaded"):
             await files.load()
+
+    async def test_attach_reuses_tree_on_a_new_app(self, tmp_path: Path) -> None:
+        (tmp_path / "file.txt").write_text("ok")
+        files = Files(tmp_path)
+        first = App()
+        await files.attach(first)
+        second = App()
+        await files.attach(second)
+        async with TestClient(second) as client:
+            response = await client.get("/data/file.txt")
+        assert response.content == b"ok"
 
 
 class TestAssets:

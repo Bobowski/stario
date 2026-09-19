@@ -25,7 +25,7 @@ MAX_MESSAGE_LENGTH = 2000
 
 
 def room_from_route(c: Context, db: Database) -> Room | None:
-    room_id = c.route.params.get("room_id", "")
+        room_id = c.match.params.get("room_id", "")
     return data.get_room(db, room_id) if room_id else None
 
 

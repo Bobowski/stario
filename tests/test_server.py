@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 import stario.responses as responses
-from stario import App
+from stario import App, Route
 from stario.exceptions import StarioError
 from stario.http.config import RequestPolicy, ServerConfig
 from stario.http.server import Server
@@ -129,7 +129,7 @@ class TestServerRunLifecycle:
             async def hello(c, w):
                 responses.text(w, "hello")
 
-            app.get("/", hello)
+            app.add(Route("GET", "/"), hello)
             yield
 
         server = Server(
@@ -162,7 +162,7 @@ class TestServerRunLifecycle:
         spans = [json.loads(line) for line in output.getvalue().splitlines()]
         names = [s["name"] for s in spans]
         assert "server.startup" in names
-        assert "GET" in names
+        assert "GET /" in names
         shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
         assert shutdown_span["attributes"]["server.shutdown.trigger"] == "expected_stop"
         assert shutdown_span["status"] == "ok"
@@ -252,7 +252,7 @@ class TestServerRunLifecycle:
             async def hello(c, w):
                 responses.text(w, "hello")
 
-            app.get("/", hello)
+            app.add(Route("GET", "/"), hello)
             yield
 
         server = Server(
@@ -300,7 +300,7 @@ class TestServerRunLifecycle:
                 handler_started.set()
                 await asyncio.Event().wait()
 
-            app.get("/", slow)
+            app.add(Route("GET", "/"), slow)
             yield
 
         server = Server(
@@ -346,7 +346,7 @@ class TestServerRunLifecycle:
             async def hello(c, w):
                 responses.text(w, "hello")
 
-            app.get("/", hello)
+            app.add(Route("GET", "/"), hello)
             yield
 
         server = Server(

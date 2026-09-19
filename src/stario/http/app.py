@@ -19,7 +19,7 @@ from stario.exceptions import (
     StarioRuntime,
 )
 from stario.http.context import Context
-from stario.routing.locations import normalize_path
+from stario.http.route import normalize_path
 
 from .dispatch import Router
 from .writer import Writer
@@ -166,7 +166,7 @@ class App(Router):
     async def __call__(self, c: Context, w: Writer) -> None:
         """Protocol entrypoint: open a span, resolve routes, handle errors, and finish started responses.
 
-        - `c`: Request context (`app`, `req`, `span`, `route`, `state`).
+        - `c`: Request context (`app`, `req`, `span`, `match`, `state`).
         - `w`: Response writer for this message on the connection.
 
         Trailing slashes (except `/`) get `308` to a canonical path (leading `/`, no trailing
@@ -182,31 +182,35 @@ class App(Router):
         """
         span = c.span
         span.start()
-        span.attrs({"request.method": c.req.method, "request.path": c.req.path})
+        span.attr("request.method", c.req.method)
+        span.attr("request.path", c.req.path)
         failed_after_start = False
 
         try:
             path = c.req.path
-            # Canonicalize trailing slashes before routing (query string preserved).
+            host = c.req.host if self.host_routing else ""
             if path != "/" and path.endswith("/"):
                 target = normalize_path(path)
+                _, _, hit = self.find_handler(host, target, c.req.method)
+                if hit.pattern:
+                    span.rename(hit.pattern)
                 if c.req.query_bytes:
                     target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
                 responses.redirect(w, target, 308)
                 return
 
-            # If it's a valid path, find the handler and call it.
-            host = c.req.host if self.host_routing else ""
-            handler, c.route = self.find_handler(host, path, c.req.method)
+            handler, route, c.match = self.find_handler(host, path, c.req.method)
+            if c.match.pattern:
+                span.rename(c.match.pattern)
+                span.attr("http.route", route.path)
             await handler(c, w)
-            # Success path must leave the writer started or explicitly completed.
             if not w.started and not w.completed:
                 raise StarioRuntime(
                     "Handler returned without sending a response",
                     context={
                         "method": c.req.method,
                         "path": c.req.path,
-                        "route": c.route.pattern or None,
+                        "route": c.match.pattern or None,
                     },
                     help_text=(
                         "Call a response helper such as responses.text/json/html/empty, "
@@ -218,7 +222,6 @@ class App(Router):
             handler_responded = False
             failed_after_start = w.started
             if not w.started:
-                # Headers not sent yet: try typed error handlers, then generic 500.
                 if handler := self._find_error_handler(type(exc)):
                     try:
                         await handler(c, w, exc)
@@ -232,7 +235,6 @@ class App(Router):
                 span.fail(str(exc))
                 span.exception(exc)
         finally:
-            # After headers: abort the transport on failure; otherwise finish the message.
             if failed_after_start and not w.completed:
                 w.abort()
             else:

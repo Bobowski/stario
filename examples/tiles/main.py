@@ -66,10 +66,10 @@ ASSETS = Assets(Path(__file__).parent / "static", "/static")
 STYLE_CSS = ASSETS.href("css/style.css")
 DATASTAR_JS = ASSETS.href("js/datastar.js")
 
-# One Route per endpoint — register with app.add, link with href() or at.fetch.
-HOME = Route.get("/")
-SUBSCRIBE = Route.get("/subscribe")
-CLICK = Route.post("/click")
+# One Route per endpoint — register with app.add, link with href() or at.get / at.post.
+HOME = Route("GET", "/")
+SUBSCRIBE = Route("GET", "/subscribe")
+CLICK = Route("POST", "/click")
 
 # =============================================================================
 # 2. State
@@ -249,7 +249,7 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
             # if_missing=True: set defaults only when absent so reconnects don't clobber client state.
             data.signals({"user_id": user_id}, if_missing=True),
             # Mount opens GET /subscribe; retry="always" survives brief network blips.
-            data.init(at.fetch(SUBSCRIBE, retry="always")),
+            data.init(at.get(SUBSCRIBE.href(), retry="always")),
             # data.init runs once when the node mounts — here it opens the SSE stream (`@get`).
             h.H1("Tiles - Stario App"),
             h.P(

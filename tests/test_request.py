@@ -48,6 +48,10 @@ class TestRequestHost:
         req = _make_request(headers={"Host": "  Example.COM:8080  "})
         assert req.host == "example.com"
 
+    def test_host_is_lowercased_before_routing(self):
+        req = _make_request(headers={"Host": "API.Example.COM"})
+        assert req.host == "api.example.com"
+
 
 class TestRequestBody:
     """Test request body handling."""

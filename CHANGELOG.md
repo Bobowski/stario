@@ -17,10 +17,11 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 - `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
   is lazy. `await attach(app)` registers GET/HEAD and loads the tree
-  (`register()` and `load()` stay available). `Assets` hashes names and
-  307s logical paths. Both send strong ETags, 304, and
-  `X-Content-Type-Options: nosniff`. Pass `content_types=` at
-  construction to add or override MIME types.
+  (`register()` and `load()` stay available). A later `attach()` on a
+  new `App` re-adds GET/HEAD and reuses the loaded tree. `load()` still
+  runs once. `Assets` hashes names and 307s logical paths. Both send
+  strong ETags, 304, and `X-Content-Type-Options: nosniff`. Pass
+  `content_types=` at construction to add or override MIME types.
 - `stario.json` — one process-wide codec for JSON responses, Datastar signals,
   telemetry, and the test client. `dumps()` and `dumps_bytes()` preserve fast
   text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
@@ -29,16 +30,42 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Changed
 
-- File serving lives in `stario.Assets` and `stario.Files`. `stario.staticassets`
-  (`AssetManifest`, `StaticAssets`) is obsolete and kept only for existing
-  apps. `load()` keeps the identity body when a compressed variant does not
-  fit the byte budget. `image/svg+xml` is compressible. Migrate with
-  `Assets(...)` and `await attach(app)` in place of `AssetManifest` plus
-  `StaticAssets(...).register(app)`.
-- Removed the `aiofiles` dependency. File streaming (`Assets`, `Files`, and the
-  obsolete `stario.staticassets`) now reads already-open file descriptors
-  with `os.pread` in a worker thread instead of a second `open()` per
-  streamed response.
+- `find_handler` has no LRU. Static `(host, path, method)` hits an exact
+  map and reuses that `Match`. Exact hosts have their own path trie.
+  Exact-only path chains are radix-compressed. One cursor walks the
+  trie. The matcher does not lowercase `host` — pass `Request.host`
+  (already folded).
+- File streaming (`Assets`, `Files`, and `stario.staticassets`) reads
+  already-open file descriptors with `os.pread` in a worker thread.
+  The `aiofiles` dependency is gone.
+
+### Deprecated
+
+These still work. They will be removed in 5.0.
+
+Prefer `Route("GET /home")` or `Route("POST", ROOM + "/send")` and
+`app.add(route, handler)`. Host is `//host/path` or `host=`. Paths
+start with `/` or `//`. `{name}` and `{name...}` must be a whole path
+segment or host label. `{{name}}` is a literal `{name}`. Query and
+fragment go to `href()` only. After a match, read `c.match`.
+
+- `UrlPath` — prefer `Route` or a `/` / `//` string. `href()` and `/`
+  composition still work. `app.use`, `not_found`, `Files`, and `Assets`
+  take strings.
+- `app.get` / `app.post` / `app.handle` and `Route.get` / `Route.post`
+  / … — register with `app.add(Route("GET /"), handler)`.
+  `Route.query(path)` stays as the HTTP QUERY factory until 5.0;
+  `Route("QUERY /feed")` is the replacement.
+- `at.fetch` — build the URL with `route.href()` and name the verb at
+  the call site (`at.get(...)`, `at.post(...)`).
+- `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use
+  `Assets(...)` or `Files(...)` and `await attach(app)`.
+
+### Removed
+
+- `c.route` (`RouteMatch`) — use `c.match` (`Match`).
+- `stario.routing` — import `Route` and `UrlPath` from `stario` or
+  `stario.http`. `from stario.http import RouteMatch` becomes `Match`.
 
 ## 4.1.1 - 2026-08-31
 

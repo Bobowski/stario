@@ -14,26 +14,53 @@ from stario.telemetry.core import Span
 from .request import Request
 from .writer import Writer
 
+_NO_PARAMS: MappingProxyType[str, str] = MappingProxyType({})
+
+
+class Match:
+    """Immutable hit: pattern plus this request's captures."""
+
+    __slots__ = ("params", "pattern")
+
+    def __init__(
+        self,
+        pattern: str,
+        params: Mapping[str, str] = _NO_PARAMS,
+    ) -> None:
+        object.__setattr__(self, "pattern", pattern)
+        if not params:
+            frozen: Mapping[str, str] = _NO_PARAMS
+        elif isinstance(params, MappingProxyType):
+            frozen = params
+        else:
+            frozen = MappingProxyType(params)
+        object.__setattr__(self, "params", frozen)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Match is immutable")
+
+    def __repr__(self) -> str:
+        if not self.pattern:
+            return "Match.empty"
+        return f"Match({self.pattern!r})"
+
+    @classmethod
+    def empty(cls) -> Match:
+        """Unmatched 404 / 405 sentinel."""
+        return EMPTY_MATCH
+
+
+EMPTY_MATCH = Match.__new__(Match)
+object.__setattr__(EMPTY_MATCH, "pattern", "")
+object.__setattr__(EMPTY_MATCH, "params", _NO_PARAMS)
+
 if TYPE_CHECKING:
     from .app import App
 
 
-@dataclass(slots=True, frozen=True)
-class RouteMatch:
-    """Result of routing: a canonical pattern string plus captured path/host segments."""
-
-    pattern: str
-    """Matched route template (useful for logs), including host part when present."""
-    params: Mapping[str, str]
-    """Map from `{param}` / `{rest...}` names to decoded segment text."""
-
-
-EMPTY_ROUTE_MATCH = RouteMatch(pattern="", params=MappingProxyType({}))
-
-
 @dataclass(slots=True)
 class Context:
-    """Per-request bundle passed to every handler and middleware (routing fills `route` before the handler runs)."""
+    """Per-request bundle passed to every handler and middleware (routing fills `match` before the handler runs)."""
 
     app: App
     """The `App` instance for this request."""
@@ -45,8 +72,8 @@ class Context:
     """Completes when the client closes this request's connection."""
     state: dict[str, Any] = field(default_factory=lambda: {})
     """Mutable dict for middleware to pass data to inner layers and the handler."""
-    route: RouteMatch = field(default=EMPTY_ROUTE_MATCH)
-    """Filled by `App.__call__` before the handler runs; do not assign in handlers."""
+    match: Match = field(default=EMPTY_MATCH)
+    """Hit for this request: `.pattern` and `.params`. Empty pattern on 404 and 405."""
 
     @property
     def disconnect(self) -> asyncio.Future[None]:

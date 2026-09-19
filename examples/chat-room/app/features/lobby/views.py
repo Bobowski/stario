@@ -72,7 +72,7 @@ def lobby_view(
                     if_missing=True,
                 ),
                 data.init(
-                    f"{VISITOR_SESSION_INIT}\n{at.fetch(SUBSCRIBE, retry='always')}"
+                    f"{VISITOR_SESSION_INIT}\n{at.get(SUBSCRIBE.href(), retry='always')}"
                 ),
                 lobby_live_view(rooms=rooms, online_counts=online_counts),
             ),
@@ -126,7 +126,7 @@ def _create_room_dialog() -> HtmlElement:
                         "click",
                         f"""
                         if ($room_title.trim()) {{
-                            {at.fetch(CREATE)};
+                            {at.post(CREATE.href())};
                             $room_title = '';
                             $room_description = '';
                             el.closest('dialog').close();
@@ -160,7 +160,7 @@ def _room_card(room: Room, *, online: int) -> HtmlElement:
                     f"""
                     evt.stopPropagation();
                     if (confirm({confirm_text})) {{
-                        {at.fetch(DELETE, {"room_id": room.id})};
+                        {at.delete(DELETE.href(room.id))};
                     }}
                     """,
                 ),

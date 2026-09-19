@@ -135,7 +135,7 @@ async def home(c: Context, w: Writer) -> None:
     responses.text(w, "Hello from Stario")
 
 
-HOME = Route.get("/")
+HOME = Route("GET", "/")
 
 async def bootstrap(app: App, span: Span):
     span.attr("app.name", "example")

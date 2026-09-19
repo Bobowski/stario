@@ -108,7 +108,7 @@ def delete_room(db: Database, relay: Relay[str]):
     """
 
     async def handler(c: Context, w: Writer) -> None:
-        room_id = c.route.params.get("room_id", "")
+        room_id = c.match.params.get("room_id", "")
         if room_data.delete_room(db, room_id):
             c.span.event("Room deleted", {"room_id": room_id})
             relay.publish(room_subjects.deleted(room_id), "deleted")

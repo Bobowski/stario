@@ -106,7 +106,7 @@ def online_users_view(users: list[User]) -> HtmlElement:
 
 
 def input_form_view(room_id: str) -> HtmlElement:
-    send = at.fetch(SEND, {"room_id": room_id})
+    send = at.post(SEND.href(room_id))
     return h.Form(
         {"id": "input-form", "class": "input-form"},
         data.on("submit", "evt.preventDefault()"),
@@ -130,7 +130,7 @@ def input_form_view(room_id: str) -> HtmlElement:
                 }}
                 """,
             ),
-            data.on("input", at.fetch(TYPING, {"room_id": room_id})),
+            data.on("input", at.post(TYPING.href(room_id))),
         ),
         h.Button(
             {"type": "button", "class": "send-button"},
@@ -211,7 +211,7 @@ def room_view(
                     if_missing=True,
                 ),
                 data.init(
-                    f"{VISITOR_SESSION_INIT}\n{at.fetch(SUBSCRIBE, {'room_id': room.id})}"
+                    f"{VISITOR_SESSION_INIT}\n{at.get(SUBSCRIBE.href(room.id))}"
                 ),
                 room_live_view(
                     room,

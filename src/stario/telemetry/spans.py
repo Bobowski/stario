@@ -79,6 +79,9 @@ class NoOpSpan:
     def fail(self, message: str) -> None:
         pass
 
+    def rename(self, name: str) -> None:
+        pass
+
     def end(self) -> None:
         pass
 
@@ -171,6 +174,9 @@ class ProxySpan:
 
     def fail(self, message: str) -> None:
         self._span.fail(message)
+
+    def rename(self, name: str) -> None:
+        self._span.rename(name)
 
     def end(self) -> None:
         self._span.end()
@@ -345,6 +351,11 @@ class RecordingSpan:
         if self.start_ns is None or self.end_ns is not None:
             return
         self.error = message
+
+    def rename(self, name: str) -> None:
+        if self.end_ns is not None:
+            return
+        self.name = name
 
     def end(self) -> None:
         if self.end_ns is not None:

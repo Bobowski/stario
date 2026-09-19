@@ -12,7 +12,6 @@ def test_core_modules_import() -> None:
     import stario.http
     import stario.json
     import stario.markup
-    import stario.routing
     import stario.staticassets
 
     assert isinstance(stario.__version__, str)
@@ -34,6 +33,7 @@ def test_core_modules_import() -> None:
                 "Assets",
                 "Context",
                 "Files",
+                "Match",
                 "Route",
                 "StaticAssets",
                 "UrlPath",
@@ -49,17 +49,14 @@ def test_core_modules_import() -> None:
             ["AssetManifest", "StaticAssets", "fingerprint"],
         ),
         (
-            "stario.routing",
-            ["Route", "UrlPath", "Segment", "normalize_path", "append_query_fragment"],
-        ),
-        (
             "stario.http",
             [
                 "App",
+                "Match",
+                "Route",
                 "Router",
                 "Request",
                 "Writer",
-                "RouteMatch",
                 "normalized_location",
                 "default_not_found",
             ],
@@ -119,8 +116,7 @@ def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
         "stario.filesystem.live",
         "stario.http.router",
         "stario.http.staticassets",
-        "stario.routing.trie",
-        "stario.routing.pattern",
+        "stario.routing",
     ],
 )
 def test_removed_shim_modules(removed_module: str) -> None:

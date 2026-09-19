@@ -15,7 +15,7 @@ import stario.responses as responses
 from stario import App, Context, Route, Span, Writer
 from stario.markup import html as h
 
-HOME = Route.get("/")
+HOME = Route("GET", "/")
 
 
 def home_view():

@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 import stario.responses as responses
-from stario import App, Relay
+from stario import App, Relay, Route
 from stario.datastar import SSE
 from stario.http.compression import CompressionConfig
 from stario.http.config import RequestPolicy
@@ -186,7 +186,7 @@ async def test_header_total_over_limit_returns_431() -> None:
         hits += 1
         responses.text(w, "should not run")
 
-    app.get("/", handler)
+    app.add(Route("GET", "/"), handler)
     proto, app, transport = _make_protocol(
         app=app,
         max_header_bytes=limit,
@@ -213,7 +213,7 @@ async def test_body_over_limit_returns_413() -> None:
 
         responses.text(w, "ok")
 
-    app.post("/", read_body)
+    app.add(Route("POST", "/"), read_body)
 
     proto, app, transport = _make_protocol(
         app=app,
@@ -242,7 +242,7 @@ async def test_declared_body_over_limit_fails_before_handler_runs() -> None:
         hits += 1
         responses.text(w, "ok")
 
-    app.post("/", ignore_body)
+    app.add(Route("POST", "/"), ignore_body)
 
     proto, app, transport = _make_protocol(app=app, max_body_bytes=20)
     try:
@@ -292,7 +292,7 @@ async def test_percent_encoded_path_reaches_handler() -> None:
         seen.append(c.req.path)
         responses.text(w, "ok")
 
-    app.get("/hello world", handler)
+    app.add(Route("GET", "/hello world"), handler)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -312,15 +312,15 @@ async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
     seen: list[str] = []
 
     async def wildcard(c, w) -> None:
-        seen.append(c.route.params["name"])
+        seen.append(c.match.params["name"])
         responses.text(w, "wildcard")
 
     async def nested(c, w) -> None:
         seen.append("nested")
         responses.text(w, "nested")
 
-    app.get("/files/{name}", wildcard)
-    app.get("/files/a/b", nested)
+    app.add(Route("GET", "/files/{name}"), wildcard)
+    app.add(Route("GET", "/files/a/b"), nested)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -355,7 +355,7 @@ async def test_started_stream_failure_closes_without_terminal_chunk() -> None:
         w.write(b"partial")
         raise RuntimeError("stream failed")
 
-    app.get("/", handler)
+    app.add(Route("GET", "/"), handler)
     proto, app, transport = _make_protocol(app=app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -387,8 +387,8 @@ async def test_pipelined_requests_are_served_in_order() -> None:
         order.append("fast")
         responses.text(w, "fast")
 
-    app.get("/slow", slow)
-    app.get("/fast", fast)
+    app.add(Route("GET", "/slow"), slow)
+    app.add(Route("GET", "/fast"), fast)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -421,7 +421,7 @@ async def test_chunked_request_body_reaches_handler() -> None:
         bodies.append(await c.req.body())
         responses.text(w, "ok")
 
-    app.post("/", echo)
+    app.add(Route("POST", "/"), echo)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -451,7 +451,7 @@ async def test_expect_100_continue_sends_interim_response() -> None:
         body = await c.req.body()
         responses.text(w, body.decode())
 
-    app.post("/", echo)
+    app.add(Route("POST", "/"), echo)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -485,7 +485,7 @@ async def test_connection_close_header_closes_socket_after_response() -> None:
     async def handler(c, w) -> None:
         responses.text(w, "bye")
 
-    app.get("/", handler)
+    app.add(Route("GET", "/"), handler)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -572,8 +572,8 @@ async def test_close_with_error_signals_disconnect_without_cancelling_active_han
     async def second(_c, _w) -> None:
         responses.text(_w, "should not run")
 
-    app.get("/first", first)
-    app.post("/second", second)
+    app.add(Route("GET", "/first"), first)
+    app.add(Route("POST", "/second"), second)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -611,7 +611,7 @@ async def test_connection_lost_signals_disconnect_without_cancelling_handler() -
             await hang.wait()
         finished.set()
 
-    app.get("/", handler)
+    app.add(Route("GET", "/"), handler)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -642,7 +642,7 @@ async def test_connection_lost_lets_sse_handler_run_post_alive_cleanup() -> None
         cleanup_events.append("disconnected")
         c.span.event("disconnected", {})
 
-    app.get("/subscribe", subscribe)
+    app.add(Route("GET", "/subscribe"), subscribe)
 
     proto, app, transport = _make_protocol(app=app)
     try:
@@ -668,8 +668,8 @@ async def test_keep_alive_serves_second_request_on_same_connection() -> None:
         hits.append("b")
         responses.text(w, "b")
 
-    app.get("/a", a)
-    app.get("/b", b)
+    app.add(Route("GET", "/a"), a)
+    app.add(Route("GET", "/b"), b)
 
     proto, app, transport = _make_protocol(app=app)
     try:

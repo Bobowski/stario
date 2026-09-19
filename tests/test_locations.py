@@ -1,6 +1,6 @@
 """Tests for URL path normalization and query/fragment helpers."""
 
-from stario.routing.locations import append_query_fragment, normalize_path
+from stario.http.route import append_query_fragment, normalize_path
 
 
 class TestNormalizePath:

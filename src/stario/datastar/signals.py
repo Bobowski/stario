@@ -36,9 +36,11 @@ async def read_signals(req: Request) -> dict[str, Any]:
     sent as nested JSON objects.
 
     ```python
+    from stario import Route
     from stario.datastar import SSE, read_signals
 
-    @app.post("/action")
+    ACTION = Route("POST", "/action")
+
     async def action(c, w):
         sig = await read_signals(c.req)
         SSE(w).patch_signals({"n": int(sig.get("n", 0)) + 1})

@@ -41,8 +41,8 @@ from stario.http.compression import (
 )
 from stario.http.context import Context
 from stario.http.headers import Headers, encode_header_value
+from stario.http.route import Route, append_query_fragment, public_prefix
 from stario.http.writer import Writer
-from stario.routing import UrlPath, append_query_fragment
 
 DEFAULT_TYPE: Final = b"application/octet-stream"
 CONTENT_TYPES: Final = {
@@ -354,7 +354,6 @@ class _Mount:
         "_content_types",
         "_loaded",
         "_min_size",
-        "_registered",
         "_route",
         "directory",
         "follow_symlinks",
@@ -368,7 +367,7 @@ class _Mount:
     def __init__(
         self,
         directory: Path | str,
-        url_prefix: str | UrlPath | None = None,
+        url_prefix: str | None = None,
         *,
         include_hidden: bool = False,
         follow_symlinks: bool = False,
@@ -389,16 +388,18 @@ class _Mount:
                 context={"path": str(self.directory)},
                 help_text=f"Create the directory before {kind}(...).",
             )
-        prefix = self._default_prefix if url_prefix is None else url_prefix
-        self.prefix = prefix if isinstance(prefix, UrlPath) else UrlPath(prefix)
-        if self.prefix.placeholders:
+        if url_prefix is not None and type(url_prefix) is not str:
             raise StarioError(
-                f"{kind} URL prefix must not contain placeholders",
-                context={"url_prefix": self.prefix.text},
-                help_text='Use a fixed prefix such as "/static".',
-                example=f'{kind}("./static", "/static")',
+                "URL prefix must be a string",
+                context={"url_prefix": url_prefix},
+                help_text='Use "/static" or "//cdn.example.com/static".',
             )
-        self._route = self.prefix / "{path...}"
+        prefix = self._default_prefix if url_prefix is None else url_prefix
+        self.prefix = public_prefix(prefix)
+        self._route = Route(
+            "GET",
+            "/{path...}" if self.prefix == "/" else f"{self.prefix}/{{path...}}",
+        )
         self.include_hidden = include_hidden
         self.follow_symlinks = follow_symlinks
         types = dict(CONTENT_TYPES)
@@ -415,7 +416,6 @@ class _Mount:
                 )
         self._content_types = types
         self._cache: dict[str, _Cached] = {}
-        self._registered = False
         self._loaded = False
 
     def register(
@@ -426,16 +426,11 @@ class _Mount:
     ) -> None:
         """Attach GET and HEAD routes. Prefer `attach()` in bootstrap."""
         kind = type(self).__name__
-        if self.prefix.host:
+        if self.prefix.startswith("//"):
             raise StarioError(
                 f"{kind} can only serve an app-relative prefix",
-                context={"url_prefix": self.prefix.text},
+                context={"url_prefix": self.prefix},
                 help_text="Use a host prefix on href() only. attach() needs /static or /data.",
-            )
-        if self._registered:
-            raise StarioRuntime(
-                f"{kind} is already registered",
-                help_text=f"You can only register a {kind} object once.",
             )
         if not self.directory.is_dir():
             raise StarioError(
@@ -447,9 +442,8 @@ class _Mount:
             self._default_cache_control if cache_control is None else cache_control,
             field="cache_control",
         )
-        app.get(self._route, self)
-        app.head(self._route, self)
-        self._registered = True
+        app.add(self._route, self)
+        app.add(Route("HEAD", self._route.target), self)
 
     async def load(
         self,
@@ -547,6 +541,8 @@ class _Mount:
     ) -> Mapping[str, int]:
         """Register GET/HEAD, then load the tree. Returns the same stats as `load()`."""
         self.register(app, cache_control=cache_control)
+        if self._loaded:
+            return self.stats
         return await self.load(
             max_bytes=max_bytes,
             max_file_size=max_file_size,
@@ -756,7 +752,7 @@ class Assets(_Mount):
     def __init__(
         self,
         directory: Path | str,
-        url_prefix: str | UrlPath | None = None,
+        url_prefix: str | None = None,
         *,
         include_hidden: bool = False,
         follow_symlinks: bool = False,
@@ -814,7 +810,7 @@ class Assets(_Mount):
         hashed_path = f"{parent}/{hashed}" if slash else hashed
         self._catalog[logical] = entry = _Hashed(
             hashed_path,
-            (self.prefix / hashed_path).href(),
+            self._route.href(hashed_path),
             path,
             size,
             modified_ns,
@@ -872,7 +868,7 @@ class Assets(_Mount):
         self.stats = stats
 
     async def __call__(self, context: Context, writer: Writer) -> None:
-        path = context.route.params.get("path", "")
+        path = context.match.params.get("path", "")
         if not _is_relative(path):
             _not_found(writer)
             return
@@ -976,9 +972,7 @@ class Files(_Mount):
             raise _bad_path(path)
         if self.resolve(path) is None:
             raise _missing(path)
-        return append_query_fragment(
-            self._route.href(path=path), query=query, fragment=fragment
-        )
+        return self._route.href(path, query=query, fragment=fragment)
 
     def _load(self) -> None:
         stats = _empty_stats()
@@ -1005,7 +999,7 @@ class Files(_Mount):
         self.stats = stats
 
     async def __call__(self, context: Context, writer: Writer) -> None:
-        path = context.route.params.get("path", "")
+        path = context.match.params.get("path", "")
         if not _is_relative(path):
             _not_found(writer)
             return

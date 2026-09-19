@@ -2,6 +2,8 @@
 
 import pytest
 
+import stario.responses as responses
+from stario import Route
 from stario.exceptions import (
     ClientDisconnected,
     HttpException,
@@ -12,7 +14,7 @@ from stario.exceptions import (
 from stario.http.app import App
 from stario.http.context import Context
 from stario.http.writer import Writer
-from stario.routing import UrlPath
+from stario.testing import TestClient
 from tests.helpers import run_with_app
 
 
@@ -21,17 +23,19 @@ class TestHostRouting:
         seen: list[tuple[str, str]] = []
 
         async def handler(c: Context, w: Writer) -> None:
-            seen.append((c.route.params["subhost"], c.route.pattern))
+            seen.append((c.match.params["subhost"], c.match.pattern))
             w.end()
 
         def setup(app: App) -> None:
-            app.get(UrlPath("/dashboard", host="{subhost}.example.com"), handler)
+            app.add(
+                Route("GET //{subhost}.example.com/dashboard"), handler
+            )
 
         context, _writer = run_with_app(setup, "/dashboard", host="acme.example.com")
 
-        assert dict(context.route.params) == {"subhost": "acme"}
-        assert context.route.pattern == "{subhost}.example.com/dashboard"
-        assert seen == [("acme", "{subhost}.example.com/dashboard")]
+        assert dict(context.match.params) == {"subhost": "acme"}
+        assert context.match.pattern == "GET //{subhost}.example.com/dashboard"
+        assert seen == [("acme", "GET //{subhost}.example.com/dashboard")]
 
     def test_trailing_slash_redirect_preserves_query_string(self):
         _context, writer = run_with_app(
@@ -48,7 +52,7 @@ class TestAppErrorSurface:
             raise RuntimeError("boom")
 
         def setup(app: App) -> None:
-            app.get("/boom", boom)
+            app.add(Route("GET", "/boom"), boom)
 
         _context, writer = run_with_app(setup, "/boom")
 
@@ -72,7 +76,7 @@ class TestAppErrorSurface:
 
         def setup(app: App) -> None:
             app.on_error(StarioRuntime, runtime_error_handler)
-            app.get("/missing", missing_response)
+            app.add(Route("GET", "/missing"), missing_response)
 
         _context, writer = run_with_app(setup, "/missing")
 
@@ -85,7 +89,7 @@ class TestAppErrorSurface:
             raise HttpException(422, "nope")
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET", "/x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -97,7 +101,7 @@ class TestAppErrorSurface:
             raise RedirectException(303, "/next")
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET", "/x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -110,7 +114,7 @@ class TestAppErrorSurface:
             raise ClientDisconnected()
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET", "/x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -123,7 +127,7 @@ class TestAppErrorSurface:
             raise RedirectException(302, "javascript:alert(1)")
 
         def setup(app: App) -> None:
-            app.get("/x", handler)
+            app.add(Route("GET", "/x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -142,7 +146,7 @@ class TestAppErrorSurface:
 
         def setup(app: App) -> None:
             app.on_error(ValueError, custom)
-            app.get("/x", handler)
+            app.add(Route("GET", "/x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -158,7 +162,7 @@ class TestAppErrorSurface:
 
         def setup(app: App) -> None:
             app.on_error(ValueError, bad_handler)
-            app.get("/x", handler)
+            app.add(Route("GET", "/x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -168,3 +172,42 @@ class TestAppErrorSurface:
     def test_app_requires_running_loop(self):
         with pytest.raises(StarioError, match="requires a running event loop"):
             App()
+
+
+class TestRequestSpanName:
+    async def test_matched_route_renames_span(self):
+        async def ok(c: Context, w: Writer) -> None:
+            responses.empty(w, 204)
+
+        app = App()
+        app.add(Route("GET", "/users/{user_id}"), ok)
+        async with TestClient(app) as client:
+            response = await client.get("/users/7")
+
+        root = client.tracer.get_span(response.span_id)
+        assert root is not None
+        assert root.name == "GET /users/{user_id}"
+        assert root.attributes["http.route"] == "/users/{user_id}"
+
+    async def test_trailing_slash_uses_canonical_route_name(self):
+        async def ok(c: Context, w: Writer) -> None:
+            responses.empty(w, 204)
+
+        app = App()
+        app.add(Route("GET", "/search"), ok)
+        async with TestClient(app) as client:
+            response = await client.get("/search/", follow_redirects=False)
+
+        assert response.status_code == 308
+        root = client.tracer.get_span(response.span_id)
+        assert root is not None
+        assert root.name == "GET /search"
+
+    async def test_not_found_keeps_method_name(self):
+        async with TestClient(App()) as client:
+            response = await client.get("/missing")
+
+        root = client.tracer.get_span(response.span_id)
+        assert root is not None
+        assert root.name == "GET"
+        assert "http.route" not in root.attributes
