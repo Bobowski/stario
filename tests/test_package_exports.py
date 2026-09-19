@@ -117,13 +117,9 @@ def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
         "stario.http.router",
         "stario.http.staticassets",
         "stario.routing",
+        "stario.html",
     ],
 )
 def test_removed_shim_modules(removed_module: str) -> None:
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module(removed_module)
-
-
-def test_stario_html_module_removed() -> None:
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("stario.html")

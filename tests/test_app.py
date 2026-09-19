@@ -27,9 +27,7 @@ class TestHostRouting:
             w.end()
 
         def setup(app: App) -> None:
-            app.add(
-                Route("GET //{subhost}.example.com/dashboard"), handler
-            )
+            app.add(Route("GET //{subhost}.example.com/dashboard"), handler)
 
         context, _writer = run_with_app(setup, "/dashboard", host="acme.example.com")
 
@@ -44,6 +42,12 @@ class TestHostRouting:
 
         assert writer.status == 308
         assert writer.headers.unsafe_get(b"location") == b"/search?q=cats&page=2"
+
+    def test_trailing_slash_on_double_slash_is_not_protocol_relative(self):
+        _context, writer = run_with_app(lambda _app: None, "//aftra.io/")
+
+        assert writer.status == 308
+        assert writer.headers.get("location") == "/aftra.io"
 
 
 class TestAppErrorSurface:

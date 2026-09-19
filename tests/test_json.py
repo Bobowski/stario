@@ -8,11 +8,9 @@ import pytest
 import stario.json as stario_json
 import stario.responses as responses
 from stario.datastar import SSE, data, read_signals
-from stario.http.headers import Headers
-from stario.http.request import BodyReader, Request
 from stario.http.writer import Writer
 from stario.telemetry.formatters import dumps_json
-from tests.helpers import make_writer_raw
+from tests.helpers import make_request, make_writer_raw
 
 
 class RecordingCodec:
@@ -62,19 +60,6 @@ def _restore_codec():
     stario_json.set_codec(stario_json.StdlibJsonCodec())
     yield
     stario_json.set_codec(previous)
-
-
-def _request(body: bytes) -> Request:
-    reader = BodyReader(pause=lambda: None, resume=lambda: None, disconnect=None)
-    reader._cached = body
-    reader._complete = True
-    return Request(
-        method="POST",
-        path="/",
-        query_bytes=b"",
-        headers=Headers(),
-        body=reader,
-    )
 
 
 def test_default_codec_uses_compact_utf8_bytes_and_accepts_text() -> None:
@@ -131,7 +116,9 @@ async def test_framework_json_paths_use_configured_codec() -> None:
     finally:
         loop.close()
 
-    assert await read_signals(_request(b'{"request":true}')) == {"request": True}
+    assert await read_signals(
+        make_request(method="POST", body=b'{"request":true}')
+    ) == {"request": True}
     assert dumps_json({"unknown": object()}).startswith('{"unknown":"<object object')
 
     byte_values = [value for value, _default in codec.dumped_bytes]

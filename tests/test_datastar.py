@@ -587,9 +587,10 @@ class TestDatastarActions:
         with pytest.warns(DeprecationWarning, match="at.get"):
             assert at.fetch(remove) == "@delete('/rooms/7')"
         with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(
-                send, query={"src": "btn"}, fragment="latest"
-            ) == "@post('/rooms/7/send?src=btn#latest')"
+            assert (
+                at.fetch(send, query={"src": "btn"}, fragment="latest")
+                == "@post('/rooms/7/send?src=btn#latest')"
+            )
 
     def test_fetch_rejects_unknown_methods(self):
         with (
