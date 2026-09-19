@@ -235,7 +235,7 @@ def _enc_catchall_path(value: object, name: str) -> str:
 
 def _host_text(value: object, name: str) -> str:
     text = _require(value, name, where="host").lower()
-    if any(ch in text for ch in "/:@[]"):
+    if any(ch in text for ch in "/:@[]?#\\ \t\r\n"):
         _value_error("Route host parameter contains invalid character", name, value=text)
     return text
 

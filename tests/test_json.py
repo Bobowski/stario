@@ -9,8 +9,9 @@ import stario.json as stario_json
 import stario.responses as responses
 from stario.datastar import SSE, data, read_signals
 from stario.http.headers import Headers
-from stario.testing.harness import TestRequest
+from stario.http.writer import Writer
 from stario.telemetry.formatters import dumps_json
+from stario.testing.harness import TestRequest
 from tests.helpers import make_writer_raw
 
 

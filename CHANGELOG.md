@@ -27,6 +27,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Fixed
 
+- `Assets.load()` re-hashes files already pinned by `href()`, so same-size
+  content changes are detected even when mtime does not move.
 - TTY tracer live footer — skip terminal writes when the text and width do not
   change. Cap the live block to `terminal_rows - 2` so cursor-up erase cannot
   clear scrollback. Tall trees keep the root header and the newest lines.

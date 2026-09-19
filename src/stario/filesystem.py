@@ -843,10 +843,11 @@ class Assets(_Mount):
         stats = _empty_stats()
         for logical, entry in self._catalog.items():
             try:
+                digest = _fingerprint(entry.source)
                 file_stat = entry.source.stat()
             except FileNotFoundError as exc:
                 raise _changed(entry.source) from exc
-            if (file_stat.st_size, file_stat.st_mtime_ns) != (
+            if digest != entry.digest or (file_stat.st_size, file_stat.st_mtime_ns) != (
                 entry.size,
                 entry.modified_ns,
             ):

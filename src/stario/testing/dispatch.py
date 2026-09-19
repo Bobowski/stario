@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from stario.http.app import App
 from stario.http.headers import Headers
+from stario.http.wire import decode_path
 from stario.telemetry.core import Span
 from stario.testing.cookies import serialize_cookie_header
 from stario.testing.encode import encode_request_body, expand_pairs
