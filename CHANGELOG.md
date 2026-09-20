@@ -56,11 +56,13 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Changed
 
-- `find_handler` has no LRU. Static `(host, path, method)` hits an exact
-  map and reuses that `Match`. Exact hosts have their own path trie.
-  Exact-only path chains are radix-compressed. One cursor walks the
-  trie. The matcher does not lowercase `host` — pass `Request.host`
-  (already folded).
+- `find_handler` keeps a 1024-entry LRU in front of the trie (same cap as
+  pre-4.2 Cython). Static `(host, path, method)` still hits an exact map
+  and reuses that `Match`. Parameterized paths reuse the resolved
+  `(handler, route, Match)` while they stay in the cache. Exact hosts
+  have their own path trie. Exact-only path chains are radix-compressed.
+  One cursor walks the trie on a miss. The matcher does not lowercase
+  `host` — pass `Request.host` (already folded).
 - File streaming (`Assets`, `Files`, and `stario.staticassets`) reads
   already-open file descriptors with `os.pread` in a worker thread.
   The `aiofiles` dependency is gone.

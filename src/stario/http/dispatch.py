@@ -417,6 +417,7 @@ class Router:
         "_host_routing",
         "_hosts_exact",
         "_hosts_param",
+        "_lookup",
         "_path",
     )
 
@@ -428,12 +429,25 @@ class Router:
         self._host_routing = False
         self._exact: dict[tuple[str, str, str], RouteMatch] = {}
 
+        @lru_cache(maxsize=1024)
+        def lookup(host: str, path: str, method: str) -> RouteMatch:
+            return self._resolve_handler(host, path, method)
+
+        self._lookup = lookup
+
     @property
     def host_routing(self) -> bool:
         return self._host_routing
 
     def find_handler(self, host: str, path: str, method: str) -> RouteMatch:
         """`host` must already be lowercased (`Request.host`)."""
+        return self._lookup(host, path, method)
+
+    def _invalidate_lookup(self) -> None:
+        self._lookup.cache_clear()
+
+    def _resolve_handler(self, host: str, path: str, method: str) -> RouteMatch:
+        """Static exact map, then trie. Cached by `find_handler`."""
         hit = self._exact.get((host, path, method))
         if hit is not None:
             return hit
@@ -515,10 +529,12 @@ class Router:
                 context={"pattern": pattern},
             )
         current.middleware = current.middleware + tuple(middleware)
+        self._invalidate_lookup()
 
     def not_found(self, pattern: UrlPath | str, handler: Handler) -> None:
         require_async_handler(handler, what="Not-found handler")
         self._policy_node(pattern).not_found_handler = handler
+        self._invalidate_lookup()
 
     def method_not_allowed(
         self,
@@ -531,6 +547,7 @@ class Router:
             return resolved
 
         self._policy_node(pattern).method_not_allowed_handler = checked
+        self._invalidate_lookup()
 
     def add(
         self,
@@ -590,6 +607,7 @@ class Router:
             )
         if tree is not self._hosts_param:
             _compress(tree, "/")
+        self._invalidate_lookup()
 
     @deprecated("Use add(Route(method, path), handler).")
     def handle(
