@@ -34,6 +34,19 @@ a self-signed cert serves both. See
 `PYTHONPATH=src` is required so `stario_cython` resolves after the inplace
 build.
 
+## Merge snapshot (2026-09-19)
+
+4.2 APIs (`Route` / `c.match` / `Assets` / `stario.json`) on this Cython
+runtime. Python httptools is gone. Complete official suite vs Granian
+RSGI 2.8.3 and the other fast stacks (Socketify, Robyn, Sanic,
+Django-Bolt, BlackSheep, FastAPI, Falcon): 4 vCPU cloud Xeon, `10s` × 5
+measured + 1 warmup.
+
+Granian leads GET (plaintext **0.87×**, JSON **0.85×**, params **0.70×**).
+Stario is even on small POST and ahead on larger bodies (64KB **1.24×**,
+2MB buffer **1.59×**, multipart **1.41×**). Full tables:
+[`benchmarks/server/baseline-20260919.md`](benchmarks/server/baseline-20260919.md).
+
 ## Merge snapshot (2026-08-28)
 
 Official `benchmarks/server` suite, one worker, `10s` × 5 measured + 1
