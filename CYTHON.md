@@ -42,9 +42,10 @@ RSGI 2.8.3 and the other fast stacks (Socketify, Robyn, Sanic,
 Django-Bolt, BlackSheep, FastAPI, Falcon): 4 vCPU cloud Xeon, `10s` × 5
 measured + 1 warmup.
 
-Granian leads GET (plaintext **0.87×**, JSON **0.85×**, params **0.70×**).
-Stario is even on small POST and ahead on larger bodies (64KB **1.24×**,
-2MB buffer **1.59×**, multipart **1.41×**). Full tables:
+Granian leads GET (plaintext **0.87×**, JSON **0.85×**, params **0.70×**
+on the first capture). The params hole was 4.2 dropping the lookup LRU
+so `/user/42` walked the trie every request; restoring it brings params
+in line with plaintext (**0.93× / 0.89× / 0.85×**). Full tables:
 [`benchmarks/server/baseline-20260919.md`](benchmarks/server/baseline-20260919.md).
 
 ## Merge snapshot (2026-08-28)
