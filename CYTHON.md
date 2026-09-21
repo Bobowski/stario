@@ -3,7 +3,11 @@
 HTTP/1 is [llhttp](https://github.com/nodejs/llhttp); HTTP/2 is nghttp2.
 Both live in one `HttpProtocol` and share `RequestExchange` in
 `src/stario_cython`. `stario serve` uses this protocol. uvloop is optional
-(`STARIO_LOOP=uvloop`).
+(`STARIO_LOOP=uvloop`). Current numbers, implemented surface, holes, and
+lab assumptions:
+[Current snapshot (2026-09-21)](#current-snapshot-2026-09-21). Current performance, what is implemented, what is
+missing, and the lab assumptions:
+[Current snapshot (2026-09-21)](#current-snapshot-2026-09-21).
 
 Linux builds need `pkg-config`, the Brotli development package, and
 `libnghttp2-dev`. Gzip links system zlib (`-lz`). The native protocol
@@ -34,18 +38,127 @@ a self-signed cert serves both. See
 `PYTHONPATH=src` is required so `stario_cython` resolves after the inplace
 build.
 
-## Merge snapshot (2026-09-19)
+## Current snapshot (2026-09-21)
 
-4.2 APIs (`Route` / `c.match` / `Assets` / `stario.json`) on this Cython
-runtime. Python httptools is gone. Complete official suite vs Granian
-RSGI 2.8.3 and the other fast stacks (Socketify, Robyn, Sanic,
-Django-Bolt, BlackSheep, FastAPI, Falcon): 4 vCPU cloud Xeon, `10s` × 5
-measured + 1 warmup.
+`cython-core` after 4.2 (`Route` / `c.match` / `Assets` / `stario.json`)
+and the request hotpath (fresh `Request`, lazy query, Router `_lookup`).
+Python httptools stays on `main`. Production HTTP here is Cython:
+`stario serve` and `python -m stario_cython` are the same protocol.
 
-Granian leads GET (plaintext **0.87×**, JSON **0.85×**, params **0.70×**
-on the first capture). The params hole was 4.2 dropping the lookup LRU
-so `/user/42` walked the trie every request; restoring it brings params
-in line with plaintext (**0.93× / 0.89× / 0.85×**). Full tables:
+Official wrk suite, one worker, `10s` × 5 measured + 1 warmup, 4 vCPU
+cloud Xeon, same-host loopback. Full tables:
+[`benchmarks/server/baseline-20260921-core.md`](benchmarks/server/baseline-20260921-core.md).
+
+### How we're doing
+
+Headline is **Stario CLI** vs Granian RSGI 2.8.3 (Rust, no framework) and
+FastAPI + Uvicorn. Median req/s.
+
+| Endpoint | Stario | Granian | vs Granian | vs FastAPI |
+| --- | ---: | ---: | ---: | ---: |
+| Plaintext | 137,565 | 149,473 | 0.92× | **3.0×** |
+| Request fields | 101,591 | 150,195 | 0.68× | **3.1×** |
+| JSON small POST | 103,106 | 105,270 | 0.98× | **3.6×** |
+| Octet 64KB | 32,793 | 30,271 | **1.08×** | **2.4×** |
+| Octet 2MB (buffer) | 1,809 | 1,477 | **1.23×** | **1.3×** |
+| Octet 2MB (stream) | 3,449 | 3,209 | **1.07×** | **3.0×** |
+| Multipart 2MB | 1,993 | 1,415 | **1.41×** | **1.5×** |
+
+Granian wins static GET and the request-fields case because it is not a
+framework. Stario is even on a small async JSON POST and ahead once the
+body is tens of kilobytes. Stario is the fastest *frameworked* server on
+this suite (ahead of BlackSheep+Granian, Socketify GET, Sanic, FastAPI,
+Falcon, Django-Bolt, Robyn). Socketify still leads 2MB **stream** (native
+chunk callbacks): 3,624 vs Stario 3,449.
+
+The leftover GET gap is **not** pooled-Request overhead. `/plaintext`
+never builds query/cookies; dispatch allocates one `Request` and runs
+`create_task(handler)`. Request-fields is the real hole: wrk uses 4096
+distinct `/user/{id}?q=` URLs (larger than the 1024 LRU), then the
+handler reads path param + query + header and interpolates a line.
+Granian does `path.rsplit` and a raw query scan and stays at ~150k.
+
+An earlier params re-run that hit `/user/42` every time was **0.85×**
+Granian (LRU always hot). This capture is the honest one.
+
+### Implemented
+
+- **HTTP/1** llhttp and **HTTP/2** nghttp2 in one `HttpProtocol`, sharing
+  pooled `RequestExchange` (arena, compressors, output buffers).
+- **Fresh `Request` per dispatch** via `make_request()` (`__new__`, no
+  Python `__init__`). Keep-alive does not reuse the Request object.
+- **Lazy** `ParsedQuery` / cookies / host until first read. Plaintext and
+  JSON GET never allocate them.
+- Protocol binds the Python Router **LRU** (`app._lookup`, max 1024)
+  directly. Trailing-slash **308** on the decoded path.
+- 4.2 app APIs: `Route`, `c.match`, `Assets`, `stario.json`. Handlers are
+  `async def(c, w)`.
+- Bodies with `Content-Length` ≤ **256 KiB** complete before the handler
+  starts (`SMALL_BODY_COMPLETE_DISPATCH`); larger bodies dispatch at
+  headers-complete so `stream()` can run early. Expect: 100-continue.
+- Timeouts share the Date-header tick (header 5s, idle 5s, body-stall 30s,
+  pipeline cap 8). Hatch: `STARIO_CYTHON_TIMEOUTS=off`.
+- Optional uvloop (`STARIO_LOOP=uvloop`). TLS ALPN `h2` then `http/1.1`.
+  Native compress is **br** and **gzip** (system zlib). Official benches
+  turn compression off.
+- Official suite shape: static GET, one interpolating request-fields GET,
+  async uploads (`await asyncio.sleep(0)`) from small JSON through 2MB
+  buffer / stream / multipart. Both Stario runner targets are Cython.
+
+### Missing / not doing (on purpose)
+
+App and Router stay Python. Do not revive:
+
+- a dual Cython App/Router
+- a contiguous serializer
+- pooled `asyncio.Event`
+- static / pre-serialized handlers
+- pooled / reset `Request` objects
+
+Python httptools lives on `main`. Native zstd is not offered (Python
+response helpers still negotiate it for non-native writers). picohttpparser
+is not the H1 parser: parser-only it is ~2.5–3.3× llhttp, but end-to-end
+GET was even and a tiny JSON POST was slower.
+
+### Not working / known holes
+
+- **Request-fields vs Granian (0.68×).** Framework routing + three field
+  reads vs a Rust server with hand-written path parse. Closing this
+  without a Cython Router means paying Python `_lookup` / `Match` /
+  query / header on a working set that misses the LRU.
+- **Official wrk suite is HTTP/1 only.** H2 works (`tests/cython/test_h2.py`);
+  same-host `h2load` GETs were ~1.8× HTTP/1 at 100 streams/connection
+  (2026-08-31). Not re-measured on this snapshot.
+- **Native entry vs CLI.** `python -m stario_cython` was ~12% slower on
+  plaintext here (123k vs 138k). Same protocol; treat CLI as production.
+- **4 vCPU loopback ceiling / noise.** Plaintext stdev ±5–7k. ~150k is
+  this machine’s wrk/Xeon band, not a portable absolute.
+- Falcon’s comparison app was still on the old `/json` `/validate` suite
+  and aborted the first full run; it is aligned now. Robyn/Django-Bolt
+  still buffer the stream route (no streaming API).
+
+### Main assumptions
+
+- Same-host wrk, 4 vCPU Xeon, 16 GiB, one worker, Python 3.14, uvloop.
+- Responses are plaintext; serializers cannot win a case.
+- wrk working set 4096 > LRU 1024, so request-fields is not a permanent
+  cache hit.
+- Upload handlers always `await asyncio.sleep(0)` so the case is actually
+  async.
+- Granian RSGI is a **ceiling**, not a peer framework: no router, no
+  `Request` object, path/query/header by hand.
+- Compression off, tracer noop. Numbers are relative signal, not a claim
+  about another machine.
+- `stario` and `stario-cython` runner targets are both this Cython
+  protocol. A Python vs Cython comparison needs `main`.
+
+## Historical snapshot (2026-09-19)
+
+Old endpoint set (plaintext / JSON GET / single-URL params, no `sleep(0)`).
+Granian led GET (plaintext **0.87×**, JSON **0.85×**, params **0.70×**).
+Params was 4.2 dropping the lookup LRU; restoring it brought params in
+line with plaintext (**0.93× / 0.89× / 0.85×**) on a cached `/user/42`.
+Full tables:
 [`benchmarks/server/baseline-20260919.md`](benchmarks/server/baseline-20260919.md).
 
 ## Merge snapshot (2026-08-28)
