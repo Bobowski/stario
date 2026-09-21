@@ -90,20 +90,19 @@ cdef class Request:
     cdef object _cookies
     cdef object _host
 
-    cdef void reset(
-        self,
-        object method,
-        object path,
-        object query_bytes,
-        object protocol_version,
-        bint keep_alive,
-        object headers,
-        object body,
-    )
     cdef object _materialize_query(self)
-    cdef void _rebind_query(self, object query_bytes) noexcept
+    cdef object _ensure_query(self)
     cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept
     cdef void prefetch_host(self) noexcept
+
+cdef Request make_request(
+    object method,
+    object path,
+    object protocol_version,
+    bint keep_alive,
+    object headers,
+    object body,
+)
 
 cdef class RequestExchange:
     cdef object _transport

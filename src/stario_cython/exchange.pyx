@@ -1,11 +1,10 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """One request's lifecycle: headers, arena-backed request, body, and response.
 
-``Headers`` lives here (one extension). ``RequestExchange`` is pooled. The
-protocol appends URL and header fragments into the arena; this module indexes
-Host/Cookie/Authorization at parse time, keeps ``RequestHeaders`` read-only,
-indexes query pairs on first read, scans cookies on demand, and writes the
-response (including native compression).
+``Headers`` lives here (one extension). ``RequestExchange`` is pooled for its
+native buffers (arena, compressors, output). ``Request`` is not: the protocol
+allocates a new one when the message is ready to dispatch. Query and cookies
+stay unset until the handler reads them.
 """
 
 import asyncio
@@ -1544,7 +1543,22 @@ cdef object _host_without_port_n(const char* s, Py_ssize_t n):
 
 
 cdef class Request:
-    """Request view. Same handler API as stario.http.request.Request."""
+    """One HTTP request. New object per dispatch; not pooled with the exchange."""
+
+    def __cinit__(self):
+        self.method = None
+        self.path = None
+        self.headers = None
+        self.protocol_version = None
+        self.keep_alive = True
+        self._query_bytes = None
+        self._q_owner = None
+        self._q_off = 0
+        self._q_len = 0
+        self._body = None
+        self._query = None
+        self._cookies = None
+        self._host = None
 
     def __init__(
         self,
@@ -1557,20 +1571,6 @@ cdef class Request:
         headers=None,
         body=None,
     ):
-        self.reset(
-            method, path, query_bytes, protocol_version, keep_alive, headers, body
-        )
-
-    cdef void reset(
-        self,
-        object method,
-        object path,
-        object query_bytes,
-        object protocol_version,
-        bint keep_alive,
-        object headers,
-        object body,
-    ):
         self.method = method
         self.path = path
         self.headers = headers
@@ -1581,34 +1581,18 @@ cdef class Request:
         self._q_off = 0
         self._q_len = 0
         self._body = body
+        self._query = None
         self._cookies = None
         self._host = None
-        self._rebind_query(query_bytes)
-
-    cdef void _rebind_query(self, object query_bytes) noexcept:
-        cdef ParsedQuery parsed
-        if self._query is None:
-            parsed = ParsedQuery.__new__(ParsedQuery)
-            self._query = parsed
-        else:
-            parsed = <ParsedQuery>self._query
-        if query_bytes is not None:
-            parsed.bind_bytes(query_bytes)
-        else:
-            parsed.bind_span(None, 0, 0)
 
     cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
-        cdef ParsedQuery parsed
+        # Remember where the query sits in the exchange arena. ParsedQuery
+        # is built only if the handler reads ``req.query``.
         self._q_owner = owner
         self._q_off = off
         self._q_len = n
         self._query_bytes = None
-        if self._query is None:
-            parsed = ParsedQuery.__new__(ParsedQuery)
-            self._query = parsed
-        else:
-            parsed = <ParsedQuery>self._query
-        parsed.bind_span(owner, off, n)
+        self._query = None
 
     cdef void prefetch_host(self) noexcept:
         cdef RequestHeaders req_headers
@@ -1673,6 +1657,18 @@ cdef class Request:
         )
         return self._query_bytes
 
+    cdef object _ensure_query(self):
+        cdef ParsedQuery parsed
+        if self._query is not None:
+            return self._query
+        parsed = ParsedQuery.__new__(ParsedQuery)
+        if self._q_len > 0:
+            parsed.bind_span(self._q_owner, self._q_off, self._q_len)
+        else:
+            parsed.bind_bytes(self._materialize_query())
+        self._query = parsed
+        return parsed
+
     @property
     def query_bytes(self):
         return self._materialize_query()
@@ -1687,9 +1683,7 @@ cdef class Request:
 
     @property
     def query(self):
-        if self._query is None:
-            self._rebind_query(self._query_bytes)
-        return self._query
+        return self._ensure_query()
 
     @property
     def cookies(self):
@@ -1722,6 +1716,29 @@ cdef class Request:
             return
         async for chunk in self._body.stream(max_chunk=max_chunk):
             yield chunk
+
+
+cdef Request make_request(
+    object method,
+    object path,
+    object protocol_version,
+    bint keep_alive,
+    object headers,
+    object body,
+):
+    """Hot-path constructor. ``__new__`` skips Python ``__init__``.
+
+    Query, cookies, and host stay unset. Handlers that never read them
+    (plaintext / JSON GET) never allocate those objects.
+    """
+    cdef Request req = Request.__new__(Request)
+    req.method = method
+    req.path = path
+    req.headers = headers
+    req.protocol_version = protocol_version
+    req.keep_alive = keep_alive
+    req._body = body
+    return req
 
 
 cdef class RequestExchange:
@@ -1770,7 +1787,7 @@ cdef class RequestExchange:
     def __init__(self):
         self.headers = Headers()
         self.request_headers = RequestHeaders(self)
-        self.req = Request()
+        self.req = None
         self._chunks = None
         self._cached = None
         self._data_ready = None
@@ -2478,6 +2495,7 @@ cdef class RequestExchange:
         self._timeout = body_timeout
         self.span = None
         self.match = EMPTY_MATCH
+        self.req = None
         self._state = None
         self._clear_request_headers()
         self.handler_done = False
@@ -2601,6 +2619,7 @@ cdef class RequestExchange:
         if self.in_pool:
             return
         self.in_pool = True
+        self.req = None
         self._cached = None
         self._data_ready = None
         self._h2_pending = b""
@@ -2626,7 +2645,7 @@ cdef class RequestExchange:
         self._free_compressors()
         self.headers.c_clear()
         self._clear_request_headers()
-        self.req.reset("GET", "/", b"", "1.1", True, None, None)
+        self.req = None
         self.span = None
         self.match = EMPTY_MATCH
         self._state = None
