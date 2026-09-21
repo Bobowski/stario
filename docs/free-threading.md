@@ -64,13 +64,15 @@ loop. We should copy that split, not invent a shared-loop scheduler.
                     ┌─────────────────────────────────────────┐
                     │  process (one interpreter, GIL off)     │
                     │                                         │
-  listen sock ───►  │  main: signals, bootstrap, shutdown     │
+                    │  thread 0: signals, bootstrap, shutdown │
+                    │            + a full SO_REUSEPORT server │
                     │         shared App/Router (frozen)      │
                     │         shared Relay, Tracer, Assets    │
                     │                                         │
                     │   thread 0          thread 1            │
                     │   ┌──────────┐      ┌──────────┐        │
-  accepted fd ───►  │   │ loop 0   │      │ loop 1   │        │
+  kernel SYN ──────┼──► │ loop 0   │      │ loop 1   │        │
+  SO_REUSEPORT     │    │ listen   │      │ listen   │        │
                     │   │ conns A  │      │ conns B  │        │
                     │   │ tasks A  │      │ tasks B  │        │
                     │   │ date 0   │      │ date 1   │        │
@@ -301,7 +303,7 @@ import). `watchfiles` is the parent of `stario watch` only.
 | `c.alive()` | Waits on that Future. SSE would either never see shutdown or raise. |
 | `App.tasks` | `set.add` + `discard` from N loops. Builtin set ops are individually safe; drain’s `list(self.tasks)` + `asyncio.wait` is not a consistent snapshot, and those Task objects are loop-affine. Per-loop sets, or trust `asyncio.all_tasks()`. |
 | `Server._date_tick` | One task, one `date_box`, walks `_live_connections`. Must exist **once per loop**. |
-| `Server._create_listener` | Captures `asyncio.get_running_loop()` into every protocol. Each worker must build its own listener/handoff with **its** loop. |
+| `Server._create_listener` | Captures `asyncio.get_running_loop()` into every protocol. Each worker must `create_server` on **its** loop. |
 | `_signal_handlers` | Must remain on the main thread; fan out with `call_soon_threadsafe`. |
 | Keep-alive + `app.shutdown.done()` in `response_completed` | Must read the process-wide flag. |
 

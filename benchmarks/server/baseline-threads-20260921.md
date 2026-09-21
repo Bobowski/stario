@@ -1,4 +1,8 @@
-# Stario `STARIO_THREADS` 1 vs 2 vs 4 (2026-09-21)
+# Stario `STARIO_THREADS` 1 vs 2 vs 4 (2026-09-21, acceptor handoff)
+
+Superseded runtime: one acceptor thread plus `connect_accepted_socket`
+handoff (`c114fc5`). Current shape is N `SO_REUSEPORT` servers — see
+[`baseline-threads-reuseport-20260921.md`](baseline-threads-reuseport-20260921.md).
 
 Same checkout, same machine, same wrk settings. Only the server worker
 count changes.
