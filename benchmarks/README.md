@@ -299,7 +299,9 @@ Each run writes a timestamped directory under `benchmarks/server/results/`:
 A committed reference baseline (hardware, methodology, Python vs Cython tables)
 lives at `benchmarks/server/baseline-20260827.md`. Framework comparison on the
 reshaped suite (static / request fields / async uploads):
-[`baseline-20260921.md`](server/baseline-20260921.md). Sync-handler capture vs
+[`baseline-20260921.md`](server/baseline-20260921.md).
+`STARIO_THREADS` 1 vs 2 vs 4 on 3.14t:
+[`baseline-threads-20260921.md`](server/baseline-threads-20260921.md). Sync-handler capture vs
 Granian and others: `benchmarks/server/baseline-20260829.md`. Timestamped
 `results/` dirs remain gitignored.
 
