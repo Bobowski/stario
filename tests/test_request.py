@@ -22,6 +22,14 @@ class TestRequestBasic:
         assert post.method == "POST"
         assert post.path == "/users/123"
 
+    def test_query_is_built_on_first_read(self):
+        req = Request(method="GET", path="/", headers=Headers(), body=b"")
+        first = req.query
+        second = req.query
+        assert first is second
+        assert first.get("missing") is None
+        assert bool(first) is False
+
 
 class TestRequestCookies:
     def test_multiple_cookie_headers_merge(self):

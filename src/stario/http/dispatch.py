@@ -433,6 +433,7 @@ class Router:
         def lookup(host: str, path: str, method: str) -> RouteMatch:
             return self._resolve_handler(host, path, method)
 
+        # The protocol binds this cache directly (one Python call per request).
         self._lookup = lookup
 
     @property

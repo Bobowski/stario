@@ -588,6 +588,34 @@ async def test_connection_close_header_closes_socket_after_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_keep_alive_uses_a_new_request_object() -> None:
+    app = App()
+    ids: list[int] = []
+    held: list[object] = []
+
+    async def echo(c, w) -> None:
+        held.append(c.req)
+        ids.append(id(c.req))
+        responses.text(w, "ok")
+
+    app.get("/", echo)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert len(ids) == 2
+        assert ids[0] != ids[1]
+        assert held[0] is not held[1]
+        assert not transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
 async def test_keep_alive_serves_second_request_on_same_connection() -> None:
     app = App()
     hits: list[str] = []

@@ -3,8 +3,9 @@
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
 H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). URL bytes
-and header fragments go into the current exchange arena. Path/query
-decoding is cached here because it is connection-parse work.
+and header fragments go into the current exchange arena. When the message
+is ready, dispatch allocates a new ``Request`` (query/cookies/host stay
+lazy). Path decoding is cached here because it is connection-parse work.
 
 Header, idle, and body-stall timeouts share one cleanup path. Under Server
 that path is the Date-header tick (once a second): one ``loop.time()``, then
@@ -32,7 +33,12 @@ from cpython.bytes cimport (
     PyBytes_GET_SIZE,
 )
 from cpython.exc cimport PyErr_Clear
-from cpython.unicode cimport PyUnicode_DecodeASCII, PyUnicode_DecodeLatin1
+from cpython.unicode cimport (
+    PyUnicode_DecodeASCII,
+    PyUnicode_DecodeLatin1,
+    PyUnicode_GET_LENGTH,
+    PyUnicode_READ_CHAR,
+)
 
 from stario.http.config import (
     DEFAULT_HEADER_TIMEOUT,
@@ -51,6 +57,7 @@ from stario_cython.exchange cimport (
     RequestExchange,
     acquire_exchange,
     host_value_ok,
+    make_request,
     _status_line,
 )
 from stario_cython.llhttp cimport *
@@ -812,7 +819,8 @@ cdef class HttpProtocol:
         self.compression = compression
         self.connections = connections
         self._create_task = app.create_task
-        self._find_handler = app.find_handler
+        # The LRU match cache, not the Router wrapper method.
+        self._find_handler = app._lookup
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -1556,12 +1564,13 @@ cdef class HttpProtocol:
         self.reading_exchange = None
 
     cdef Request _build_request(self, RequestExchange exchange, object body):
+        """New Request for this message. Query/cookies/host stay lazy."""
         cdef object method
         cdef object version
         cdef object path
         cdef Py_ssize_t qoff = 0
         cdef Py_ssize_t qlen = 0
-        cdef Request request = exchange.req
+        cdef Request request
         if exchange._req_url_length > 0:
             path = _path_for_url(
                 exchange._req_arena + exchange._req_url_offset,
@@ -1582,23 +1591,21 @@ cdef class HttpProtocol:
             )
         if method is METH_HEAD:
             exchange._head_request = True
-        request.reset(
+        request = make_request(
             method,
             path,
-            None,
             version,
             True if exchange._http2 else self.request_keep_alive,
             exchange.request_headers,
             body,
         )
+        exchange.req = request
         if qlen > 0:
             request.bind_query_span(
                 exchange,
                 exchange._req_url_offset + qoff,
                 qlen,
             )
-        if self.app.host_routing:
-            request.prefetch_host()
         return request
 
     cdef void _dispatch(self, RequestExchange exchange, Request request):
@@ -1625,7 +1632,7 @@ cdef class HttpProtocol:
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
-        cdef object req
+        cdef Request req
         cdef object path
         cdef object handler
         cdef object route
@@ -1637,13 +1644,20 @@ cdef class HttpProtocol:
         cdef object loc
         cdef const char* url
         cdef Py_ssize_t n
+        cdef Py_ssize_t plen
         cdef Py_ssize_t path_end
         cdef Py_ssize_t start
         cdef Py_ssize_t end
         if not exchange._http2:
             self.active_exchange = exchange
-        n = exchange._req_url_length
-        if n > 1:
+        req = exchange.req
+        path = req.path
+        method = req.method
+        # Trailing-slash 308: the decoded path already ends with /. Only then
+        # walk the raw URL for Location (strip extra slashes, keep query).
+        plen = PyUnicode_GET_LENGTH(path) if path is not None else 0
+        if plen > 1 and PyUnicode_READ_CHAR(path, plen - 1) == 47:
+            n = exchange._req_url_length
             url = exchange._req_arena + exchange._req_url_offset
             if _trailing_slash_redirect(url, n, &start, &end, &path_end):
                 loc = b"/"
@@ -1655,20 +1669,20 @@ cdef class HttpProtocol:
                     )
                 exchange.start_response()
                 exchange.headers.set("location", loc.decode("latin-1"))
-                req = exchange.req
-                self._finish_protocol_span(308, exchange.span, req.method, req.path)
+                self._finish_protocol_span(308, exchange.span, method, path)
                 exchange.respond(b"", b"text/plain; charset=utf-8", 308)
                 exchange.handler_finished()
                 return
         exchange.start_response()
-        req = exchange.req
-        path = req.path
-        method = req.method
         span = exchange.span
         if span is not None and self.noop_span is None:
             span.start()
             span.attrs({"request.method": method, "request.path": path})
-        host = req.host if self.app.host_routing else ""
+        if self.app.host_routing:
+            req.prefetch_host()
+            host = req.host
+        else:
+            host = ""
         handler, route, match = self._find_handler(host, path, method)
         exchange.match = match
         if span is not None and self.noop_span is None and match.pattern:
@@ -1725,6 +1739,8 @@ cdef class HttpProtocol:
         cdef object transport = self.transport
         cdef object conn
         cdef RequestExchange next_exchange
+        cdef Request req
+        cdef bint keep
         if exchange._http2:
             # Keep the stream mapped until on_stream_close so the DATA
             # provider cannot be recycled while nghttp2 still holds it.
@@ -1743,7 +1759,12 @@ cdef class HttpProtocol:
             transport.close()
             self._drop_pending()
             return
-        if not exchange.req.keep_alive or self.app.shutdown.done():
+        req = exchange.req
+        if req is not None:
+            keep = req.keep_alive
+        else:
+            keep = self.request_keep_alive
+        if not keep or self.app.shutdown.done():
             transport.close()
             self._drop_pending()
             return
@@ -2205,6 +2226,8 @@ cdef class HttpProtocol:
         cdef object req
         cdef object method
         cdef object path
+        cdef Py_ssize_t qoff
+        cdef Py_ssize_t qlen
         if ex is None or self.rejected:
             return
         ex._h2_awaiting_headers = False
@@ -2215,7 +2238,19 @@ cdef class HttpProtocol:
             ex.start_response()
             req = ex.req
             method = ex._h2_method
-            path = req.path if req is not None else None
+            if req is not None:
+                path = req.path
+            elif ex._req_url_length > 0:
+                qoff = 0
+                qlen = 0
+                path = _path_for_url(
+                    ex._req_arena + ex._req_url_offset,
+                    ex._req_url_length,
+                    &qoff,
+                    &qlen,
+                )
+            else:
+                path = None
             self._finish_protocol_span(status, ex.span, method, path)
             ex.respond(b"", b"text/plain; charset=utf-8", status)
             ex.handler_finished()
