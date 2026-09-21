@@ -17,6 +17,8 @@ PYTHON="${PYTHON:-3.14}"
 KEEP_RAW="${KEEP_RAW:-0}"
 WRK="${WRK:-wrk}"
 BROTLI_PKG_CONFIG="${BROTLI_PKG_CONFIG:-}"
+GRANIAN_WORKERS="${GRANIAN_WORKERS:-1}"
+GRANIAN_RUNTIME_THREADS="${GRANIAN_RUNTIME_THREADS:-1}"
 TARGETS=(
   stario stario-cython
   socketify robyn granian-rsgi sanic django-bolt
@@ -80,7 +82,8 @@ Targets (default: all):
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 UPLOAD_CONNECTIONS=32
              RUNS=7 WARMUP=2 HOST=127.0.0.1 PORT=3000 PYTHON=3.14
              ENDPOINT_TIER=all|static|request|read|upload|app  ENDPOINTS=csv
-             REFRESH_ENVS=1 KEEP_RAW=1
+             REFRESH_ENVS=1 KEEP_RAW=1 RESULT_NAME=subdir
+             STARIO_THREADS=1 GRANIAN_WORKERS=1 GRANIAN_RUNTIME_THREADS=1
 
 Endpoint tiers:
   static  — plaintext (prebuilt body, fixed URL)
@@ -367,8 +370,8 @@ command_for() {
         "$(python_for blacksheep-granian)" -m granian apps.blacksheep_app:app
         --interface asgi
         --host "$HOST" --port "$SERVER_PORT"
-        --workers 1
-        --runtime-threads 1
+        --workers "$GRANIAN_WORKERS"
+        --runtime-threads "$GRANIAN_RUNTIME_THREADS"
         --loop uvloop
         --no-access-log
         --log-level warning
@@ -400,8 +403,8 @@ command_for() {
         "$(python_for granian-rsgi)" -m granian apps.granian_rsgi_app:app
         --interface rsgi
         --host "$HOST" --port "$SERVER_PORT"
-        --workers 1
-        --runtime-threads 1
+        --workers "$GRANIAN_WORKERS"
+        --runtime-threads "$GRANIAN_RUNTIME_THREADS"
         --loop uvloop
         --no-access-log
         --log-level warning
@@ -678,7 +681,7 @@ main() {
   fi
   ensure_fixtures "$(python_for "${selected[0]}")"
 
-  RUN_DIR="$RESULTS_DIR/$(date -u +%Y%m%dT%H%M%SZ)"
+  RUN_DIR="$RESULTS_DIR/${RESULT_NAME:-$(date -u +%Y%m%dT%H%M%SZ)}"
   mkdir -p "$RUN_DIR"
   cat >"$RUN_DIR/config.txt" <<EOF
 host=$HOST
@@ -697,6 +700,10 @@ param_id_count=4096
 git_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 ports=$(port_list)
+STARIO_THREADS=${STARIO_THREADS:-1}
+GRANIAN_WORKERS=$GRANIAN_WORKERS
+GRANIAN_RUNTIME_THREADS=$GRANIAN_RUNTIME_THREADS
+PYTHON_GIL=${PYTHON_GIL:-}
 EOF
 
   echo "Writing results to ${RUN_DIR#$ROOT/}"

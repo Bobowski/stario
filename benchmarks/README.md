@@ -282,6 +282,8 @@ ENDPOINTS=json-small,post-octet-64k benchmarks/server/run.sh stario
 PORT=3999 benchmarks/server/run.sh
 REFRESH_ENVS=1 benchmarks/server/run.sh
 KEEP_RAW=1 benchmarks/server/run.sh
+STARIO_THREADS=4 PYTHON=3.14t benchmarks/server/run.sh stario
+GRANIAN_WORKERS=4 PYTHON=3.14t benchmarks/server/run.sh granian-rsgi
 WRK=/path/to/wrk benchmarks/server/run.sh
 BROTLI_PKG_CONFIG=/opt/brotli/lib/pkgconfig benchmarks/server/run.sh stario-cython
 ```
