@@ -487,7 +487,7 @@ class TTYTracer:
         self._roots: dict[UUID, RecordingSpan] = {}
         self._children: dict[UUID, list[RecordingSpan]] = {}
         self._open_span_ids: set[UUID] = set()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._running = False
         self._closed_blocks: list[str] = []
@@ -529,6 +529,7 @@ class TTYTracer:
             parent_id,
             name,
             attributes=dict(attributes) if attributes else None,
+            mutex=self._lock,
         )
         with self._lock:
             if span.parent_id is None:

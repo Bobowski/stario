@@ -26,6 +26,16 @@ def test_server_config_rejects_blank_tcp_host() -> None:
         ServerConfig(host="   ")
 
 
+def test_server_config_rejects_zero_threads() -> None:
+    with pytest.raises(StarioError, match="threads must be at least 1"):
+        ServerConfig(threads=0)
+
+
+def test_server_config_rejects_too_many_threads() -> None:
+    with pytest.raises(StarioError, match="threads must be at most 256"):
+        ServerConfig(threads=257)
+
+
 def test_server_config_ssl_and_certfile_are_exclusive() -> None:
     import ssl
 

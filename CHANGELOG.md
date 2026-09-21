@@ -36,6 +36,10 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Added
 
+- `STARIO_THREADS` — opt-in worker count (`1` default). `N>1` runs one
+  asyncio loop per OS thread, forwarding `STARIO_LOOP` (asyncio/uvloop)
+  to every worker. Requires free-threaded Python 3.14t unless
+  `STARIO_THREADS_ALLOW_GIL=1`. See `docs/free-threading.md`.
 - `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
   is lazy. `await attach(app)` registers GET/HEAD and loads the tree
   (`register()` and `load()` stay available). A later `attach()` on a

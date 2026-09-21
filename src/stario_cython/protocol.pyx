@@ -1,4 +1,4 @@
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
 """asyncio Protocol: llhttp for HTTP/1, nghttp2 for HTTP/2.
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
@@ -15,6 +15,7 @@ sweeper at the same period. See ``stario_cython.timeouts``.
 
 import asyncio
 from collections import deque
+from threading import Lock
 
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint16_t, uint32_t, uint64_t
@@ -166,6 +167,8 @@ cdef Py_ssize_t _UC_QLEN[256]
 cdef list _UC_PATH = None
 cdef object PATH_EMPTY = ""
 cdef bytes H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+cdef object _url_lock = Lock()
+cdef object _settings_lock = Lock()
 
 
 cdef uint32_t _url_hash(const char* s, Py_ssize_t n) noexcept:
@@ -292,11 +295,12 @@ cdef object _path_for_url(
         return PATH_EMPTY
     if n <= URL_CACHE_MAX_KEY:
         h = _url_hash(url, n)
-        slot = _url_find(url, n, h)
-        if slot >= 0:
-            qoff[0] = _UC_QOFF[slot]
-            qlen[0] = _UC_QLEN[slot]
-            return _UC_PATH[slot]
+        with _url_lock:
+            slot = _url_find(url, n, h)
+            if slot >= 0:
+                qoff[0] = _UC_QOFF[slot]
+                qlen[0] = _UC_QLEN[slot]
+                return _UC_PATH[slot]
     for i in range(n):
         if url[i] == 63:
             question = i
@@ -315,7 +319,8 @@ cdef object _path_for_url(
         n <= URL_CACHE_MAX_KEY
         and not (path_end > 1 and url[path_end - 1] == 47)
     ):
-        _url_store(url, n, h, path, qoff[0], qlen[0])
+        with _url_lock:
+            _url_store(url, n, h, path, qoff[0], qlen[0])
     return path
 
 cdef inline bint _as_buf(object data, const char** ptr, Py_ssize_t* n) noexcept:
@@ -478,20 +483,28 @@ cdef object _method_from_bytes(const char* p, size_t n) noexcept:
 
 cdef void _bind_settings():
     global _SETTINGS
+    cdef llhttp_settings_t* settings
     if _SETTINGS != NULL:
         return
-    _url_cache_init()
-    _SETTINGS = stario_settings_new()
-    if _SETTINGS == NULL:
-        raise MemoryError()
-    _SETTINGS.on_message_begin = _cb_message_begin
-    _SETTINGS.on_url = _cb_url
-    _SETTINGS.on_header_field = _cb_header_field
-    _SETTINGS.on_header_value = _cb_header_value
-    _SETTINGS.on_header_value_complete = _cb_header_value_complete
-    _SETTINGS.on_headers_complete = _cb_headers_complete
-    _SETTINGS.on_body = _cb_body
-    _SETTINGS.on_message_complete = _cb_message_complete
+    _settings_lock.acquire()
+    try:
+        if _SETTINGS != NULL:
+            return
+        _url_cache_init()
+        settings = stario_settings_new()
+        if settings == NULL:
+            raise MemoryError()
+        settings.on_message_begin = _cb_message_begin
+        settings.on_url = _cb_url
+        settings.on_header_field = _cb_header_field
+        settings.on_header_value = _cb_header_value
+        settings.on_header_value_complete = _cb_header_value_complete
+        settings.on_headers_complete = _cb_headers_complete
+        settings.on_body = _cb_body
+        settings.on_message_complete = _cb_message_complete
+        _SETTINGS = settings
+    finally:
+        _settings_lock.release()
 
 
 cdef int _cb_message_begin(llhttp_t* parser) noexcept:
@@ -1329,7 +1342,7 @@ cdef class HttpProtocol:
         return False
 
     cdef inline RequestExchange _take_exchange(self):
-        """Reuse the idle exchange or take one from the global pool."""
+        """Reuse the idle exchange or take one from this thread's pool."""
         cdef RequestExchange ex = self.idle_exchange
         if ex is not None:
             self.idle_exchange = None
@@ -1764,7 +1777,7 @@ cdef class HttpProtocol:
             keep = req.keep_alive
         else:
             keep = self.request_keep_alive
-        if not keep or self.app.shutdown.done():
+        if not keep or self.app.shutting_down:
             transport.close()
             self._drop_pending()
             return

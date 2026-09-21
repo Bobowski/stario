@@ -5,6 +5,8 @@ Bootstrap startup completes before `start_serving`; exceptions there fail startu
 (TCP vs Unix, backlog, compression defaults) lives here so `Router`/`App` stay free of process-level concerns.
 """
 
+from __future__ import annotations
+
 import asyncio
 import importlib
 import os
@@ -12,6 +14,8 @@ import signal
 import socket
 import stat
 import sys
+import sysconfig
+import threading
 from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
@@ -19,6 +23,9 @@ from email.utils import format_datetime
 from types import FrameType
 from typing import Any, Literal
 
+from stario_cython.protocol import HttpProtocol
+
+from stario._env import env_bool
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
 from stario.telemetry.spans import ProxySpan
@@ -31,7 +38,6 @@ from .bootstrap import (
 )
 from .compression import CompressionConfig
 from .config import RequestPolicy, ServerConfig
-from stario_cython.protocol import HttpProtocol
 
 type Connection = Any
 type ProtocolMaker = Callable[
@@ -71,6 +77,7 @@ def _make_http_protocol(
         body_timeout=requests.body_timeout,
         max_pipelined_requests=requests.max_pipelined_requests,
     )
+
 
 type SignalHandler = Callable[[int, FrameType | None], object]
 type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
@@ -113,6 +120,140 @@ def resolve_loop_runner(event_loop: Literal["asyncio", "uvloop"]) -> LoopRun[Any
     return run
 
 
+def gil_is_enabled() -> bool:
+    """True when this process cannot run Python bytecode in parallel."""
+    check = getattr(sys, "_is_gil_enabled", None)
+    if check is None:
+        return True
+    return bool(check())
+
+
+def require_thread_workers(threads: int) -> None:
+    """Refuse `threads>1` when the GIL is on, unless `STARIO_THREADS_ALLOW_GIL=1`."""
+    if threads <= 1:
+        return
+    if not gil_is_enabled():
+        return
+    if env_bool("STARIO_THREADS_ALLOW_GIL", False):
+        return
+    if sysconfig.get_config_var("Py_GIL_DISABLED") == 1:
+        raise StarioError(
+            "STARIO_THREADS>1 needs the GIL to stay disabled",
+            help_text=(
+                "An extension re-enabled the GIL. Use free-threaded wheels "
+                "or set STARIO_THREADS=1."
+            ),
+        )
+    raise StarioError(
+        "STARIO_THREADS>1 requires free-threaded Python (3.14t)",
+        help_text="Run a 3.14t interpreter or set STARIO_THREADS=1.",
+    )
+
+
+class _LoopWorker:
+    """One OS thread, one event loop, connection-affine HTTP protocols."""
+
+    def __init__(
+        self,
+        *,
+        index: int,
+        app: App,
+        server: Server,
+        loop_run: LoopRun[Any],
+    ) -> None:
+        self.index = index
+        self.app = app
+        self.server = server
+        self.loop_run = loop_run
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.connections: set[Connection] = set()
+        self.date_box: list[bytes] = [b""]
+        self.ready = threading.Event()
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"stario-worker-{index}",
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        self.thread.join(timeout)
+
+    def submit(self, sock: socket.socket) -> None:
+        loop = self.loop
+        if loop is None or loop.is_closed() or self.app.shutting_down:
+            sock.close()
+            return
+        try:
+            loop.call_soon_threadsafe(self._begin, sock)
+        except RuntimeError:
+            sock.close()
+
+    def _run(self) -> None:
+        try:
+            self.loop_run(self._serve())
+        except BaseException as exc:
+            self.error = exc
+            with suppress(Exception):
+                self.app.signal_shutdown()
+        finally:
+            self.ready.set()
+
+    async def _serve(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.app.attach_loop(self.loop)
+        self.ready.set()
+        async with self.server._date_tick(self.date_box, self.connections):
+            try:
+                await self.app.shutdown
+            finally:
+                await self.server._drain_worker(self.connections, self.app)
+
+    def _begin(self, sock: socket.socket) -> None:
+        loop = self.loop
+        if loop is None or loop.is_closed():
+            sock.close()
+            return
+        loop.create_task(self._attach(sock), name="stario.worker.accept")
+
+    async def _attach(self, sock: socket.socket) -> None:
+        loop = self.loop
+        assert loop is not None
+        try:
+            await loop.connect_accepted_socket(
+                self._protocol,
+                sock,
+                ssl=self.server.config.ssl,
+            )
+        except asyncio.CancelledError:
+            with suppress(OSError):
+                sock.close()
+            raise
+        except Exception:
+            with suppress(OSError):
+                sock.close()
+
+    def _protocol(self) -> asyncio.Protocol:
+        loop = self.loop
+        assert loop is not None
+        factory = (
+            self.server.make_protocol
+            if self.server.make_protocol is not None
+            else _make_http_protocol
+        )
+        return factory(
+            loop,
+            self.app,
+            self.server.tracer,
+            self.date_box,
+            self.server.config.compression,
+            self.connections,
+            self.server.config.requests,
+        )
+
+
 class Server:
     """Binds a listener, runs bootstrap on a fresh app, serves until SIGINT/SIGTERM, then drains.
 
@@ -149,13 +290,24 @@ class Server:
         self._date_box = [b""]
         self._urgent_drain = False
         self._live_connections: set[Connection] | None = None
+        self._loop_run: LoopRun[Any] | None = None
+
+    def loop_runner(self) -> LoopRun[Any]:
+        """Event-loop runner for this process (`asyncio.run` or `uvloop.run`).
+
+        `run()` and every worker thread use this same callable so `STARIO_LOOP`
+        is forwarded, not re-detected per thread.
+        """
+        if self._loop_run is None:
+            self._loop_run = resolve_loop_runner(self.config.event_loop)
+        return self._loop_run
 
     def run(self) -> None:
         """Block until shutdown; picks the event loop from `config.event_loop`.
 
         The tracer must already be entered by the caller (see `cli/runtime.py`).
         """
-        resolve_loop_runner(self.config.event_loop)(self.serve())
+        self.loop_runner()(self.serve())
 
     async def serve(self) -> None:
         """Run until SIGINT/SIGTERM (or fatal error); requires a running event loop.
@@ -169,22 +321,32 @@ class Server:
             )
         self._used = True
 
+        if self.config.threads > 1:
+            require_thread_workers(self.config.threads)
+            # Resolve once on this thread; every worker calls this same runner
+            # (asyncio.run or uvloop.run) instead of re-detecting STARIO_LOOP.
+            self.loop_runner()
+
         app = App()
         span = self._open_startup_span()  # ProxySpan: startup → shutdown via replace()
 
         # Signal handlers stay active through span.end(); see _signal_handlers.
         with (
-            self._unix_listen_socket() as listen_sock,
-            self._signal_handlers(app.shutdown),
+            self._listen_socket() as listen_sock,
+            self._signal_handlers(app),
         ):
             try:
-                async with (
-                    bootstrap_run(self.bootstrap, app, span),
-                    self._date_tick(),
-                    self._listener(listen_sock, app, span),
-                ):
-                    # Blocks until a signal (or test code) completes app.shutdown.
-                    await app.shutdown
+                if self.config.threads > 1:
+                    async with bootstrap_run(self.bootstrap, app, span):
+                        await self._serve_threaded(listen_sock, app, span)
+                else:
+                    async with (
+                        bootstrap_run(self.bootstrap, app, span),
+                        self._date_tick(),
+                        self._listener(listen_sock, app, span),
+                    ):
+                        # Blocks until a signal (or test code) completes app.shutdown.
+                        await app.shutdown
             except BaseException as exc:
                 span.exception(exc)
                 span.fail(str(exc))
@@ -221,7 +383,9 @@ class Server:
         make_protocol = self.make_protocol
 
         def protocol_factory() -> asyncio.Protocol:
-            factory = make_protocol if make_protocol is not None else _make_http_protocol
+            factory = (
+                make_protocol if make_protocol is not None else _make_http_protocol
+            )
             return factory(
                 loop,
                 app,
@@ -370,14 +534,35 @@ class Server:
         return len(pending)
 
     @contextmanager
+    def _listen_socket(self) -> Generator[socket.socket | None]:
+        """Unix or (when `threads>1`) TCP listen socket. `None` = N=1 TCP via create_server."""
+        if self.config.unix_socket is not None:
+            with self._unix_listen_socket() as sock:
+                yield sock
+            return
+        if self.config.threads <= 1:
+            yield None
+            return
+        sock = socket.create_server(
+            (self.config.host, self.config.port),
+            reuse_address=self.config.reuse_addr,
+            backlog=self.config.backlog,
+        )
+        sock.setblocking(False)
+        try:
+            yield sock
+        finally:
+            sock.close()
+
+    @contextmanager
     def _signal_handlers(
         self,
-        shutdown_future: asyncio.Future[None],
+        app: App,
     ) -> Generator[None]:
         """Install SIGINT/SIGTERM handlers for graceful shutdown.
 
         Contract:
-          - 1st signal → complete `shutdown_future` and start drain
+          - 1st signal → `app.signal_shutdown()` and start drain
           - 2nd signal → set `_urgent_drain` (skip remaining graceful wait)
           - after shutdown started → `SIG_IGN` until exit so extra signals
             during tracer flush do not become `KeyboardInterrupt`
@@ -385,10 +570,10 @@ class Server:
         loop = asyncio.get_running_loop()
 
         def on_signal() -> None:
-            if shutdown_future.done():
+            if app.shutting_down:
                 self._urgent_drain = True
                 return
-            shutdown_future.set_result(None)
+            app.signal_shutdown()
 
         previous_handlers: dict[signal.Signals, PreviousSignalHandler] = {}
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -407,7 +592,7 @@ class Server:
         finally:
             for sig, previous in previous_handlers.items():
                 try:
-                    if shutdown_future.done():
+                    if app.shutting_down:
                         signal.signal(sig, signal.SIG_IGN)
                     else:
                         signal.signal(sig, previous)
@@ -485,13 +670,17 @@ class Server:
             await self._drain_listener(listener, app, connections, span)
             self._live_connections = None
 
-    def _sweep_connection_timeouts(self, loop: asyncio.AbstractEventLoop) -> None:
+    def _sweep_connection_timeouts(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        connections: set[Connection] | None = None,
+    ) -> None:
         """Compare stored deadlines to one ``loop.time()`` (Date-tick cadence)."""
-        connections = self._live_connections
-        if not connections:
+        live = self._live_connections if connections is None else connections
+        if not live:
             return
         now = loop.time()
-        for proto in tuple(connections):
+        for proto in tuple(live):
             check = getattr(proto, "check_timeouts", None)
             if check is None:
                 continue
@@ -501,19 +690,22 @@ class Server:
                 continue
 
     @asynccontextmanager
-    async def _date_tick(self) -> AsyncGenerator[None]:
+    async def _date_tick(
+        self,
+        date_box: list[bytes] | None = None,
+        connections: set[Connection] | None = None,
+    ) -> AsyncGenerator[None]:
         """Refresh Date, then once per second also sweep connection timeouts.
 
         Header/idle/body-stall defaults are 5s/5s/30s. One-second granularity
         matches Date and avoids a second timer on the event loop.
         """
+        box = self._date_box if date_box is None else date_box
 
         def refresh() -> None:
             now = datetime.now(UTC)
             # Preformatted wire bytes; Writer concatenates without per-response format_datetime.
-            self._date_box[0] = b"date: %s\r\n" % format_datetime(
-                now, usegmt=True
-            ).encode("ascii")
+            box[0] = b"date: %s\r\n" % format_datetime(now, usegmt=True).encode("ascii")
 
         loop = asyncio.get_running_loop()
         setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, True)
@@ -522,7 +714,7 @@ class Server:
             while True:
                 await asyncio.sleep(1)
                 refresh()
-                self._sweep_connection_timeouts(loop)
+                self._sweep_connection_timeouts(loop, connections)
 
         refresh()  # first value before any connection can read it
         task = asyncio.create_task(tick())
@@ -533,6 +725,124 @@ class Server:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+    async def _drain_worker(self, connections: set[Connection], app: App) -> None:
+        """Drain one worker loop (no asyncio.Server — the acceptor owns listen)."""
+        for _ in range(_ACCEPT_REGISTER_YIELDS):
+            if connections:
+                break
+            await asyncio.sleep(0)
+        idle_closed = sum(
+            1 for protocol in list(connections) if protocol.close_if_idle()
+        )
+        if idle_closed:
+            await asyncio.sleep(0)
+        await self._wait_for_managed_work_to_drain(connections, app.tasks)
+        force_close_budget = min(
+            max(self.config.graceful_shutdown_timeout, 0.0), _FORCE_CLOSE_CAP
+        )
+        loop = asyncio.get_running_loop()
+        close_deadline = loop.time() + force_close_budget
+        while connections and not self._urgent_drain and loop.time() < close_deadline:
+            await self._force_close_open_transports(connections)
+            await asyncio.sleep(0)
+        if connections:
+            await self._force_close_open_transports(connections)
+        await self._cancel_pending_tasks(app.tasks)
+
+    async def _serve_threaded(
+        self,
+        listen_sock: socket.socket | None,
+        app: App,
+        span: ProxySpan,
+    ) -> None:
+        """Accept on this loop; each worker thread runs `loop_runner()` (uvloop/asyncio)."""
+        if listen_sock is None:
+            raise StarioError(
+                "threaded serve requires a bound listen socket",
+                help_text="Set STARIO_HOST/STARIO_PORT or STARIO_UNIX_SOCKET.",
+            )
+        runner = self.loop_runner()
+        workers = [
+            _LoopWorker(index=index, app=app, server=self, loop_run=runner)
+            for index in range(self.config.threads)
+        ]
+        for worker in workers:
+            worker.start()
+        join_timeout = (
+            max(self.config.graceful_shutdown_timeout, 0.0) + _FORCE_CLOSE_CAP + 1.0
+        )
+        try:
+            for worker in workers:
+                started = await asyncio.to_thread(worker.ready.wait, 5.0)
+                if not started:
+                    raise StarioError(
+                        f"worker {worker.index} failed to start",
+                        help_text="Check worker thread logs; STARIO_LOOP must match a usable runner.",
+                    )
+                if worker.error is not None:
+                    raise worker.error
+            span.attr("server.listening", True)
+            span.end()
+            try:
+                await self._accept_loop(listen_sock, workers, app)
+            except BaseException:
+                self._open_shutdown_span(span, "runtime_failure")
+                raise
+            else:
+                self._open_shutdown_span(span, "expected_stop")
+            finally:
+                app.signal_shutdown()
+                with suppress(OSError):
+                    listen_sock.close()
+                for worker in workers:
+                    await asyncio.to_thread(worker.join, join_timeout)
+                await self._wait_for_managed_work_to_drain(set(), app.tasks)
+                await self._cancel_pending_tasks(app.tasks)
+                errors = [
+                    worker.error for worker in workers if worker.error is not None
+                ]
+                if errors:
+                    raise errors[0]
+        except BaseException:
+            app.signal_shutdown()
+            with suppress(OSError):
+                listen_sock.close()
+            for worker in workers:
+                await asyncio.to_thread(worker.join, min(join_timeout, 1.0))
+            raise
+
+    async def _accept_loop(
+        self,
+        listen_sock: socket.socket,
+        workers: list[_LoopWorker],
+        app: App,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+
+        async def accept_forever() -> None:
+            while not app.shutting_down:
+                try:
+                    conn, _addr = await loop.sock_accept(listen_sock)
+                except OSError, asyncio.CancelledError:
+                    return
+                if app.shutting_down:
+                    with suppress(OSError):
+                        conn.close()
+                    return
+                conn.setblocking(False)
+                worker = min(workers, key=lambda item: len(item.connections))
+                worker.submit(conn)
+
+        task = asyncio.create_task(accept_forever(), name="stario.accept")
+        try:
+            await app.shutdown
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            with suppress(OSError):
+                listen_sock.close()
 
     def _record_startup_attrs(self, span: Span) -> None:
         attrs: dict[str, str | int | float] = {
@@ -546,6 +856,7 @@ class Server:
             "server.timeout.request_body": self.config.requests.body_timeout,
             "server.timeout.keep_alive": self.config.requests.keep_alive_timeout,
             "server.event_loop": self.config.event_loop,
+            "server.threads": self.config.threads,
             "server.tls": self.config.ssl is not None,
         }
         if self.config.compression.zstd_window_log is not None:

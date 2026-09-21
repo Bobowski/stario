@@ -1,6 +1,8 @@
 """Concrete `Span` implementations used by bundled tracers and tests."""
 
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -222,6 +224,16 @@ class RecordingSpan:
     attributes: dict[str, Any] | None = None
     events: list[RecordedEvent] | None = None
     links: list[RecordedLink] | None = field(default=None, repr=False)
+    mutex: threading.RLock | None = field(default=None, repr=False, compare=False)
+
+    @contextmanager
+    def _mutate(self):
+        lock = self.mutex
+        if lock is None:
+            yield
+            return
+        with lock:
+            yield
 
     @property
     def started(self) -> bool:
@@ -246,8 +258,9 @@ class RecordingSpan:
         return self.error is not None
 
     def start(self) -> None:
-        if self.start_ns is None:
-            self.start_ns = time.time_ns()
+        with self._mutate():
+            if self.start_ns is None:
+                self.start_ns = time.time_ns()
 
     def __enter__(self) -> Span:
         self.start()
@@ -267,18 +280,19 @@ class RecordingSpan:
         *,
         body: EventBody = None,
     ) -> None:
-        if self.start_ns is None or self.end_ns is not None:
-            return
-        event = RecordedEvent(
-            time.time_ns(),
-            name,
-            attributes=dict(attributes) if attributes else None,
-            body=serialize_event_body(body),
-        )
-        if self.events is None:
-            self.events = [event]
-        else:
-            self.events.append(event)
+        with self._mutate():
+            if self.start_ns is None or self.end_ns is not None:
+                return
+            event = RecordedEvent(
+                time.time_ns(),
+                name,
+                attributes=dict(attributes) if attributes else None,
+                body=serialize_event_body(body),
+            )
+            if self.events is None:
+                self.events = [event]
+            else:
+                self.events.append(event)
 
     def exception(
         self,
@@ -298,22 +312,24 @@ class RecordingSpan:
         self.event("exception", attrs, body=body)
 
     def attr(self, name: str, value: Any) -> None:
-        if self.end_ns is not None:
-            return
-        if self.attributes is None:
-            self.attributes = {name: value}
-        else:
-            self.attributes[name] = value
+        with self._mutate():
+            if self.end_ns is not None:
+                return
+            if self.attributes is None:
+                self.attributes = {name: value}
+            else:
+                self.attributes[name] = value
 
     def attrs(self, attributes: Attributes) -> None:
-        if self.end_ns is not None:
-            return
-        if not attributes:
-            return
-        if self.attributes is None:
-            self.attributes = dict(attributes)
-        else:
-            self.attributes.update(attributes)
+        with self._mutate():
+            if self.end_ns is not None:
+                return
+            if not attributes:
+                return
+            if self.attributes is None:
+                self.attributes = dict(attributes)
+            else:
+                self.attributes.update(attributes)
 
     def __setitem__(self, name: str, value: Any) -> None:
         self.attr(name, value)
@@ -335,35 +351,39 @@ class RecordingSpan:
         attributes: Attributes | None = None,
         /,
     ) -> None:
-        if self.start_ns is None or self.end_ns is not None:
-            return
-        link = RecordedLink(
-            name,
-            span_id,
-            attributes=dict(attributes) if attributes else None,
-        )
-        if self.links is None:
-            self.links = [link]
-        else:
-            self.links.append(link)
+        with self._mutate():
+            if self.start_ns is None or self.end_ns is not None:
+                return
+            link = RecordedLink(
+                name,
+                span_id,
+                attributes=dict(attributes) if attributes else None,
+            )
+            if self.links is None:
+                self.links = [link]
+            else:
+                self.links.append(link)
 
     def fail(self, message: str) -> None:
-        if self.start_ns is None or self.end_ns is not None:
-            return
-        self.error = message
+        with self._mutate():
+            if self.start_ns is None or self.end_ns is not None:
+                return
+            self.error = message
 
     def rename(self, name: str) -> None:
-        if self.end_ns is not None:
-            return
-        self.name = name
+        with self._mutate():
+            if self.end_ns is not None:
+                return
+            self.name = name
 
     def end(self) -> None:
-        if self.end_ns is not None:
-            return
-        if self.start_ns is None:
-            raise RuntimeError(
-                "Cannot end a span that was never started. "
-                "Call span.start() or use the span as a context manager."
-            )
-        self.end_ns = time.time_ns()
-        self.tracer.on_end(self)
+        with self._mutate():
+            if self.end_ns is not None:
+                return
+            if self.start_ns is None:
+                raise RuntimeError(
+                    "Cannot end a span that was never started. "
+                    "Call span.start() or use the span as a context manager."
+                )
+            self.end_ns = time.time_ns()
+            self.tracer.on_end(self)

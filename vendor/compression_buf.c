@@ -31,10 +31,18 @@ struct StarioGzip {
 #define STARIO_CODEC_POOL_MAX 32
 #define STARIO_RETAINED_OUTPUT_MAX (64 * 1024)
 
-static StarioBrotli* brotli_pool[STARIO_CODEC_POOL_MAX];
-static size_t brotli_pool_count = 0;
-static StarioGzip* gzip_pool[STARIO_CODEC_POOL_MAX];
-static size_t gzip_pool_count = 0;
+#if defined(_MSC_VER)
+#define STARIO_TLS __declspec(thread)
+#else
+#define STARIO_TLS _Thread_local
+#endif
+
+/* Per-OS-thread pools: connection affinity never shares an encoder, and
+   free-threaded workers must not race a process-global free-list. */
+static STARIO_TLS StarioBrotli* brotli_pool[STARIO_CODEC_POOL_MAX];
+static STARIO_TLS size_t brotli_pool_count = 0;
+static STARIO_TLS StarioGzip* gzip_pool[STARIO_CODEC_POOL_MAX];
+static STARIO_TLS size_t gzip_pool_count = 0;
 
 static void trim_output(unsigned char** out, size_t* cap) {
     if (*cap > STARIO_RETAINED_OUTPUT_MAX) {

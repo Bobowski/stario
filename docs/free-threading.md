@@ -1,12 +1,15 @@
 # Free-threaded Stario (Python 3.14t)
 
-Research note: how to run **one process, several OS threads**, each with its
-own asyncio loop, so handler CPU (JSON, HTML, TLS, compression, Datastar
-patches) uses more than one core without giving up in-process `Relay`.
+`STARIO_THREADS=N` (default `1`) runs **one asyncio loop per OS thread** in a
+single process. Every worker calls the same loop runner as `Server.run()`
+(`asyncio.run` or `uvloop.run` from `STARIO_LOOP`). Bootstrap still runs
+once. `Relay` stays in-process.
 
-This is not an implementation. It is the design we would have to follow, what
-already works, and what would race, leak, or re-enable the GIL if we flipped
-a `STARIO_THREADS` switch tomorrow.
+`N=1` is the historical server. `N>1` requires free-threaded Python 3.14t
+with the GIL still off, unless `STARIO_THREADS_ALLOW_GIL=1`.
+
+The rest of this note is the design: why one loop per thread, what had to
+be locked or made thread-local, and how app state should cross workers.
 
 ## Why this is worth it
 

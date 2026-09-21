@@ -1,4 +1,4 @@
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
 """One request's lifecycle: headers, arena-backed request, body, and response.
 
 ``Headers`` lives here (one extension). ``RequestExchange`` is pooled for its
@@ -9,6 +9,7 @@ stay unset until the handler reads them.
 
 import asyncio
 import http
+import threading
 
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
@@ -131,8 +132,18 @@ cdef object STARTED_ERROR = (
     "Set headers via w.headers.set() before the first write or one-shot respond()."
 )
 
-cdef list _POOL = []
+cdef object _POOL_LOCAL = threading.local()
 cdef object _UNBOUND = object()
+
+
+cdef inline list _thread_pool():
+    """Per-OS-thread exchange free-list (connection affinity + free-threading)."""
+    cdef list pool
+    pool = getattr(_POOL_LOCAL, "pool", None)
+    if pool is None:
+        pool = []
+        _POOL_LOCAL.pool = pool
+    return pool
 
 
 cdef inline bint _is_bytes_like(object obj) noexcept:
@@ -2642,6 +2653,7 @@ cdef class RequestExchange:
             self._out_hold = None
 
     cdef void release_global(self):
+        cdef list pool
         self._free_compressors()
         self.headers.c_clear()
         self._clear_request_headers()
@@ -2652,8 +2664,9 @@ cdef class RequestExchange:
         self.app = None
         self._connection = None
         self._transport = None
-        if len(_POOL) < POOL_MAX:
-            _POOL.append(self)
+        pool = _thread_pool()
+        if len(pool) < POOL_MAX:
+            pool.append(self)
 
     cdef void _done(self):
         self._connection.response_completed(self)
@@ -3856,8 +3869,9 @@ cdef RequestExchange acquire_exchange(
     double body_timeout,
 ):
     cdef RequestExchange exchange
-    if _POOL:
-        exchange = _POOL.pop()
+    cdef list pool = _thread_pool()
+    if pool:
+        exchange = pool.pop()
     else:
         exchange = RequestExchange()
     exchange.reset(
