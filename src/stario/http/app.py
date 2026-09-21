@@ -29,7 +29,8 @@ def _complete_loop_future(fut: asyncio.Future[None]) -> None:
     if fut.done():
         return
     try:
-        asyncio.Future.set_result(fut, None)
+        # Bypass `_LoopShutdown.set_result`, which fans out through signal_shutdown.
+        asyncio.Future.set_result(fut, None)  # pyright: ignore[reportUnknownMemberType]
     except asyncio.InvalidStateError:
         return
 
@@ -160,7 +161,7 @@ class App(Router):
     @property
     def tasks(self) -> set[asyncio.Task[Any]]:
         """Tasks scheduled via `create_task` on this OS thread."""
-        stored = getattr(self._task_local, "tasks", None)
+        stored: set[asyncio.Task[Any]] | None = getattr(self._task_local, "tasks", None)
         if stored is None:
             stored = set()
             self._task_local.tasks = stored

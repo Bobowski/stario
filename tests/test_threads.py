@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import queue
+import socket
 import tempfile
 import threading
 from io import StringIO
@@ -12,12 +13,29 @@ from typing import Any
 import pytest
 
 import stario.responses as responses
-from stario import App
+from stario import App, Route
 from stario.exceptions import StarioError
 from stario.http.config import ServerConfig
 from stario.http.server import Server, gil_is_enabled, require_thread_workers
 from stario.telemetry.json import JsonTracer
 from tests.test_server import _connect_with_retry, _read_http_response, _serve
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def _connect_tcp(
+    host: str, port: int
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async with asyncio.timeout(2.0):
+        while True:
+            try:
+                return await asyncio.open_connection(host, port)
+            except OSError:
+                await asyncio.sleep(0.005)
 
 
 @pytest.fixture
@@ -143,7 +161,7 @@ async def test_threaded_serve_uses_configured_runner(
         async def hello(_c: Any, w: Any) -> None:
             responses.text(w, "hello-threads")
 
-        app.get("/", hello)
+        app.add(Route("GET", "/"), hello)
         yield
 
     server = Server(
@@ -189,7 +207,7 @@ async def test_threaded_serve_records_thread_count(
         async def hello(_c: Any, w: Any) -> None:
             responses.text(w, "ok")
 
-        app.get("/", hello)
+        app.add(Route("GET", "/"), hello)
         yield
 
     server = Server(
@@ -236,7 +254,7 @@ async def test_threaded_workers_use_uvloop_runtime(
             loop_modules.append(type(asyncio.get_running_loop()).__module__)
             responses.text(w, "hello-uvloop")
 
-        app.get("/", hello)
+        app.add(Route("GET", "/"), hello)
         yield
 
     server = Server(
@@ -262,6 +280,48 @@ async def test_threaded_workers_use_uvloop_runtime(
         assert body == b"hello-uvloop"
         assert loop_modules
         assert all(module.startswith("uvloop") for module in loop_modules)
+    finally:
+        apps[0].signal_shutdown()
+        async with asyncio.timeout(5.0):
+            await run_task
+
+
+@pytest.mark.asyncio
+async def test_threaded_serve_tcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
+    port = _free_tcp_port()
+    apps: list[App] = []
+
+    async def serve_bootstrap(app: App, span: Any):
+        apps.append(app)
+
+        async def hello(_c: Any, w: Any) -> None:
+            responses.text(w, "hello-tcp")
+
+        app.add(Route("GET", "/"), hello)
+        yield
+
+    server = Server(
+        serve_bootstrap,
+        JsonTracer(StringIO()),
+        config=ServerConfig(
+            host="127.0.0.1",
+            port=port,
+            graceful_shutdown_timeout=0.5,
+            threads=2,
+            event_loop="asyncio",
+        ),
+    )
+
+    run_task = asyncio.create_task(_serve(server))
+    try:
+        reader, writer = await _connect_tcp("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await writer.drain()
+        status, body = await _read_http_response(reader)
+        writer.close()
+        assert status == 200
+        assert body == b"hello-tcp"
     finally:
         apps[0].signal_shutdown()
         async with asyncio.timeout(5.0):

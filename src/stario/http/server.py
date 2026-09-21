@@ -160,11 +160,13 @@ class _LoopWorker:
         app: App,
         server: Server,
         loop_run: LoopRun[Any],
+        body: Callable[[_LoopWorker], Coroutine[Any, Any, None]],
     ) -> None:
         self.index = index
         self.app = app
         self.server = server
         self.loop_run = loop_run
+        self._body = body
         self.loop: asyncio.AbstractEventLoop | None = None
         self.connections: set[Connection] = set()
         self.date_box: list[bytes] = [b""]
@@ -193,23 +195,13 @@ class _LoopWorker:
 
     def _run(self) -> None:
         try:
-            self.loop_run(self._serve())
+            self.loop_run(self._body(self))
         except BaseException as exc:
             self.error = exc
             with suppress(Exception):
                 self.app.signal_shutdown()
         finally:
             self.ready.set()
-
-    async def _serve(self) -> None:
-        self.loop = asyncio.get_running_loop()
-        self.app.attach_loop(self.loop)
-        self.ready.set()
-        async with self.server._date_tick(self.date_box, self.connections):
-            try:
-                await self.app.shutdown
-            finally:
-                await self.server._drain_worker(self.connections, self.app)
 
     def _begin(self, sock: socket.socket) -> None:
         loop = self.loop
@@ -543,16 +535,34 @@ class Server:
         if self.config.threads <= 1:
             yield None
             return
-        sock = socket.create_server(
-            (self.config.host, self.config.port),
-            reuse_address=self.config.reuse_addr,
-            backlog=self.config.backlog,
-        )
-        sock.setblocking(False)
+        sock = self._tcp_listen_socket()
         try:
             yield sock
         finally:
             sock.close()
+
+    def _tcp_listen_socket(self) -> socket.socket:
+        """Bind a TCP listener for the acceptor thread (`threads>1`)."""
+        infos = socket.getaddrinfo(
+            self.config.host,
+            self.config.port,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+            flags=socket.AI_PASSIVE,
+        )
+        if not infos:
+            raise StarioError(
+                f"could not resolve listen address {self.config.host!r}",
+                help_text="Set STARIO_HOST to a bindable address.",
+            )
+        family, socktype, proto, _canon, sockaddr = infos[0]
+        sock = socket.socket(family, socktype, proto)
+        if self.config.reuse_addr:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+        sock.listen(self.config.backlog)
+        sock.setblocking(False)
+        return sock
 
     @contextmanager
     def _signal_handlers(
@@ -750,6 +760,17 @@ class Server:
             await self._force_close_open_transports(connections)
         await self._cancel_pending_tasks(app.tasks)
 
+    async def _run_worker(self, worker: _LoopWorker) -> None:
+        """One worker thread's loop: Date tick, serve until shutdown, then drain."""
+        worker.loop = asyncio.get_running_loop()
+        worker.app.attach_loop(worker.loop)
+        worker.ready.set()
+        async with self._date_tick(worker.date_box, worker.connections):
+            try:
+                await worker.app.shutdown
+            finally:
+                await self._drain_worker(worker.connections, worker.app)
+
     async def _serve_threaded(
         self,
         listen_sock: socket.socket | None,
@@ -764,7 +785,13 @@ class Server:
             )
         runner = self.loop_runner()
         workers = [
-            _LoopWorker(index=index, app=app, server=self, loop_run=runner)
+            _LoopWorker(
+                index=index,
+                app=app,
+                server=self,
+                loop_run=runner,
+                body=self._run_worker,
+            )
             for index in range(self.config.threads)
         ]
         for worker in workers:
