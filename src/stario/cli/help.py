@@ -12,6 +12,8 @@ Listen:
   STARIO_BACKLOG=2048
   STARIO_REUSE_ADDR=1          (TCP only; set 0 to disable SO_REUSEADDR)
   STARIO_GRACEFUL_SHUTDOWN_TIMEOUT=5
+  STARIO_SSL_CERTFILE=         (PEM cert; enables direct TLS + ALPN h2,http/1.1)
+  STARIO_SSL_KEYFILE=          (PEM key; defaults to the cert file if omitted)
 
 Telemetry (STARIO_TRACER plus json/sqlite backend tuning):
   STARIO_TRACER=auto|tty|json|noop|sqlite|module|module:callable

@@ -1,8 +1,9 @@
 """Route table: register `Route` values on a trie and resolve `(host, path, method)`."""
 
+import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Literal
 from warnings import deprecated
 
@@ -17,6 +18,44 @@ type MethodNotAllowedHandler = Callable[[frozenset[str]], Handler]
 type MatchStatus = Literal["found", "method_not_allowed", "not_found"]
 type RouteMatch = tuple[Handler, Route, Match]
 type Resolve = tuple[RouteMatch, MatchStatus, bool]
+
+
+def require_async_handler(handler: object, *, what: str = "Handler") -> None:
+    """Reject anything that is not an async callable (checked at registration)."""
+    if not callable(handler):
+        raise StarioError(
+            f"{what} must be callable",
+            context={"got": type(handler).__name__},
+            help_text="Register `async def handler(c, w):`.",
+        )
+
+    fn: object = handler
+    while isinstance(fn, partial):
+        fn = fn.func
+
+    if inspect.isasyncgenfunction(fn):
+        raise StarioError(
+            f"{what} cannot be an async generator",
+            help_text="Use `async def handler(c, w):` and write to the Writer, not `yield`.",
+        )
+    if inspect.iscoroutinefunction(fn):
+        return
+
+    call = getattr(fn, "__call__", None)
+    if call is not None and call is not fn:
+        if inspect.isasyncgenfunction(call):
+            raise StarioError(
+                f"{what} cannot be an async generator",
+                help_text="Use `async def __call__(self, c, w):` and write to the Writer, not `yield`.",
+            )
+        if inspect.iscoroutinefunction(call):
+            return
+
+    raise StarioError(
+        f"{what} must be async",
+        context={"got": type(handler).__name__},
+        help_text="Register `async def handler(c, w):`. Sync handlers are not supported.",
+    )
 
 
 async def default_not_found(_c: Context, w: Writer) -> None:
@@ -378,6 +417,7 @@ class Router:
         "_host_routing",
         "_hosts_exact",
         "_hosts_param",
+        "_lookup",
         "_path",
     )
 
@@ -389,12 +429,25 @@ class Router:
         self._host_routing = False
         self._exact: dict[tuple[str, str, str], RouteMatch] = {}
 
+        @lru_cache(maxsize=1024)
+        def lookup(host: str, path: str, method: str) -> RouteMatch:
+            return self._resolve_handler(host, path, method)
+
+        self._lookup = lookup
+
     @property
     def host_routing(self) -> bool:
         return self._host_routing
 
     def find_handler(self, host: str, path: str, method: str) -> RouteMatch:
         """`host` must already be lowercased (`Request.host`)."""
+        return self._lookup(host, path, method)
+
+    def _invalidate_lookup(self) -> None:
+        self._lookup.cache_clear()
+
+    def _resolve_handler(self, host: str, path: str, method: str) -> RouteMatch:
+        """Static exact map, then trie. Cached by `find_handler`."""
         hit = self._exact.get((host, path, method))
         if hit is not None:
             return hit
@@ -476,16 +529,25 @@ class Router:
                 context={"pattern": pattern},
             )
         current.middleware = current.middleware + tuple(middleware)
+        self._invalidate_lookup()
 
     def not_found(self, pattern: UrlPath | str, handler: Handler) -> None:
+        require_async_handler(handler, what="Not-found handler")
         self._policy_node(pattern).not_found_handler = handler
+        self._invalidate_lookup()
 
     def method_not_allowed(
         self,
         pattern: UrlPath | str,
         handler: MethodNotAllowedHandler,
     ) -> None:
-        self._policy_node(pattern).method_not_allowed_handler = handler
+        def checked(allowed: frozenset[str]) -> Handler:
+            resolved = handler(allowed)
+            require_async_handler(resolved, what="Method-not-allowed handler")
+            return resolved
+
+        self._policy_node(pattern).method_not_allowed_handler = checked
+        self._invalidate_lookup()
 
     def add(
         self,
@@ -494,6 +556,7 @@ class Router:
         *,
         middleware: Sequence[Middleware] = (),
     ) -> None:
+        require_async_handler(handler)
         if route is EMPTY_ROUTE:
             raise StarioError("Cannot register the unmatched route")
         if not route.method:
@@ -515,6 +578,8 @@ class Router:
         wrapped = handler
         for mw in reversed([*scoped_middleware, *middleware]):
             wrapped = mw(wrapped)
+        if wrapped is not handler:
+            require_async_handler(wrapped, what="Composed handler")
 
         existing = None if current.endpoints is None else current.endpoints.get(method)
         if existing is not None:
@@ -542,6 +607,7 @@ class Router:
             )
         if tree is not self._hosts_param:
             _compress(tree, "/")
+        self._invalidate_lookup()
 
     @deprecated("Use add(Route(method, path), handler).")
     def handle(

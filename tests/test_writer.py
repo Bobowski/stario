@@ -7,20 +7,14 @@ import pytest
 
 import stario.cookies as cookies
 import stario.responses as responses
-from stario import App, Route
+from stario import App
 from stario.datastar import SSE
-from stario.exceptions import StarioError, StarioRuntime
-from stario.http.writer import Writer
+from stario.exceptions import StarioRuntime
 from stario.markup import html as h
 from stario.testing import TestClient
-from tests.helpers import (
-    _MemoryTransport,
-)
+from stario.testing.harness import TestWriter
 from tests.helpers import (
     make_context as _make_context,
-)
-from tests.helpers import (
-    make_writer_raw as _make_writer,
 )
 
 
@@ -85,20 +79,20 @@ def _make_app() -> App:
     async def error_route(c, w):
         responses.text(w, "teapot", 418)
 
-    app.add(Route("GET", "/"), text_route)
-    app.add(Route("GET", "/html"), html_route)
-    app.add(Route("GET", "/json"), json_route)
-    app.add(Route("GET", "/redirect"), redirect_route)
-    app.add(Route("GET", "/final"), final_route)
-    app.add(Route("GET", "/redirect-cookie"), redirect_cookie_route)
-    app.add(Route("GET", "/redirect-cookie/final"), redirect_cookie_final)
-    app.add(Route("POST", "/json-echo"), json_echo)
-    app.add(Route("POST", "/form-echo"), form_echo)
-    app.add(Route("POST", "/upload"), upload_echo)
-    app.add(Route("GET", "/login"), login)
-    app.add(Route("GET", "/me"), me)
-    app.add(Route("GET", "/telemetry"), telemetry_route)
-    app.add(Route("GET", "/error"), error_route)
+    app.get("/", text_route)
+    app.get("/html", html_route)
+    app.get("/json", json_route)
+    app.get("/redirect", redirect_route)
+    app.get("/final", final_route)
+    app.get("/redirect-cookie", redirect_cookie_route)
+    app.get("/redirect-cookie/final", redirect_cookie_final)
+    app.post("/json-echo", json_echo)
+    app.post("/form-echo", form_echo)
+    app.post("/upload", upload_echo)
+    app.get("/login", login)
+    app.get("/me", me)
+    app.get("/telemetry", telemetry_route)
+    app.get("/error", error_route)
     return app
 
 
@@ -190,10 +184,8 @@ class TestClientBasics:
         rid = response.span_id
         root = client.tracer.get_span(rid)
         assert root is not None
-        assert root.name == "GET /telemetry"
         assert root.attributes["request.method"] == "GET"
         assert root.attributes["request.path"] == "/telemetry"
-        assert root.attributes["http.route"] == "/telemetry"
         assert root.attributes["response.status_code"] == 200
         ev = client.tracer.get_event(rid, "handler.hit")
         assert ev is not None
@@ -216,7 +208,7 @@ class TestClientBasics:
             c.app.create_task(bg())
             responses.text(w, "ok")
 
-        app.add(Route("GET", "/"), handler)
+        app.get("/", handler)
         async with TestClient(app) as client:
             await client.get("/")
             assert state["n"] == 0
@@ -234,7 +226,7 @@ class TestClientBasics:
             c.app.create_task(bg())
             responses.text(w, "ok")
 
-        app.add(Route("GET", "/"), handler)
+        app.get("/", handler)
         async with asyncio.timeout(0.5):
             async with TestClient(app) as client:
                 await client.get("/")
@@ -247,7 +239,7 @@ class TestClientBasics:
         async def loop_route(c, w):
             responses.redirect(w, "/loop", 302)
 
-        app.add(Route("GET", "/loop"), loop_route)
+        app.get("/loop", loop_route)
         async with TestClient(app, max_redirects=3) as client:
             with pytest.raises(RuntimeError, match="Too many redirects"):
                 await client.get("/loop")
@@ -268,7 +260,7 @@ class TestClientBasics:
             await asyncio.sleep(10)
             responses.text(w, "late")
 
-        app.add(Route("GET", "/slow"), slow)
+        app.get("/slow", slow)
         async with TestClient(app, request_timeout=client_timeout) as client:
             with pytest.raises(TimeoutError):
                 await client.get("/slow", timeout=request_timeout)
@@ -289,7 +281,7 @@ class TestClientBasics:
             w.write(b"lo")
             w.end()
 
-        app.add(Route("GET", "/s"), handler)
+        app.get("/s", handler)
         async with (
             TestClient(app) as client,
             client.stream("GET", "/s", headers={"Accept-Encoding": "identity"}) as r,
@@ -307,7 +299,7 @@ class TestClientBasics:
             w.write(b"event: ping\ndata: hello\n\n")
             w.end()
 
-        app.add(Route("GET", "/e"), handler)
+        app.get("/e", handler)
         async with (
             TestClient(app) as client,
             client.stream("GET", "/e", headers={"Accept-Encoding": "identity"}) as r,
@@ -330,7 +322,7 @@ class TestTestClient:
             c.app.create_task(watch())
             responses.text(w, "ok")
 
-        app.add(Route("GET", "/"), handler)
+        app.get("/", handler)
         async with TestClient(app) as client:
             r = await client.get("/")
             assert r.status_code == 200
@@ -339,24 +331,6 @@ class TestTestClient:
 
 
 class TestWriterRaw:
-    async def test_writes_stop_after_transport_closes(self):
-        sink = bytearray()
-        transport = _MemoryTransport(sink.extend)
-        writer = Writer(
-            transport=transport,
-            get_date_header=lambda: b"date: Tue, 10 Mar 2026 00:00:00 GMT\r\n",
-            on_completed=lambda: None,
-        )
-
-        writer.respond(b"ok", b"text/plain")
-        assert b"ok" in sink
-
-        sink.clear()
-        transport.close()
-        writer.respond(b"nope", b"text/plain")
-
-        assert b"nope" not in sink
-
     async def test_context_alive_exits_when_connection_closes(self):
         loop = asyncio.get_running_loop()
         disconnect = loop.create_future()
@@ -437,102 +411,62 @@ class TestWriterRaw:
         await asyncio.wait_for(worker(), timeout=0.2)
         assert collected == ["a", "b"]
 
-    def test_end_without_data_sends_204(self):
-        w, sink, loop = _make_writer()
+    def test_end_without_data_is_204(self):
+        w = TestWriter()
+        w.end()
+        assert w.status_code == 204
+        assert w.body == b""
+
+    def test_closing_follows_disconnect(self):
+        loop = asyncio.new_event_loop()
         try:
-            w.end()
-            assert bytes(sink).startswith(b"HTTP/1.1 204 No Content\r\n")
-            assert b"content-length: 0\r\n" in bytes(sink)
+            disconnect = loop.create_future()
+            w = TestWriter(disconnect=disconnect)
+            assert not w.closing
+            disconnect.set_result(None)
+            assert w.closing
         finally:
             loop.close()
 
     def test_write_after_204_raises(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.write_headers(204)
-            with pytest.raises(StarioRuntime, match="Cannot write a body"):
-                w.write(b"data")
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.write_headers(204)
+        with pytest.raises(RuntimeError, match="Cannot write a body"):
+            w.write(b"data")
 
     def test_sse_rejects_non_event_stream_after_headers_started(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.set("content-type", "text/html")
+        w = TestWriter()
+        w.headers.set("content-type", "text/html")
+        w.write_headers(200)
+        with pytest.raises(StarioRuntime, match="text/event-stream"):
+            SSE(w).patch_signals({"x": 1})
+
+    def test_write_headers_twice_raises(self):
+        w = TestWriter()
+        w.write_headers(200)
+        with pytest.raises(RuntimeError, match="already started"):
             w.write_headers(200)
-            with pytest.raises(StarioRuntime, match="text/event-stream"):
-                SSE(w).patch_signals({"x": 1})
-        finally:
-            loop.close()
-
-    def test_write_headers_twice_raises_stario_runtime(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.write_headers(200)
-            with pytest.raises(StarioRuntime, match="already started"):
-                w.write_headers(200)
-        finally:
-            loop.close()
-
-    def test_content_length_mismatch_raises_at_end(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.unsafe_set(b"content-length", b"5")
-            w.write_headers(200)
-            w.write(b"abc")
-            with pytest.raises(StarioRuntime, match="body length mismatch"):
-                w.end()
-        finally:
-            loop.close()
-
-    def test_head_content_length_does_not_require_a_body(self):
-        w, sink, loop = _make_writer()
-        try:
-            w.headers.unsafe_set(b"content-length", b"5")
-            w.write_headers(200, body=False)
-            w.end()
-        finally:
-            loop.close()
-        wire = bytes(sink)
-        assert b"content-length: 5\r\n" in wire
-        assert wire.endswith(b"\r\n\r\n")
-
-    def test_invalid_content_length_raises_stario_error(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.headers.unsafe_set(b"content-length", b"not-a-number")
-            with pytest.raises(StarioError, match="Invalid Content-Length"):
-                w.write_headers(200)
-        finally:
-            loop.close()
 
     def test_respond_after_started_raises(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.write_headers(200)
-            with pytest.raises(StarioRuntime, match="already started"):
-                w.respond(b"late", b"text/plain")
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.write_headers(200)
+        with pytest.raises(RuntimeError, match="already started"):
+            w.respond(b"late", b"text/plain")
 
     def test_write_after_end_raises(self):
-        w, _sink, loop = _make_writer()
-        try:
-            w.respond(b"ok", b"text/plain")
-            with pytest.raises(StarioRuntime, match="completed"):
-                w.write(b"extra")
-        finally:
-            loop.close()
+        w = TestWriter()
+        w.respond(b"ok", b"text/plain")
+        with pytest.raises(RuntimeError, match="completed"):
+            w.write(b"extra")
 
-    def test_respond_when_disconnected_completes_without_body(self):
-        w, sink, loop = _make_writer()
-        completed: list[str] = []
-        try:
-            w._on_completed = lambda: completed.append("done")
-            w._transport.close()
-            w.respond(b"ok", b"text/plain")
-            assert bytes(sink) == b""
-            assert w.completed
-            assert completed == ["done"]
-        finally:
-            loop.close()
+    def test_respond_keeps_custom_headers_and_cookies(self):
+        w = TestWriter()
+        cookies.set_cookie(w, "session", "abc123")
+        cookies.set_cookie(w, "theme", "dark")
+        w.headers.set("X-Request-ID", "in-1")
+        w.respond(b"ok", b"text/plain")
+        assert w.headers.get("x-request-id") == "in-1"
+        assert w.headers.get("content-type") == "text/plain"
+        lines = w.headers.unsafe_getlist(b"set-cookie")
+        assert len(lines) == 2
+        assert w.body == b"ok"

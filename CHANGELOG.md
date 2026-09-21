@@ -6,8 +6,29 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Breaking changes
+
+- Cython llhttp/nghttp2 is the production HTTP runtime. The Python httptools
+  protocol is gone. `stario serve` uses the compiled protocol.
+- `App.on_error` and exception-type mapping are gone. Uncaught handler
+  exceptions are logged. If the handler sent nothing, the framework writes
+  **500**; a response already on the wire is not rewritten. Handlers must
+  write a complete response (`respond` / `end`) or use
+  `stario.http.middleware.catch_errors` to map app exceptions.
+- **`HttpException` removed.** Body read failures raise `RequestBodyError`
+  (408/413). Map them with `catch_request_body_errors()` or custom middleware.
+- Route handlers must be `async def` (or a callable whose `__call__` is async).
+- The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
+  instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
+  the Cython protocol (no handler task).
+- `c.route` (`RouteMatch`) is gone. Use `c.match` (`Match`).
+- `stario.routing` is gone. Import `Route` and `UrlPath` from `stario` or
+  `stario.http`.
+
 ### Fixed
 
+- `Assets.load()` re-hashes files already pinned by `href()`, so same-size
+  content changes are detected even when mtime does not move.
 - TTY tracer live footer — skip terminal writes when the text and width do not
   change. Cap the live block to `terminal_rows - 2` so cursor-up erase cannot
   clear scrollback. Tall trees keep the root header and the newest lines.
@@ -27,17 +48,45 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
   standard-library default emits strict compact JSON. Replace it explicitly
   with `set_codec()`.
+- `stario.http.middleware.catch_errors` — wrap handlers so listed exceptions
+  become HTTP responses when nothing was sent yet. Presets:
+  `catch_request_body_errors()` and `respond_request_body_error`.
+- Cython HTTP/2 via nghttp2 on the same connection class. Switch once per socket (TLS ALPN `h2` or the cleartext connection preface). Responses go out as frames, not HTTP/1.1 text.
+- Direct TLS: `ServerConfig(ssl=…)` or `STARIO_SSL_CERTFILE` / `STARIO_SSL_KEYFILE`. Context is TLS 1.2+ with ALPN `h2`, `http/1.1`.
 
 ### Changed
 
-- `find_handler` has no LRU. Static `(host, path, method)` hits an exact
-  map and reuses that `Match`. Exact hosts have their own path trie.
-  Exact-only path chains are radix-compressed. One cursor walks the
-  trie. The matcher does not lowercase `host` — pass `Request.host`
-  (already folded).
+- `find_handler` keeps a 1024-entry LRU in front of the trie (same cap as
+  pre-4.2 Cython). Static `(host, path, method)` still hits an exact map
+  and reuses that `Match`. Parameterized paths reuse the resolved
+  `(handler, route, Match)` while they stay in the cache. Exact hosts
+  have their own path trie. Exact-only path chains are radix-compressed.
+  One cursor walks the trie on a miss. The matcher does not lowercase
+  `host` — pass `Request.host` (already folded).
 - File streaming (`Assets`, `Files`, and `stario.staticassets`) reads
   already-open file descriptors with `os.pread` in a worker thread.
   The `aiofiles` dependency is gone.
+- Handler-task finish is `stario.http.invoke.on_handler_done`: log, write 500
+  if nothing was sent, abort if a body was started but not finished, close
+  the span. No auto-`end()`. A write-then-raise still logs (`Handler failed`);
+  the response already on the wire is not rewritten.
+- Every request that writes an HTTP status gets a started-and-ended span:
+  handler responses, trailing-slash 308, and protocol 400 / 413 / 431 / 429
+  / 503. Protocol outcomes are not `fail`ed. `NoOpSpan` still skips start/end.
+  Matched routes rename the span to `Route.pattern` and set `http.route`.
+- Cython GET path: skip upload state when there is no body (`mark_nobody`),
+  and arm idle timeouts on the Date-tick sweeper instead of `loop.time()`
+  per keep-alive request.
+- Cython uploads: Content-Length bodies ≤ 256 KiB dispatch after the
+  message is complete (`body()` is already bytes). `stream()` with a known
+  Content-Length yields `min(length, 256 KiB)` instead of a fixed 64 KiB.
+- HTTP/2 POST without Content-Length is END_STREAM-delimited (like H1
+  chunked). Recycle clears nghttp2 stream user_data. Duplicate `:method` /
+  `:path` / `:authority` are RST; `:authority` and `Host` must be equal.
+- `ParsedQuery` first read fills a C name/value span table. HTTP/1 stays on
+  [llhttp](https://github.com/nodejs/llhttp).
+- HTTP/2 receive window is 1MiB per stream / 4MiB per connection. RST-stream
+  flood is rate-limited. Header budget 431 / body 413 apply per stream.
 
 ### Deprecated
 
@@ -60,12 +109,6 @@ fragment go to `href()` only. After a match, read `c.match`.
   the call site (`at.get(...)`, `at.post(...)`).
 - `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use
   `Assets(...)` or `Files(...)` and `await attach(app)`.
-
-### Removed
-
-- `c.route` (`RouteMatch`) — use `c.match` (`Match`).
-- `stario.routing` — import `Route` and `UrlPath` from `stario` or
-  `stario.http`. `from stario.http import RouteMatch` becomes `Match`.
 
 ## 4.1.1 - 2026-08-31
 
@@ -168,7 +211,7 @@ Major release from 3.4. Delete old `stario-traces.sqlite3` files before upgradin
 ### Added
 
 - `ServerConfig` and `RequestPolicy` — listen, compression, shutdown, and request limits (`stario.http.config`).
-- `AssetManifest` and `StaticAssets.stats`.
+- `AssetManifest`, `Asset`, and `StaticAssets.stats`.
 - Static serving — `precompress=` codec selection, per-instance `content_types=` overrides, and `Range: bytes=…` on large streamed files (206 / 416; one range per request).
 - `STARIO_REUSE_ADDR` — TCP `SO_REUSEADDR` (default `1`).
 - `normalized_location` — shared redirect URL safety for `responses.redirect` and SSE navigation.
