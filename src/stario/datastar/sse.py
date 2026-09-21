@@ -53,11 +53,6 @@ def _sse_field_value(name: str, value: str) -> bytes:
     return value.encode()
 
 
-def _sse_payload_lines(data: bytes) -> list[bytes]:
-    """Split an SSE payload on CR, LF, or CRLF (HTML event-stream line endings)."""
-    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
-
-
 class SSE:
     """Datastar SSE response bound to one `Writer`.
 
@@ -125,9 +120,7 @@ class SSE:
             html_bytes = render(content).encode("utf-8")
 
         # SSE represents multiline payloads as repeated `data:` lines.
-        # Split on CR, LF, and CRLF: a bare CR is a line terminator in the
-        # event-stream parser and must not remain inside a `data:` field.
-        for line in _sse_payload_lines(html_bytes):
+        for line in html_bytes.split(b"\n"):
             lines.append(b"data: elements " + line)
 
         self._prepare_headers()
@@ -147,7 +140,7 @@ class SSE:
         lines = [_EVENT_PATCH_SIGNALS]
         if only_if_missing:
             lines.append(b"data: onlyIfMissing true")
-        for line in _sse_payload_lines(json_bytes):
+        for line in json_bytes.split(b"\n"):
             lines.append(b"data: signals " + line)
         self._prepare_headers()
         self.w.write(b"\n".join(lines) + b"\n\n")

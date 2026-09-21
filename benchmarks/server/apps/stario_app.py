@@ -3,10 +3,10 @@
 import ujson
 
 import stario.responses as responses
-from apps.common import JSON_CONTENT_TYPE, validate_fields
 from stario import App, Route, Span
 
 HELLO = "Hello, World!"
+JSON_CONTENT_TYPE = b"application/json"
 
 
 def json_response(w, value, status: int = 200) -> None:
@@ -28,35 +28,17 @@ async def get_user(c, w):
 
 async def validate(c, w):
     body = ujson.loads(await c.req.body())
-    payload, status = validate_fields(body)
-    json_response(w, payload, status)
+    name = body.get("name")
+    age = body.get("age")
 
+    if not isinstance(name, str) or not name:
+        json_response(w, {"error": "name must be a non-empty string"}, 400)
+        return
+    if not isinstance(age, int) or age < 0 or age > 150:
+        json_response(w, {"error": "age must be an integer between 0 and 150"}, 400)
+        return
 
-async def post_form(c, w):
-    await c.req.body()
-    responses.empty(w)
-
-
-async def post_echo_json(c, w):
-    body = await c.req.body()
-    json_response(w, {"bytes": len(body)})
-
-
-async def ingest_buffer(c, w):
-    body = await c.req.body()
-    json_response(w, {"bytes": len(body)})
-
-
-async def ingest_stream(c, w):
-    total = 0
-    async for chunk in c.req.stream():
-        total += len(chunk)
-    json_response(w, {"bytes": total})
-
-
-async def upload(c, w):
-    body = await c.req.body()
-    json_response(w, {"bytes": len(body)})
+    json_response(w, {"name": name, "age": age, "valid": True})
 
 
 async def bootstrap(app: App, span: Span) -> None:
@@ -64,10 +46,4 @@ async def bootstrap(app: App, span: Span) -> None:
     app.add(Route("GET /json"), json_endpoint)
     app.add(Route("GET /user/{user_id}"), get_user)
     app.add(Route("POST /validate"), validate)
-    app.add(Route("POST /form"), post_form)
-    app.add(Route("POST /echo/json"), post_echo_json)
-    app.add(Route("POST /ingest/64k"), ingest_buffer)
-    app.add(Route("POST /ingest/2m"), ingest_buffer)
-    app.add(Route("POST /ingest/stream/2m"), ingest_stream)
-    app.add(Route("POST /upload"), upload)
     yield

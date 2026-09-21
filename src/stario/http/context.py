@@ -1,19 +1,18 @@
-"""Request-scoped handler bundle: Protocol plus route match and ``alive()``.
-
-Production ``c`` is the Cython ``RequestExchange``. TestClient supplies its own
-context. ``Match`` and ``_Alive`` stay as small Python helpers.
 """
-
-from __future__ import annotations
+Request-scoped bundle for handlers: app, request, telemetry, routing, state, and client lifetime.
+"""
 
 import asyncio
 import contextlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, overload
+from typing import TYPE_CHECKING, Any, overload
 
 from stario.telemetry.core import Span
+
+from .request import Request
+from .writer import Writer
 
 _NO_PARAMS: MappingProxyType[str, str] = MappingProxyType({})
 
@@ -56,39 +55,48 @@ object.__setattr__(EMPTY_MATCH, "pattern", "")
 object.__setattr__(EMPTY_MATCH, "params", _NO_PARAMS)
 
 if TYPE_CHECKING:
-    from stario.http.app import App
-    from stario.http.request import Request
-    from stario.http.writer import Writer
+    from .app import App
 
 
-class Context(Protocol):
-    """Per-request bundle passed to every handler and middleware."""
+@dataclass(slots=True)
+class Context:
+    """Per-request bundle passed to every handler and middleware (routing fills `match` before the handler runs)."""
 
     app: App
+    """The `App` instance for this request."""
     req: Request
+    """Parsed HTTP request (method, path, headers, body reader)."""
     span: Span
-    state: dict[str, Any]
-    match: Match
+    """Telemetry span for this request; started/ended by the app callable."""
+    _disconnect: asyncio.Future[None] = field(repr=False)
+    """Completes when the client closes this request's connection."""
+    state: dict[str, Any] = field(default_factory=lambda: {})
+    """Mutable dict for middleware to pass data to inner layers and the handler."""
+    match: Match = field(default=EMPTY_MATCH)
+    """Hit for this request: `.pattern` and `.params`. Empty pattern on 404 and 405."""
 
     @property
     def disconnect(self) -> asyncio.Future[None]:
         """Completes when the client closes this request's connection."""
-        ...
+        return self._disconnect
 
     @property
     def disconnected(self) -> bool:
-        """``True`` when the client closed this request's connection."""
-        ...
+        """`True` when the client closed this request's connection."""
+        return self._disconnect.done()
 
     @property
     def shutting_down(self) -> bool:
-        """``True`` when the server is draining this app."""
-        ...
+        """`True` when the server is draining this app (same signal as `app.shutting_down`)."""
+        return self.app.shutting_down
 
     @property
     def closing(self) -> bool:
-        """``True`` when handler work should stop (client left or app draining)."""
-        ...
+        """`True` when handler work should stop because the client left or the app is draining.
+
+        For response I/O during drain, `Writer` may still write until `disconnected`.
+        """
+        return self.disconnected or self.shutting_down
 
     @overload
     def alive(self, source: None = None) -> _Alive[None]: ...
@@ -100,8 +108,14 @@ class Context(Protocol):
         self,
         source: AsyncIterable[T] | None = None,
     ) -> _Alive[T] | _Alive[None]:
-        """Watch client disconnect and app shutdown; cancel this task when either happens."""
-        ...
+        """Watch client disconnect and app shutdown; cancel this task when either happens.
+
+        Use `async with c.alive(): ...` for scoped work, or
+        `async for item in c.alive(source): ...` to stream from `source` until
+        disconnect or shutdown. Do not use `async for` without `source`; the
+        context-manager form is the supported no-source pattern.
+        """
+        return _Alive(self, source)
 
 
 @dataclass(slots=True)
@@ -157,5 +171,6 @@ class _Alive[T]:
         )
 
 
-type Handler = Callable[[Context, "Writer"], Awaitable[None]]
+type Handler = Callable[[Context, Writer], Awaitable[None]]
+
 type Middleware = Callable[[Handler], Handler]

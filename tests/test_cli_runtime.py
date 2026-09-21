@@ -91,8 +91,6 @@ def test_watch_app_passes_sigint_timeout_and_serve_command(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("STARIO_SSL_CERTFILE", raising=False)
-    monkeypatch.delenv("STARIO_SSL_KEYFILE", raising=False)
     captured: list[dict[str, object]] = []
 
     def fake_run_process(*args: object, **kwargs: object) -> int:

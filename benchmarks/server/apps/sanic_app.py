@@ -2,20 +2,14 @@
 
 import argparse
 
-import ujson
-from sanic import Sanic, empty, json, text
-from sanic.views import stream
-
-from apps.common import validate_fields
+from sanic import Sanic, json, text
 
 HELLO = "Hello, World!"
 
 app = Sanic("stario_benchmark_sanic")
 app.config.ACCESS_LOG = False
-app.config.MOTD = False
-app.config.RESPONSE_TIMEOUT = 120
-app.config.REQUEST_TIMEOUT = 120
-app.config.REQUEST_MAX_SIZE = 4 * 1024 * 1024
+app.config.RESPONSE_TIMEOUT = 60
+app.config.REQUEST_TIMEOUT = 60
 
 
 @app.get("/plaintext")
@@ -35,39 +29,19 @@ async def get_user(request, user_id: str):
 
 @app.post("/validate")
 async def validate(request):
-    payload, status = validate_fields(ujson.loads(request.body))
-    return json(payload, status=status)
+    body = request.json or {}
+    name = body.get("name")
+    age = body.get("age")
 
+    if not isinstance(name, str) or not name:
+        return json({"error": "name must be a non-empty string"}, status=400)
+    if not isinstance(age, int) or age < 0 or age > 150:
+        return json(
+            {"error": "age must be an integer between 0 and 150"},
+            status=400,
+        )
 
-@app.post("/form")
-async def post_form(request):
-    _ = request.body
-    return empty()
-
-
-@app.post("/echo/json")
-async def post_echo_json(request):
-    return json({"bytes": len(request.body)})
-
-
-@app.post("/ingest/64k", name="ingest_64k")
-@app.post("/ingest/2m", name="ingest_2m")
-async def ingest_buffer(request):
-    return json({"bytes": len(request.body)})
-
-
-@app.post("/ingest/stream/2m", name="ingest_stream_2m")
-@stream
-async def ingest_stream(request):
-    total = 0
-    async for chunk in request.stream:
-        total += len(chunk)
-    return json({"bytes": total})
-
-
-@app.post("/upload")
-async def upload(request):
-    return json({"bytes": len(request.body)})
+    return json({"name": name, "age": age, "valid": True})
 
 
 if __name__ == "__main__":
@@ -81,5 +55,4 @@ if __name__ == "__main__":
         single_process=True,
         access_log=False,
         debug=False,
-        motd=False,
     )

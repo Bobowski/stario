@@ -7,8 +7,6 @@ from stario.cli.errors import CliError
 
 
 def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
-    monkeypatch.delenv("STARIO_SSL_CERTFILE", raising=False)
-    monkeypatch.delenv("STARIO_SSL_KEYFILE", raising=False)
     monkeypatch.setenv("STARIO_HOST", "0.0.0.0")
     monkeypatch.setenv("STARIO_PORT", "9000")
     monkeypatch.setenv("STARIO_LOOP", "uvloop")
@@ -23,7 +21,6 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     assert config.unix_socket == "/tmp/stario.sock"
     assert config.graceful_shutdown_timeout == 12.5
     assert config.reuse_addr is False
-    assert config.ssl is None
 
 
 @pytest.mark.parametrize(

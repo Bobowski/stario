@@ -54,8 +54,6 @@ class TestTracer:
     they only return finished span snapshots.
     """
 
-    __test__ = False
-
     def __init__(self) -> None:
         self._entry_depth = 0
         self._open: set[UUID] = set()
@@ -224,8 +222,3 @@ class TestTracer:
         """`True` while any span created through this tracer has not been ended."""
 
         return bool(self._open)
-
-    def finished_spans(self) -> tuple[TelemetrySpan, ...]:
-        """Finished spans in start-time order."""
-
-        return tuple(self._finished)

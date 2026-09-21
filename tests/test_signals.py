@@ -7,7 +7,7 @@ import pytest
 from stario.datastar import read_signals
 from stario.exceptions import StarioError
 from stario.http.headers import Headers
-from stario.testing.harness import TestRequest
+from stario.http.request import BodyReader, Request
 
 
 def _make_request(
@@ -17,18 +17,26 @@ def _make_request(
     headers: dict[str, str] | None = None,
     body: bytes = b"",
     query: dict[str, object] | None = None,
-) -> TestRequest:
+) -> Request:
     hdrs = Headers()
     if headers:
         for name, value in headers.items():
             hdrs.set(name, value)
 
-    return TestRequest(
+    reader = BodyReader(
+        pause=lambda: None,
+        resume=lambda: None,
+        disconnect=None,
+    )
+    reader._cached = body
+    reader._complete = True
+
+    return Request(
         method=method,
         path=path,
         query_bytes=urlencode(query or {}, doseq=True).encode("ascii"),
         headers=hdrs,
-        body=body,
+        body=reader,
     )
 
 

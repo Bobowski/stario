@@ -25,32 +25,13 @@ from stario.markup import html as h
 from stario.markup import render
 from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
 from stario.markup.types import Attrs
-from stario.testing.harness import TestWriter
-
-
-class _ClosedLoop:
-    def close(self) -> None:
-        return None
-
-
-def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
-    writer = TestWriter()
-    return writer, writer.sink.buf, _ClosedLoop()
-
-
-class _ClosedLoop:
-    def close(self) -> None:
-        return None
-
-
-def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
-    writer = TestWriter()
-    return writer, writer.sink.buf, _ClosedLoop()
-
-
-def _sse_body(writer: TestWriter) -> bytes:
-    return writer.body
-
+from stario.testing.transport import decode_chunked as _decode_chunked
+from tests.helpers import (
+    make_writer_raw as _make_writer,
+)
+from tests.helpers import (
+    split_response as _split_response,
+)
 
 Div = h.Div
 
@@ -98,7 +79,8 @@ class TestSseNavigate:
         w, sink, loop = _make_writer()
         try:
             SSE(w).navigate("/page?name=O'Brien")
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert b'window.location = "/page?name=O\'Brien"' in result
         finally:
@@ -109,7 +91,8 @@ class TestSseNavigate:
         w, sink, loop = _make_writer()
         try:
             SSE(w).navigate("/users/日本語")
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert b'window.location = "/users/%E6%97%A5%E6%9C%AC%E8%AA%9E"' in result
         finally:
@@ -120,7 +103,8 @@ class TestSseNavigate:
         w, sink, loop = _make_writer()
         try:
             SSE(w).navigate("/page?q=</script><script>alert(1)</script>")
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             # The angle brackets must be percent-encoded inside the JS string;
             # the only raw </script> on the wire is the patch's own closing tag.
@@ -144,7 +128,7 @@ class TestSseNavigate:
         try:
             with pytest.raises(StarioError, match="app-relative path or absolute"):
                 SSE(w).navigate(url)
-            assert w.body == b""
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
@@ -160,7 +144,7 @@ class TestSseNavigate:
         try:
             with pytest.raises(StarioError):
                 SSE(w).navigate(url)
-            assert w.body == b""
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
@@ -174,7 +158,7 @@ class TestSseWireFormat:
             SSE(w)
 
             assert not w.started
-            assert w.body == b""
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
@@ -182,10 +166,11 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).open()
+            head, body = _split_response(bytes(sink))
 
-            assert w.headers.get("content-type") == "text/event-stream"
-            assert w.headers.get("cache-control") == "no-cache"
-            assert w.body == b""
+            assert b"content-type: text/event-stream" in head
+            assert b"cache-control: no-cache" in head
+            assert body == b""
         finally:
             loop.close()
 
@@ -193,10 +178,11 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).patch_signals({"ok": True})
+            head, body = _split_response(bytes(sink))
 
-            assert w.headers.get("content-type") == "text/event-stream"
-            assert w.headers.get("cache-control") == "no-cache"
-            assert b'data: signals {"ok":true}' in _sse_body(w)
+            assert b"content-type: text/event-stream" in head
+            assert b"cache-control: no-cache" in head
+            assert b'data: signals {"ok":true}' in _decode_chunked(body)
         finally:
             loop.close()
 
@@ -223,7 +209,8 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).patch_elements(h.Div("x"), mode=mode, selector="#t")
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert f"data: mode {mode}".encode() in result
         finally:
@@ -233,7 +220,8 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).patch_elements(h.Div("x"))
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert b"data: mode" not in result
         finally:
@@ -243,7 +231,8 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).patch_elements(b"<mi>x</mi>", namespace="mathml")
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert b"data: namespace mathml" in result
         finally:
@@ -253,7 +242,8 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).patch_elements("<div>\n  <p>a</p>\n</div>")
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert (
                 b"data: elements <div>\n"
@@ -263,25 +253,12 @@ class TestSseWireFormat:
         finally:
             loop.close()
 
-    def test_bare_cr_in_patch_elements_becomes_data_line(self):
-        w, sink, loop = _make_writer()
-        try:
-            SSE(w).patch_elements("<div>\revil")
-            result = _sse_body(w)
-            assert b"event: datastar-patch-elements\n" in result
-            assert b"\revil" not in result
-            assert b"data: elements <div>\n" in result
-            assert b"data: elements evil" in result
-            assert b"event: evil" not in result
-        finally:
-            loop.close()
-
     def test_patch_signals_rejects_raw_json_text(self):
         w, sink, loop = _make_writer()
         try:
             with pytest.raises(TypeError, match="mapping"):
                 SSE(w).patch_signals('{"raw":true}')  # type: ignore[arg-type]
-            assert w.body == b""
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
@@ -289,7 +266,8 @@ class TestSseWireFormat:
         w, sink, loop = _make_writer()
         try:
             SSE(w).patch_signals({"msg": "日本語"})
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert 'data: signals {"msg":"日本語"}'.encode() in result
         finally:
@@ -300,7 +278,7 @@ class TestSseWireFormat:
         try:
             with pytest.raises(TypeError, match="mapping"):
                 SSE(w).patch_signals(b'{"raw":true}')  # type: ignore[arg-type]
-            assert w.body == b""
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
@@ -317,7 +295,8 @@ class TestSseScriptTrustContract:
         w, sink, loop = _make_writer()
         try:
             SSE(w).execute_script('console.log("</script>")', auto_remove=False)
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert b'data: elements <script>console.log("</script>")</script>' in result
         finally:
@@ -330,7 +309,8 @@ class TestSseScriptTrustContract:
                 "let a = 1;\nconsole.log(a);",
                 auto_remove=False,
             )
-            result = _sse_body(w)
+            _, body = _split_response(bytes(sink))
+            result = _decode_chunked(body)
 
             assert (
                 b"data: elements <script>let a = 1;\n"
@@ -364,7 +344,7 @@ class TestSseRemove:
         try:
             with pytest.raises(StarioError, match="line breaks"):
                 SSE(w).remove("#old\ndata: mode append")
-            assert w.body == b""
+            assert bytes(sink) == b""
         finally:
             loop.close()
 
@@ -379,14 +359,6 @@ class TestDatastarAttributeValidation:
     def test_bind_rejects_non_snake_signal_path_segment(self):
         with pytest.raises(StarioError, match="snake_case"):
             data.bind("crane.selectedCrane")
-
-    def test_attr_rejects_quote_breakout_key(self):
-        with pytest.raises(StarioError, match="Invalid attribute name"):
-            data.attr('x" onfocus="alert(1)', "$x")
-
-    def test_on_rejects_breakout_event_name(self):
-        with pytest.raises(StarioError, match="Invalid attribute name"):
-            data.on('click" onfocus="alert(1)', "go()")
 
     @pytest.mark.parametrize(
         "time",

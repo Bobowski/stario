@@ -41,27 +41,6 @@ class TestFindHandler:
         with pytest.raises(TypeError):
             hit.params["user_id"] = "9"  # type: ignore[index]
 
-    def test_param_find_reuses_the_same_match(self):
-        router = Router()
-        router.add(Route("GET /users/{user_id}"), noop_handler)
-
-        _, _, first = router.find_handler("", "/users/42", "GET")
-        _, _, second = router.find_handler("", "/users/42", "GET")
-
-        assert first is second
-        assert dict(first.params) == {"user_id": "42"}
-
-    def test_add_after_miss_is_visible(self):
-        router = Router()
-        handler, _, hit = router.find_handler("", "/later", "GET")
-        assert hit is EMPTY_MATCH
-        assert handler is default_not_found
-
-        router.add(Route("GET /later"), noop_handler)
-        _, route, found = router.find_handler("", "/later", "GET")
-        assert found.pattern == "GET /later"
-        assert route.target == "/later"
-
     def test_escaped_braces_register_and_match(self):
         router = Router()
         curly = Route("GET /curly/{{id}}")

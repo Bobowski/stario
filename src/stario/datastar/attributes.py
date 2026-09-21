@@ -28,7 +28,7 @@ from typing import Literal
 from stario.exceptions import StarioError
 from stario.json import dumps as json_dumps
 from stario.markup.escape import escape_attribute_value as escape_attr
-from stario.markup.escape import escape_sq_attribute_value, validate_attribute_key
+from stario.markup.escape import escape_sq_attribute_value
 from stario.markup.types import Attrs
 
 from ._jsevents import JSEvent
@@ -81,7 +81,6 @@ class DatastarAttributes:
         # Attrs(' data-attr:title="$item.label"')
         ```
         """
-        validate_attribute_key(key)
         return Attrs(f' {self.prefix}attr:{key}="{escape_attr(expression)}"')
 
     def attrs(self, mapping: dict[str, str]) -> Attrs:
@@ -112,10 +111,6 @@ class DatastarAttributes:
         ```
         """
         validate_signal_path(signal_name)
-        if prop is not None:
-            validate_attribute_key(prop)
-        if event is not None:
-            validate_attribute_key(event)
         if prop is None and event is None:
             return Attrs(f' {self.prefix}bind="{escape_attr(signal_name)}"')
 
@@ -134,7 +129,6 @@ class DatastarAttributes:
         # Attrs(' data-class:hidden="!$expanded"')
         ```
         """
-        validate_attribute_key(name)
         return Attrs(f' {self.prefix}class:{name}="{escape_attr(expression)}"')
 
     def classes(self, mapping: dict[str, str]) -> Attrs:
@@ -313,8 +307,6 @@ class DatastarAttributes:
                     "`prevent` calls it. Pass only one."
                 ),
             )
-
-        validate_attribute_key(event)
 
         if (
             not once
@@ -584,7 +576,6 @@ class DatastarAttributes:
         # Attrs(' data-style:width="$pct + '%'"')
         ```
         """
-        validate_attribute_key(prop)
         return Attrs(f' {self.prefix}style:{prop}="{escape_attr(expression)}"')
 
     def styles(self, mapping: dict[str, str]) -> Attrs:
@@ -704,8 +695,6 @@ class DatastarAttributes:
         """
         filters = filter_js(include, exclude)
         value: str | bool = filters if filters is not None else True
-        if storage_key is not None:
-            validate_attribute_key(storage_key)
         key = (
             self.prefix + "persist"
             if storage_key is None
