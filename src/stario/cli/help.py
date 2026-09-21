@@ -7,7 +7,7 @@ Listen:
   STARIO_HOST=127.0.0.1
   STARIO_PORT=8000
   STARIO_LOOP=asyncio|uvloop
-  STARIO_THREADS=1            (N>1: one asyncio loop per OS thread; 3.14t)
+  STARIO_THREADS=1            (N>1: N SO_REUSEPORT servers; 3.14t; else 1)
   STARIO_UNIX_SOCKET=          (empty = TCP)
   STARIO_UNIX_SOCKET_MODE=660  (octal; after bind on unix socket)
   STARIO_BACKLOG=2048

@@ -36,12 +36,13 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Added
 
-- `STARIO_THREADS` — opt-in worker count (`1` default). `N>1` runs one
-  asyncio loop per OS thread. `STARIO_LOOP` (asyncio/uvloop) is resolved
-  once: asyncio workers always get a stdlib loop (a process-wide
-  `uvloop.install()` cannot leak in), uvloop workers call `uvloop.run`,
-  and each worker refuses to start if the running loop is the other
-  library. Requires free-threaded Python 3.14t unless
+- `STARIO_THREADS` — opt-in worker count (`1` default). `N>1` runs N
+  event-loop threads, each a full `create_server` on the same TCP port
+  via `SO_REUSEPORT` (thread 0 also owns signals and shutdown). The
+  kernel load-balances new connections. `STARIO_LOOP` is resolved once
+  and audited per thread. If `SO_REUSEPORT` cannot share the listen
+  address (Unix sockets on many kernels, Windows), Stario stays at one
+  thread. Requires free-threaded Python 3.14t unless
   `STARIO_THREADS_ALLOW_GIL=1`. See `docs/free-threading.md`.
 - `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
   is lazy. `await attach(app)` registers GET/HEAD and loads the tree

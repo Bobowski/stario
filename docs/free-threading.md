@@ -1,14 +1,19 @@
 # Free-threaded Stario (Python 3.14t)
 
-`STARIO_THREADS=N` (default `1`) runs **one asyncio loop per OS thread** in a
-single process. `Server.loop_runner()` resolves `STARIO_LOOP` once:
-stdlib asyncio (explicit loop factory, so a process-wide uvloop policy
-cannot leak in) or `uvloop.run`. Every worker calls that runner and
-refuses to start if the live loop is the other library. Bootstrap still
-runs once. `Relay` stays in-process.
+`STARIO_THREADS=N` (default `1`) runs **N event-loop threads** in one
+process. Thread 0 bootstraps, installs signals, and is also a server.
+Every thread binds the same TCP `host:port` with `SO_REUSEPORT` and runs
+its own `create_server` — accept, parse, and handlers stay on that loop.
+The kernel load-balances new connections. `Server.loop_runner()` resolves
+`STARIO_LOOP` once (stdlib asyncio with an explicit loop factory, or
+`uvloop.run`) and each thread refuses to start on the other library.
 
-`N=1` is the historical server. `N>1` requires free-threaded Python 3.14t
-with the GIL still off, unless `STARIO_THREADS_ALLOW_GIL=1`.
+If this kernel cannot share the listen address with `SO_REUSEPORT`
+(typical for Unix sockets; Windows has no flag), Stario stays at **one**
+thread — the historical server. No fd-handoff fallback. `N>1` also
+requires free-threaded Python 3.14t with the GIL still off, unless
+`STARIO_THREADS_ALLOW_GIL=1`. Bootstrap still runs once. `Relay` stays
+in-process.
 
 The rest of this note is the design: why one loop per thread, what had to
 be locked or made thread-local, and how app state should cross workers.
@@ -93,26 +98,21 @@ worker count, not a second server.
 | Bootstrap | **Once**, on the main thread, before workers accept. One `App`, one closed-over `Game` / `Database` / `Relay`. Do **not** re-run bootstrap per thread (that is multiprocess with extra races). |
 | Signals | Stay on the main thread (`signal.signal` + `call_soon_threadsafe` into every worker loop). |
 
-### Accept: handoff, not one `asyncio.Server`
+### Accept: `SO_REUSEPORT`, each thread is a server
 
-`loop.create_server` is bound to one loop. Sharing one `asyncio.Server`
-across threads is undefined.
+Sharing one `asyncio.Server` across threads is undefined. `N>1` does
+**not** hand accepted fds across threads.
 
-**Preferred (portable, Unix socket + TCP + TLS):**
+**TCP (Linux and other kernels that implement `SO_REUSEPORT`):** each
+thread binds the same `host:port` with `SO_REUSEPORT` and runs
+`create_server` on its own loop. The kernel distributes new SYNs.
+Thread 0 also owns `signal.signal` and fans out shutdown. TLS handshake
+stays on the accepting worker.
 
-1. Main thread binds the listen socket (today’s `_unix_listen_socket` /
-   TCP bind).
-2. A small acceptor (main loop, or a dedicated thread doing blocking
-   `accept`) takes connected fds.
-3. It picks a worker (round-robin or least `len(connections)`).
-4. The worker does `loop.create_connection(protocol_factory, sock=conn)`
-   (and TLS handshake on **that** worker — TLS is CPU we want to spread).
-
-**Linux shortcut:** `SO_REUSEPORT` so each worker binds the same
-`host:port` and the kernel load-balances `accept`. Simpler, worse
-stickiness, not a Unix-socket story we should depend on, not Windows.
-
-Do not have every loop `epoll` the same listen fd (thundering herd).
+**If `SO_REUSEPORT` cannot share the address** (Unix sockets on many
+kernels, Windows): stay at `N=1`. Do not `epoll` one listen fd from
+every loop (thundering herd). Do not fall back to `connect_accepted_socket`
+handoff.
 
 ### Split “app table” from “loop runtime”
 
@@ -438,17 +438,18 @@ thread-local will look “done” and corrupt.
 3. **Loop runtime split.** Per-loop connections, date tick, task set,
    shutdown Future. Shared frozen `App` after one bootstrap. Still
    `STARIO_THREADS=1` on the old code path.
-4. **Acceptor + N workers.** `STARIO_THREADS=N` on 3.14t only. Refuse if
-   GIL came back. Graceful drain: flag → each loop’s Future → existing
-   `_drain_listener` per worker → join threads → bootstrap teardown.
+4. **N `SO_REUSEPORT` servers.** `STARIO_THREADS=N` on 3.14t only. Refuse
+   if GIL came back. Each thread `create_server`s; fall back to `N=1`
+   when the kernel cannot share the port. Graceful drain: flag → each
+   loop’s Future → `_drain_listener` per thread → join extras →
+   bootstrap teardown.
 5. **Examples.** Lock or actor for `Game`; sqlite policy for chat-room.
 6. **Benches.** Same suite as `benchmarks/server`, `THREADS=N` in wrk
    **and** `STARIO_THREADS` in the server, 3.14 vs 3.14t, N=1 and N=ncpu.
    Expect plaintext to move less than HTML/JSON/TLS.
 
 Out of scope for v1: task stealing across loops, migrating keep-alive
-connections, `SO_REUSEPORT` as the only accept path, making `Writer`
-thread-safe, multiprocess + Relay.
+connections, making `Writer` thread-safe, multiprocess + Relay.
 
 ## What not to do
 

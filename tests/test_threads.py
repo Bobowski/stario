@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import socket
+import sys
 import tempfile
 import threading
 from io import StringIO
@@ -23,6 +24,7 @@ from stario.http.server import (
     require_configured_loop,
     require_thread_workers,
     resolve_loop_runner,
+    reuseport_supported,
 )
 from stario.telemetry.json import JsonTracer
 from tests.test_server import _connect_with_retry, _read_http_response, _serve
@@ -43,6 +45,21 @@ async def _connect_tcp(
                 return await asyncio.open_connection(host, port)
             except OSError:
                 await asyncio.sleep(0.005)
+
+
+def _run_server(server: Server) -> tuple[threading.Thread, list[BaseException]]:
+    errors: list[BaseException] = []
+
+    def body() -> None:
+        try:
+            with server.tracer:
+                server.run()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=body, name="stario-main")
+    thread.start()
+    return thread, errors
 
 
 @pytest.fixture
@@ -203,10 +220,74 @@ def test_loop_runner_forwards_uvloop() -> None:
     assert server.loop_runner() is runner
 
 
+def test_reuseport_supported_on_tcp() -> None:
+    if sys.platform == "win32":
+        pytest.skip("SO_REUSEPORT is not available on Windows")
+    assert reuseport_supported(unix=False) is True
+
+
+def test_unix_reuseport_probe_does_not_raise() -> None:
+    supported = reuseport_supported(unix=True)
+    assert supported in (True, False)
+
+
 @pytest.mark.asyncio
-async def test_threaded_serve_uses_configured_runner(
+async def test_unix_threads_fall_back_to_one(
     monkeypatch: pytest.MonkeyPatch, short_socket_path: str
 ) -> None:
+    monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
+    monkeypatch.setattr(
+        "stario.http.server.reuseport_supported", lambda **_kwargs: False
+    )
+    output = StringIO()
+    apps: list[App] = []
+
+    async def serve_bootstrap(app: App, span: Any):
+        apps.append(app)
+
+        async def hello(_c: Any, w: Any) -> None:
+            responses.text(w, "one-thread")
+
+        app.add(Route("GET", "/"), hello)
+        yield
+
+    server = Server(
+        serve_bootstrap,
+        JsonTracer(output),
+        config=ServerConfig(
+            unix_socket=short_socket_path,
+            graceful_shutdown_timeout=0.5,
+            threads=4,
+        ),
+    )
+
+    run_task = asyncio.create_task(_serve(server))
+    try:
+        reader, writer = await _connect_with_retry(short_socket_path)
+        writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await writer.drain()
+        status, body = await _read_http_response(reader)
+        writer.close()
+        assert status == 200
+        assert body == b"one-thread"
+    finally:
+        apps[0].signal_shutdown()
+        async with asyncio.timeout(5.0):
+            await run_task
+
+    spans = [json.loads(line) for line in output.getvalue().splitlines()]
+    startup = next(s for s in spans if s["name"] == "server.startup")
+    assert startup["attributes"]["server.threads"] == 1
+    assert startup["attributes"]["server.threads_requested"] == 4
+    assert startup["attributes"]["server.listen_balance"] == "single"
+
+
+@pytest.mark.asyncio
+async def test_threaded_serve_uses_configured_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
     runs: list[str] = []
     kinds: list[str] = []
@@ -218,6 +299,7 @@ async def test_threaded_serve_uses_configured_runner(
         return real_run(coro)
 
     apps: list[App] = []
+    port = _free_tcp_port()
 
     async def serve_bootstrap(app: App, span: Any):
         apps.append(app)
@@ -234,7 +316,8 @@ async def test_threaded_serve_uses_configured_runner(
         serve_bootstrap,
         JsonTracer(StringIO()),
         config=ServerConfig(
-            unix_socket=short_socket_path,
+            host="127.0.0.1",
+            port=port,
             graceful_shutdown_timeout=0.5,
             threads=2,
             event_loop="asyncio",
@@ -242,33 +325,38 @@ async def test_threaded_serve_uses_configured_runner(
     )
     server._loop_run = tracking_run
 
-    run_task = asyncio.create_task(_serve(server))
+    thread, errors = _run_server(server)
     try:
-        reader, writer = await _connect_with_retry(short_socket_path)
+        reader, writer = await _connect_tcp("127.0.0.1", port)
         writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await writer.drain()
         status, body = await _read_http_response(reader)
         writer.close()
         assert status == 200
         assert body == b"hello-threads"
-        assert {name.startswith("stario-worker-") for name in runs} == {True}
+        assert "stario-main" in runs
+        assert any(name.startswith("stario-worker-") for name in runs)
         assert len(runs) == 2
         assert kinds == ["asyncio"]
         assert modules
         assert all(not module.startswith("uvloop") for module in modules)
     finally:
-        apps[0].signal_shutdown()
-        async with asyncio.timeout(5.0):
-            await run_task
+        if apps:
+            apps[0].signal_shutdown()
+        thread.join(5.0)
+        assert errors == []
 
 
 @pytest.mark.asyncio
 async def test_threaded_serve_records_thread_count(
-    monkeypatch: pytest.MonkeyPatch, short_socket_path: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
     output = StringIO()
     apps: list[App] = []
+    port = _free_tcp_port()
 
     async def serve_bootstrap(app: App, span: Any):
         apps.append(app)
@@ -283,40 +371,47 @@ async def test_threaded_serve_records_thread_count(
         serve_bootstrap,
         JsonTracer(output),
         config=ServerConfig(
-            unix_socket=short_socket_path,
+            host="127.0.0.1",
+            port=port,
             graceful_shutdown_timeout=0.5,
             threads=2,
         ),
     )
 
-    run_task = asyncio.create_task(_serve(server))
+    thread, errors = _run_server(server)
     try:
-        reader, writer = await _connect_with_retry(short_socket_path)
+        reader, writer = await _connect_tcp("127.0.0.1", port)
         writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await writer.drain()
         await _read_http_response(reader)
         writer.close()
     finally:
-        apps[0].signal_shutdown()
-        async with asyncio.timeout(5.0):
-            await run_task
+        if apps:
+            apps[0].signal_shutdown()
+        thread.join(5.0)
+        assert errors == []
 
     spans = [json.loads(line) for line in output.getvalue().splitlines()]
     startup = next(s for s in spans if s["name"] == "server.startup")
     assert startup["attributes"]["server.threads"] == 2
+    assert startup["attributes"]["server.threads_requested"] == 2
     assert startup["attributes"]["server.event_loop"] == "asyncio"
     assert startup["attributes"]["server.worker_event_loop"] == "asyncio"
+    assert startup["attributes"]["server.listen_balance"] == "reuseport"
 
 
 @pytest.mark.asyncio
 async def test_threaded_workers_use_uvloop_runtime(
-    monkeypatch: pytest.MonkeyPatch, short_socket_path: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     uvloop = pytest.importorskip("uvloop")
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
     loop_modules: list[str] = []
     kinds: list[str] = []
     apps: list[App] = []
+    port = _free_tcp_port()
 
     async def serve_bootstrap(app: App, span: Any):
         apps.append(app)
@@ -333,7 +428,8 @@ async def test_threaded_workers_use_uvloop_runtime(
         serve_bootstrap,
         JsonTracer(StringIO()),
         config=ServerConfig(
-            unix_socket=short_socket_path,
+            host="127.0.0.1",
+            port=port,
             graceful_shutdown_timeout=0.5,
             threads=2,
             event_loop="uvloop",
@@ -341,9 +437,9 @@ async def test_threaded_workers_use_uvloop_runtime(
     )
     assert server.loop_runner() is uvloop.run
 
-    run_task = asyncio.create_task(_serve(server))
+    thread, errors = _run_server(server)
     try:
-        reader, writer = await _connect_with_retry(short_socket_path)
+        reader, writer = await _connect_tcp("127.0.0.1", port)
         writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await writer.drain()
         status, body = await _read_http_response(reader)
@@ -354,13 +450,16 @@ async def test_threaded_workers_use_uvloop_runtime(
         assert all(module.startswith("uvloop") for module in loop_modules)
         assert kinds == ["uvloop"]
     finally:
-        apps[0].signal_shutdown()
-        async with asyncio.timeout(5.0):
-            await run_task
+        if apps:
+            apps[0].signal_shutdown()
+        thread.join(5.0)
+        assert errors == []
 
 
 @pytest.mark.asyncio
 async def test_threaded_serve_tcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
     port = _free_tcp_port()
     apps: list[App] = []
@@ -403,9 +502,12 @@ async def test_threaded_serve_tcp(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_threaded_worker_rejects_loop_mismatch(
-    monkeypatch: pytest.MonkeyPatch, short_socket_path: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
+    port = _free_tcp_port()
 
     async def serve_bootstrap(app: App, span: Any):
         yield
@@ -414,7 +516,8 @@ async def test_threaded_worker_rejects_loop_mismatch(
         serve_bootstrap,
         JsonTracer(StringIO()),
         config=ServerConfig(
-            unix_socket=short_socket_path,
+            host="127.0.0.1",
+            port=port,
             graceful_shutdown_timeout=0.5,
             threads=2,
             event_loop="uvloop",
@@ -428,10 +531,13 @@ async def test_threaded_worker_rejects_loop_mismatch(
 
 @pytest.mark.asyncio
 async def test_threaded_worker_rejects_uvloop_when_configured_asyncio(
-    monkeypatch: pytest.MonkeyPatch, short_socket_path: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     uvloop = pytest.importorskip("uvloop")
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
+    port = _free_tcp_port()
 
     async def serve_bootstrap(app: App, span: Any):
         yield
@@ -440,7 +546,8 @@ async def test_threaded_worker_rejects_uvloop_when_configured_asyncio(
         serve_bootstrap,
         JsonTracer(StringIO()),
         config=ServerConfig(
-            unix_socket=short_socket_path,
+            host="127.0.0.1",
+            port=port,
             graceful_shutdown_timeout=0.5,
             threads=2,
             event_loop="asyncio",
@@ -454,10 +561,12 @@ async def test_threaded_worker_rejects_uvloop_when_configured_asyncio(
 
 @pytest.mark.asyncio
 async def test_threaded_asyncio_survives_uvloop_install(
-    monkeypatch: pytest.MonkeyPatch, short_socket_path: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """STARIO_LOOP=asyncio must stay stdlib even if uvloop.install() ran."""
     uvloop = pytest.importorskip("uvloop")
+    if not reuseport_supported(unix=False):
+        pytest.skip("SO_REUSEPORT is required for STARIO_THREADS>1")
     monkeypatch.setenv("STARIO_THREADS_ALLOW_GIL", "1")
     previous = asyncio.get_event_loop_policy()
     uvloop.install()
@@ -465,6 +574,7 @@ async def test_threaded_asyncio_survives_uvloop_install(
         kinds: list[str] = []
         modules: list[str] = []
         apps: list[App] = []
+        port = _free_tcp_port()
 
         async def serve_bootstrap(app: App, span: Any):
             apps.append(app)
@@ -481,16 +591,17 @@ async def test_threaded_asyncio_survives_uvloop_install(
             serve_bootstrap,
             JsonTracer(StringIO()),
             config=ServerConfig(
-                unix_socket=short_socket_path,
+                host="127.0.0.1",
+                port=port,
                 graceful_shutdown_timeout=0.5,
                 threads=2,
                 event_loop="asyncio",
             ),
         )
 
-        run_task = asyncio.create_task(_serve(server))
+        thread, errors = _run_server(server)
         try:
-            reader, writer = await _connect_with_retry(short_socket_path)
+            reader, writer = await _connect_tcp("127.0.0.1", port)
             writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
             await writer.drain()
             status, body = await _read_http_response(reader)
@@ -501,9 +612,10 @@ async def test_threaded_asyncio_survives_uvloop_install(
             assert modules
             assert all(not module.startswith("uvloop") for module in modules)
         finally:
-            apps[0].signal_shutdown()
-            async with asyncio.timeout(5.0):
-                await run_task
+            if apps:
+                apps[0].signal_shutdown()
+            thread.join(5.0)
+            assert errors == []
     finally:
         asyncio.set_event_loop_policy(previous)
 

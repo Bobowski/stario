@@ -36,7 +36,7 @@ uv add "stario[uvloop]"
 # or: pip install "stario[uvloop]"
 ```
 
-Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows. Worker threads started with `STARIO_THREADS=N` use that same loop library (`uvloop.run` vs stdlib asyncio, audited per thread).
+Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows. `STARIO_THREADS=N` is N full servers on one TCP port (`SO_REUSEPORT`); each thread uses that same loop library, audited. Without `SO_REUSEPORT` the process stays at one thread.
 
 **Free-threaded workers (optional):** on Python 3.14t, `STARIO_THREADS=N` runs N event loops in one process so handler CPU can use more cores while `Relay` stays in-process. See [`docs/free-threading.md`](docs/free-threading.md).
 

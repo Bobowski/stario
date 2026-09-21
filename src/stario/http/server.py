@@ -196,8 +196,78 @@ def require_thread_workers(threads: int) -> None:
     )
 
 
+_tcp_reuseport_ok: bool | None = None
+_unix_reuseport_ok: bool | None = None
+
+
+def reuseport_supported(*, unix: bool = False) -> bool:
+    """True when this kernel can bind two SOCK_STREAM sockets with SO_REUSEPORT."""
+    flag = getattr(socket, "SO_REUSEPORT", None)
+    if flag is None or sys.platform == "win32":
+        return False
+    if unix:
+        return _probe_unix_reuseport(flag)
+    return _probe_tcp_reuseport(flag)
+
+
+def _probe_tcp_reuseport(flag: int) -> bool:
+    global _tcp_reuseport_ok
+    if _tcp_reuseport_ok is not None:
+        return _tcp_reuseport_ok
+    first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    second: socket.socket | None = None
+    try:
+        first.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        first.setsockopt(socket.SOL_SOCKET, flag, 1)
+        first.bind(("127.0.0.1", 0))
+        port = int(first.getsockname()[1])
+        first.listen(1)
+        second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        second.setsockopt(socket.SOL_SOCKET, flag, 1)
+        second.bind(("127.0.0.1", port))
+        second.listen(1)
+        _tcp_reuseport_ok = True
+    except OSError:
+        _tcp_reuseport_ok = False
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+    return _tcp_reuseport_ok
+
+
+def _probe_unix_reuseport(flag: int) -> bool:
+    global _unix_reuseport_ok
+    if _unix_reuseport_ok is not None:
+        return _unix_reuseport_ok
+    path = os.path.join(
+        os.getenv("TMPDIR", "/tmp"), f"stario-reuseport-{os.getpid()}.sock"
+    )
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    second: socket.socket | None = None
+    try:
+        first.setsockopt(socket.SOL_SOCKET, flag, 1)
+        first.bind(path)
+        first.listen(1)
+        second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        second.setsockopt(socket.SOL_SOCKET, flag, 1)
+        second.bind(path)
+        second.listen(1)
+        _unix_reuseport_ok = True
+    except OSError:
+        _unix_reuseport_ok = False
+    finally:
+        first.close()
+        if second is not None:
+            second.close()
+        with suppress(FileNotFoundError, OSError):
+            os.unlink(path)
+    return _unix_reuseport_ok
+
+
 class _LoopWorker:
-    """One OS thread, one event loop, connection-affine HTTP protocols."""
+    """One extra OS thread: its own loop, SO_REUSEPORT listener, and connections."""
 
     def __init__(
         self,
@@ -206,13 +276,11 @@ class _LoopWorker:
         app: App,
         server: Server,
         loop_run: LoopRun[Any],
-        body: Callable[[_LoopWorker], Coroutine[Any, Any, None]],
     ) -> None:
         self.index = index
         self.app = app
         self.server = server
         self.loop_run = loop_run
-        self._body = body
         self.loop: asyncio.AbstractEventLoop | None = None
         self.loop_kind: EventLoopKind | None = None
         self.connections: set[Connection] = set()
@@ -230,67 +298,15 @@ class _LoopWorker:
     def join(self, timeout: float | None = None) -> None:
         self.thread.join(timeout)
 
-    def submit(self, sock: socket.socket) -> None:
-        loop = self.loop
-        if loop is None or loop.is_closed() or self.app.shutting_down:
-            sock.close()
-            return
-        try:
-            loop.call_soon_threadsafe(self._begin, sock)
-        except RuntimeError:
-            sock.close()
-
     def _run(self) -> None:
         try:
-            self.loop_run(self._body(self))
+            self.loop_run(self.server._run_reuseport_worker(self))
         except BaseException as exc:
             self.error = exc
             with suppress(Exception):
                 self.app.signal_shutdown()
         finally:
             self.ready.set()
-
-    def _begin(self, sock: socket.socket) -> None:
-        loop = self.loop
-        if loop is None or loop.is_closed():
-            sock.close()
-            return
-        loop.create_task(self._attach(sock), name="stario.worker.accept")
-
-    async def _attach(self, sock: socket.socket) -> None:
-        loop = self.loop
-        assert loop is not None
-        try:
-            await loop.connect_accepted_socket(
-                self._protocol,
-                sock,
-                ssl=self.server.config.ssl,
-            )
-        except asyncio.CancelledError:
-            with suppress(OSError):
-                sock.close()
-            raise
-        except Exception:
-            with suppress(OSError):
-                sock.close()
-
-    def _protocol(self) -> asyncio.Protocol:
-        loop = self.loop
-        assert loop is not None
-        factory = (
-            self.server.make_protocol
-            if self.server.make_protocol is not None
-            else _make_http_protocol
-        )
-        return factory(
-            loop,
-            self.app,
-            self.server.tracer,
-            self.date_box,
-            self.server.config.compression,
-            self.connections,
-            self.server.config.requests,
-        )
 
 
 class Server:
@@ -302,6 +318,9 @@ class Server:
 
         with tracer:
             Server(bootstrap, tracer, config=config).run()
+
+    `STARIO_THREADS>1` is N `SO_REUSEPORT` listeners (thread 0 included).
+    Without kernel support the server stays single-threaded.
     """
 
     def __init__(
@@ -331,13 +350,14 @@ class Server:
         self._live_connections: set[Connection] | None = None
         self._loop_run: LoopRun[Any] | None = None
         self._owns_loop = False
+        self._thread_count = 1
 
     def loop_runner(self) -> LoopRun[Any]:
         """Event-loop runner for this process (`asyncio` stdlib or `uvloop.run`).
 
-        `run()` and every worker thread use this same callable so `STARIO_LOOP`
-        is forwarded, not re-detected per thread. asyncio workers do not inherit
-        a process-wide uvloop policy.
+        `run()` and every extra worker thread use this same callable so
+        `STARIO_LOOP` is forwarded, not re-detected per thread. asyncio
+        workers do not inherit a process-wide uvloop policy.
         """
         if self._loop_run is None:
             self._loop_run = resolve_loop_runner(self.config.event_loop)
@@ -366,9 +386,10 @@ class Server:
         if self._owns_loop:
             require_configured_loop(self.config.event_loop, where="Server.run")
 
-        if self.config.threads > 1:
-            require_thread_workers(self.config.threads)
-            # Resolve once on this thread; every worker calls this same runner
+        self._thread_count = self._effective_threads()
+        if self._thread_count > 1:
+            require_thread_workers(self._thread_count)
+            # Resolve once on this thread; extra workers call this same runner
             # instead of re-detecting STARIO_LOOP.
             self.loop_runner()
 
@@ -376,22 +397,20 @@ class Server:
         span = self._open_startup_span()  # ProxySpan: startup → shutdown via replace()
 
         # Signal handlers stay active through span.end(); see _signal_handlers.
-        with (
-            self._listen_socket() as listen_sock,
-            self._signal_handlers(app),
-        ):
+        with self._signal_handlers(app):
             try:
-                if self.config.threads > 1:
+                if self._thread_count > 1:
                     async with bootstrap_run(self.bootstrap, app, span):
-                        await self._serve_threaded(listen_sock, app, span)
+                        await self._serve_reuseport(app, span)
                 else:
-                    async with (
-                        bootstrap_run(self.bootstrap, app, span),
-                        self._date_tick(),
-                        self._listener(listen_sock, app, span),
-                    ):
-                        # Blocks until a signal (or test code) completes app.shutdown.
-                        await app.shutdown
+                    with self._listen_socket() as listen_sock:
+                        async with (
+                            bootstrap_run(self.bootstrap, app, span),
+                            self._date_tick(),
+                            self._listener(listen_sock, app, span),
+                        ):
+                            # Blocks until a signal (or test code) completes app.shutdown.
+                            await app.shutdown
             except BaseException as exc:
                 span.exception(exc)
                 span.fail(str(exc))
@@ -443,7 +462,11 @@ class Server:
 
         ssl_ctx = self.config.ssl
         if listen_sock is not None:
-            return await loop.create_unix_server(
+            if listen_sock.family == socket.AF_UNIX:
+                return await loop.create_unix_server(
+                    protocol_factory, sock=listen_sock, ssl=ssl_ctx
+                )
+            return await loop.create_server(
                 protocol_factory, sock=listen_sock, ssl=ssl_ctx
             )
         return await loop.create_server(
@@ -578,24 +601,29 @@ class Server:
             await asyncio.gather(*pending, return_exceptions=True)
         return len(pending)
 
-    @contextmanager
-    def _listen_socket(self) -> Generator[socket.socket | None]:
-        """Unix or (when `threads>1`) TCP listen socket. `None` = N=1 TCP via create_server."""
-        if self.config.unix_socket is not None:
-            with self._unix_listen_socket() as sock:
-                yield sock
-            return
-        if self.config.threads <= 1:
-            yield None
-            return
-        sock = self._tcp_listen_socket()
-        try:
-            yield sock
-        finally:
-            sock.close()
+    def _effective_threads(self) -> int:
+        """`STARIO_THREADS` if SO_REUSEPORT can share the listen address, else 1."""
+        requested = self.config.threads
+        if requested <= 1:
+            return 1
+        unix = self.config.unix_socket is not None
+        if reuseport_supported(unix=unix):
+            return requested
+        return 1
 
-    def _tcp_listen_socket(self) -> socket.socket:
-        """Bind a TCP listener for the acceptor thread (`threads>1`)."""
+    def _bind_reuseport(self, *, leader: bool) -> socket.socket:
+        if self.config.unix_socket is not None:
+            return self._bind_unix_reuseport(leader=leader)
+        return self._bind_tcp_reuseport()
+
+    def _bind_tcp_reuseport(self) -> socket.socket:
+        """One TCP listener in the SO_REUSEPORT group."""
+        flag = getattr(socket, "SO_REUSEPORT", None)
+        if flag is None:
+            raise StarioError(
+                "SO_REUSEPORT is not available",
+                help_text="Set STARIO_THREADS=1.",
+            )
         infos = socket.getaddrinfo(
             self.config.host,
             self.config.port,
@@ -610,12 +638,75 @@ class Server:
             )
         family, socktype, proto, _canon, sockaddr = infos[0]
         sock = socket.socket(family, socktype, proto)
-        if self.config.reuse_addr:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(sockaddr)
-        sock.listen(self.config.backlog)
-        sock.setblocking(False)
-        return sock
+        try:
+            if self.config.reuse_addr:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, flag, 1)
+            sock.bind(sockaddr)
+            sock.listen(self.config.backlog)
+            sock.setblocking(False)
+            return sock
+        except Exception:
+            sock.close()
+            raise
+
+    def _bind_unix_reuseport(self, *, leader: bool) -> socket.socket:
+        """Join (or create) the Unix SO_REUSEPORT group on `unix_socket`."""
+        path = self.config.unix_socket
+        flag = getattr(socket, "SO_REUSEPORT", None)
+        if path is None or flag is None:
+            raise StarioError(
+                "Unix SO_REUSEPORT is not available",
+                help_text="Set STARIO_THREADS=1 or listen on TCP.",
+            )
+        if leader and os.path.exists(path):
+            st_mode = os.stat(path).st_mode
+            if stat.S_ISSOCK(st_mode):
+                os.unlink(path)
+            else:
+                raise StarioError(
+                    f"Unix socket path exists and is not a socket: {path}",
+                    help_text="Remove the file or choose a different STARIO_UNIX_SOCKET path.",
+                )
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, flag, 1)
+            sock.bind(path)
+            if leader:
+                os.chmod(path, self.config.unix_socket_mode)
+            sock.listen(self.config.backlog)
+            sock.setblocking(False)
+            return sock
+        except Exception:
+            sock.close()
+            if leader:
+                with suppress(FileNotFoundError, OSError):
+                    os.unlink(path)
+            raise
+
+    def _unlink_unix_listener(self, file_id: tuple[int, int] | None) -> None:
+        path = self.config.unix_socket
+        if path is None or file_id is None:
+            return
+        try:
+            current = os.stat(path)
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISSOCK(current.st_mode)
+            and (current.st_dev, current.st_ino) == file_id
+        ):
+            with suppress(FileNotFoundError, OSError):
+                os.unlink(path)
+
+    @contextmanager
+    def _listen_socket(self) -> Generator[socket.socket | None]:
+        """N=1 listen socket. `None` = TCP via `create_server`."""
+        if self.config.unix_socket is not None:
+            with self._unix_listen_socket() as sock:
+                yield sock
+            return
+        yield None
 
     @contextmanager
     def _signal_handlers(
@@ -789,32 +880,8 @@ class Server:
             with suppress(asyncio.CancelledError):
                 await task
 
-    async def _drain_worker(self, connections: set[Connection], app: App) -> None:
-        """Drain one worker loop (no asyncio.Server — the acceptor owns listen)."""
-        for _ in range(_ACCEPT_REGISTER_YIELDS):
-            if connections:
-                break
-            await asyncio.sleep(0)
-        idle_closed = sum(
-            1 for protocol in list(connections) if protocol.close_if_idle()
-        )
-        if idle_closed:
-            await asyncio.sleep(0)
-        await self._wait_for_managed_work_to_drain(connections, app.tasks)
-        force_close_budget = min(
-            max(self.config.graceful_shutdown_timeout, 0.0), _FORCE_CLOSE_CAP
-        )
-        loop = asyncio.get_running_loop()
-        close_deadline = loop.time() + force_close_budget
-        while connections and not self._urgent_drain and loop.time() < close_deadline:
-            await self._force_close_open_transports(connections)
-            await asyncio.sleep(0)
-        if connections:
-            await self._force_close_open_transports(connections)
-        await self._cancel_pending_tasks(app.tasks)
-
-    async def _run_worker(self, worker: _LoopWorker) -> None:
-        """One worker thread's loop: Date tick, serve until shutdown, then drain."""
+    async def _run_reuseport_worker(self, worker: _LoopWorker) -> None:
+        """Extra thread: bind SO_REUSEPORT, serve until shutdown, then drain."""
         loop = asyncio.get_running_loop()
         kind = require_configured_loop(
             self.config.event_loop,
@@ -824,122 +891,110 @@ class Server:
         worker.loop = loop
         worker.loop_kind = kind
         worker.app.attach_loop(loop)
-        worker.ready.set()
-        async with self._date_tick(worker.date_box, worker.connections):
-            try:
-                await worker.app.shutdown
-            finally:
-                await self._drain_worker(worker.connections, worker.app)
+        sock = self._bind_reuseport(leader=False)
+        listener: asyncio.Server | None = None
+        try:
+            async with self._date_tick(worker.date_box, worker.connections):
+                listener = await self._create_listener(
+                    sock, worker.app, worker.connections
+                )
+                sock = None
+                worker.ready.set()
+                try:
+                    await worker.app.shutdown
+                finally:
+                    if listener is not None:
+                        await self._drain_listener(
+                            listener, worker.app, worker.connections
+                        )
+        finally:
+            if sock is not None:
+                sock.close()
 
-    async def _serve_threaded(
-        self,
-        listen_sock: socket.socket | None,
-        app: App,
-        span: ProxySpan,
-    ) -> None:
-        """Accept on this loop; each worker thread runs `loop_runner()` (uvloop/asyncio)."""
-        if listen_sock is None:
-            raise StarioError(
-                "threaded serve requires a bound listen socket",
-                help_text="Set STARIO_HOST/STARIO_PORT or STARIO_UNIX_SOCKET.",
-            )
+    async def _serve_reuseport(self, app: App, span: ProxySpan) -> None:
+        """Thread 0 listens and orchestrates; extras are the same kind of server."""
         runner = self.loop_runner()
-        workers = [
+        extras = [
             _LoopWorker(
                 index=index,
                 app=app,
                 server=self,
                 loop_run=runner,
-                body=self._run_worker,
             )
-            for index in range(self.config.threads)
+            for index in range(1, self._thread_count)
         ]
-        for worker in workers:
-            worker.start()
+        if self._owns_loop:
+            require_configured_loop(self.config.event_loop, where="Server.run")
+        sock = self._bind_reuseport(leader=True)
+        unix_file_id: tuple[int, int] | None = None
+        if self.config.unix_socket is not None:
+            bound = os.stat(self.config.unix_socket)
+            unix_file_id = (bound.st_dev, bound.st_ino)
+        connections: set[Connection] = set()
         join_timeout = (
             max(self.config.graceful_shutdown_timeout, 0.0) + _FORCE_CLOSE_CAP + 1.0
         )
         try:
-            for worker in workers:
-                started = await asyncio.to_thread(worker.ready.wait, 5.0)
-                if not started:
-                    raise StarioError(
-                        f"worker {worker.index} failed to start",
-                        help_text="Check worker thread logs; STARIO_LOOP must match a usable runner.",
-                    )
-                if worker.error is not None:
-                    raise worker.error
-            kinds = {worker.loop_kind for worker in workers}
-            if kinds != {self.config.event_loop}:
-                raise StarioError(
-                    "worker event loops do not match STARIO_LOOP",
-                    help_text=(
-                        f"configured {self.config.event_loop}, workers running "
-                        f"{', '.join(sorted(k for k in kinds if k is not None)) or 'nothing'}."
-                    ),
-                )
-            span.attr("server.worker_event_loop", self.config.event_loop)
-            span.attr("server.listening", True)
-            span.end()
-            try:
-                await self._accept_loop(listen_sock, workers, app)
-            except BaseException:
-                self._open_shutdown_span(span, "runtime_failure")
-                raise
-            else:
-                self._open_shutdown_span(span, "expected_stop")
-            finally:
-                app.signal_shutdown()
-                with suppress(OSError):
-                    listen_sock.close()
-                for worker in workers:
-                    await asyncio.to_thread(worker.join, join_timeout)
-                await self._wait_for_managed_work_to_drain(set(), app.tasks)
-                await self._cancel_pending_tasks(app.tasks)
-                errors = [
-                    worker.error for worker in workers if worker.error is not None
-                ]
-                if errors:
-                    raise errors[0]
+            async with self._date_tick(self._date_box, connections):
+                listener = await self._create_listener(sock, app, connections)
+                sock = None
+                for worker in extras:
+                    worker.start()
+                try:
+                    for worker in extras:
+                        started = await asyncio.to_thread(worker.ready.wait, 5.0)
+                        if not started:
+                            raise StarioError(
+                                f"worker {worker.index} failed to start",
+                                help_text=(
+                                    "Check worker thread logs; STARIO_LOOP must "
+                                    "match a usable runner."
+                                ),
+                            )
+                        if worker.error is not None:
+                            raise worker.error
+                    kinds = {worker.loop_kind for worker in extras}
+                    if self._owns_loop:
+                        kinds.add(loop_implementation())
+                    if kinds and kinds != {self.config.event_loop}:
+                        raise StarioError(
+                            "worker event loops do not match STARIO_LOOP",
+                            help_text=(
+                                f"configured {self.config.event_loop}, workers running "
+                                f"{', '.join(sorted(k for k in kinds if k is not None)) or 'nothing'}."
+                            ),
+                        )
+                    span.attr("server.worker_event_loop", self.config.event_loop)
+                    span.attr("server.listen_balance", "reuseport")
+                    span.attr("server.listening", True)
+                    span.end()
+                    try:
+                        await app.shutdown
+                    except BaseException:
+                        self._open_shutdown_span(span, "runtime_failure")
+                        raise
+                    else:
+                        self._open_shutdown_span(span, "expected_stop")
+                    finally:
+                        await self._drain_listener(listener, app, connections, span)
+                finally:
+                    app.signal_shutdown()
+                    for worker in extras:
+                        await asyncio.to_thread(worker.join, join_timeout)
+                    errors = [
+                        worker.error for worker in extras if worker.error is not None
+                    ]
+                    if errors:
+                        raise errors[0]
         except BaseException:
             app.signal_shutdown()
-            with suppress(OSError):
-                listen_sock.close()
-            for worker in workers:
+            for worker in extras:
                 await asyncio.to_thread(worker.join, min(join_timeout, 1.0))
             raise
-
-    async def _accept_loop(
-        self,
-        listen_sock: socket.socket,
-        workers: list[_LoopWorker],
-        app: App,
-    ) -> None:
-        loop = asyncio.get_running_loop()
-
-        async def accept_forever() -> None:
-            while not app.shutting_down:
-                try:
-                    conn, _addr = await loop.sock_accept(listen_sock)
-                except OSError, asyncio.CancelledError:
-                    return
-                if app.shutting_down:
-                    with suppress(OSError):
-                        conn.close()
-                    return
-                conn.setblocking(False)
-                worker = min(workers, key=lambda item: len(item.connections))
-                worker.submit(conn)
-
-        task = asyncio.create_task(accept_forever(), name="stario.accept")
-        try:
-            await app.shutdown
         finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-            with suppress(OSError):
-                listen_sock.close()
+            if sock is not None:
+                sock.close()
+            self._unlink_unix_listener(unix_file_id)
 
     def _record_startup_attrs(self, span: Span) -> None:
         attrs: dict[str, str | int | float] = {
@@ -953,7 +1008,11 @@ class Server:
             "server.timeout.request_body": self.config.requests.body_timeout,
             "server.timeout.keep_alive": self.config.requests.keep_alive_timeout,
             "server.event_loop": self.config.event_loop,
-            "server.threads": self.config.threads,
+            "server.threads": self._thread_count,
+            "server.threads_requested": self.config.threads,
+            "server.listen_balance": (
+                "reuseport" if self._thread_count > 1 else "single"
+            ),
             "server.tls": self.config.ssl is not None,
         }
         if self.config.compression.zstd_window_log is not None:
