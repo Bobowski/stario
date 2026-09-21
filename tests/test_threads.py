@@ -1,6 +1,7 @@
 """Worker-thread runtime: shutdown fan-out, loop runner forwarding, STARIO_THREADS."""
 
 import asyncio
+import gc
 import json
 import os
 import queue
@@ -487,6 +488,14 @@ async def test_threaded_serve_tcp(monkeypatch: pytest.MonkeyPatch) -> None:
 
     run_task = asyncio.create_task(_serve(server))
     try:
+        reader, writer = await _connect_tcp("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await writer.drain()
+        status, body = await _read_http_response(reader)
+        writer.close()
+        assert status == 200
+        assert body == b"hello-tcp"
+        gc.collect()
         reader, writer = await _connect_tcp("127.0.0.1", port)
         writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         await writer.drain()

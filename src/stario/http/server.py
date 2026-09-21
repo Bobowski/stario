@@ -285,6 +285,7 @@ class _LoopWorker:
         self.loop_kind: EventLoopKind | None = None
         self.connections: set[Connection] = set()
         self.date_box: list[bytes] = [b""]
+        self.listen_sock: socket.socket | None = None
         self.ready = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
@@ -351,6 +352,7 @@ class Server:
         self._loop_run: LoopRun[Any] | None = None
         self._owns_loop = False
         self._thread_count = 1
+        self._leader_sock: socket.socket | None = None
 
     def loop_runner(self) -> LoopRun[Any]:
         """Event-loop runner for this process (`asyncio` stdlib or `uvloop.run`).
@@ -442,9 +444,13 @@ class Server:
         listen_sock: socket.socket | None,
         app: App,
         connections: set[Connection],
+        *,
+        date_box: list[bytes] | None = None,
+        reuse_port: bool = False,
     ) -> asyncio.Server:
         loop = asyncio.get_running_loop()
         make_protocol = self.make_protocol
+        box = self._date_box if date_box is None else date_box
 
         def protocol_factory() -> asyncio.Protocol:
             factory = (
@@ -454,7 +460,7 @@ class Server:
                 loop,
                 app,
                 self.tracer,
-                self._date_box,
+                box,
                 self.config.compression,
                 connections,
                 self.config.requests,
@@ -475,6 +481,7 @@ class Server:
             self.config.port,
             backlog=self.config.backlog,
             reuse_address=self.config.reuse_addr,
+            reuse_port=reuse_port,
             ssl=ssl_ctx,
         )
 
@@ -891,13 +898,19 @@ class Server:
         worker.loop = loop
         worker.loop_kind = kind
         worker.app.attach_loop(loop)
-        sock = self._bind_reuseport(leader=False)
+        unix = self.config.unix_socket is not None
+        sock = self._bind_reuseport(leader=False) if unix else None
         listener: asyncio.Server | None = None
         try:
             async with self._date_tick(worker.date_box, worker.connections):
                 listener = await self._create_listener(
-                    sock, worker.app, worker.connections
+                    sock,
+                    worker.app,
+                    worker.connections,
+                    date_box=worker.date_box,
+                    reuse_port=not unix,
                 )
+                worker.listen_sock = sock
                 sock = None
                 worker.ready.set()
                 try:
@@ -925,9 +938,10 @@ class Server:
         ]
         if self._owns_loop:
             require_configured_loop(self.config.event_loop, where="Server.run")
-        sock = self._bind_reuseport(leader=True)
+        unix = self.config.unix_socket is not None
+        sock = self._bind_reuseport(leader=True) if unix else None
         unix_file_id: tuple[int, int] | None = None
-        if self.config.unix_socket is not None:
+        if unix:
             bound = os.stat(self.config.unix_socket)
             unix_file_id = (bound.st_dev, bound.st_ino)
         connections: set[Connection] = set()
@@ -936,7 +950,13 @@ class Server:
         )
         try:
             async with self._date_tick(self._date_box, connections):
-                listener = await self._create_listener(sock, app, connections)
+                listener = await self._create_listener(
+                    sock,
+                    app,
+                    connections,
+                    reuse_port=not unix,
+                )
+                self._leader_sock = sock
                 sock = None
                 for worker in extras:
                     worker.start()
