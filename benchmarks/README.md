@@ -304,6 +304,8 @@ reshaped suite (static / request fields / async uploads):
 [`baseline-20260921.md`](server/baseline-20260921.md).
 `STARIO_THREADS` 1 vs 2 vs 4 on 3.14t (`SO_REUSEPORT`, N full servers):
 [`baseline-threads-reuseport-20260921.md`](server/baseline-threads-reuseport-20260921.md).
+Same-day head-to-head vs Granian RSGI `--workers` 1/2/4 (3.14t threads and
+GIL processes): [`baseline-threads-vs-granian-20260921.md`](server/baseline-threads-vs-granian-20260921.md).
 Earlier acceptor-handoff capture (same host, superseded runtime):
 [`baseline-threads-20260921.md`](server/baseline-threads-20260921.md). Sync-handler capture vs
 Granian and others: `benchmarks/server/baseline-20260829.md`. Timestamped

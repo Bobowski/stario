@@ -125,3 +125,6 @@ Kernel `SO_REUSEPORT` is enough on Linux TCP. Two threads pack this box.
 Four threads keep climbing on JSON / 64KB and stop helping (or hurt) once
 the workload is already I/O-and-core bound next to wrk. Unix sockets on
 this kernel cannot dual-bind (`EOPNOTSUPP`); those stay at one thread.
+
+Head-to-head vs Granian RSGI `--workers` 1/2/4 (same host, later the same
+day): [`baseline-threads-vs-granian-20260921.md`](baseline-threads-vs-granian-20260921.md).
