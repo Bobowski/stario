@@ -17,7 +17,7 @@ Import feature areas from their modules: `import stario.responses as responses`,
 Prefer `from stario import …` for:
 
 - **Per-handler:** `App`, `Context`, `Writer`, `Route`
-- **Control flow:** `RedirectException`, `catch_errors` middleware (`stario.http.middleware`)
+- **Control flow:** `HttpException`, `RedirectException`
 - **Bootstrap / filesystem:** `Assets`, `Files`, `Span`
 - **Middleware / realtime:** `Handler`, `Middleware`, `Relay`
 
@@ -31,7 +31,7 @@ from importlib.metadata import version as _package_version
 
 __version__ = _package_version("stario")
 
-from stario.exceptions import RedirectException
+from stario.exceptions import HttpException, RedirectException
 from stario.filesystem import Assets, Files
 from stario.http.app import App
 from stario.http.context import Context, Handler, Match, Middleware
@@ -51,6 +51,7 @@ __all__ = [
     "Context",
     "Files",
     "Handler",
+    "HttpException",
     "Match",
     "Middleware",
     "RedirectException",

@@ -1,1 +1,0 @@
-"""Cython HTTP protocol tests."""

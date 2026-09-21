@@ -1,39 +1,57 @@
 """
-Application object: route table, shutdown-aware tasks, thin test entrypoint.
+Single entrypoint for request handling above the router: error surface, tracing, and `writer.end()` guarantees.
 
-The HTTP protocol does not call this class per request. It uses
-`find_handler` and `create_task(handler(c, w))`. `App.__call__` exists so
-tests and `TestClient` share that same path.
+The protocol dispatches a callable; this class is where policy lives so the route trie stays a pure match/registration
+structure. `create_task` registers work the server can wait on during shutdown—use it instead of orphan `asyncio.create_task` calls for request-adjacent work.
 """
 
 import asyncio
-import contextlib
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
+from functools import lru_cache
 from typing import Any
 
 import stario.responses as responses
-from stario.exceptions import StarioError
+from stario.exceptions import (
+    ClientDisconnected,
+    HttpException,
+    RedirectException,
+    StarioError,
+    StarioRuntime,
+)
 from stario.http.context import Context
-from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.route import normalize_path
-from stario.telemetry.spans import NoOpSpan
 
 from .dispatch import Router
 from .writer import Writer
 
+type ErrorHandler[E: Exception] = Callable[[Context, Writer, E], Awaitable[None]]
+
+
+async def _default_http_exception(_c: Context, w: Writer, exc: HttpException) -> None:
+    responses.text(w, exc.detail or "Error", exc.status_code)
+
+
+async def _default_redirect_exception(
+    _c: Context, w: Writer, exc: RedirectException
+) -> None:
+    responses.redirect(w, exc.location, exc.status_code)
+
+
+async def _default_client_disconnected(
+    _c: Context, w: Writer, _exc: ClientDisconnected
+) -> None:
+    w.abort()
+
 
 class App(Router):
-    """Route table plus task tracking for graceful shutdown.
+    """Concrete app type: everything on `Router` plus errors and shutdown-aware tasks.
 
-    Handlers are `async def` and must write a complete response. Uncaught
-    exceptions are logged; if nothing was sent, the framework writes 500.
-    A response already on the wire is not rewritten. Use `catch_errors` middleware
-    or write error responses in handlers. Use `create_task` for work tied to a running server
-    so drain can observe it.
+    Uncaught exceptions become HTTP responses only before headers are sent; after that, telemetry still records the failure.
+    Use `create_task` for work tied to a running server so graceful shutdown can observe it.
     """
 
     def __init__(self) -> None:
-        """Create an application (a `Router` with tracked tasks).
+        """Create an application (a `Router` with error handling and tasks).
 
         Requires a running event loop — create inside `serve()`, bootstrap,
         or async test code. `shutdown` completes when the runner begins draining.
@@ -49,6 +67,23 @@ class App(Router):
 
         self.shutdown = loop.create_future()
         self.tasks: set[asyncio.Task[Any]] = set()
+        self._error_handlers: dict[type[Exception], ErrorHandler[Any]] = {
+            HttpException: _default_http_exception,
+            RedirectException: _default_redirect_exception,
+            ClientDisconnected: _default_client_disconnected,
+        }
+
+        @lru_cache(maxsize=64)
+        def find_handler(exc_type: type[Exception]) -> ErrorHandler[Any] | None:
+            # Most-specific registered type wins by walking the MRO.
+            for t in exc_type.__mro__:
+                if t is Exception:
+                    return None
+                if handler := self._error_handlers.get(t):
+                    return handler
+            return None
+
+        self._find_error_handler = find_handler
 
     @property
     def shutting_down(self) -> bool:
@@ -60,24 +95,42 @@ class App(Router):
         if not self.shutdown.done():
             self.shutdown.set_result(None)
 
+    # --- error handler registry ---
+
+    def on_error(
+        self, exc_type: type[Exception], handler: ErrorHandler[Exception]
+    ) -> None:
+        """Register a handler for uncaught exceptions of type `exc_type` (subclasses use MRO; most specific wins).
+
+        - `exc_type`: Exception class to match.
+        - `handler`: Async callable receiving `(context, writer, exc)`.
+
+        Only runs while the writer has not started (`w.started` is false); after
+        headers are sent, failures use `w.abort()` in the `finally` block.
+        `HttpException`, `RedirectException`, and `ClientDisconnected` are
+        registered by default.
+        """
+        self._error_handlers[exc_type] = handler
+        self._find_error_handler.cache_clear()
+
+    # --- background tasks (tracked until drain_tasks or server shutdown) ---
+
     def create_task[T](
         self,
         coro: Coroutine[Any, Any, T],
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         name: str | None = None,
-        eager_start: bool = False,
     ) -> asyncio.Task[T]:
         """Schedule a coroutine on the running loop and retain the task until it completes.
 
-        The HTTP protocol schedules each request handler through this method so
-        graceful shutdown can await in-flight work. App code can use the same
-        API for background work; both share `tasks` until shutdown drain.
+        The HTTP protocol schedules each request's `App.__call__` through this
+        method so graceful shutdown can await in-flight handlers. App code can use
+        the same API for background work; both share `tasks` until shutdown drain.
 
         - `coro`: Coroutine to run.
         - `loop`: Optional loop to schedule on when the caller already has it.
         - `name`: Optional task name for debuggers.
-        - `eager_start`: Run immediately until the first suspension.
 
         The new `asyncio.Task`.
 
@@ -91,15 +144,9 @@ class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        task = asyncio.Task(
-            coro,
-            loop=loop,
-            name=name,
-            eager_start=eager_start,
-        )
-        if not task.done():
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
+        task = loop.create_task(coro, name=name)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
         return task
 
     async def drain_tasks(self) -> None:
@@ -114,52 +161,83 @@ class App(Router):
                 return
             await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
 
+    # --- protocol entrypoint (called once per HTTP request) ---
+
     async def __call__(self, c: Context, w: Writer) -> None:
-        """Test / `TestClient` entrypoint: `find_handler` then the handler coroutine.
+        """Protocol entrypoint: open a span, resolve routes, handle errors, and finish started responses.
 
-        Trailing-slash 308 is a protocol concern (Cython writes it inline). Tests
-        that go through `App.__call__` get the same redirect here so they stay
-        honest without a shared helper.
+        - `c`: Request context (`app`, `req`, `span`, `match`, `state`).
+        - `w`: Response writer for this message on the connection.
+
+        Trailing slashes (except `/`) get `308` to a canonical path (leading `/`, no trailing
+        slash) before `find_handler` runs. Wrong method on a matching path yields `405`.
+
+        Uncaught exceptions while headers are not sent: `HttpException` →
+        `responses.text`, `RedirectException` → `responses.redirect`,
+        `ClientDisconnected` → `w.abort()` (no body); anything else falls back
+        to 500 unless `on_error` handled it. If a registered error handler
+        raises, the request span is marked failed and 500 is sent when the
+        handler did not start or complete the writer. Handlers must explicitly
+        send a response on the success path.
         """
-        path = c.req.path
-        host = c.req.host if self.host_routing else ""
-        if path != "/" and path.endswith("/"):
-            target = normalize_path(path)
-            _, _, hit = self.find_handler(host, target, c.req.method)
-            if type(c.span) is not NoOpSpan and hit.pattern:
-                c.span.rename(hit.pattern)
-            if c.req.query_bytes:
-                target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
-            responses.redirect(w, target, 308)
-            finish_request_span(
-                c.span, status=308, method=c.req.method, path=path
-            )
-            return
-
-        handler, route, c.match = self.find_handler(host, path, c.req.method)
         span = c.span
-        if type(span) is not NoOpSpan:
-            span.start()
-            span.attrs({"request.method": c.req.method, "request.path": path})
+        span.start()
+        span.attr("request.method", c.req.method)
+        span.attr("request.path", c.req.path)
+        failed_after_start = False
+
+        try:
+            path = c.req.path
+            host = c.req.host if self.host_routing else ""
+            if path != "/" and path.endswith("/"):
+                target = normalize_path(path)
+                _, _, hit = self.find_handler(host, target, c.req.method)
+                if hit.pattern:
+                    span.rename(hit.pattern)
+                if c.req.query_bytes:
+                    target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
+                responses.redirect(w, target, 308)
+                return
+
+            handler, route, c.match = self.find_handler(host, path, c.req.method)
             if c.match.pattern:
                 span.rename(c.match.pattern)
                 span.attr("http.route", route.path)
+            await handler(c, w)
+            if not w.started and not w.completed:
+                raise StarioRuntime(
+                    "Handler returned without sending a response",
+                    context={
+                        "method": c.req.method,
+                        "path": c.req.path,
+                        "route": c.match.pattern or None,
+                    },
+                    help_text=(
+                        "Call a response helper such as responses.text/json/html/empty, "
+                        "or explicitly use Writer.write_headers()/write()/end()."
+                    ),
+                )
 
-        task = self.create_task(handler(c, w), eager_start=True)
-        try:
-            if not task.done():
-                await task
-        except asyncio.CancelledError:
-            if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            raise
+        except Exception as exc:
+            handler_responded = False
+            failed_after_start = w.started
+            if not w.started:
+                if handler := self._find_error_handler(type(exc)):
+                    try:
+                        await handler(c, w, exc)
+                        handler_responded = w.started or w.completed
+                    except Exception as handler_exc:
+                        failed_after_start = w.started
+                        exc = handler_exc
+                if not handler_responded:
+                    responses.text(w, "Internal Server Error", 500)
+            if not handler_responded:
+                span.fail(str(exc))
+                span.exception(exc)
         finally:
-            if task.done():
-                on_handler_done(c, w, task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None and not w.started:
-            raise exc
+            if failed_after_start and not w.completed:
+                w.abort()
+            else:
+                w.end()
+            span.attr("response.status_code", w.status_code)
+            span.end()

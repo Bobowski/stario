@@ -1,13 +1,11 @@
 """Process-level HTTP server configuration (listen, limits, compression, shutdown).
 
-Body and header size defaults for `RequestPolicy` are defined in `request.py`;
-this module re-exports them for env wiring.
+Body and header size defaults for `RequestPolicy` are defined in `request.py`
+alongside `BodyReader`; this module re-exports them for env wiring.
 """
 
 from collections.abc import Callable
-from pathlib import Path
 from typing import Literal
-from ssl import SSLContext
 
 from stario._env import (
     env_bool,
@@ -18,7 +16,6 @@ from stario._env import (
     env_str,
 )
 from stario.exceptions import StarioError
-from stario.http.tls import load_tls_context
 
 from .compression import CompressionConfig, compression_config_from_env
 from .request import (
@@ -68,20 +65,10 @@ class RequestPolicy:
                 "max_header_bytes must be at least 256",
                 help_text="Increase the limit or use the default Server settings.",
             )
-        if max_header_bytes > 2_147_483_647:
-            raise StarioError(
-                "max_header_bytes must be at most 2^31-1",
-                help_text="The Cython protocol stores this cap as a 32-bit int.",
-            )
         if max_body_bytes < 1:
             raise StarioError(
                 "max_body_bytes must be at least 1",
                 help_text="Use a positive byte limit for request bodies.",
-            )
-        if max_body_bytes > 2_147_483_647:
-            raise StarioError(
-                "max_body_bytes must be at most 2^31-1",
-                help_text="The Cython protocol stores this cap as a 32-bit int.",
             )
         for field, value in (
             ("header_timeout", header_timeout),
@@ -164,7 +151,6 @@ class ServerConfig:
         "port",
         "requests",
         "reuse_addr",
-        "ssl",
         "unix_socket",
         "unix_socket_mode",
     )
@@ -182,9 +168,6 @@ class ServerConfig:
         backlog: int = DEFAULT_BACKLOG,
         reuse_addr: bool = DEFAULT_REUSE_ADDR,
         event_loop: EventLoopKind = DEFAULT_EVENT_LOOP,
-        ssl: SSLContext | None = None,
-        ssl_certfile: str | Path | None = None,
-        ssl_keyfile: str | Path | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
             raise StarioError(
@@ -221,16 +204,6 @@ class ServerConfig:
                 "event_loop must be 'asyncio' or 'uvloop'",
                 help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
             )
-        if ssl is not None and (ssl_certfile is not None or ssl_keyfile is not None):
-            raise StarioError(
-                "pass either ssl= or ssl_certfile=, not both",
-                help_text="Use a prepared SSLContext or certificate paths.",
-            )
-        if ssl_keyfile is not None and ssl_certfile is None:
-            raise StarioError(
-                "ssl_keyfile requires ssl_certfile",
-                help_text="Set STARIO_SSL_CERTFILE with STARIO_SSL_KEYFILE.",
-            )
 
         self.host = host
         self.port = port
@@ -244,15 +217,6 @@ class ServerConfig:
         self.backlog = backlog
         self.reuse_addr = reuse_addr
         self.event_loop: EventLoopKind = event_loop
-        if ssl is not None:
-            self.ssl = ssl
-        elif ssl_certfile is not None:
-            self.ssl = load_tls_context(
-                certfile=ssl_certfile,
-                keyfile=ssl_keyfile,
-            )
-        else:
-            self.ssl = None
 
 
 def _event_loop_from_env() -> EventLoopKind:
@@ -283,7 +247,5 @@ def server_config_from_env() -> ServerConfig:
             backlog=env_int("STARIO_BACKLOG", DEFAULT_BACKLOG),
             reuse_addr=env_bool("STARIO_REUSE_ADDR", DEFAULT_REUSE_ADDR),
             event_loop=_event_loop_from_env(),
-            ssl_certfile=env_optional_str("STARIO_SSL_CERTFILE"),
-            ssl_keyfile=env_optional_str("STARIO_SSL_KEYFILE"),
         )
     )

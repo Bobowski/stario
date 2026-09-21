@@ -9,9 +9,9 @@ import stario.json as stario_json
 import stario.responses as responses
 from stario.datastar import SSE, data, read_signals
 from stario.http.headers import Headers
+from stario.http.request import BodyReader, Request
 from stario.http.writer import Writer
 from stario.telemetry.formatters import dumps_json
-from stario.testing.harness import TestRequest
 from tests.helpers import make_writer_raw
 
 
@@ -64,13 +64,16 @@ def _restore_codec():
     stario_json.set_codec(previous)
 
 
-def _request(body: bytes) -> TestRequest:
-    return TestRequest(
+def _request(body: bytes) -> Request:
+    reader = BodyReader(pause=lambda: None, resume=lambda: None, disconnect=None)
+    reader._cached = body
+    reader._complete = True
+    return Request(
         method="POST",
         path="/",
         query_bytes=b"",
         headers=Headers(),
-        body=body,
+        body=reader,
     )
 
 

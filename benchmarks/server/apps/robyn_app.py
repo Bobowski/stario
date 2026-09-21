@@ -1,88 +1,53 @@
 # pyright: reportMissingImports=false
 
-import os
+import argparse
 
 import ujson
-from robyn import Config, Robyn
-from robyn.jsonify import jsonify
-from robyn.robyn import Headers, Response
-
-from apps.common import validate_fields
-
-config = Config()
-app = Robyn(__file__, config=config)
+from robyn import Robyn
 
 HELLO = "Hello, World!"
+JSON_HEADERS = {"Content-Type": "application/json"}
 
 
-def _body_bytes(request) -> bytes:
-    body = request.body
-    if isinstance(body, str):
-        return body.encode("utf-8")
-    return body or b""
+def error_json(value):
+    return (value, JSON_HEADERS, 400)
 
 
-@app.get("/plaintext")
-async def plaintext():
+app = Robyn(__file__)
+
+
+@app.get("/plaintext", const=True)
+def plaintext():
     return HELLO
 
 
-@app.get("/json")
-async def json_endpoint():
+@app.get("/json", const=True)
+def json_endpoint():
     return {"message": HELLO}
 
 
 @app.get("/user/:user_id")
-async def get_user(request):
-    user_id = request.path_params["user_id"]
+def get_user(user_id: str):
     return {"id": user_id, "name": f"User {user_id}"}
 
 
 @app.post("/validate")
-async def validate(request):
-    raw = _body_bytes(request)
-    payload, status = validate_fields(ujson.loads(raw) if raw else {})
-    if status != 200:
-        return Response(
-            status_code=status,
-            headers=Headers({"Content-Type": "application/json"}),
-            description=jsonify(payload),
-        )
-    return payload
+def validate(request):
+    body = ujson.loads(request.body)
+    name = body.get("name")
+    age = body.get("age")
 
+    if not isinstance(name, str) or not name:
+        return error_json({"error": "name must be a non-empty string"})
+    if not isinstance(age, int) or age < 0 or age > 150:
+        return error_json({"error": "age must be an integer between 0 and 150"})
 
-@app.post("/form")
-async def post_form(request):
-    _body_bytes(request)
-    return "", 204
-
-
-@app.post("/echo/json")
-async def post_echo_json(request):
-    body = _body_bytes(request)
-    return {"bytes": len(body)}
-
-
-@app.post("/ingest/64k")
-@app.post("/ingest/2m")
-async def ingest_buffer(request):
-    body = _body_bytes(request)
-    return {"bytes": len(body)}
-
-
-@app.post("/ingest/stream/2m")
-async def ingest_stream(request):
-    body = _body_bytes(request)
-    return {"bytes": len(body)}
-
-
-@app.post("/upload")
-async def upload(request):
-    body = _body_bytes(request)
-    return {"bytes": len(body)}
+    return {"name": name, "age": age, "valid": True}
 
 
 if __name__ == "__main__":
-    host = os.environ.get("BENCH_HOST", "127.0.0.1")
-    port = int(os.environ.get("BENCH_PORT", "8080"))
-    app.start(host=host, port=port, _check_port=False)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=3000)
+    args, _ = parser.parse_known_args()
+    app.start(host=args.host, port=args.port, _check_port=False)
