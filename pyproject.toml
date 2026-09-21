@@ -71,7 +71,7 @@ include = [
     "tests",
     "examples",
 ]
-exclude = ["benchmarks", "**/.venv", "**/__pycache__"]
+exclude = ["benchmarks", "examples/jinja", "**/.venv", "**/__pycache__"]
 
 [[tool.pyright.executionEnvironments]]
 root = "examples/chat-room"

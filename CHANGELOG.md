@@ -6,73 +6,55 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
-## 4.2.0 - 2026-09-19
-
-### Fixed
-
-- TTY tracer live footer — skip terminal writes when the text and width do not
-  change. Cap the live block to `terminal_rows - 2` so cursor-up erase cannot
-  clear scrollback. Tall trees keep the root header and the newest lines.
-  The footer is removed when no roots are open.
+## 4.2.0 - 2026-09-21
 
 ### Added
 
-- `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
-  is lazy. `await attach(app)` registers GET/HEAD and loads the tree
-  (`register()` and `load()` stay available). A later `attach()` on a
-  new `App` re-adds GET/HEAD and reuses the loaded tree. `load()` still
-  runs once. `Assets` hashes names and 307s logical paths. Both send
-  strong ETags, 304, and `X-Content-Type-Options: nosniff`. Pass
-  `content_types=` at construction to add or override MIME types.
+- `Assets` and `Files` — a directory at a URL prefix. Call `href()` at import.
+  Call `await attach(app)` in bootstrap to register GET/HEAD and load the tree.
+  `register()` and `load()` stay available. `Assets` hashes names and 307s the
+  logical path. Both send strong ETags, 304, and `nosniff`. Pass
+  `content_types=` to add or override MIME types.
 - `stario.json` — one process-wide codec for JSON responses, Datastar signals,
-  telemetry, and the test client. `dumps()` and `dumps_bytes()` preserve fast
-  text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
-  standard-library default emits strict compact JSON. Replace it explicitly
-  with `set_codec()`.
+  telemetry, and the test client. Replace the standard-library default with
+  `set_codec()`.
 
 ### Changed
 
-- `Route` is the HTTP address: one method, one host, one path.
-  `Route("GET /home")` or `Route("POST", ROOM + "/send")`. `href()`
-  compiles a join of literals and placeholder names. Names must be
-  unique across host and path. After a match, read `c.match`.
-  Matching lives in `stario.http`.
-- `find_handler` has no LRU. Static `(host, path, method)` hits an exact
-  map and reuses that `Match`. Exact hosts have their own path trie.
-  Exact-only path chains are radix-compressed. One cursor walks the
-  trie. The matcher does not lowercase `host` — pass `Request.host`
-  (already folded).
-- File streaming (`Assets`, `Files`, and `stario.staticassets`) reads
-  already-open file descriptors with `os.pread` in a worker thread.
-  The `aiofiles` dependency is gone.
+- `Route` is the HTTP address: `Route("GET /home")` or
+  `Route("POST", ROOM + "/send")`. After a match, read `c.match`. Matching
+  lives in `stario.http`.
+- Static routes hit an exact map. Parameterized routes walk a compressed trie.
+  Pass `Request.host` (already folded). The matcher does not lowercase host.
+- File streaming uses `os.pread` in a worker thread. The `aiofiles`
+  dependency is gone.
+
+### Fixed
+
+- TTY tracer live footer — skip the write when text and width do not change.
+  Cap the live block so erase cannot clear scrollback.
+- `Assets.load()` re-hashes files already pinned by `href()`, so a same-size
+  content edit is not missed.
 
 ### Deprecated
 
 These still work. They will be removed in 5.0.
 
-Prefer `Route("GET /home")` or `Route("POST", ROOM + "/send")` and
-`app.add(route, handler)`. Host is `//host/path` or `host=`. Paths
-start with `/` or `//`. `{name}` and `{name...}` must be a whole path
-segment or host label. `{{name}}` is a literal `{name}`. Query and
-fragment go to `href()` only. After a match, read `c.match`.
-
-- `UrlPath` — prefer `Route` or a `/` / `//` string. `href()` and `/`
-  composition still work. `app.use`, `not_found`, `Files`, and `Assets`
+- `UrlPath` — prefer `Route` or a `/` / `//` string. `Files` and `Assets`
   take strings.
-- `app.get` / `app.post` / `app.handle` and `Route.get` / `Route.post`
-  / … — register with `app.add(Route("GET /"), handler)`.
-  `Route.query(path)` stays as the HTTP QUERY factory until 5.0;
-  `Route("QUERY /feed")` is the replacement.
-- `at.fetch` — build the URL with `route.href()` and name the verb at
-  the call site (`at.get(...)`, `at.post(...)`).
-- `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use
-  `Assets(...)` or `Files(...)` and `await attach(app)`.
+- `app.get` / `app.post` / `app.handle` and `Route.get` / `Route.post` / …
+  — use `app.add(Route("GET /"), handler)`. `Route.query(path)` stays until
+  5.0; `Route("QUERY /feed")` is the replacement.
+- `at.fetch` — build the URL with `route.href()` and name the verb at the
+  call site (`at.get(...)`, `at.post(...)`).
+- `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use `Assets` or
+  `Files` and `await attach(app)`.
 
 ### Removed
 
 - `c.route` (`RouteMatch`) — use `c.match` (`Match`).
 - `stario.routing` — import `Route` and `UrlPath` from `stario` or
-  `stario.http`. `from stario.http import RouteMatch` becomes `Match`.
+  `stario.http`.
 
 ## 4.1.1 - 2026-08-31
 

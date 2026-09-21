@@ -405,7 +405,9 @@ class TestClient:
         current_files = files
         current_content = content
         current_headers = headers
-        current_cookies = dict(cookies) if cookies is not None else None
+        current_cookies: dict[str, str] | None = (
+            dict(cookies) if cookies is not None else None
+        )
         history: list[TestResponse] = []
 
         for _ in range(self.max_redirects + 1):

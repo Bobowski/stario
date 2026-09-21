@@ -10,7 +10,7 @@ join as `" ".join(parts)` → `<METHOD> <url>`. `method=`, `host=`, and
 """
 
 from collections.abc import Callable, Mapping
-from typing import NoReturn
+from typing import NoReturn, cast
 from urllib.parse import quote, urlencode
 from warnings import deprecated, warn
 
@@ -284,7 +284,7 @@ def _compile_href(
     def literal(text: str) -> None:
         pending.append(text)
 
-    def param(segment, where: str) -> None:
+    def param(segment: Segment, where: str) -> None:
         flush()
         names.append(segment.name)
         slot = "K" if where == "host" else "C"
@@ -319,7 +319,7 @@ def _compile_href(
     )
     namespace = dict(_HREF_NS)
     exec(compile(source, f"<stario href {target}>", "exec"), namespace)
-    return namespace["href"]
+    return cast(Callable[..., str], namespace["href"])
 
 
 def _fill_href(
@@ -377,6 +377,15 @@ class Route:
         "pattern",
         "target",
     )
+
+    method: str
+    path: str
+    host: str | None
+    target: str
+    pattern: str
+    _host_segments: tuple[Segment, ...]
+    _path_segments: tuple[Segment, ...]
+    _href: Callable[..., str] | None
 
     def __init__(
         self,
@@ -455,6 +464,18 @@ class Route:
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Route is immutable")
 
+    @property
+    def host_segments(self) -> tuple[Segment, ...]:
+        return self._host_segments
+
+    @property
+    def path_segments(self) -> tuple[Segment, ...]:
+        return self._path_segments
+
+    @property
+    def has_params(self) -> bool:
+        return self._href is not None
+
     def href(
         self,
         *args: object,
@@ -508,6 +529,46 @@ class Route:
         """Unmatched 404 / 405 sentinel. Do not register it."""
         return EMPTY_ROUTE
 
+    @classmethod
+    @deprecated("Use Route('GET /path') or Route('GET', path).")
+    def get(cls, path: str | UrlPath) -> Route:
+        return cls("GET", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('QUERY /path') or Route('QUERY', path).")
+    def query(cls, path: str | UrlPath) -> Route:
+        return cls("QUERY", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('POST /path') or Route('POST', path).")
+    def post(cls, path: str | UrlPath) -> Route:
+        return cls("POST", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('PUT /path') or Route('PUT', path).")
+    def put(cls, path: str | UrlPath) -> Route:
+        return cls("PUT", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('DELETE /path') or Route('DELETE', path).")
+    def delete(cls, path: str | UrlPath) -> Route:
+        return cls("DELETE", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('PATCH /path') or Route('PATCH', path).")
+    def patch(cls, path: str | UrlPath) -> Route:
+        return cls("PATCH", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('HEAD /path') or Route('HEAD', path).")
+    def head(cls, path: str | UrlPath) -> Route:
+        return cls("HEAD", as_target(path))
+
+    @classmethod
+    @deprecated("Use Route('OPTIONS /path') or Route('OPTIONS', path).")
+    def options(cls, path: str | UrlPath) -> Route:
+        return cls("OPTIONS", as_target(path))
+
 
 EMPTY_ROUTE = Route.__new__(Route)
 object.__setattr__(EMPTY_ROUTE, "method", "")
@@ -518,18 +579,3 @@ object.__setattr__(EMPTY_ROUTE, "pattern", "")
 object.__setattr__(EMPTY_ROUTE, "_href", None)
 object.__setattr__(EMPTY_ROUTE, "_host_segments", ())
 object.__setattr__(EMPTY_ROUTE, "_path_segments", ())
-
-
-def _route_verb(method: str):
-    @classmethod
-    @deprecated(f"Use Route('{method} /path') or Route('{method}', path).")
-    def verb(cls, path: str | UrlPath) -> Route:
-        return cls(method, as_target(path))
-
-    verb.__name__ = method.lower()
-    verb.__qualname__ = f"Route.{method.lower()}"
-    return verb
-
-
-for _method in HTTP_METHODS:
-    setattr(Route, _method.lower(), _route_verb(_method))

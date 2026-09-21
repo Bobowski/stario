@@ -190,7 +190,7 @@ class TestFindHandler:
     def test_verb_helpers_are_deprecated(self):
         router = Router()
         with pytest.warns(DeprecationWarning, match=r"add\(Route\('GET'"):
-            router.get("/x", noop_handler)
+            router.get("/x", noop_handler)  # pyright: ignore[reportDeprecated]
 
         _, route, _ = router.find_handler("", "/x", "GET")
         assert route.target == "/x"
@@ -198,7 +198,7 @@ class TestFindHandler:
     def test_handle_is_deprecated(self):
         router = Router()
         with pytest.warns(DeprecationWarning, match=r"add\(Route"):
-            router.handle("GET", "/y", noop_handler)
+            router.handle("GET", "/y", noop_handler)  # pyright: ignore[reportDeprecated]
 
         _, route, _ = router.find_handler("", "/y", "GET")
         assert route.target == "/y"

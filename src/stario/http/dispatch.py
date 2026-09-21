@@ -9,7 +9,7 @@ from warnings import deprecated
 import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import EMPTY_MATCH, Context, Handler, Match, Middleware
-from stario.http.route import EMPTY_ROUTE, HTTP_METHODS, Route, UrlPath, as_target
+from stario.http.route import EMPTY_ROUTE, Route, UrlPath, as_target
 from stario.http.segment import Segment
 from stario.http.writer import Writer
 
@@ -17,6 +17,10 @@ type MethodNotAllowedHandler = Callable[[frozenset[str]], Handler]
 type MatchStatus = Literal["found", "method_not_allowed", "not_found"]
 type RouteMatch = tuple[Handler, Route, Match]
 type Resolve = tuple[RouteMatch, MatchStatus, bool]
+
+
+def _exact_nodes() -> dict[str, Node]:
+    return {}
 
 
 async def default_not_found(_c: Context, w: Writer) -> None:
@@ -45,7 +49,7 @@ class Node:
     not_found_handler: Handler | None = None
     method_not_allowed_handler: MethodNotAllowedHandler | None = None
     middleware: tuple[Middleware, ...] = ()
-    exact: dict[str, Node] = field(default_factory=dict)
+    exact: dict[str, Node] = field(default_factory=_exact_nodes)
     rest: dict[str, str] | None = None
     wildcard_name: str | None = None
     wildcard: Node | None = None
@@ -436,7 +440,7 @@ class Router:
         if not route.host:
             return self._path
         self._host_routing = True
-        if all(segment.kind == "exact" for segment in route._host_segments):
+        if all(segment.kind == "exact" for segment in route.host_segments):
             return self._hosts_exact.setdefault(route.host, Node())
         self._has_param_hosts = True
         return self._hosts_param
@@ -444,20 +448,20 @@ class Router:
     def _descend(self, tree: Node, route: Route) -> Node:
         current = tree
         if tree is self._hosts_param:
-            for segment in route._host_segments[::-1]:
+            for segment in route.host_segments[::-1]:
                 current = _descend_or_create(current, segment, ".")
-        for segment in route._path_segments:
+        for segment in route.path_segments:
             current = _descend_or_create(current, segment, "/")
         return current
 
     def _policy_node(self, pattern: UrlPath | str) -> Node:
         route = Route(as_target(pattern))
-        if any(segment.kind == "catchall" for segment in route._host_segments):
+        if any(segment.kind == "catchall" for segment in route.host_segments):
             raise StarioError(
                 "Catchall host policy is not supported",
                 context={"target": route.target},
             )
-        if route._path_segments and route._path_segments[-1].kind == "catchall":
+        if route.path_segments and route.path_segments[-1].kind == "catchall":
             raise StarioError(
                 "Catchall route policy cannot have child routes",
                 context={"target": route.target},
@@ -504,8 +508,8 @@ class Router:
                 context={"target": route.target},
             )
         method = route.method
-        host_segments = route._host_segments
-        path_segments = route._path_segments
+        host_segments = route.host_segments
+        path_segments = route.path_segments
         tree = self._tree_for(route)
         walk_host = host_segments if tree is self._hosts_param else ()
         scoped_middleware = _collect_middleware(tree, walk_host, path_segments)
@@ -531,7 +535,7 @@ class Router:
         else:
             current.endpoints[method] = endpoint
 
-        if route._href is None:
+        if not route.has_params:
             key = (
                 "/" + "/".join(segment.name for segment in path_segments)
                 if path_segments
@@ -557,6 +561,86 @@ class Router:
         """Deprecated. Register with `add(Route(method, path), handler)`."""
         _add_path(self, method, path, handler, middleware)
 
+    @deprecated("Use add(Route('GET', path), handler).")
+    def get(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "GET", path, handler, middleware)
+
+    @deprecated("Use add(Route('QUERY', path), handler).")
+    def query(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "QUERY", path, handler, middleware)
+
+    @deprecated("Use add(Route('POST', path), handler).")
+    def post(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "POST", path, handler, middleware)
+
+    @deprecated("Use add(Route('PUT', path), handler).")
+    def put(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "PUT", path, handler, middleware)
+
+    @deprecated("Use add(Route('DELETE', path), handler).")
+    def delete(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "DELETE", path, handler, middleware)
+
+    @deprecated("Use add(Route('PATCH', path), handler).")
+    def patch(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "PATCH", path, handler, middleware)
+
+    @deprecated("Use add(Route('HEAD', path), handler).")
+    def head(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "HEAD", path, handler, middleware)
+
+    @deprecated("Use add(Route('OPTIONS', path), handler).")
+    def options(
+        self,
+        path: UrlPath | str,
+        handler: Handler,
+        *,
+        middleware: Sequence[Middleware] = (),
+    ) -> None:
+        _add_path(self, "OPTIONS", path, handler, middleware)
+
 
 def _add_path(
     router: Router,
@@ -566,26 +650,6 @@ def _add_path(
     middleware: Sequence[Middleware],
 ) -> None:
     router.add(Route(method, as_target(path)), handler, middleware=middleware)
-
-
-def _router_verb(method: str):
-    @deprecated(f"Use add(Route({method!r}, path), handler).")
-    def verb(
-        self: Router,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, method, path, handler, middleware)
-
-    verb.__name__ = method.lower()
-    verb.__qualname__ = f"Router.{method.lower()}"
-    return verb
-
-
-for _method in HTTP_METHODS:
-    setattr(Router, _method.lower(), _router_verb(_method))
 
 
 __all__ = [

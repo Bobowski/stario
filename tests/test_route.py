@@ -117,9 +117,9 @@ class TestRoute:
 
     def test_obsolete_factories_still_work(self):
         with pytest.warns(DeprecationWarning, match="Route\\('GET /path'\\)"):
-            home = Route.get("/")
+            home = Route.get("/")  # pyright: ignore[reportDeprecated]
         with pytest.warns(DeprecationWarning, match="Route\\('QUERY /path'\\)"):
-            feed = Route.query("/feed")
+            feed = Route.query("/feed")  # pyright: ignore[reportDeprecated]
         assert home == Route("GET /")
         assert feed == Route("QUERY /feed")
 

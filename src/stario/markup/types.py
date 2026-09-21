@@ -33,7 +33,7 @@ class Attrs:
 type AttributeValue = str | SafeString | bool | int | float | None
 
 # Omitted helper values (styles/class conditionals).
-type Omitted = None | Literal[False]
+type Omitted = Literal[False] | None
 
 # Inline style declarations — str/int/float only (no SafeString; escape always).
 type StyleValue = str | int | float

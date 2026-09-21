@@ -55,9 +55,9 @@ class TestFiles:
 
     def test_rejects_urlpath_prefix(self, tmp_path: Path) -> None:
         with pytest.raises(StarioError, match="must be a string"):
-            Files(tmp_path, UrlPath("/media"))
+            Files(tmp_path, UrlPath("/media"))  # pyright: ignore[reportArgumentType]
         with pytest.raises(StarioError, match="must be a string"):
-            Assets(tmp_path, UrlPath("/static"))
+            Assets(tmp_path, UrlPath("/static"))  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
         "path",
