@@ -3,16 +3,17 @@
 import ujson
 import falcon.asgi
 
-from apps.common import validate_fields
-
-HELLO = "Hello, World!"
-JSON_MEDIA_TYPE = falcon.MEDIA_JSON
-
-
-def json_body(resp, value, status=falcon.HTTP_200):
-    resp.status = status
-    resp.content_type = JSON_MEDIA_TYPE
-    resp.data = ujson.dumps(value).encode("utf-8")
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
 
 async def _read_all(req) -> bytes:
@@ -26,68 +27,63 @@ async def _read_stream(req) -> int:
     return total
 
 
+def text(resp, line: str | bytes) -> None:
+    resp.content_type = TEXT_CONTENT_TYPE_STR
+    resp.data = line if isinstance(line, bytes) else line.encode("ascii")
+
+
 class Plaintext:
     async def on_get(self, req, resp):
-        resp.text = HELLO
-
-
-class JsonResource:
-    async def on_get(self, req, resp):
-        json_body(resp, {"message": HELLO})
+        text(resp, PLAINTEXT_BODY)
 
 
 class UserResource:
     async def on_get(self, req, resp, user_id):
-        json_body(resp, {"id": user_id, "name": f"User {user_id}"})
-
-
-class ValidateResource:
-    async def on_post(self, req, resp):
-        body = ujson.loads(await _read_all(req))
-        payload, status = validate_fields(body)
-        json_body(
+        text(
             resp,
-            payload,
-            falcon.HTTP_400 if status == 400 else falcon.HTTP_200,
+            request_line(
+                user_id,
+                query_value(req.get_param("q")),
+                as_str(
+                    req.get_header("X-REQUEST-ID")
+                    or req.get_header(REQUEST_HEADER)
+                ),
+            ),
         )
-
-
-class FormResource:
-    async def on_post(self, req, resp):
-        await _read_all(req)
-        resp.status = falcon.HTTP_204
 
 
 class EchoJson:
     async def on_post(self, req, resp):
-        body = await _read_all(req)
-        json_body(resp, {"bytes": len(body)})
+        raw = await _read_all(req)
+        await yield_once()
+        text(resp, json_echo_line(ujson.loads(raw) if raw else {}))
 
 
 class IngestBuffer:
     async def on_post(self, req, resp):
         body = await _read_all(req)
-        json_body(resp, {"bytes": len(body)})
+        await yield_once()
+        text(resp, bytes_line(len(body)))
 
 
 class IngestStream:
     async def on_post(self, req, resp):
-        json_body(resp, {"bytes": await _read_stream(req)})
+        total = await _read_stream(req)
+        await yield_once()
+        text(resp, bytes_line(total))
 
 
 class Upload:
     async def on_post(self, req, resp):
         body = await _read_all(req)
-        json_body(resp, {"bytes": len(body)})
+        await yield_once()
+        text(resp, bytes_line(len(body)))
 
 
 app = falcon.asgi.App()
 app.add_route("/plaintext", Plaintext())
-app.add_route("/json", JsonResource())
 app.add_route("/user/{user_id}", UserResource())
-app.add_route("/validate", ValidateResource())
-app.add_route("/form", FormResource())
-app.add_route("/echo/json", EchoJson())
+app.add_route("/echo", EchoJson())
 app.add_route("/ingest/64k", IngestBuffer())
 app.add_route("/ingest/2m", IngestBuffer())
 app.add_route("/ingest/stream/2m", IngestStream())
