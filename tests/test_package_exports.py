@@ -117,6 +117,9 @@ def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
         "stario.http.router",
         "stario.http.staticassets",
         "stario.routing",
+        "stario.routing.trie",
+        "stario.routing.pattern",
+        "stario.http.protocol",
     ],
 )
 def test_removed_shim_modules(removed_module: str) -> None:
