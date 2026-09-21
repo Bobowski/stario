@@ -40,8 +40,10 @@ SUMMARY_GROUPS=(
   "Native HTTP servers|socketify robyn granian-rsgi sanic django-bolt"
   "ASGI framework stacks|blacksheep-granian blacksheep-uvicorn fastapi falcon"
 )
-READ_ENDPOINTS=(plaintext json params)
-UPLOAD_ENDPOINTS=(validate post-form post-json-1k post-octet-64k post-octet-2m post-stream-2m multipart-2m)
+STATIC_ENDPOINTS=(plaintext)
+REQUEST_ENDPOINTS=(request)
+READ_ENDPOINTS=( "${STATIC_ENDPOINTS[@]}" "${REQUEST_ENDPOINTS[@]}" )
+UPLOAD_ENDPOINTS=(json-small post-octet-64k post-octet-2m post-stream-2m multipart-2m)
 DEFAULT_ENDPOINTS=( "${READ_ENDPOINTS[@]}" "${UPLOAD_ENDPOINTS[@]}" )
 if [[ -n "${ENDPOINTS:-}" ]]; then
   ENDPOINTS_CSV="$ENDPOINTS"
@@ -52,11 +54,8 @@ ENDPOINTS=()
 UPLOAD_CONNECTIONS="${UPLOAD_CONNECTIONS:-32}"
 ENDPOINT_LABELS=(
   "plaintext|Plaintext"
-  "json|JSON"
-  "params|Params"
-  "validate|Validate JSON"
-  "post-form|Form POST"
-  "post-json-1k|JSON 1KB"
+  "request|Request fields"
+  "json-small|JSON small"
   "post-octet-64k|Octet 64KB"
   "post-octet-2m|Octet 2MB (buffer)"
   "post-stream-2m|Octet 2MB (stream)"
@@ -80,13 +79,17 @@ Targets (default: all):
 
 Environment: DURATION=10s THREADS=2 CONNECTIONS=128 UPLOAD_CONNECTIONS=32
              RUNS=7 WARMUP=2 HOST=127.0.0.1 PORT=3000 PYTHON=3.14
-             ENDPOINT_TIER=all|read|upload  ENDPOINTS=csv  REFRESH_ENVS=1 KEEP_RAW=1
+             ENDPOINT_TIER=all|static|request|read|upload|app  ENDPOINTS=csv
+             REFRESH_ENVS=1 KEEP_RAW=1
 
 Endpoint tiers:
-  read   — plaintext, json, params
-  upload — validate, post-form, post-json-1k, post-octet-64k, post-octet-2m,
-           post-stream-2m, multipart-2m
-  all    — every endpoint (default)
+  static  — plaintext (prebuilt body, fixed URL)
+  request — path param + query q + header x-request-id, interpolated text
+  read    — static + request
+  upload  — json-small, post-octet-64k, post-octet-2m, post-stream-2m,
+            multipart-2m (each awaits asyncio.sleep(0))
+  app     — request + upload
+  all     — every endpoint (default)
 
 Large upload cases use UPLOAD_CONNECTIONS (default 32) instead of CONNECTIONS.
 
@@ -120,11 +123,8 @@ target_offset() {
 path_for() {
   case "$1" in
     plaintext) echo /plaintext ;;
-    json) echo /json ;;
-    params) echo /user/42 ;;
-    validate) echo /validate ;;
-    post-form) echo /form ;;
-    post-json-1k) echo /echo/json ;;
+    request) echo /user/1 ;;
+    json-small) echo /echo ;;
     post-octet-64k) echo /ingest/64k ;;
     post-octet-2m) echo /ingest/2m ;;
     post-stream-2m) echo /ingest/stream/2m ;;
@@ -138,9 +138,8 @@ path_for() {
 
 script_for() {
   case "$1" in
-    validate) echo "$BENCHMARK_DIR/validate.lua" ;;
-    post-form) echo "$BENCHMARK_DIR/scripts/post-form.lua" ;;
-    post-json-1k) echo "$BENCHMARK_DIR/scripts/post-json-1k.lua" ;;
+    request) echo "$BENCHMARK_DIR/scripts/get-user.lua" ;;
+    json-small) echo "$BENCHMARK_DIR/validate.lua" ;;
     post-octet-64k) echo "$BENCHMARK_DIR/scripts/post-octet-64k.lua" ;;
     post-octet-2m) echo "$BENCHMARK_DIR/scripts/post-octet-2m.lua" ;;
     post-stream-2m) echo "$BENCHMARK_DIR/scripts/post-stream-2m.lua" ;;
@@ -187,11 +186,14 @@ parse_endpoints() {
   fi
   if [[ -n "${ENDPOINT_TIER:-}" ]]; then
     case "$ENDPOINT_TIER" in
+      static) ENDPOINTS=("${STATIC_ENDPOINTS[@]}") ;;
+      request) ENDPOINTS=("${REQUEST_ENDPOINTS[@]}") ;;
       read|core) ENDPOINTS=("${READ_ENDPOINTS[@]}") ;;
       upload) ENDPOINTS=("${UPLOAD_ENDPOINTS[@]}") ;;
+      app) ENDPOINTS=("${REQUEST_ENDPOINTS[@]}" "${UPLOAD_ENDPOINTS[@]}") ;;
       all) ENDPOINTS=("${DEFAULT_ENDPOINTS[@]}") ;;
       *)
-        echo "Unknown ENDPOINT_TIER: $ENDPOINT_TIER (use read, upload, or all)" >&2
+        echo "Unknown ENDPOINT_TIER: $ENDPOINT_TIER (use static, request, read, upload, app, or all)" >&2
         exit 1
         ;;
     esac
@@ -619,8 +621,9 @@ print_summary() {
       group_name="${group_entry%%|*}"
       group_targets="${group_entry#*|}"
       group_printed=0
-      print_summary_section "$group_name" group_printed "$group_targets" "Read-heavy" "${READ_ENDPOINTS[@]}"
-      print_summary_section "$group_name" group_printed "$group_targets" "Upload / body" "${UPLOAD_ENDPOINTS[@]}"
+      print_summary_section "$group_name" group_printed "$group_targets" "Static" "${STATIC_ENDPOINTS[@]}"
+      print_summary_section "$group_name" group_printed "$group_targets" "Request fields" "${REQUEST_ENDPOINTS[@]}"
+      print_summary_section "$group_name" group_printed "$group_targets" "Upload / async" "${UPLOAD_ENDPOINTS[@]}"
       if [[ "$group_printed" == 1 ]]; then
         printed_any=1
       fi
@@ -690,6 +693,7 @@ python=$PYTHON
 client=$WRK
 keep_raw=$KEEP_RAW
 endpoints=${ENDPOINTS[*]}
+param_id_count=4096
 git_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 git_branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 ports=$(port_list)

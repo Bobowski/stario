@@ -3,12 +3,20 @@
 import argparse
 
 import ujson
-from sanic import Sanic, empty, json, text
+from sanic import Sanic, raw
 from sanic.views import stream
 
-from apps.common import validate_fields
-
-HELLO = "Hello, World!"
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
 app = Sanic("stario_benchmark_sanic")
 app.config.ACCESS_LOG = False
@@ -18,42 +26,40 @@ app.config.REQUEST_TIMEOUT = 120
 app.config.REQUEST_MAX_SIZE = 4 * 1024 * 1024
 
 
+def text_response(line: str | bytes):
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    return raw(body, content_type=TEXT_CONTENT_TYPE_STR)
+
+
 @app.get("/plaintext")
 async def plaintext(request):
-    return text(HELLO)
-
-
-@app.get("/json")
-async def json_endpoint(request):
-    return json({"message": HELLO})
+    return text_response(PLAINTEXT_BODY)
 
 
 @app.get("/user/<user_id>")
-async def get_user(request, user_id: str):
-    return json({"id": user_id, "name": f"User {user_id}"})
+async def read_request(request, user_id: str):
+    return text_response(
+        request_line(
+            user_id,
+            query_value(request.args.get("q")),
+            as_str(request.headers.get(REQUEST_HEADER)),
+        )
+    )
 
 
-@app.post("/validate")
-async def validate(request):
-    payload, status = validate_fields(ujson.loads(request.body))
-    return json(payload, status=status)
-
-
-@app.post("/form")
-async def post_form(request):
-    _ = request.body
-    return empty()
-
-
-@app.post("/echo/json")
-async def post_echo_json(request):
-    return json({"bytes": len(request.body)})
+@app.post("/echo")
+async def post_json(request):
+    raw_body = request.body
+    await yield_once()
+    return text_response(json_echo_line(ujson.loads(raw_body) if raw_body else {}))
 
 
 @app.post("/ingest/64k", name="ingest_64k")
 @app.post("/ingest/2m", name="ingest_2m")
 async def ingest_buffer(request):
-    return json({"bytes": len(request.body)})
+    body = request.body
+    await yield_once()
+    return text_response(bytes_line(len(body)))
 
 
 @app.post("/ingest/stream/2m", name="ingest_stream_2m")
@@ -62,12 +68,15 @@ async def ingest_stream(request):
     total = 0
     async for chunk in request.stream:
         total += len(chunk)
-    return json({"bytes": total})
+    await yield_once()
+    return text_response(bytes_line(total))
 
 
 @app.post("/upload")
 async def upload(request):
-    return json({"bytes": len(request.body)})
+    body = request.body
+    await yield_once()
+    return text_response(bytes_line(len(body)))
 
 
 if __name__ == "__main__":
