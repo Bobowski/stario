@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from types import FrameType
-from typing import Any, Literal
+from typing import Any
 
 from stario_cython.protocol import HttpProtocol
 
@@ -37,7 +37,7 @@ from .bootstrap import (
     bootstrap_run,
 )
 from .compression import CompressionConfig
-from .config import RequestPolicy, ServerConfig
+from .config import EventLoopKind, RequestPolicy, ServerConfig
 
 type Connection = Any
 type ProtocolMaker = Callable[
@@ -95,10 +95,56 @@ _DATE_TICK_SWEEPS_TIMEOUTS = "_stario_date_tick_sweeps_timeouts"
 _ACCEPT_REGISTER_YIELDS = 10
 
 
-def resolve_loop_runner(event_loop: Literal["asyncio", "uvloop"]) -> LoopRun[Any]:
-    """Return `asyncio.run` or `uvloop.run` for the configured event loop."""
+def loop_implementation(
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> EventLoopKind:
+    """Classify the running (or given) loop as `asyncio` or `uvloop`."""
+    if loop is None:
+        loop = asyncio.get_running_loop()
+    module = type(loop).__module__
+    if module == "uvloop" or module.startswith("uvloop."):
+        return "uvloop"
+    return "asyncio"
+
+
+def require_configured_loop(
+    event_loop: EventLoopKind,
+    *,
+    loop: asyncio.AbstractEventLoop | None = None,
+    where: str,
+) -> EventLoopKind:
+    """Refuse to continue when this thread's loop is not `STARIO_LOOP`."""
+    actual = loop_implementation(loop)
+    if actual != event_loop:
+        raise StarioError(
+            f"{where} is running {actual}, configured {event_loop}",
+            help_text=(
+                "Every worker uses Server.loop_runner() from STARIO_LOOP. "
+                "Do not install a different event loop policy in the process."
+            ),
+        )
+    return actual
+
+
+def _stdlib_loop_factory() -> asyncio.AbstractEventLoop:
+    """Stdlib loop, ignoring a process-wide uvloop policy."""
+    if sys.platform == "win32":
+        return asyncio.ProactorEventLoop()
+    return asyncio.SelectorEventLoop()
+
+
+def _asyncio_run[T](main: Coroutine[Any, Any, T]) -> T:
+    return asyncio.run(main, loop_factory=_stdlib_loop_factory)
+
+
+def resolve_loop_runner(event_loop: EventLoopKind) -> LoopRun[Any]:
+    """Return the runner that constructs `event_loop` on the calling thread.
+
+    `asyncio` always uses a stdlib loop factory so `uvloop.install()` cannot
+    leak into workers. `uvloop` is `uvloop.run`.
+    """
     if event_loop == "asyncio":
-        return asyncio.run
+        return _asyncio_run
     if sys.platform == "win32":
         raise StarioError(
             "uvloop is not supported on Windows",
@@ -168,6 +214,7 @@ class _LoopWorker:
         self.loop_run = loop_run
         self._body = body
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.loop_kind: EventLoopKind | None = None
         self.connections: set[Connection] = set()
         self.date_box: list[bytes] = [b""]
         self.ready = threading.Event()
@@ -283,12 +330,14 @@ class Server:
         self._urgent_drain = False
         self._live_connections: set[Connection] | None = None
         self._loop_run: LoopRun[Any] | None = None
+        self._owns_loop = False
 
     def loop_runner(self) -> LoopRun[Any]:
-        """Event-loop runner for this process (`asyncio.run` or `uvloop.run`).
+        """Event-loop runner for this process (`asyncio` stdlib or `uvloop.run`).
 
         `run()` and every worker thread use this same callable so `STARIO_LOOP`
-        is forwarded, not re-detected per thread.
+        is forwarded, not re-detected per thread. asyncio workers do not inherit
+        a process-wide uvloop policy.
         """
         if self._loop_run is None:
             self._loop_run = resolve_loop_runner(self.config.event_loop)
@@ -299,6 +348,7 @@ class Server:
 
         The tracer must already be entered by the caller (see `cli/runtime.py`).
         """
+        self._owns_loop = True
         self.loop_runner()(self.serve())
 
     async def serve(self) -> None:
@@ -313,10 +363,13 @@ class Server:
             )
         self._used = True
 
+        if self._owns_loop:
+            require_configured_loop(self.config.event_loop, where="Server.run")
+
         if self.config.threads > 1:
             require_thread_workers(self.config.threads)
             # Resolve once on this thread; every worker calls this same runner
-            # (asyncio.run or uvloop.run) instead of re-detecting STARIO_LOOP.
+            # instead of re-detecting STARIO_LOOP.
             self.loop_runner()
 
         app = App()
@@ -762,8 +815,15 @@ class Server:
 
     async def _run_worker(self, worker: _LoopWorker) -> None:
         """One worker thread's loop: Date tick, serve until shutdown, then drain."""
-        worker.loop = asyncio.get_running_loop()
-        worker.app.attach_loop(worker.loop)
+        loop = asyncio.get_running_loop()
+        kind = require_configured_loop(
+            self.config.event_loop,
+            loop=loop,
+            where=f"worker {worker.index}",
+        )
+        worker.loop = loop
+        worker.loop_kind = kind
+        worker.app.attach_loop(loop)
         worker.ready.set()
         async with self._date_tick(worker.date_box, worker.connections):
             try:
@@ -809,6 +869,16 @@ class Server:
                     )
                 if worker.error is not None:
                     raise worker.error
+            kinds = {worker.loop_kind for worker in workers}
+            if kinds != {self.config.event_loop}:
+                raise StarioError(
+                    "worker event loops do not match STARIO_LOOP",
+                    help_text=(
+                        f"configured {self.config.event_loop}, workers running "
+                        f"{', '.join(sorted(k for k in kinds if k is not None)) or 'nothing'}."
+                    ),
+                )
+            span.attr("server.worker_event_loop", self.config.event_loop)
             span.attr("server.listening", True)
             span.end()
             try:

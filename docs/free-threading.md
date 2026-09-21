@@ -1,9 +1,11 @@
 # Free-threaded Stario (Python 3.14t)
 
 `STARIO_THREADS=N` (default `1`) runs **one asyncio loop per OS thread** in a
-single process. Every worker calls the same loop runner as `Server.run()`
-(`asyncio.run` or `uvloop.run` from `STARIO_LOOP`). Bootstrap still runs
-once. `Relay` stays in-process.
+single process. `Server.loop_runner()` resolves `STARIO_LOOP` once:
+stdlib asyncio (explicit loop factory, so a process-wide uvloop policy
+cannot leak in) or `uvloop.run`. Every worker calls that runner and
+refuses to start if the live loop is the other library. Bootstrap still
+runs once. `Relay` stays in-process.
 
 `N=1` is the historical server. `N>1` requires free-threaded Python 3.14t
 with the GIL still off, unless `STARIO_THREADS_ALLOW_GIL=1`.
