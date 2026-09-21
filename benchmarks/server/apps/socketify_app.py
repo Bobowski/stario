@@ -5,10 +5,19 @@ from io import BytesIO
 
 import ujson
 
-from apps.common import validate_fields
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 from socketify import App, AppListenOptions
 
-HELLO = "Hello, World!"
 app = App()
 app.json_serializer(ujson)
 
@@ -48,41 +57,37 @@ async def _read_body(res) -> bytes:
         _unpin(res)
 
 
+def _text(res, line: str | bytes):
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    res.write_header("Content-Type", TEXT_CONTENT_TYPE_STR)
+    res.end(body)
+
+
 def plaintext(res, req):
-    res.end(HELLO)
+    _text(res, PLAINTEXT_BODY)
 
 
-def json_endpoint(res, req):
-    res.end({"message": HELLO})
+def read_request(res, req):
+    _text(
+        res,
+        request_line(
+            req.get_parameter(0),
+            query_value(req.get_query("q")),
+            as_str(req.get_header(REQUEST_HEADER)),
+        ),
+    )
 
 
-def get_user(res, req):
-    user_id = req.get_parameter(0)
-    res.end({"id": user_id, "name": f"User {user_id}"})
-
-
-async def validate(res, req):
+async def post_json(res, req):
     raw = await _read_body(res)
-    body = ujson.loads(raw) if raw else {}
-    payload, status = validate_fields(body)
-    if status != 200:
-        return res.write_status(status).end(payload)
-    res.end(payload)
-
-
-async def post_form(res, req):
-    await _read_body(res)
-    res.write_status(204).end_without_body()
-
-
-async def post_echo_json(res, req):
-    data = await _read_body(res)
-    res.end({"bytes": len(data)})
+    await yield_once()
+    _text(res, json_echo_line(ujson.loads(raw) if raw else {}))
 
 
 async def ingest_buffer(res, req):
     data = await _read_body(res)
-    res.end({"bytes": len(data)})
+    await yield_once()
+    _text(res, bytes_line(len(data)))
 
 
 async def _read_stream(res) -> int:
@@ -111,20 +116,19 @@ async def _read_stream(res) -> int:
 
 async def ingest_stream(res, req):
     total = await _read_stream(res)
-    res.end({"bytes": total})
+    await yield_once()
+    _text(res, bytes_line(total))
 
 
 async def upload(res, req):
     data = await _read_body(res)
-    res.end({"bytes": len(data)})
+    await yield_once()
+    _text(res, bytes_line(len(data)))
 
 
 app.get("/plaintext", plaintext)
-app.get("/json", json_endpoint)
-app.get("/user/:user_id", get_user)
-app.post("/validate", validate)
-app.post("/form", post_form)
-app.post("/echo/json", post_echo_json)
+app.get("/user/:user_id", read_request)
+app.post("/echo", post_json)
 app.post("/ingest/64k", ingest_buffer)
 app.post("/ingest/2m", ingest_buffer)
 app.post("/ingest/stream/2m", ingest_stream)

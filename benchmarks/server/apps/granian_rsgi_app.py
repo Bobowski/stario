@@ -2,14 +2,19 @@
 
 import ujson
 
-from apps.common import validate_fields
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_param,
+    request_line,
+    yield_once,
+)
 
-HELLO = "Hello, World!"
-JSON_HEADERS = [("content-type", "application/json")]
-
-
-def _json_bytes(value: object) -> bytes:
-    return ujson.dumps(value).encode()
+TEXT_HEADERS = [("content-type", TEXT_CONTENT_TYPE_STR)]
 
 
 async def _read_buffer(proto) -> bytes:
@@ -23,6 +28,10 @@ async def _read_stream(proto) -> int:
     return total
 
 
+def _text(proto, line: str) -> None:
+    proto.response_bytes(200, TEXT_HEADERS, line.encode("ascii"))
+
+
 async def app(scope, proto):
     if scope.proto != "http":
         return
@@ -30,42 +39,32 @@ async def app(scope, proto):
     path, method = scope.path, scope.method
 
     if method == "GET" and path == "/plaintext":
-        proto.response_str(
-            200,
-            [("content-type", "text/plain; charset=utf-8")],
-            HELLO,
-        )
-    elif method == "GET" and path == "/json":
-        proto.response_bytes(
-            200,
-            JSON_HEADERS,
-            _json_bytes({"message": HELLO}),
-        )
+        proto.response_bytes(200, TEXT_HEADERS, PLAINTEXT_BODY)
     elif method == "GET" and path.startswith("/user/"):
         user_id = path.rsplit("/", 1)[-1]
-        proto.response_bytes(
-            200,
-            JSON_HEADERS,
-            _json_bytes({"id": user_id, "name": f"User {user_id}"}),
+        _text(
+            proto,
+            request_line(
+                user_id,
+                query_param(scope.query_string, "q"),
+                as_str(scope.headers.get(REQUEST_HEADER)),
+            ),
         )
-    elif method == "POST" and path == "/validate":
+    elif method == "POST" and path == "/echo":
         raw = await _read_buffer(proto)
-        payload, status = validate_fields(ujson.loads(raw))
-        proto.response_bytes(status, JSON_HEADERS, _json_bytes(payload))
-    elif method == "POST" and path == "/form":
-        await _read_buffer(proto)
-        proto.response_empty(204, [])
-    elif method == "POST" and path == "/echo/json":
-        raw = await _read_buffer(proto)
-        proto.response_bytes(200, JSON_HEADERS, _json_bytes({"bytes": len(raw)}))
+        await yield_once()
+        _text(proto, json_echo_line(ujson.loads(raw) if raw else {}))
     elif method == "POST" and path in {"/ingest/64k", "/ingest/2m"}:
         raw = await _read_buffer(proto)
-        proto.response_bytes(200, JSON_HEADERS, _json_bytes({"bytes": len(raw)}))
+        await yield_once()
+        _text(proto, bytes_line(len(raw)))
     elif method == "POST" and path == "/ingest/stream/2m":
         total = await _read_stream(proto)
-        proto.response_bytes(200, JSON_HEADERS, _json_bytes({"bytes": total}))
+        await yield_once()
+        _text(proto, bytes_line(total))
     elif method == "POST" and path == "/upload":
         raw = await _read_buffer(proto)
-        proto.response_bytes(200, JSON_HEADERS, _json_bytes({"bytes": len(raw)}))
+        await yield_once()
+        _text(proto, bytes_line(len(raw)))
     else:
         proto.response_str(404, [], "Not Found")

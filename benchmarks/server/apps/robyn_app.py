@@ -4,15 +4,22 @@ import os
 
 import ujson
 from robyn import Config, Robyn
-from robyn.jsonify import jsonify
 from robyn.robyn import Headers, Response
 
-from apps.common import validate_fields
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
 config = Config()
 app = Robyn(__file__, config=config)
-
-HELLO = "Hello, World!"
 
 
 def _body_bytes(request) -> bytes:
@@ -22,64 +29,80 @@ def _body_bytes(request) -> bytes:
     return body or b""
 
 
+def _query_map(request) -> object:
+    return getattr(request, "query_params", None) or getattr(request, "queries", {})
+
+
+def _header(request, name: str) -> str:
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return ""
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return ""
+    for key in (name, name.title(), name.upper()):
+        try:
+            value = getter(key)
+        except TypeError:
+            value = getter(key, None)
+        if value:
+            return as_str(value)
+    return ""
+
+
+def text_response(line: str | bytes) -> Response:
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    return Response(
+        status_code=200,
+        headers=Headers({"Content-Type": TEXT_CONTENT_TYPE_STR}),
+        description=body,
+    )
+
+
 @app.get("/plaintext")
 async def plaintext():
-    return HELLO
-
-
-@app.get("/json")
-async def json_endpoint():
-    return {"message": HELLO}
+    return text_response(PLAINTEXT_BODY)
 
 
 @app.get("/user/:user_id")
-async def get_user(request):
-    user_id = request.path_params["user_id"]
-    return {"id": user_id, "name": f"User {user_id}"}
+async def read_request(request):
+    params = _query_map(request)
+    getter = getattr(params, "get", None)
+    q = query_value(getter("q", "") if getter else None)
+    return request_line(
+        request.path_params["user_id"],
+        q,
+        _header(request, REQUEST_HEADER),
+    )
 
 
-@app.post("/validate")
-async def validate(request):
+@app.post("/echo")
+async def post_json(request):
     raw = _body_bytes(request)
-    payload, status = validate_fields(ujson.loads(raw) if raw else {})
-    if status != 200:
-        return Response(
-            status_code=status,
-            headers=Headers({"Content-Type": "application/json"}),
-            description=jsonify(payload),
-        )
-    return payload
-
-
-@app.post("/form")
-async def post_form(request):
-    _body_bytes(request)
-    return "", 204
-
-
-@app.post("/echo/json")
-async def post_echo_json(request):
-    body = _body_bytes(request)
-    return {"bytes": len(body)}
+    await yield_once()
+    return json_echo_line(ujson.loads(raw) if raw else {})
 
 
 @app.post("/ingest/64k")
 @app.post("/ingest/2m")
 async def ingest_buffer(request):
     body = _body_bytes(request)
-    return {"bytes": len(body)}
+    await yield_once()
+    return bytes_line(len(body))
 
 
 @app.post("/ingest/stream/2m")
 async def ingest_stream(request):
     body = _body_bytes(request)
-    return {"bytes": len(body)}
+    await yield_once()
+    return bytes_line(len(body))
 
 
 @app.post("/upload")
 async def upload(request):
     body = _body_bytes(request)
-    return {"bytes": len(body)}
+    await yield_once()
+    return bytes_line(len(body))
 
 
 if __name__ == "__main__":

@@ -106,8 +106,8 @@ server cannot be reused by accident.
 
 | Target | Server |
 | --- | --- |
-| `stario` | Cython llhttp/nghttp2 via `stario serve` |
-| `stario-cython` | Same protocol via `python -m stario_cython` |
+| `stario` | Cython llhttp + nghttp2 (`stario serve`) |
+| `stario-cython` | Same runtime via `python -m stario_cython` |
 
 **Native HTTP servers**
 
@@ -125,87 +125,110 @@ server cannot be reused by accident.
 | --- | --- |
 | `blacksheep-granian` | BlackSheep + Granian ASGI |
 | `blacksheep-uvicorn` | BlackSheep + Uvicorn |
-| `fastapi` | FastAPI + Uvicorn + Pydantic |
+| `fastapi` | FastAPI + Uvicorn |
 | `falcon` | Falcon ASGI + Uvicorn |
 
 ### Benchmark shape
 
 - One worker/process per target.
-- Same read paths: `/plaintext`, `/json`, `/user/42`.
-- Same upload/body paths (see **Endpoint tiers** below).
+- Same paths and response bytes per endpoint (see **Endpoint tiers**).
 - Same `wrk` settings per tier; large uploads use fewer connections
-  (`UPLOAD_CONNECTIONS`, default 32) than read-heavy cases (`CONNECTIONS`,
-  default 128).
+  (`UPLOAD_CONNECTIONS`, default 32) than GET cases (`CONNECTIONS`, default 128).
 - Each endpoint is measured multiple times (`RUNS`, default 7). The first
   `WARMUP` samples are discarded, then IQR outlier trimming is applied before
   reporting median requests/sec ± sample stdev.
 - Stario response compression disabled with negative codec levels.
-- JSON response bodies use `ujson` where the stack allows it.
 - Access logging and OpenAPI docs disabled for competitors where configurable.
 
-FastAPI uses Pydantic validation, matching the referenced benchmark. Stario,
-BlackSheep, Sanic, Socketify, Robyn, and Granian RSGI validate the JSON body
-manually. Django-Bolt uses msgspec structs.
+The progression follows a normal app: a static page, then a request that actually
+reads incoming fields, then async body work from a small JSON POST up through
+buffered, streamed, and multipart uploads. FastAPI routes stay on Starlette
+`Route` (no Pydantic models). Incoming JSON is parsed with `ujson` where the
+stack allows it; **responses are always plain text**, so JSON serializers cannot
+win a case.
 
 ### Endpoint tiers
 
-| Tier | Endpoints | Paths |
+| Tier | Endpoints | What it measures |
 | --- | --- | --- |
-| **read** | `plaintext`, `json`, `params` | `GET /plaintext`, `GET /json`, `GET /user/42` |
-| **upload** | see below | POST body / multipart cases |
+| **static** | `plaintext` | Prebuilt body, fixed method + path |
+| **request** | `request` | Path param + query + header, interpolated text |
+| **read** | static + request | Both GET cases |
+| **upload** | see below | Async body work, small → large |
+| **app** | request + upload | Everything except the static page |
 | **all** | read + upload | default |
 
-Upload endpoints (all targets implement the same semantics):
+GET endpoints:
 
-| Endpoint key | Path | Client payload | Server behavior |
-| --- | --- | --- | --- |
-| `validate` | `POST /validate` | JSON `{"name":"Ada","age":42}` | Validate fields, return JSON |
-| `post-form` | `POST /form` | urlencoded form | Read body, `204 No Content` |
-| `post-json-1k` | `POST /echo/json` | 1 KB JSON | Buffered read, return `{"bytes": N}` |
-| `post-octet-64k` | `POST /ingest/64k` | 64 KB octet stream | Buffered read |
-| `post-octet-2m` | `POST /ingest/2m` | 2 MB octet stream | Buffered read |
-| `post-stream-2m` | `POST /ingest/stream/2m` | 2 MB octet stream | Streaming read (where supported) |
-| `multipart-2m` | `POST /upload` | 2 MB multipart file | Read multipart/raw body |
+| Endpoint key | Path | Client | Server reads | Response |
+| --- | --- | --- | --- | --- |
+| `plaintext` | `GET /plaintext` | Fixed URL | nothing | prebuilt `Hello, World!` |
+| `request` | `GET /user/{id}` | wrk cycles 4096 ids, `q`, and `X-Request-Id` | path `user_id`, query `q`, header `x-request-id` | `user={id} q={q} x={header}` |
+
+`request` uses a working set of 4096 unique paths, larger than Stario's
+`find_handler` LRU (1024). Query `q=term{N}` and header `X-Request-Id: h{N}`
+vary with the same counter. The body is a single interpolated line so the
+checkpoint is that those values appear; there is no JSON encode step.
+
+Upload endpoints (every handler `await`s `asyncio.sleep(0)` after reading, so
+the case is an async operation, not a sync function declared `async def`):
+
+| Endpoint key | Path | Client payload | Server behavior | Response |
+| --- | --- | --- | --- | --- |
+| `json-small` | `POST /echo` | JSON `{"name":"Ada","age":42}` | Parse object, `await` | `name=Ada age=42` |
+| `post-octet-64k` | `POST /ingest/64k` | 64 KB octet stream | Buffered read, `await` | `bytes=N` |
+| `post-octet-2m` | `POST /ingest/2m` | 2 MB octet stream | Buffered read, `await` | `bytes=N` |
+| `post-stream-2m` | `POST /ingest/stream/2m` | 2 MB octet stream | Streaming read, `await` | `bytes=N` |
+| `multipart-2m` | `POST /upload` | 2 MB multipart file | Read body, `await` | `bytes=N` |
+
+`asyncio.sleep(0)` yields once with no timer delay. It does not cap throughput
+at `1 / delay`. Robyn and Django-Bolt buffer the full body on the stream route
+(no request streaming API). All other targets use chunked streaming reads on
+`POST /ingest/stream/2m`.
 
 Binary fixtures live under `benchmarks/server/fixtures/` (generated on demand,
-gitignored). Lua scripts under `benchmarks/server/scripts/` load those fixtures.
-
-Robyn and Django-Bolt buffer the full body on the stream route (no request
-streaming API). All other targets use chunked streaming reads on
-`POST /ingest/stream/2m`.
+gitignored). Lua scripts under `benchmarks/server/scripts/` drive wrk.
 
 ### Route parity
 
-Every app exposes the same paths and response shapes:
+Every app exposes the same paths and response lines:
 
 | Route | Method | Response |
 | --- | --- | --- |
-| `/plaintext` | GET | `Hello, World!` |
-| `/json` | GET | `{"message":"Hello, World!"}` |
-| `/user/{id}` | GET | `{"id":"…","name":"User …"}` |
-| `/validate` | POST | `validate_fields()` → JSON + status |
-| `/form` | POST | read body → `204` |
-| `/echo/json` | POST | read body → `{"bytes":N}` |
-| `/ingest/64k`, `/ingest/2m` | POST | buffered read → `{"bytes":N}` |
-| `/ingest/stream/2m` | POST | stream read → `{"bytes":N}` (buffered on Robyn/Django-Bolt) |
-| `/upload` | POST | read raw body → `{"bytes":N}` |
+| `/plaintext` | GET | prebuilt `Hello, World!` |
+| `/user/{id}` | GET | `user={id} q={q} x={x-request-id}` |
+| `/echo` | POST | `name={name} age={age}` after `await` |
+| `/ingest/64k`, `/ingest/2m` | POST | `bytes={n}` after buffered read + `await` |
+| `/ingest/stream/2m` | POST | `bytes={n}` after stream read + `await` |
+| `/upload` | POST | `bytes={n}` after body read + `await` |
 
-Validation uses `apps.common.validate_fields()` on every target. JSON responses
-use `ujson` where the stack allows it.
+`apps.common.request_line` / `json_echo_line` / `bytes_line` are the exact
+strings. The GET `request` case reads:
 
-### Handler policy (no static responses)
+- path parameter `user_id`
+- query parameter `q`
+- header `x-request-id`
 
-Benchmark handlers must **compute every response on each request**: build dicts,
-run `validate_fields`, call `ujson.dumps` / framework JSON helpers, and construct
-`Response` objects per call. Do **not**:
+### Handler policy
 
-- Reuse a single `Response` / `PlainTextResponse` instance across requests
-- Pre-serialize JSON at import time and return cached bytes
-- Skip validation or serialization because the wrk payload is fixed
+**Static** (`plaintext`): return a prebuilt body. The app side may be fully
+optimized. Do not serialize or allocate payload bytes per request. A new
+`Response` wrapper is fine when the framework requires one.
 
-Framework-specific routing or server tuning is fine when output bytes and status
-codes stay identical. The goal is to measure handler + serialization work, not
-wire throughput of prebuilt buffers.
+**Request fields** (`request`): on every request, read the path param, query
+`q`, and `x-request-id`, and interpolate them into `request_line`. wrk must
+vary all three (`scripts/get-user.lua`). Do not JSON-encode the result.
+
+**Uploads**: read the body (or stream it) every time, then `await` via
+`apps.common.yield_once` (`asyncio.sleep(0)`). `json-small` parses the object
+and interpolates `name` and `age`; larger cases report `bytes={n}`. Declaring
+`async def` and never awaiting is not this case.
+
+Framework-specific routing or server tuning is fine when output bytes and
+status codes stay identical.
+
+Older committed baselines (`baseline-20260827.md` and later) used a single
+`/user/42` URL and JSON responses. They are not comparable to this suite.
 
 ### Requirements
 
@@ -238,14 +261,14 @@ The default run benchmarks every target above.
 - `CONNECTIONS=128` (read-heavy and small upload cases)
 - `UPLOAD_CONNECTIONS=32` (64 KB / 2 MB upload cases)
 - `RUNS=7` measured samples per endpoint (plus `WARMUP=2` discarded warmup runs)
-- `ENDPOINT_TIER=all|read|upload` (default `all`)
+- `ENDPOINT_TIER=all|static|request|read|upload|app` (default `all`)
 - `PORT=3000` as the base port
 - one process or worker per target
 
 Use those defaults when you want numbers that are easiest to compare with
 other local runs. The generated `config.txt` records the exact settings for
 that run. The summary groups results into **Stario**, **Native HTTP servers**,
-and **ASGI framework stacks**.
+and **ASGI framework stacks**, with Static / Request fields / Upload tables.
 
 Common options:
 
@@ -253,7 +276,9 @@ Common options:
 DURATION=30s THREADS=2 CONNECTIONS=128 RUNS=9 WARMUP=2 benchmarks/server/run.sh
 benchmarks/server/run.sh stario stario-cython socketify robyn granian-rsgi
 ENDPOINT_TIER=upload benchmarks/server/run.sh
-ENDPOINTS=validate,post-form,post-json-1k benchmarks/server/run.sh stario
+ENDPOINT_TIER=static benchmarks/server/run.sh stario stario-cython
+ENDPOINT_TIER=request benchmarks/server/run.sh
+ENDPOINTS=json-small,post-octet-64k benchmarks/server/run.sh stario
 PORT=3999 benchmarks/server/run.sh
 REFRESH_ENVS=1 benchmarks/server/run.sh
 KEEP_RAW=1 benchmarks/server/run.sh
@@ -272,7 +297,9 @@ Each run writes a timestamped directory under `benchmarks/server/results/`:
 - `config.txt` — run settings.
 
 A committed reference baseline (hardware, methodology, Python vs Cython tables)
-lives at `benchmarks/server/baseline-20260827.md`. Sync-handler capture vs
+lives at `benchmarks/server/baseline-20260827.md`. Framework comparison on the
+reshaped suite (static / request fields / async uploads):
+[`baseline-20260921.md`](server/baseline-20260921.md). Sync-handler capture vs
 Granian and others: `benchmarks/server/baseline-20260829.md`. Timestamped
 `results/` dirs remain gitignored.
 
@@ -280,8 +307,9 @@ Successful runs keep only `summary.md` and `config.txt` by default. Use
 `KEEP_RAW=1` to keep the per-endpoint `wrk` output and server logs. Failed
 runs leave the logs in place so startup issues can be inspected.
 
-POST endpoints use small Lua scripts under `benchmarks/server/` so every case runs
-through `wrk`. `validate.lua` is the simplest example:
+`wrk` Lua scripts live under `benchmarks/server/` and `benchmarks/server/scripts/`.
+GET `request` varies path, query, and `X-Request-Id` (`scripts/get-user.lua`).
+POST cases set method, body, and content type. `validate.lua` is the small JSON:
 
 ```lua
 wrk.method = "POST"
