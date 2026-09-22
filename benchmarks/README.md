@@ -299,8 +299,10 @@ Each run writes a timestamped directory under `benchmarks/server/results/`:
 - `config.txt` — run settings.
 
 A committed reference baseline (hardware, methodology, Python vs Cython tables)
-lives at `benchmarks/server/baseline-20260827.md`. Framework comparison on the
-reshaped suite (static / request fields / async uploads):
+lives at `benchmarks/server/baseline-20260827.md`. Current **cython-core**
+capture on the reshaped suite (static / request fields / async uploads):
+[`baseline-20260921-core.md`](server/baseline-20260921-core.md). Dual Python
+vs Cython capture from before this merge:
 [`baseline-20260921.md`](server/baseline-20260921.md).
 `STARIO_THREADS` 1 vs 2 vs 4 on 3.14t (`SO_REUSEPORT`, N full servers):
 [`baseline-threads-reuseport-20260921.md`](server/baseline-threads-reuseport-20260921.md).
