@@ -6,8 +6,8 @@ this module re-exports them for env wiring.
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
 from ssl import SSLContext
+from typing import Literal
 
 from stario._env import (
     env_bool,
@@ -37,6 +37,7 @@ DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
 DEFAULT_REUSE_ADDR = True
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
 DEFAULT_EVENT_LOOP = "asyncio"
+DEFAULT_THREADS = 1
 
 type EventLoopKind = Literal["asyncio", "uvloop"]
 
@@ -165,6 +166,7 @@ class ServerConfig:
         "requests",
         "reuse_addr",
         "ssl",
+        "threads",
         "unix_socket",
         "unix_socket_mode",
     )
@@ -182,6 +184,7 @@ class ServerConfig:
         backlog: int = DEFAULT_BACKLOG,
         reuse_addr: bool = DEFAULT_REUSE_ADDR,
         event_loop: EventLoopKind = DEFAULT_EVENT_LOOP,
+        threads: int = DEFAULT_THREADS,
         ssl: SSLContext | None = None,
         ssl_certfile: str | Path | None = None,
         ssl_keyfile: str | Path | None = None,
@@ -221,6 +224,16 @@ class ServerConfig:
                 "event_loop must be 'asyncio' or 'uvloop'",
                 help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
             )
+        if threads < 1:
+            raise StarioError(
+                "threads must be at least 1",
+                help_text="Set STARIO_THREADS to 1 (default) or a positive worker count.",
+            )
+        if threads > 256:
+            raise StarioError(
+                "threads must be at most 256",
+                help_text="Set STARIO_THREADS to a smaller worker count.",
+            )
         if ssl is not None and (ssl_certfile is not None or ssl_keyfile is not None):
             raise StarioError(
                 "pass either ssl= or ssl_certfile=, not both",
@@ -244,6 +257,7 @@ class ServerConfig:
         self.backlog = backlog
         self.reuse_addr = reuse_addr
         self.event_loop: EventLoopKind = event_loop
+        self.threads = threads
         if ssl is not None:
             self.ssl = ssl
         elif ssl_certfile is not None:
@@ -283,6 +297,7 @@ def server_config_from_env() -> ServerConfig:
             backlog=env_int("STARIO_BACKLOG", DEFAULT_BACKLOG),
             reuse_addr=env_bool("STARIO_REUSE_ADDR", DEFAULT_REUSE_ADDR),
             event_loop=_event_loop_from_env(),
+            threads=env_int("STARIO_THREADS", DEFAULT_THREADS),
             ssl_certfile=env_optional_str("STARIO_SSL_CERTFILE"),
             ssl_keyfile=env_optional_str("STARIO_SSL_KEYFILE"),
         )

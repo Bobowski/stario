@@ -91,3 +91,26 @@ async def test_stario_benchmark_app_route_shapes() -> None:
             headers={"content-type": "application/octet-stream"},
         )
         assert ingest.text == "bytes=64"
+
+
+def test_peer_apps_use_reshaped_routes() -> None:
+    """Comparison apps must match the official suite, not the old /json /validate set."""
+    names = (
+        "stario_app.py",
+        "granian_rsgi_app.py",
+        "socketify_app.py",
+        "robyn_app.py",
+        "sanic_app.py",
+        "fastapi_app.py",
+        "blacksheep_app.py",
+        "falcon_app.py",
+        "django_bolt/api.py",
+    )
+    forbidden = ("validate_fields", 'add_route("/json"', 'add_route("/validate"')
+    for name in names:
+        text = (SERVER_DIR / "apps" / name).read_text()
+        for token in forbidden:
+            assert token not in text, f"{name} still mentions {token!r}"
+        assert "/plaintext" in text
+        assert "/echo" in text
+        assert "/user/" in text or "/user/:" in text or "/user/{" in text

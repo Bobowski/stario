@@ -46,6 +46,7 @@ def _uvloop_config(
         "backlog": cfg.backlog,
         "reuse_addr": cfg.reuse_addr,
         "event_loop": "uvloop",
+        "threads": cfg.threads,
         "ssl": cfg.ssl,
     }
     values.update(overrides)
