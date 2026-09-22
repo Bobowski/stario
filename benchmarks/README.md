@@ -306,6 +306,8 @@ reshaped suite (static / request fields / async uploads):
 [`baseline-threads-reuseport-20260921.md`](server/baseline-threads-reuseport-20260921.md).
 Same-day head-to-head vs Granian RSGI `--workers` 1/2/4 (3.14t threads and
 GIL processes): [`baseline-threads-vs-granian-20260921.md`](server/baseline-threads-vs-granian-20260921.md).
+RSS / PSS and OS threads during a wrk spike, and which Granian workers are
+actually threads: [`baseline-rss-threads-20260922.md`](server/baseline-rss-threads-20260922.md).
 Earlier acceptor-handoff capture (same host, superseded runtime):
 [`baseline-threads-20260921.md`](server/baseline-threads-20260921.md). Sync-handler capture vs
 Granian and others: `benchmarks/server/baseline-20260829.md`. Timestamped
