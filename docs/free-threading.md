@@ -17,6 +17,8 @@ in-process.
 
 The rest of this note is the design: why one loop per thread, what had to
 be locked or made thread-local, and how app state should cross workers.
+Where the 3.14t time goes, and why another listen strategy will not move
+the keep-alive benches, is [`free-threading-perf.md`](free-threading-perf.md).
 
 ## Why this is worth it
 
