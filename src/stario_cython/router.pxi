@@ -14,7 +14,51 @@ compile time (same Match identity). Param hits allocate one Match + one
 params dict. 404/405 tuples are interned on the node.
 """
 
+import sys
+
+from cpython.dict cimport PyDict_GetItem
+from cpython.object cimport PyObject
 from cpython.unicode cimport PyUnicode_AsUTF8AndSize, PyUnicode_DecodeUTF8
+
+cdef extern from *:
+    """
+    /* Match(pattern, params) without running Match.__init__ in Python:
+       allocate, then fill the two slots (GenericSetAttr skips the class's
+       immutable __setattr__), params frozen as a mappingproxy. */
+    static PyObject* stario_new_match(
+        PyObject* cls,
+        PyObject* pattern_name,
+        PyObject* pattern,
+        PyObject* params_name,
+        PyObject* params
+    ) {
+        PyObject* proxy;
+        PyObject* m = PyType_GenericAlloc((PyTypeObject*)cls, 0);
+        if (m == NULL) {
+            return NULL;
+        }
+        proxy = PyDictProxy_New(params);
+        if (proxy == NULL) {
+            Py_DECREF(m);
+            return NULL;
+        }
+        if (PyObject_GenericSetAttr(m, pattern_name, pattern) < 0
+            || PyObject_GenericSetAttr(m, params_name, proxy) < 0) {
+            Py_DECREF(proxy);
+            Py_DECREF(m);
+            return NULL;
+        }
+        Py_DECREF(proxy);
+        return m;
+    }
+    """
+    object stario_new_match(
+        object cls,
+        object pattern_name,
+        object pattern,
+        object params_name,
+        object params,
+    )
 
 cdef object _ROUTER_EMPTY_ROUTE = None
 cdef object _ROUTER_EMPTY_MATCH = None
@@ -124,6 +168,8 @@ cdef CNode _compile_node(object node):
     if endpoints:
         out.endpoints = {}
         for method, endpoint in endpoints.items():
+            # Interned so the protocol's method constants hit by identity.
+            method = sys.intern(method)
             match = _ROUTER_MATCH_CLS(endpoint.route.pattern)
             hit = _pack(endpoint.handler, endpoint.route, match)
             out.endpoints[method] = hit
@@ -227,9 +273,10 @@ cdef inline object _finish(
     int* status,
 ):
     cdef object endpoints
-    cdef object hit
+    cdef object hit = None
     cdef object packed
     cdef object factory
+    cdef PyObject* found
     endpoints = node.endpoints
     if endpoints is None:
         status[0] = 2
@@ -237,15 +284,19 @@ cdef inline object _finish(
     if node.one_method is not None and method is node.one_method:
         hit = node.one_hit
     else:
-        hit = endpoints.get(method)
+        found = PyDict_GetItem(<dict>endpoints, method)
+        if found != NULL:
+            hit = <object>found
     if hit is not None:
         status[0] = 0
-        if params is not None:
+        if params:
             packed = <tuple>hit
             return _pack(
                 packed[0],
                 packed[1],
-                _ROUTER_MATCH_CLS(packed[2].pattern, params),
+                stario_new_match(
+                    _ROUTER_MATCH_CLS, "pattern", packed[2].pattern, "params", params
+                ),
             )
         return hit
     status[0] = 1

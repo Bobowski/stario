@@ -18,8 +18,8 @@ from stario.http.headers import Headers
 from stario.http.host import host_without_port
 from stario.http.query import ParsedQuery
 from stario.http.request import ParsedCookies
-from stario.testing.transport import GrowingSink
 from stario.telemetry.core import Span
+from stario.testing.transport import GrowingSink
 
 if TYPE_CHECKING:
     from stario.http.app import App
@@ -158,7 +158,9 @@ class TestWriter:
         if not self._headers_event.is_set():
             self._headers_event.set()
 
-    def respond(self, body: bytes, content_type: bytes | str, status: int = 200) -> None:
+    def respond(
+        self, body: bytes, content_type: bytes | str, status: int = 200
+    ) -> None:
         if self._completed:
             return
         if self._status_code is not None:

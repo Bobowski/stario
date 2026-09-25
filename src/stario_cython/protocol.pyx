@@ -45,6 +45,7 @@ from cpython.bytes cimport (
     PyBytes_GET_SIZE,
 )
 from cpython.exc cimport PyErr_Clear
+from cpython.object cimport PyObject_Call
 from cpython.unicode cimport (
     PyUnicode_AsUTF8AndSize,
     PyUnicode_DecodeASCII,
@@ -211,6 +212,7 @@ cdef enum:
 cdef bytes H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 cdef object _settings_lock = Lock()
 cdef object _asyncio_Task = asyncio.Task
+cdef object _task_done = asyncio.Task.done
 cdef object _log = logging.getLogger("stario.http")
 
 
@@ -670,6 +672,10 @@ cdef class CHttpProtocol(Connection):
     cdef bint h1_headers_too_large
     cdef int deferred_status
     cdef list _write_waiters
+    # Bound once per connection: skips a method lookup on every request.
+    cdef object _t_is_closing
+    cdef dict _task_kw_eager
+    cdef dict _task_kw_lazy
     cdef object deferred_body
     cdef bint deferred_head
 
@@ -708,6 +714,9 @@ cdef class CHttpProtocol(Connection):
         self.deferred_body = None
         self.deferred_head = False
         self._write_waiters = []
+        self._t_is_closing = None
+        self._task_kw_eager = None
+        self._task_kw_lazy = None
         self._app_state = None
         self._in_buf = None
         self._in_view = None
@@ -740,6 +749,9 @@ cdef class CHttpProtocol(Connection):
         self.loop = loop
         self.app = app
         self.tracer = tracer
+        # Task(coro, loop=..., eager_start=...) without building kwargs per call.
+        self._task_kw_eager = {"loop": loop, "eager_start": True}
+        self._task_kw_lazy = {"loop": loop, "eager_start": False}
         self.noop_span = (
             tracer.create("request") if isinstance(tracer, NoOpTracer) else None
         )
@@ -781,6 +793,7 @@ cdef class CHttpProtocol(Connection):
         cdef object ssl_object
         cdef object selected
         self.transport = transport
+        self._t_is_closing = transport.is_closing
         self.closed = False
         self.disconnect = None
         self.pause_reasons = 0
@@ -862,6 +875,7 @@ cdef class CHttpProtocol(Connection):
         self.held_offset = 0
         self.pump_scheduled = False
         self.transport = None
+        self._t_is_closing = None
 
     cdef void release_exchange(self, RequestExchange exchange):
         """Detach, then keep one idle on this connection or recycle on this thread."""
@@ -971,8 +985,7 @@ cdef class CHttpProtocol(Connection):
         cdef object transport
         if self.timeout_cleanup == CLEANUP_OFF:
             return
-        transport = self.transport
-        if transport is None or transport.is_closing() or seconds <= 0:
+        if seconds <= 0 or self._closing():
             return
         self.timeout_kind = kind
         # Sweeper fills now+seconds on the next Date tick. Avoid loop.time()
@@ -1303,6 +1316,15 @@ cdef class CHttpProtocol(Connection):
             return fut
         return None
 
+    cdef inline bint _closing(self) noexcept:
+        cdef object is_closing = self._t_is_closing
+        if is_closing is None:
+            return True
+        try:
+            return bool(is_closing())
+        except Exception:
+            return True
+
     cdef bint _header_too_large(self, size_t length) noexcept:
         self.head_bytes += <int>length
         if self.head_bytes > self.max_header_bytes:
@@ -1465,7 +1487,7 @@ cdef class CHttpProtocol(Connection):
         exchange.cache_hot_request_headers()
         if self.request_dispatched or self.rejected:
             return
-        if self.transport is None or self.transport.is_closing():
+        if self._closing():
             return
         try:
             if (
@@ -1537,7 +1559,7 @@ cdef class CHttpProtocol(Connection):
             and not self.rejected
         ):
             try:
-                if self.transport is None or self.transport.is_closing():
+                if self._closing():
                     self.reading_exchange = None
                     return
                 self._bind_request(exchange)
@@ -1762,6 +1784,7 @@ cdef class CHttpProtocol(Connection):
         cdef CRouter router
         cdef RequestHandle h
         cdef bint host_routing
+        cdef object kw
         if not exchange._http2:
             self.active_exchange = exchange
         method = exchange._method
@@ -1813,15 +1836,12 @@ cdef class CHttpProtocol(Connection):
         # frees the connection via response_completed; the Task may outlive the
         # response. Incomplete work joins app.tasks so shutdown drain sees it.
         h = exchange.start_handle()
-        task = _asyncio_Task(
-            exchange._handler(h, h),
-            loop=self.loop,
-            eager_start=eager_start,
-        )
+        kw = self._task_kw_eager if eager_start else self._task_kw_lazy
+        task = PyObject_Call(_asyncio_Task, (exchange._handler(h, h),), kw)
         # Recycle counts references to ``h`` to spot user code that kept it.
         h = None
         exchange._handler_task = task
-        if task.done():
+        if _task_done(task):
             # Skip only a clean NoOp success. Write-then-raise / cancel / an
             # incomplete response must still hit on_handler_done (log + abort).
             if (
@@ -1876,7 +1896,7 @@ cdef class CHttpProtocol(Connection):
         if self.active_exchange is not exchange:
             return
         self.active_exchange = None
-        if transport is None or transport.is_closing():
+        if self._closing():
             self._drop_pending()
             return
         # User may have set Connection: close on the response Headers.
@@ -2963,6 +2983,12 @@ cdef class CHttpProtocol(Connection):
         self._h2_send()
 
     cpdef object c_get_buffer(self, Py_ssize_t sizehint):
+        return self._get_buffer(sizehint)
+
+    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
+        self._buffer_updated(nbytes)
+
+    cdef object _get_buffer(self, Py_ssize_t sizehint):
         """Reusable read buffer. Consume it in buffer_updated before reuse.
 
         SSL/uvloop want a writable memoryview. Cache one for the current
@@ -2997,7 +3023,7 @@ cdef class CHttpProtocol(Connection):
             return self._in_view
         return self._in_view[:want]
 
-    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
+    cdef void _buffer_updated(self, Py_ssize_t nbytes):
         cdef const char* ptr
         if self.rejected or nbytes <= 0 or self._in_buf is None:
             return
@@ -3073,7 +3099,7 @@ class HttpProtocol(CHttpProtocol, asyncio.BufferedProtocol):
     """Python subclass so uvloop/asyncio can find BufferedProtocol methods."""
 
     def get_buffer(self, sizehint):
-        return self.c_get_buffer(sizehint)
+        return (<CHttpProtocol>self)._get_buffer(sizehint)
 
     def buffer_updated(self, nbytes):
-        self.c_buffer_updated(nbytes)
+        (<CHttpProtocol>self)._buffer_updated(nbytes)

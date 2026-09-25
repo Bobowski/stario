@@ -155,16 +155,6 @@ cdef int ENCODING_NONE = 0
 cdef int ENCODING_BR = 1
 cdef int ENCODING_GZIP = 2
 
-cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
-cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
-cdef bytes STATUS_304 = b"HTTP/1.1 304 Not Modified\r\n"
-cdef bytes STATUS_308 = b"HTTP/1.1 308 Permanent Redirect\r\n"
-cdef bytes STATUS_400 = b"HTTP/1.1 400 Bad Request\r\n"
-cdef bytes STATUS_404 = b"HTTP/1.1 404 Not Found\r\n"
-cdef bytes STATUS_405 = b"HTTP/1.1 405 Method Not Allowed\r\n"
-cdef bytes STATUS_413 = b"HTTP/1.1 413 Payload Too Large\r\n"
-cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
-cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
 cdef bytes CE_PREFIX = b"content-encoding: "
 cdef bytes VARY_PREFIX = b"vary: "
@@ -370,32 +360,27 @@ cdef inline int _require_final_status(int status) except -1:
     return 0
 
 
+cdef list _build_status_lines():
+    cdef list lines = [None] * 600
+    cdef int status
+    for status in range(100, 600):
+        try:
+            phrase = http.HTTPStatus(status).phrase.encode("ascii")
+        except ValueError:
+            phrase = b""
+        lines[status] = b"HTTP/1.1 %d %s\r\n" % (status, phrase)
+    return lines
+
+
+# Every status line 100-599, built once (was an HTTPStatus lookup per
+# response for anything but the ten most common codes).
+cdef list _STATUS_LINES = _build_status_lines()
+
+
 cdef object _status_line(int status):
-    if status == 200:
-        return STATUS_200
-    if status == 204:
-        return STATUS_204
-    if status == 304:
-        return STATUS_304
-    if status == 308:
-        return STATUS_308
-    if status == 400:
-        return STATUS_400
-    if status == 404:
-        return STATUS_404
-    if status == 405:
-        return STATUS_405
-    if status == 413:
-        return STATUS_413
-    if status == 431:
-        return STATUS_431
-    if status == 500:
-        return STATUS_500
-    try:
-        phrase = http.HTTPStatus(status).phrase.encode("ascii")
-    except ValueError:
-        phrase = b""
-    return b"HTTP/1.1 %d %s\r\n" % (status, phrase)
+    if 100 <= status < 600:
+        return _STATUS_LINES[status]
+    return b"HTTP/1.1 %d \r\n" % status
 
 
 cdef object _dec(size_t n):
@@ -2851,6 +2836,8 @@ cdef class RequestExchange:
             self._connection = connection
             self.app = app
             self._transport = transport
+            self._t_is_closing = transport.is_closing if transport is not None else None
+            self._t_writelines = transport.writelines if transport is not None else None
             self._date_box = date_box
             if self._compression is not compression:
                 self._compression = compression
@@ -3188,6 +3175,8 @@ cdef class RequestExchange:
         self.app = None
         self._connection = None
         self._transport = None
+        self._t_is_closing = None
+        self._t_writelines = None
         if self._spare_handle is not None:
             self._spare_handle._conn = None
             self._spare_handle.app = None
@@ -3215,7 +3204,7 @@ cdef class RequestExchange:
         cdef Py_ssize_t nbytes
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
-        if self._transport.is_closing():
+        if self._t_is_closing():
             if not self._completed:
                 self._completed = True
                 self._done()
@@ -3259,14 +3248,14 @@ cdef class RequestExchange:
         ):
             if not _may_have_body(status):
                 # RFC 9110 §8.6: no Content-Length on 204; 304 omits it too.
-                self._transport.writelines((
+                self._t_writelines((
                     _status_line(status),
                     self._date_box[0],
                     CRLF,
                 ))
             elif nbytes and not self._head_request:
                 if isinstance(body, (list, tuple)):
-                    self._transport.writelines((
+                    self._t_writelines((
                         _status_line(status),
                         self._date_box[0],
                         CT_PREFIX,
@@ -3275,9 +3264,9 @@ cdef class RequestExchange:
                         _dec(<size_t>nbytes),
                         CRLF2,
                     ))
-                    self._transport.writelines(body)
+                    self._t_writelines(body)
                 elif nbytes <= OUTPUT_BUFFER_RETAIN_MAX:
-                    self._transport.writelines((
+                    self._t_writelines((
                         _status_line(status),
                         self._date_box[0],
                         CT_PREFIX,
@@ -3288,7 +3277,7 @@ cdef class RequestExchange:
                         body,
                     ))
                 else:
-                    self._transport.writelines((
+                    self._t_writelines((
                         _status_line(status),
                         self._date_box[0],
                         CT_PREFIX,
@@ -3299,7 +3288,7 @@ cdef class RequestExchange:
                     ))
                     self._transport.write(body)
             else:
-                self._transport.writelines((
+                self._t_writelines((
                     _status_line(status),
                     self._date_box[0],
                     CT_PREFIX,
@@ -3384,7 +3373,7 @@ cdef class RequestExchange:
             self._status_code = status
             if nbytes and not self._head_request:
                 if isinstance(body, (list, tuple)):
-                    self._transport.writelines(body)
+                    self._t_writelines(body)
                 else:
                     self._transport.write(body)
         self._status_code = status

@@ -210,6 +210,9 @@ cpdef CRouter compile_router(object router)
 
 cdef class RequestExchange:
     cdef object _transport
+    # transport.is_closing / .writelines, bound once per connection.
+    cdef object _t_is_closing
+    cdef object _t_writelines
     cdef list _date_box
     cdef object _compression
     cdef int _req_encoding
