@@ -231,7 +231,14 @@ class Router:
         return self._host_routing
 
     def find_handler(self, host: str, path: str, method: str) -> RouteMatch:
-        """`host` must already be lowercased (`Request.host`)."""
+        """Resolve `(host, path, method)`.
+
+        `host` must already be lowercased (`Request.host`). `path` is the
+        request path as sent (`Request.raw_path`, still percent-encoded): it is
+        split on `/` first and each segment is decoded on its own, so `%2F`
+        never adds a segment. Plain paths like `/users/42` are the same either
+        way.
+        """
         return self._lookup(host, path, method)
 
     def _invalidate_lookup(self) -> None:

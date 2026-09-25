@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from stario.http.app import App
 from stario.http.headers import Headers
@@ -47,9 +47,16 @@ def wire_dispatch(
     loop = asyncio.get_running_loop()
     disconnect = loop.create_future()
     root_span = tracer.create(pm)
+    raw_path = ppath.encode("ascii")
+    try:
+        path = decode_path(raw_path)
+    except ValueError:
+        # App.__call__ answers 400 from raw_path, like the HTTP protocol.
+        path = ppath
     request = TestRequest(
         method=pm,
-        path=ppath,
+        path=path,
+        raw_path=raw_path,
         query_bytes=pqs.encode("ascii"),
         headers=phdrs,
         body=pbody,
@@ -70,7 +77,7 @@ def wire_dispatch(
         client_request=ClientRequest(
             method=pm,
             url=purl,
-            path=ppath,
+            path=path,
             query_string=pqs,
             headers=phdrs,
             content=pbody,
@@ -103,7 +110,8 @@ def prepare_request(
         raise ValueError("Use `files` with optional form `data`, not raw `content`.")
 
     parsed = urlsplit(urljoin(base_url + "/", url.lstrip("/")))
-    path = decode_path((parsed.path or "/").encode("ascii"))
+    # Wire form: keep existing %XX escapes, encode anything else a client would.
+    path = quote(parsed.path or "/", safe="/%!$&'()*+,;=:@~")
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
     if params is not None:
         query_items.extend(expand_pairs(params))

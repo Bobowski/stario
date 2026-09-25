@@ -23,10 +23,23 @@ cdef enum:
     ABORT_DISCONNECTED = 2
     ABORT_TIMEOUT = 3
 
+# ``scan_request_path`` result bits (a negative result means 400).
+cdef enum:
+    PATH_HAS_PCT = 1
+    PATH_REDIRECT = 2
+    PATH_RAW_UTF8 = 4
+    # Set by the protocol, never by the scanner.
+    PATH_BAD = 8
+    PATH_OPTIONS_STAR = 16
+
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1
 cdef object _intern_name(const char* src, size_t n)
 cdef object _encode_name(str name)
 cdef bint host_value_ok(const char* value, size_t n) noexcept
+cdef object _host_without_port_n(const char* s, Py_ssize_t n)
+cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noexcept
+cdef object decode_path_full(const char* p, Py_ssize_t n)
+cdef bytes canonical_path(const char* p, Py_ssize_t n)
 
 cdef class Headers:
     cdef list _names
@@ -76,6 +89,10 @@ cdef class ParsedCookies:
     cdef object _get_lines(self, const char* name, Py_ssize_t nlen)
     cdef bint _has_any(self)
 
+cdef class RequestExchange
+cdef class RequestHeaders
+cdef class RequestHandle
+
 cdef class Request:
     cdef public object method
     cdef public object path
@@ -83,7 +100,10 @@ cdef class Request:
     cdef public object protocol_version
     cdef public bint keep_alive
     cdef object _query_bytes
-    cdef object _q_owner
+    cdef object _raw_path
+    cdef RequestHeaders _view
+    cdef Py_ssize_t _p_off
+    cdef Py_ssize_t _p_len
     cdef Py_ssize_t _q_off
     cdef Py_ssize_t _q_len
     cdef public object _body
@@ -93,8 +113,8 @@ cdef class Request:
 
     cdef object _materialize_query(self)
     cdef object _ensure_query(self)
-    cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept
     cdef void prefetch_host(self) noexcept
+    cdef void detach_body(self, RequestExchange exchange) noexcept
 
 cdef Request make_request(
     object method,
@@ -104,8 +124,6 @@ cdef Request make_request(
     object headers,
     object body,
 )
-
-cdef class RequestExchange
 
 cdef class Connection:
     """Typed protocol surface used by RequestExchange (cpdef = virtual)."""
@@ -181,6 +199,7 @@ cdef class CRouter:
         object host,
         const char* path_p,
         Py_ssize_t path_n,
+        bint decode,
         object method,
         RequestExchange exchange,
     )
@@ -237,13 +256,16 @@ cdef class RequestExchange:
     cdef public object span
     cdef public object match
     cdef Connection _connection
-    cdef object _state
-    cdef public object request_headers
+    cdef RequestHeaders _req_view
+    cdef RequestHandle _handle
     cdef Request _req
     cdef object _method
     cdef object _path
     cdef object _version
+    cdef object _target_host
     cdef bint _keep_alive
+    cdef int _path_flags
+    cdef Py_ssize_t _path_off
     cdef Py_ssize_t _path_n
     cdef Py_ssize_t _query_off
     cdef Py_ssize_t _query_len
@@ -312,10 +334,18 @@ cdef class RequestExchange:
     cdef void _h2_respond(self, object body, object content_type, int status, Py_ssize_t nbytes)
     cdef void start_response(self)
     cdef void _clear_request_binding(self) noexcept
+    cdef const char* path_ptr(self, Py_ssize_t* n) noexcept
+    cdef RequestHeaders _ensure_view(self)
     cdef Request ensure_request(self)
+    cdef RequestHandle start_handle(self)
+    cdef void _detach_views(self)
     cdef object decode_request_path(self)
     cdef object host_from_arena(self)
     cpdef void respond(self, object body, object content_type, int status=*)
+    cpdef object write_headers(self, int status_code, bint body=*)
+    cpdef object write(self, object data)
+    cpdef void end(self, object data=*)
+    cpdef void abort(self)
     cdef void handler_finished(self)
     cdef void cancel_before_start(self)
     cdef void _maybe_recycle(self)
@@ -393,8 +423,25 @@ cdef class RequestExchange:
     cdef void _maybe_pause(self)
 
 cdef class RequestHeaders:
-    cdef object _owner
+    # Live view of the exchange arena while the request runs; owns a copy
+    # once the exchange is recycled and something still holds this view.
+    cdef RequestExchange _ex
+    cdef char* _own_arena
+    cdef Py_ssize_t _own_arena_len
+    cdef RawHeader* _own_headers
+    cdef Py_ssize_t _own_count
+    cdef Py_ssize_t _own_host
+    cdef Py_ssize_t _own_cookie
+    cdef Py_ssize_t _own_auth
 
+    cdef const char* _arena(self) noexcept
+    cdef Py_ssize_t _arena_len(self) noexcept
+    cdef RawHeader* _headers(self) noexcept
+    cdef Py_ssize_t _count(self) noexcept
+    cdef Py_ssize_t _host_index(self) noexcept
+    cdef Py_ssize_t _cookie_index(self) noexcept
+    cdef Py_ssize_t _auth_index(self) noexcept
+    cdef void _take_ownership(self) noexcept
     cdef object c_get(self, object name)
     cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept
     cdef object c_value_str(self, Py_ssize_t index)
@@ -402,6 +449,19 @@ cdef class RequestHeaders:
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length)
     cdef object c_request_indexed(self, Py_ssize_t index)
     cdef void c_parse_cookies(self, dict out) except *
+
+cdef class RequestHandle:
+    # Per-request ``c`` / ``w``. ``_ex`` is None once the exchange is recycled.
+    cdef RequestExchange _ex
+    cdef Connection _conn
+    cdef public object app
+    cdef public object span
+    cdef public object match
+    cdef object _state
+    cdef Request _req
+    cdef int _final_status
+
+    cpdef void respond(self, object body, object content_type, int status=*)
 
 cdef RequestExchange acquire_exchange(
     Connection connection,

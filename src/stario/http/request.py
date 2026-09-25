@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     class Request(Protocol):
         method: str
         path: str
+        """Fully percent-decoded path (``%2F`` becomes ``/``)."""
+        raw_path: bytes
+        """Path exactly as sent: percent-encoded, no query. Routing uses this."""
         headers: Headers
         protocol_version: str
         keep_alive: bool

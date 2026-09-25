@@ -12,6 +12,7 @@ cimport cython
 import asyncio
 import http
 import threading
+from urllib.parse import quote as _url_quote
 
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
@@ -32,6 +33,7 @@ from cpython.bytes cimport (
 from cpython.list cimport PyList_GET_ITEM, PyList_GET_SIZE
 from cpython.exc cimport PyErr_Clear, PyErr_Occurred
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
+from cpython.ref cimport Py_REFCNT
 from cpython.unicode cimport (
     PyUnicode_AsUTF8AndSize,
     PyUnicode_DecodeASCII,
@@ -160,7 +162,6 @@ cdef bytes STATUS_405 = b"HTTP/1.1 405 Method Not Allowed\r\n"
 cdef bytes STATUS_413 = b"HTTP/1.1 413 Payload Too Large\r\n"
 cdef bytes STATUS_431 = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
 cdef bytes STATUS_500 = b"HTTP/1.1 500 Internal Server Error\r\n"
-cdef bytes ZERO_CL = b"content-length: 0\r\n\r\n"
 cdef bytes CT_PREFIX = b"content-type: "
 cdef bytes CE_PREFIX = b"content-encoding: "
 cdef bytes VARY_PREFIX = b"vary: "
@@ -344,6 +345,17 @@ cdef inline bint _may_have_body(int status) noexcept:
     return not (100 <= status < 200)
 
 
+cdef inline int _require_final_status(int status) except -1:
+    # RFC 9110 §15: final responses are 200-599 (1xx is interim, >599 invalid).
+    if status < 200 or status > 599:
+        raise StarioError(
+            "Invalid response status",
+            context={"status": status},
+            help_text="Send a final status between 200 and 599.",
+        )
+    return 0
+
+
 cdef object _status_line(int status):
     if status == 200:
         return STATUS_200
@@ -413,6 +425,233 @@ cdef bint host_value_ok(const char* value, size_t n) noexcept:
         ):
             return False
     return True
+
+
+cdef inline int _utf8_step(
+    int* need,
+    int* lo,
+    int* hi,
+    unsigned char b,
+) noexcept:
+    """One byte of strict UTF-8 (no overlongs, surrogates, or > U+10FFFF)."""
+    if need[0] == 0:
+        if b < 0x80:
+            return 0
+        lo[0] = 0x80
+        hi[0] = 0xBF
+        if 0xC2 <= b <= 0xDF:
+            need[0] = 1
+        elif b == 0xE0:
+            need[0] = 2
+            lo[0] = 0xA0
+        elif 0xE1 <= b <= 0xEC or 0xEE <= b <= 0xEF:
+            need[0] = 2
+        elif b == 0xED:
+            need[0] = 2
+            hi[0] = 0x9F
+        elif b == 0xF0:
+            need[0] = 3
+            lo[0] = 0x90
+        elif 0xF1 <= b <= 0xF3:
+            need[0] = 3
+        elif b == 0xF4:
+            need[0] = 3
+            hi[0] = 0x8F
+        else:
+            return -1
+        return 0
+    if b < lo[0] or b > hi[0]:
+        return -1
+    lo[0] = 0x80
+    hi[0] = 0xBF
+    need[0] -= 1
+    return 0
+
+
+cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noexcept:
+    """Validate an origin-form path (no query) and classify it.
+
+    Returns ``PATH_*`` bits, or -1 for a path that must be rejected with 400:
+    not starting with ``/``; ``#``, space, or controls on the wire; a bad
+    ``%XX``; a decoded control byte (C0 or DEL); or decoded bytes that are
+    not strict UTF-8. ``PATH_REDIRECT`` marks dot segments (``.``, ``..``,
+    including ``%2E`` forms) or a trailing slash: the canonical path differs.
+    """
+    cdef int flags = 0
+    cdef Py_ssize_t i
+    cdef Py_ssize_t seg_len = 0
+    cdef bint seg_dots = True
+    cdef int need = 0
+    cdef int lo = 0x80
+    cdef int hi = 0xBF
+    cdef int h1
+    cdef int h2
+    cdef unsigned char c
+    cdef unsigned char d
+    if n <= 0 or p[0] != 47:
+        return -1
+    i = 1
+    while True:
+        if i == n or p[i] == 47:
+            if need != 0:
+                return -1
+            if seg_dots and (seg_len == 1 or seg_len == 2):
+                flags |= PATH_REDIRECT
+            if i == n:
+                break
+            seg_len = 0
+            seg_dots = True
+            i += 1
+            continue
+        c = <unsigned char>p[i]
+        if c == 37:
+            if i + 2 >= n:
+                return -1
+            h1 = _hex_nibble(<unsigned char>p[i + 1])
+            h2 = _hex_nibble(<unsigned char>p[i + 2])
+            if h1 < 0 or h2 < 0:
+                return -1
+            d = <unsigned char>(h1 * 16 + h2)
+            flags |= PATH_HAS_PCT
+            i += 3
+        else:
+            if c <= 32 or c == 127 or c == 35 or c == 63:
+                return -1
+            if c >= 128:
+                if not allow_raw_utf8:
+                    return -1
+                flags |= PATH_RAW_UTF8
+            d = c
+            i += 1
+        if d < 32 or d == 127:
+            return -1
+        if _utf8_step(&need, &lo, &hi, d) != 0:
+            return -1
+        seg_len += 1
+        if d != 46:
+            seg_dots = False
+    if n > 1 and p[n - 1] == 47:
+        flags |= PATH_REDIRECT
+    return flags
+
+
+cdef Py_ssize_t _pct_decode_into(const char* src, Py_ssize_t n, char* dst) noexcept:
+    """Decode every ``%XX`` (``%2F`` included). -1 on a malformed escape."""
+    cdef Py_ssize_t i = 0
+    cdef Py_ssize_t w = 0
+    cdef int h1
+    cdef int h2
+    while i < n:
+        if src[i] == 37:
+            if i + 2 >= n:
+                return -1
+            h1 = _hex_nibble(<unsigned char>src[i + 1])
+            h2 = _hex_nibble(<unsigned char>src[i + 2])
+            if h1 < 0 or h2 < 0:
+                return -1
+            dst[w] = <char>(h1 * 16 + h2)
+            i += 3
+        else:
+            dst[w] = src[i]
+            i += 1
+        w += 1
+    return w
+
+
+cdef object decode_path_full(const char* p, Py_ssize_t n):
+    """Fully percent-decoded path as ``str``, or None if it is not valid UTF-8."""
+    cdef char stack[512]
+    cdef char* buf = stack
+    cdef Py_ssize_t w
+    cdef object out
+    if n <= 0:
+        return ""
+    if n > 512:
+        buf = <char*>malloc(<size_t>n)
+        if buf == NULL:
+            return None
+    try:
+        w = _pct_decode_into(p, n, buf)
+        if w < 0:
+            return None
+        out = PyUnicode_DecodeUTF8(buf, w, NULL)
+        return out
+    except UnicodeDecodeError:
+        return None
+    finally:
+        if buf != stack:
+            free(buf)
+
+
+cdef int _dot_kind(bytes seg):
+    cdef bytes plain = seg
+    if len(seg) > 6:
+        return 0
+    if b"%" in seg:
+        plain = seg.replace(b"%2e", b".").replace(b"%2E", b".")
+    if plain == b".":
+        return 1
+    if plain == b"..":
+        return 2
+    return 0
+
+
+cdef bytes canonical_path(const char* p, Py_ssize_t n):
+    """Canonical form of a scanned path for a 308 ``Location``.
+
+    RFC 3986 dot-segment removal (``%2E`` counts as ``.``, as in the WHATWG
+    URL parser), then no trailing slash. Other segments stay exactly as sent,
+    percent-encoding included. Leading empty segments are dropped so the
+    target can never be protocol-relative (``//host``), and ``\\`` is sent as
+    ``%5C`` because browsers treat a raw backslash as ``/``.
+    """
+    cdef list out = []
+    cdef bytes seg
+    cdef int kind
+    cdef bytes raw = PyBytes_FromStringAndSize(p, n)
+    for seg in raw.split(b"/")[1:]:
+        kind = _dot_kind(seg)
+        if kind == 1:
+            continue
+        if kind == 2:
+            if out:
+                out.pop()
+            continue
+        out.append(seg)
+    while out and not out[len(out) - 1]:
+        out.pop()
+    while out and not out[0]:
+        out.pop(0)
+    return (b"/" + b"/".join(out)).replace(b"\\", b"%5C")
+
+
+def canonical_request_path(raw):
+    """``(status, target)`` for a raw origin-form path (bytes, no query).
+
+    ``(200, None)`` routes as-is, ``(308, canonical)`` redirects, and
+    ``(400, None)`` rejects. Same rules as the HTTP protocol.
+    """
+    cdef bytes data = bytes(raw)
+    cdef int flags = scan_request_path(
+        PyBytes_AS_STRING(data), PyBytes_GET_SIZE(data), False
+    )
+    if flags < 0:
+        return 400, None
+    if flags & PATH_REDIRECT:
+        return 308, canonical_path(PyBytes_AS_STRING(data), PyBytes_GET_SIZE(data))
+    return 200, None
+
+
+def decode_request_path(raw):
+    """Fully decoded ``str`` for a raw request path; ``ValueError`` if invalid."""
+    cdef bytes data = bytes(raw)
+    cdef object out
+    if scan_request_path(PyBytes_AS_STRING(data), PyBytes_GET_SIZE(data), True) < 0:
+        raise ValueError(f"invalid request path: {data[:120]!r}")
+    out = decode_path_full(PyBytes_AS_STRING(data), PyBytes_GET_SIZE(data))
+    if out is None:
+        raise ValueError(f"invalid request path: {data[:120]!r}")
+    return out
 
 
 cdef object _decode_latin1(const char* s, Py_ssize_t n):
@@ -718,7 +957,8 @@ cdef class ParsedQuery:
         self._reset_view()
 
     cdef bint _resolve_span(self, const char** out, Py_ssize_t* n) noexcept:
-        cdef RequestExchange owner
+        cdef RequestHeaders view
+        cdef const char* arena
         n[0] = self._len
         if n[0] <= 0:
             out[0] = NULL
@@ -727,11 +967,13 @@ cdef class ParsedQuery:
             out[0] = PyBytes_AS_STRING(self._raw)
             return True
         if self._owner is not None:
-            owner = <RequestExchange>self._owner
-            if owner._req_arena != NULL:
-                out[0] = owner._req_arena + self._off
+            view = <RequestHeaders>self._owner
+            arena = view._arena()
+            if arena != NULL and self._off + self._len <= view._arena_len():
+                out[0] = arena + self._off
                 return True
         out[0] = NULL
+        n[0] = 0
         return False
 
     cdef int _grow_params(self, Py_ssize_t need) except -1:
@@ -1264,24 +1506,26 @@ cdef class ParsedCookies:
 
     cdef object _get_arena(self, const char* name, Py_ssize_t nlen):
         cdef RequestHeaders headers
-        cdef RequestExchange owner
+        cdef RawHeader* raw
+        cdef const char* arena
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef object found
         headers = <RequestHeaders>self._headers
-        owner = <RequestExchange>headers._owner
-        if owner._req_cookie_index < 0:
+        if headers._cookie_index() < 0:
             return None
-        for index in range(owner._req_raw_count - 1, -1, -1):
-            header = &owner._req_raw_headers[index]
+        arena = headers._arena()
+        raw = headers._headers()
+        for index in range(headers._count() - 1, -1, -1):
+            header = &raw[index]
             if header.name_length != 6 or memcmp(
-                owner._req_arena + header.name_offset,
+                arena + header.name_offset,
                 "cookie",
                 6,
             ) != 0:
                 continue
             found = _cookie_find_in_line(
-                owner._req_arena + header.value_offset,
+                arena + header.value_offset,
                 <Py_ssize_t>header.value_length,
                 name,
                 nlen,
@@ -1364,7 +1608,8 @@ cdef class ParsedCookies:
         cdef list lines
         cdef bytes raw
         cdef RequestHeaders headers
-        cdef RequestExchange owner
+        cdef const char* arena
+        cdef RawHeader* table
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef Py_ssize_t i
@@ -1374,20 +1619,21 @@ cdef class ParsedCookies:
         cdef Py_ssize_t val_end
         if self._headers is not None and isinstance(self._headers, RequestHeaders):
             headers = <RequestHeaders>self._headers
-            owner = <RequestExchange>headers._owner
-            if owner._req_cookie_index < 0:
+            if headers._cookie_index() < 0:
                 return False
-            for index in range(owner._req_raw_count):
-                header = &owner._req_raw_headers[index]
+            arena = headers._arena()
+            table = headers._headers()
+            for index in range(headers._count()):
+                header = &table[index]
                 if header.name_length != 6 or memcmp(
-                    owner._req_arena + header.name_offset,
+                    arena + header.name_offset,
                     "cookie",
                     6,
                 ) != 0:
                     continue
                 i = 0
                 if _next_cookie_pair(
-                    owner._req_arena + header.value_offset,
+                    arena + header.value_offset,
                     <Py_ssize_t>header.value_length,
                     &i,
                     &name_start,
@@ -1539,9 +1785,27 @@ cdef object _host_without_port_n(const char* s, Py_ssize_t n):
     return _ascii_lower_latin1(s + start, end - start)
 
 
+cdef bytes _quote_path(object path):
+    """Wire form of a decoded path (for ``Request(path=...)`` built by hand)."""
+    return _url_quote(path or "/", safe="/!$&'()*+,;=:@~").encode("ascii")
+
+
+cdef object _BODY_GONE = object()
+cdef object BODY_GONE_ERROR = (
+    "Request body is no longer available after its handler finished."
+)
+
+
 @cython.final
 cdef class Request:
-    """One HTTP request. New object per dispatch; not pooled with the exchange."""
+    """One HTTP request. New object per dispatch; not pooled with the exchange.
+
+    Headers, query, and host read the exchange arena while the handler runs.
+    If the Request (or its headers / query / cookies) is still referenced when
+    the exchange is recycled, it takes a private copy, so it stays valid after
+    the handler returns. The body is only readable while the handler runs,
+    unless it was already read.
+    """
 
     def __cinit__(self):
         self.method = None
@@ -1550,7 +1814,10 @@ cdef class Request:
         self.protocol_version = None
         self.keep_alive = True
         self._query_bytes = None
-        self._q_owner = None
+        self._raw_path = None
+        self._view = None
+        self._p_off = 0
+        self._p_len = 0
         self._q_off = 0
         self._q_len = 0
         self._body = None
@@ -1568,6 +1835,7 @@ cdef class Request:
         keep_alive=True,
         headers=None,
         body=None,
+        raw_path=None,
     ):
         self.method = method
         self.path = path
@@ -1575,7 +1843,10 @@ cdef class Request:
         self.protocol_version = protocol_version
         self.keep_alive = keep_alive
         self._query_bytes = query_bytes
-        self._q_owner = None
+        self._raw_path = (
+            _quote_path(path) if raw_path is None else bytes(raw_path)
+        )
+        self._view = None
         self._q_off = 0
         self._q_len = 0
         self._body = body
@@ -1583,20 +1854,28 @@ cdef class Request:
         self._cookies = None
         self._host = None
 
-    cdef void bind_query_span(self, object owner, Py_ssize_t off, Py_ssize_t n) noexcept:
-        # Remember where the query sits in the exchange arena. ParsedQuery
-        # is built only if the handler reads ``req.query``.
-        self._q_owner = owner
-        self._q_off = off
-        self._q_len = n
-        self._query_bytes = None
-        self._query = None
+    cdef void detach_body(self, RequestExchange exchange) noexcept:
+        """Called when the exchange is recycled while this Request is still held."""
+        cdef object cached
+        if self._body is not exchange:
+            return
+        cached = exchange._cached
+        if (
+            type(cached) is bytes
+            and not exchange._discard_body
+            and exchange._consumed_as != CONSUMED_STREAM
+            and exchange._abort_reason == ABORT_NONE
+        ):
+            self._body = cached
+        else:
+            self._body = _BODY_GONE
 
     cdef void prefetch_host(self) noexcept:
-        cdef RequestHeaders req_headers
-        cdef RequestExchange owner
+        cdef RequestHeaders view
         cdef Headers hdrs
         cdef RawHeader* header
+        cdef Py_ssize_t index
+        cdef const char* arena
         cdef object host_wire
         cdef object host_str
         cdef const char* p
@@ -1604,14 +1883,15 @@ cdef class Request:
         if self._host is not None:
             return
         if isinstance(self.headers, RequestHeaders):
-            req_headers = <RequestHeaders>self.headers
-            owner = <RequestExchange>req_headers._owner
-            if owner._req_host_index < 0 or owner._req_arena == NULL:
+            view = <RequestHeaders>self.headers
+            index = view._host_index()
+            arena = view._arena()
+            if index < 0 or arena == NULL:
                 self._host = ""
                 return
-            header = &owner._req_raw_headers[owner._req_host_index]
+            header = &view._headers()[index]
             self._host = _host_without_port_n(
-                owner._req_arena + header.value_offset,
+                arena + header.value_offset,
                 <Py_ssize_t>header.value_length,
             )
             return
@@ -1642,17 +1922,17 @@ cdef class Request:
         self._host = _host_without_port_n(p, n)
 
     cdef object _materialize_query(self):
-        cdef RequestExchange owner
+        cdef const char* arena
         if self._query_bytes is not None:
             return self._query_bytes
-        if self._q_len <= 0 or self._q_owner is None:
+        if self._q_len <= 0 or self._view is None:
             self._query_bytes = b""
             return self._query_bytes
-        owner = <RequestExchange>self._q_owner
-        self._query_bytes = PyBytes_FromStringAndSize(
-            owner._req_arena + self._q_off,
-            self._q_len,
-        )
+        arena = self._view._arena()
+        if arena == NULL or self._q_off + self._q_len > self._view._arena_len():
+            self._query_bytes = b""
+            return self._query_bytes
+        self._query_bytes = PyBytes_FromStringAndSize(arena + self._q_off, self._q_len)
         return self._query_bytes
 
     cdef object _ensure_query(self):
@@ -1660,12 +1940,27 @@ cdef class Request:
         if self._query is not None:
             return self._query
         parsed = ParsedQuery.__new__(ParsedQuery)
-        if self._q_len > 0:
-            parsed.bind_span(self._q_owner, self._q_off, self._q_len)
+        if self._q_len > 0 and self._view is not None:
+            parsed.bind_span(self._view, self._q_off, self._q_len)
         else:
             parsed.bind_bytes(self._materialize_query())
         self._query = parsed
         return parsed
+
+    @property
+    def raw_path(self):
+        """Path bytes exactly as sent (still percent-encoded, no query)."""
+        cdef const char* arena
+        if self._raw_path is not None:
+            return self._raw_path
+        if self._view is None:
+            return b"/"
+        arena = self._view._arena()
+        if self._p_len <= 0 or arena == NULL or self._p_off + self._p_len > self._view._arena_len():
+            self._raw_path = b"/"
+        else:
+            self._raw_path = PyBytes_FromStringAndSize(arena + self._p_off, self._p_len)
+        return self._raw_path
 
     @property
     def query_bytes(self):
@@ -1696,6 +1991,7 @@ cdef class Request:
         return self._cookies
 
     async def body(self, max_size=None):
+        cdef object data
         if max_size is not None and max_size < 0:
             raise ValueError("max_size must be non-negative.")
         if self._body is None:
@@ -1704,7 +2000,10 @@ cdef class Request:
             if max_size is not None and len(self._body) > max_size:
                 raise RequestBodyError(413, "Request body too large")
             return self._body
-        return await self._body.read(max_size=max_size)
+        if self._body is _BODY_GONE:
+            raise StarioRuntime(BODY_GONE_ERROR)
+        data = await self._body.read(max_size=max_size)
+        return data
 
     async def stream(self, max_chunk=None):
         if self._body is None:
@@ -1712,6 +2011,8 @@ cdef class Request:
         if type(self._body) is bytes:
             yield self._body
             return
+        if self._body is _BODY_GONE:
+            raise StarioRuntime(BODY_GONE_ERROR)
         async for chunk in self._body.stream(max_chunk=max_chunk):
             yield chunk
 
@@ -1784,7 +2085,8 @@ cdef class RequestExchange:
 
     def __init__(self):
         self.headers = Headers()
-        self.request_headers = RequestHeaders(self)
+        self._req_view = None
+        self._handle = None
         self._clear_request_binding()
         self._cached = None
         self._data_ready = None
@@ -1795,7 +2097,6 @@ cdef class RequestExchange:
         self._brotli_enabled = False
         self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
-        self._state = None
         self.in_pool = False
         self._body_active = False
         self._discard_body = False
@@ -2490,7 +2791,6 @@ cdef class RequestExchange:
         self.span = None
         self.match = EMPTY_MATCH
         self._clear_request_binding()
-        self._state = None
         self._clear_request_headers()
         self.handler_done = False
         self.handler_started = False
@@ -2581,15 +2881,28 @@ cdef class RequestExchange:
         self._method = None
         self._path = None
         self._version = None
+        self._target_host = None
         self._keep_alive = True
+        self._path_flags = 0
+        self._path_off = 0
         self._path_n = 0
         self._query_off = 0
         self._query_len = 0
         self._handler = None
         self._route = None
 
+    cdef const char* path_ptr(self, Py_ssize_t* n) noexcept:
+        """Raw path bytes (no query). Absolute-form with an empty path is ``/``."""
+        if self._path_n <= 0 or self._req_arena == NULL:
+            n[0] = 1
+            return "/"
+        n[0] = self._path_n
+        return self._req_arena + self._req_url_offset + self._path_off
+
     cdef object host_from_arena(self):
         cdef RawHeader* header
+        if self._target_host is not None:
+            return self._target_host
         if self._req_host_index < 0 or self._req_arena == NULL:
             return ""
         header = &self._req_raw_headers[self._req_host_index]
@@ -2599,50 +2912,112 @@ cdef class RequestExchange:
         )
 
     cdef object decode_request_path(self):
-        cdef const char* url
-        cdef Py_ssize_t i
-        cdef Py_ssize_t n
-        cdef unsigned char c
+        """Fully decoded path. Falls back to Latin-1 of the raw bytes if invalid."""
+        cdef const char* p
+        cdef Py_ssize_t n = 0
         if self._path is not None:
             return self._path
-        n = self._path_n
-        if n <= 0 or self._req_arena == NULL:
-            self._path = ""
-            return self._path
-        url = self._req_arena + self._req_url_offset
-        for i in range(n):
-            c = <unsigned char>url[i]
-            if c == 37 or c >= 128:
-                self._path = decode_path(PyBytes_FromStringAndSize(url, n))
-                return self._path
-        self._path = PyUnicode_DecodeASCII(url, n, NULL)
+        p = self.path_ptr(&n)
+        if self._path_flags & (PATH_HAS_PCT | PATH_RAW_UTF8 | PATH_BAD):
+            self._path = decode_path_full(p, n)
+            if self._path is None:
+                self._path = PyUnicode_DecodeLatin1(p, n, NULL)
+        else:
+            self._path = PyUnicode_DecodeASCII(p, n, NULL)
         return self._path
+
+    cdef RequestHeaders _ensure_view(self):
+        cdef RequestHeaders view = self._req_view
+        if view is None:
+            view = RequestHeaders.__new__(RequestHeaders)
+            view._ex = self
+            self._req_view = view
+        return view
 
     cdef Request ensure_request(self):
         cdef Request request
+        cdef RequestHeaders view
         if self._req is not None:
             return self._req
+        view = self._ensure_view()
         request = make_request(
             self._method if self._method is not None else "GET",
             self.decode_request_path(),
             self._version if self._version is not None else "1.1",
             self._keep_alive,
-            self.request_headers,
+            view,
             self,
         )
+        request._view = view
+        if self._path_n > 0:
+            request._p_off = self._req_url_offset + self._path_off
+            request._p_len = self._path_n
+        else:
+            request._raw_path = b"/"
         if self._query_len > 0:
-            request.bind_query_span(self, self._query_off, self._query_len)
+            request._q_off = self._query_off
+            request._q_len = self._query_len
+        if self._target_host is not None:
+            request._host = self._target_host
         self._req = request
         return request
 
-    @property
-    def req(self):
-        """Lazy ``Request``. Built on first access; never pooled."""
-        return self.ensure_request()
+    cdef RequestHandle start_handle(self):
+        """Fresh ``c`` / ``w`` for this dispatch. Stale once the exchange recycles."""
+        cdef RequestHandle handle = RequestHandle.__new__(RequestHandle)
+        handle._ex = self
+        handle._conn = self._connection
+        handle.app = self.app
+        handle.span = self.span
+        handle.match = self.match
+        handle._final_status = -1
+        self._handle = handle
+        return handle
+
+    cdef void _detach_views(self):
+        """Cut every per-request object loose from this exchange.
+
+        Runs before the exchange can serve another request. A reference count
+        above our own local means user code still holds the object (a task
+        kept ``c`` / ``w`` / ``c.req`` / ``req.headers``). Those keep working
+        from a private copy; everything else is simply dropped. Either way
+        nothing handed to a handler can observe the next request.
+        """
+        cdef RequestHandle handle = self._handle
+        cdef Request request
+        cdef RequestHeaders view
+        self._handle = None
+        if handle is not None:
+            if Py_REFCNT(handle) > 1:
+                handle._req = self.ensure_request()
+                handle._final_status = self._status_code
+            handle._ex = None
+            handle = None
+        request = self._req
+        self._req = None
+        if request is not None:
+            if Py_REFCNT(request) > 1:
+                request.detach_body(self)
+            request = None
+        view = self._req_view
+        self._req_view = None
+        if view is not None:
+            if Py_REFCNT(view) > 1:
+                view._take_ownership()
+            else:
+                view._ex = None
+            view = None
+        if Py_REFCNT(self.headers) > 1:
+            # A task kept ``w.headers``; give the next response its own list.
+            self.headers = Headers()
 
     def on_handler_done(self, task):
         """Log/abort on failure, then recycle after the handler task."""
-        on_handler_done(self, self, task)
+        cdef RequestHandle handle = self._handle
+        if handle is not None:
+            on_handler_done(handle, handle, task)
+            # Drop our reference before recycle counts who still holds ``c``.
+            handle = None
         self.handler_finished()
 
     cdef void handler_finished(self):
@@ -2678,6 +3053,7 @@ cdef class RequestExchange:
         if self.in_pool:
             return
         self.in_pool = True
+        self._detach_views()
         self._clear_request_binding()
         self._cached = None
         self._data_ready = None
@@ -2708,7 +3084,6 @@ cdef class RequestExchange:
         self._clear_request_binding()
         self.span = None
         self.match = EMPTY_MATCH
-        self._state = None
         self.app = None
         self._connection = None
         self._transport = None
@@ -2743,6 +3118,7 @@ cdef class RequestExchange:
                     "then write()/end()."
                 ),
             )
+        _require_final_status(status)
         try:
             content_type = _content_type_bytes(content_type)
         except ValueError as exc:
@@ -2772,10 +3148,11 @@ cdef class RequestExchange:
             or not self._may_compress(body, content_type, False, nbytes)
         ):
             if not _may_have_body(status):
+                # RFC 9110 §8.6: no Content-Length on 204; 304 omits it too.
                 self._transport.writelines((
                     _status_line(status),
                     self._date_box[0],
-                    ZERO_CL,
+                    CRLF,
                 ))
             elif nbytes and not self._head_request:
                 if isinstance(body, (list, tuple)):
@@ -2884,12 +3261,15 @@ cdef class RequestExchange:
             if self._out_buf is None:
                 self._out_buf = bytearray(256)
             h.c_write_respond_pairs(self._out_buf, &self._out_len, False)
-            self._buf_bytes(CT_PREFIX)
-            self._buf_bytes(content_type)
-            self._buf_bytes(CRLF)
-            self._buf_bytes(CL_HEADER)
-            self._buf_uint(<size_t>nbytes, 10)
-            self._buf_bytes(CRLF2)
+            if _may_have_body(status):
+                self._buf_bytes(CT_PREFIX)
+                self._buf_bytes(content_type)
+                self._buf_bytes(CRLF)
+                self._buf_bytes(CL_HEADER)
+                self._buf_uint(<size_t>nbytes, 10)
+                self._buf_bytes(CRLF2)
+            else:
+                self._buf_bytes(CRLF)
             self._flush()
             self._status_code = status
             if nbytes and not self._head_request:
@@ -2902,7 +3282,7 @@ cdef class RequestExchange:
         self._completed = True
         self._done()
 
-    def abort(self):
+    cpdef void abort(self):
         if self._completed:
             return
         self._free_compressors()
@@ -2914,7 +3294,7 @@ cdef class RequestExchange:
             self._transport.close()
         self._done()
 
-    def write_headers(self, int status_code, bint body=True):
+    cpdef object write_headers(self, int status_code, bint body=True):
         cdef Headers headers = self.headers
         cdef object raw_length
         cdef object parsed_length
@@ -2930,11 +3310,12 @@ cdef class RequestExchange:
                     "then write()/end()."
                 ),
             )
+        _require_final_status(status_code)
         if not body:
             self._head_request = True
         if not _may_have_body(status_code):
             headers.c_remove(b"transfer-encoding")
-            headers.c_set(b"content-length", b"0")
+            headers.c_remove(b"content-length")
             self._declared_length = 0
             self._bytes_written = 0
         elif self._head_request:
@@ -3006,7 +3387,7 @@ cdef class RequestExchange:
         self._status_code = status_code
         return self
 
-    def write(self, data):
+    cpdef object write(self, object data):
         cdef Py_ssize_t n
         cdef object part
         cdef const unsigned char* native_out = NULL
@@ -3076,7 +3457,7 @@ cdef class RequestExchange:
         self._flush()
         return self
 
-    def end(self, data=None):
+    cpdef void end(self, object data=None):
         cdef object cl
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
@@ -3088,9 +3469,12 @@ cdef class RequestExchange:
             self._done()
             return
         if self._status_code < 0:
-            cl = _dec(<size_t>self._body_nbytes(data))
-            self.headers.c_set(b"content-length", cl)
-            self.write_headers(200 if data is not None else 204)
+            if data is not None:
+                cl = _dec(<size_t>self._body_nbytes(data))
+                self.headers.c_set(b"content-length", cl)
+                self.write_headers(200)
+            else:
+                self.write_headers(204)
         if data:
             self.write(data)
         if self._head_request:
@@ -3122,42 +3506,6 @@ cdef class RequestExchange:
             self._flush()
         self._completed = True
         self._done()
-
-    @property
-    def state(self):
-        if self._state is None:
-            self._state = {}
-        return self._state
-
-    @state.setter
-    def state(self, value):
-        self._state = value
-
-    @property
-    def disconnect(self):
-        return self._connection.ensure_disconnect()
-
-    @property
-    def disconnected(self):
-        cdef object connection = self._connection
-        cdef object future
-        if connection is None:
-            return True
-        if connection.closed:
-            return True
-        future = connection.disconnect
-        return future is not None and future.done()
-
-    @property
-    def shutting_down(self):
-        return self.app.shutting_down
-
-    @property
-    def closing(self):
-        return self.disconnected or self.shutting_down
-
-    def alive(self, source=None):
-        return _Alive(self, source)
 
     cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size) noexcept:
         self._body_active = True
@@ -3463,7 +3811,7 @@ cdef class RequestExchange:
         if self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
             self._raise_abort()
-        if self.disconnected:
+        if _connection_gone(self._connection):
             self._clear_body_storage()
             self._abort_reason = ABORT_DISCONNECTED
             self._raise_abort()
@@ -3585,56 +3933,136 @@ cdef class RequestExchange:
 
 @cython.final
 cdef class RequestHeaders:
-    """Read-only request headers backed by the owning exchange arena."""
+    """Read-only request headers for one request.
 
-    def __init__(self, RequestExchange owner):
-        self._owner = owner
+    While the handler runs this reads the exchange arena in place. When the
+    exchange is recycled and this view is still referenced, it copies the
+    arena and header table so it keeps answering for *its* request.
+    """
+
+    def __cinit__(self):
+        self._ex = None
+        self._own_arena = NULL
+        self._own_arena_len = 0
+        self._own_headers = NULL
+        self._own_count = 0
+        self._own_host = -1
+        self._own_cookie = -1
+        self._own_auth = -1
+
+    def __dealloc__(self):
+        if self._own_arena != NULL:
+            free(self._own_arena)
+            self._own_arena = NULL
+        if self._own_headers != NULL:
+            free(self._own_headers)
+            self._own_headers = NULL
+
+    cdef inline const char* _arena(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_arena
+        return self._own_arena
+
+    cdef inline Py_ssize_t _arena_len(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_arena_len
+        return self._own_arena_len
+
+    cdef inline RawHeader* _headers(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_raw_headers
+        return self._own_headers
+
+    cdef inline Py_ssize_t _count(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_raw_count
+        return self._own_count
+
+    cdef inline Py_ssize_t _host_index(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_host_index
+        return self._own_host
+
+    cdef inline Py_ssize_t _cookie_index(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_cookie_index
+        return self._own_cookie
+
+    cdef inline Py_ssize_t _auth_index(self) noexcept:
+        if self._ex is not None:
+            return self._ex._req_authorization_index
+        return self._own_auth
+
+    cdef void _take_ownership(self) noexcept:
+        cdef RequestExchange ex = self._ex
+        cdef Py_ssize_t n
+        cdef Py_ssize_t count
+        if ex is None:
+            return
+        n = ex._req_arena_len
+        count = ex._req_raw_count
+        self._own_host = ex._req_host_index
+        self._own_cookie = ex._req_cookie_index
+        self._own_auth = ex._req_authorization_index
+        if n > 0 and ex._req_arena != NULL:
+            self._own_arena = <char*>malloc(<size_t>n)
+            if self._own_arena != NULL:
+                memcpy(self._own_arena, ex._req_arena, <size_t>n)
+                self._own_arena_len = n
+        if count > 0 and ex._req_raw_headers != NULL and self._own_arena != NULL:
+            self._own_headers = <RawHeader*>malloc(<size_t>count * sizeof(RawHeader))
+            if self._own_headers != NULL:
+                memcpy(self._own_headers, ex._req_raw_headers, <size_t>count * sizeof(RawHeader))
+                self._own_count = count
+        if self._own_count == 0:
+            self._own_host = -1
+            self._own_cookie = -1
+            self._own_auth = -1
+        self._ex = None
 
     cdef object c_get(self, object name):
         cdef bytes key = name
         return self.c_get_n(<const char*>key, <Py_ssize_t>len(key))
 
     cdef object c_request_indexed(self, Py_ssize_t index):
-        cdef RequestExchange owner
         cdef RawHeader* header
-        if index < 0:
+        if index < 0 or index >= self._count():
             return None
-        owner = <RequestExchange>self._owner
-        header = &owner._req_raw_headers[index]
+        header = &self._headers()[index]
         return PyBytes_FromStringAndSize(
-            owner._req_arena + header.value_offset,
+            self._arena() + header.value_offset,
             header.value_length,
         )
 
     cdef object c_value_str(self, Py_ssize_t index):
-        cdef RequestExchange owner
         cdef RawHeader* header
-        if index < 0:
+        if index < 0 or index >= self._count():
             return None
-        owner = <RequestExchange>self._owner
-        header = &owner._req_raw_headers[index]
+        header = &self._headers()[index]
         return _decode_latin1(
-            owner._req_arena + header.value_offset,
+            self._arena() + header.value_offset,
             <Py_ssize_t>header.value_length,
         )
 
     cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept:
-        cdef RequestExchange owner
+        cdef RawHeader* table
         cdef RawHeader* header
+        cdef const char* arena
         cdef Py_ssize_t index
-        owner = <RequestExchange>self._owner
         if query_length == 4 and memcmp(query, "host", 4) == 0:
-            return owner._req_host_index
+            return self._host_index()
         if query_length == 6 and memcmp(query, "cookie", 6) == 0:
-            return owner._req_cookie_index
+            return self._cookie_index()
         if query_length == 13 and memcmp(query, "authorization", 13) == 0:
-            return owner._req_authorization_index
-        for index in range(owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
+            return self._auth_index()
+        table = self._headers()
+        arena = self._arena()
+        for index in range(self._count()):
+            header = &table[index]
             if (
                 header.name_length == <uint32_t>query_length
                 and memcmp(
-                    owner._req_arena + header.name_offset,
+                    arena + header.name_offset,
                     query,
                     <size_t>query_length,
                 ) == 0
@@ -3646,55 +4074,56 @@ cdef class RequestHeaders:
         return self.c_request_indexed(self.c_find_n(query, query_length))
 
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length):
-        cdef RequestExchange owner
+        cdef RawHeader* table = self._headers()
+        cdef const char* arena = self._arena()
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef Py_ssize_t start = 0
         cdef list result
-        owner = <RequestExchange>self._owner
         if query_length == 4 and memcmp(query, "host", 4) == 0:
-            start = owner._req_host_index
+            start = self._host_index()
         elif query_length == 6 and memcmp(query, "cookie", 6) == 0:
-            start = owner._req_cookie_index
+            start = self._cookie_index()
         elif query_length == 13 and memcmp(query, "authorization", 13) == 0:
-            start = owner._req_authorization_index
+            start = self._auth_index()
         if start < 0:
             return []
         result = []
-        for index in range(start, owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
+        for index in range(start, self._count()):
+            header = &table[index]
             if (
                 header.name_length == <uint32_t>query_length
                 and memcmp(
-                    owner._req_arena + header.name_offset,
+                    arena + header.name_offset,
                     query,
                     <size_t>query_length,
                 ) == 0
             ):
                 result.append(
                     PyBytes_FromStringAndSize(
-                        owner._req_arena + header.value_offset,
+                        arena + header.value_offset,
                         header.value_length,
                     )
                 )
         return result
 
     cdef void c_parse_cookies(self, dict out) except *:
-        cdef RequestExchange owner = <RequestExchange>self._owner
+        cdef RawHeader* table = self._headers()
+        cdef const char* arena = self._arena()
         cdef RawHeader* header
         cdef Py_ssize_t index
-        cdef Py_ssize_t start = owner._req_cookie_index
+        cdef Py_ssize_t start = self._cookie_index()
         if start < 0:
             return
-        for index in range(start, owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
+        for index in range(start, self._count()):
+            header = &table[index]
             if header.name_length == 6 and memcmp(
-                owner._req_arena + header.name_offset,
+                arena + header.name_offset,
                 "cookie",
                 6,
             ) == 0:
                 _parse_cookie_line(
-                    owner._req_arena + header.value_offset,
+                    arena + header.value_offset,
                     <Py_ssize_t>header.value_length,
                     out,
                 )
@@ -3741,19 +4170,20 @@ cdef class RequestHeaders:
         ]
 
     def unsafe_items(self):
-        cdef RequestExchange owner = <RequestExchange>self._owner
+        cdef RawHeader* table = self._headers()
+        cdef const char* arena = self._arena()
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef list result = []
-        for index in range(owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
+        for index in range(self._count()):
+            header = &table[index]
             result.append((
                 PyBytes_FromStringAndSize(
-                    owner._req_arena + header.name_offset,
+                    arena + header.name_offset,
                     header.name_length,
                 ),
                 PyBytes_FromStringAndSize(
-                    owner._req_arena + header.value_offset,
+                    arena + header.value_offset,
                     header.value_length,
                 ),
             ))
@@ -3769,25 +4199,181 @@ cdef class RequestHeaders:
         return self.c_find_n(buf, n) >= 0
 
     def __len__(self):
-        cdef RequestExchange owner = <RequestExchange>self._owner
+        cdef RawHeader* table = self._headers()
+        cdef const char* arena = self._arena()
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef set seen = set()
-        for index in range(owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
+        for index in range(self._count()):
+            header = &table[index]
             seen.add(
                 _intern_name(
-                    owner._req_arena + header.name_offset,
+                    arena + header.name_offset,
                     header.name_length,
                 )
             )
         return len(seen)
 
     def __bool__(self):
-        return (<RequestExchange>self._owner)._req_raw_count != 0
+        return self._count() != 0
 
     def __repr__(self):
         return f"RequestHeaders({self.items()!r})"
+
+
+cdef bint _connection_gone(object connection) except -1:
+    cdef object future
+    if connection is None or connection.closed:
+        return True
+    future = connection.disconnect
+    return future is not None and future.done()
+
+
+cdef object RESPONSE_FINISHED_ERROR = (
+    "This request has finished: its handler returned and the response is "
+    "complete, so the writer can no longer send."
+)
+
+
+cdef inline void _raise_finished() except *:
+    raise StarioRuntime(
+        RESPONSE_FINISHED_ERROR,
+        help_text=(
+            "Finish the response before the handler returns. Background work "
+            "must not write to a request whose handler already returned."
+        ),
+    )
+
+
+@cython.final
+cdef class RequestHandle:
+    """``c`` and ``w`` for one handler call (one object implements both).
+
+    The pooled exchange behind it serves many requests; this handle belongs to
+    exactly one. After the handler returns and the exchange is recycled, the
+    handle is *finished*: writes raise, ``end()`` / ``abort()`` are no-ops
+    (as on any completed writer), and reads (``req``, ``match``, ``state``,
+    ``span``, ``status_code``) keep describing this request.
+    """
+
+    def __cinit__(self):
+        self._ex = None
+        self._conn = None
+        self._state = None
+        self._req = None
+        self._final_status = -1
+
+    # --- Context ---------------------------------------------------------
+
+    @property
+    def req(self):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            return self._req
+        return ex.ensure_request()
+
+    @property
+    def state(self):
+        if self._state is None:
+            self._state = {}
+        return self._state
+
+    @state.setter
+    def state(self, value):
+        self._state = value
+
+    @property
+    def disconnect(self):
+        return self._conn.ensure_disconnect()
+
+    @property
+    def disconnected(self):
+        return _connection_gone(self._conn)
+
+    @property
+    def shutting_down(self):
+        return self.app.shutting_down
+
+    @property
+    def closing(self):
+        if self._ex is None:
+            return True
+        return self.disconnected or self.shutting_down
+
+    def alive(self, source=None):
+        return _Alive(self, source)
+
+    # --- Writer ----------------------------------------------------------
+
+    @property
+    def headers(self):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            _raise_finished()
+        return ex.headers
+
+    @property
+    def status_code(self):
+        cdef RequestExchange ex = self._ex
+        cdef int status = self._final_status if ex is None else ex._status_code
+        if status < 0:
+            return None
+        return status
+
+    @property
+    def started(self):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            return True
+        return ex._status_code >= 0
+
+    @property
+    def completed(self):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            return True
+        return ex._completed
+
+    cpdef void respond(self, body, content_type, int status=200):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            _raise_finished()
+        ex.respond(body, content_type, status)
+
+    def write_headers(self, int status_code, *, bint body=True):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            _raise_finished()
+        ex.write_headers(status_code, body)
+        return self
+
+    def write(self, data):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            _raise_finished()
+        ex.write(data)
+        return self
+
+    def end(self, data=None):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            return
+        ex.end(data)
+
+    def abort(self):
+        cdef RequestExchange ex = self._ex
+        if ex is None:
+            return
+        ex.abort()
+
+    @property
+    def _exchange_id(self):
+        """``id()`` of the pooled exchange while the handler runs (tests only)."""
+        return None if self._ex is None else id(self._ex)
+
+    def __repr__(self):
+        state = "finished" if self._ex is None else "active"
+        return f"<RequestHandle {state} match={self.match!r}>"
 
 
 cdef RequestExchange acquire_exchange(

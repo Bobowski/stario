@@ -569,7 +569,8 @@ async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
         proto.data_received(b"GET /files/a%2Fb HTTP/1.1\r\nHost: t\r\n\r\n")
         await _drain(app)
         assert response_status(transport.writes) == 200
-        assert seen == ["a%2Fb"]
+        # One segment, fully decoded: the encoded slash is data, not a separator.
+        assert seen == ["a/b"]
     finally:
         if not transport.is_closing():
             transport.close()
@@ -1395,7 +1396,8 @@ async def test_trailing_slash_backslash_is_not_protocol_relative() -> None:
         await _drain(app)
         raw = b"".join(transport.writes).lower()
         assert response_status(transport.writes) == 308
-        assert b"location: /evil.test" in raw
+        # Browsers read a raw ``\`` as ``/``; the Location sends it encoded.
+        assert b"location: /%5cevil.test\r\n" in raw
         assert b"location: /\\evil.test" not in raw
     finally:
         if not transport.is_closing():

@@ -15,14 +15,12 @@ import threading
 from collections.abc import Coroutine
 from typing import Any
 
-import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
-from stario.http.route import normalize_path
 from stario.telemetry.spans import NoOpSpan
 
-from stario_cython.exchange import AppState
+from stario_cython.exchange import AppState, canonical_request_path
 
 from .dispatch import Router
 from .writer import Writer
@@ -232,24 +230,34 @@ class App(Router):
     async def __call__(self, c: Context, w: Writer) -> None:
         """Test / `TestClient` entrypoint: `find_handler` then the handler coroutine.
 
-        Trailing-slash 308 is a protocol concern (Cython writes it inline). Tests
-        that go through `App.__call__` get the same redirect here so they stay
-        honest without a shared helper.
+        The request-path rules (400 for an invalid path, 308 to the canonical
+        path for dot segments or a trailing slash) are the HTTP protocol's;
+        this applies the same shared check so TestClient sees identical
+        behavior. Routing uses the raw (percent-encoded) path.
         """
         path = c.req.path
+        raw_path = c.req.raw_path
         host = c.req.host if self.host_routing else ""
-        if path != "/" and path.endswith("/"):
-            target = normalize_path(path)
+        status, canonical = canonical_request_path(raw_path)
+        if status == 400:
+            w.respond(b"Invalid HTTP request", b"text/plain; charset=utf-8", 400)
+            finish_request_span(c.span, status=400, method=c.req.method, path=path)
+            return
+        if canonical is not None:
+            target = canonical.decode("ascii")
             _, _, hit = self.find_handler(host, target, c.req.method)
             if type(c.span) is not NoOpSpan and hit.pattern:
                 c.span.rename(hit.pattern)
             if c.req.query_bytes:
                 target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
-            responses.redirect(w, target, 308)
+            w.headers.set("location", target)
+            w.respond(b"", b"text/plain; charset=utf-8", 308)
             finish_request_span(c.span, status=308, method=c.req.method, path=path)
             return
 
-        handler, route, c.match = self.find_handler(host, path, c.req.method)
+        handler, route, c.match = self.find_handler(
+            host, raw_path.decode("latin-1"), c.req.method
+        )
         span = c.span
         if type(span) is not NoOpSpan:
             span.start()

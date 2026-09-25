@@ -10,6 +10,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
+from urllib.parse import quote
 
 from stario.exceptions import RequestBodyError
 from stario.http.context import EMPTY_MATCH, Match, _Alive
@@ -42,6 +43,7 @@ class TestRequest:
         "path",
         "protocol_version",
         "query_bytes",
+        "raw_path",
     )
 
     def __init__(
@@ -49,6 +51,7 @@ class TestRequest:
         *,
         method: str = "GET",
         path: str = "/",
+        raw_path: bytes | None = None,
         query_bytes: bytes = b"",
         headers: Headers | None = None,
         body: bytes = b"",
@@ -57,6 +60,11 @@ class TestRequest:
     ) -> None:
         self.method = method
         self.path = path
+        self.raw_path = (
+            raw_path
+            if raw_path is not None
+            else quote(path or "/", safe="/!$&'()*+,;=:@~").encode("ascii")
+        )
         self.query_bytes = query_bytes if query_bytes else b""
         self.headers = headers if headers is not None else Headers()
         self.protocol_version = protocol_version

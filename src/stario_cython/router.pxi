@@ -1,11 +1,17 @@
 """Compiled path/host trie. One node per segment; walk UTF-8 bytes.
 
-No radix ``rest`` compression (insert order cannot change the tree),
-no exact-map sidecar, no per-lookup walk object. The protocol feeds
-arena path bytes for ASCII (no ``%``) so static GET never allocates a
-path ``str``. Static hits return the 3-tuple stored at compile time
-(same Match identity). Param hits allocate one Match + one params dict.
-404/405 tuples are interned on the node.
+Lookup takes the raw request path (as sent, still percent-encoded). It is
+split on ``/`` first, then each segment is percent-decoded on its own, so an
+encoded ``%2F`` is data inside one segment and never adds structure. Route
+literals compare against decoded segments; params are fully decoded
+(``%2F`` -> ``/``). Paths without ``%`` are walked straight from the arena
+bytes, so static GET never allocates.
+
+No radix ``rest`` compression (insert order cannot change the tree), no
+exact-map sidecar, no backtracking: at each segment an exact child wins,
+then ``{param}``, then ``{path...}``. Static hits return the 3-tuple stored at
+compile time (same Match identity). Param hits allocate one Match + one
+params dict. 404/405 tuples are interned on the node.
 """
 
 from cpython.unicode cimport PyUnicode_AsUTF8AndSize, PyUnicode_DecodeUTF8
@@ -136,29 +142,15 @@ cdef CNode _compile_node(object node):
     return out
 
 
-cdef inline CNode _match_edge(
-    CEdge edge,
-    const char* path,
-    Py_ssize_t i,
-    Py_ssize_t end,
-    Py_ssize_t* nxt,
-):
-    cdef Py_ssize_t seglen = end - i
+cdef inline CNode _match_edge(CEdge edge, const char* seg, Py_ssize_t seglen):
     if edge.key_n != seglen:
         return None
-    if seglen and memcmp(edge.key_p, path + i, <size_t>seglen) != 0:
+    if seglen and memcmp(edge.key_p, seg, <size_t>seglen) != 0:
         return None
-    nxt[0] = end + 1
     return edge.child
 
 
-cdef CNode _match_exact(
-    CNode node,
-    const char* path,
-    Py_ssize_t i,
-    Py_ssize_t end,
-    Py_ssize_t* nxt,
-):
+cdef CNode _match_exact(CNode node, const char* seg, Py_ssize_t seglen):
     cdef CEdge edge
     cdef int first
     cdef int start
@@ -166,21 +158,30 @@ cdef CNode _match_exact(
     cdef int j
     cdef CNode child
     if node.n_edges == 1:
-        return _match_edge(node.one_edge, path, i, end, nxt)
-    if end == i:
+        return _match_edge(node.one_edge, seg, seglen)
+    if seglen == 0:
         first = 0
     else:
-        first = <int><unsigned char>path[i]
+        first = <int><unsigned char>seg[0]
     start = node.edge_start[first]
     if start < 0:
         return None
     count = node.edge_count[first]
     for j in range(count):
         edge = <CEdge>node.edges[start + j]
-        child = _match_edge(edge, path, i, end, nxt)
+        child = _match_edge(edge, seg, seglen)
         if child is not None:
             return child
     return None
+
+
+cdef object _decode_param(const char* s, Py_ssize_t n):
+    cdef object out
+    try:
+        out = PyUnicode_DecodeUTF8(s, n, NULL)
+    except UnicodeDecodeError:
+        return None
+    return out
 
 
 cdef CNode _take_param(
@@ -193,15 +194,19 @@ cdef CNode _take_param(
 ):
     cdef object decoded
     if node.wildcard is not None and node.wildcard_name is not None:
-        decoded = PyUnicode_DecodeUTF8(seg, seglen, "surrogatepass")
+        decoded = _decode_param(seg, seglen)
+        if decoded is None:
+            return None
         params[node.wildcard_name] = decoded
         return node.wildcard
     if node.catchall is not None:
         if node.catchall_name is not None:
             if rest != NULL and restlen >= 0:
-                decoded = PyUnicode_DecodeUTF8(rest, restlen, "surrogatepass")
+                decoded = _decode_param(rest, restlen)
             else:
-                decoded = PyUnicode_DecodeUTF8(seg, seglen, "surrogatepass")
+                decoded = _decode_param(seg, seglen)
+            if decoded is None:
+                return None
             params[node.catchall_name] = decoded
         return node.catchall
     return None
@@ -250,16 +255,23 @@ cdef object _finish(
     return _pack(factory(node.method_set), _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH)
 
 
+cdef enum:
+    SEG_STACK = 32
+    DECODE_STACK = 512
+
+
 cdef object _resolve_tree_n(
     CNode root,
     const char* path_p,
     Py_ssize_t path_n,
+    bint decode,
     const char* host_p,
     Py_ssize_t host_n,
     object method,
     int* status,
     bint* custom,
 ):
+    """Walk ``root`` for a raw path. ``decode`` means the path contains ``%``."""
     cdef CNode node = root
     cdef CNode child
     cdef dict params = None
@@ -268,13 +280,23 @@ cdef object _resolve_tree_n(
     cdef bint cust = root.not_found_custom
     cdef object nf_before
     cdef bint custom_before
-    cdef Py_ssize_t i
     cdef Py_ssize_t end
-    cdef Py_ssize_t nxt
-    cdef Py_ssize_t slash
     cdef Py_ssize_t dot
     cdef Py_ssize_t seg_start
-    cdef Py_ssize_t unused = 0
+    cdef Py_ssize_t i
+    cdef Py_ssize_t k
+    cdef Py_ssize_t nseg = 0
+    cdef Py_ssize_t cap
+    cdef Py_ssize_t w
+    cdef Py_ssize_t dn
+    cdef Py_ssize_t seg_stack_off[SEG_STACK]
+    cdef Py_ssize_t seg_stack_len[SEG_STACK]
+    cdef Py_ssize_t* seg_off = seg_stack_off
+    cdef Py_ssize_t* seg_len = seg_stack_len
+    cdef char decode_stack[DECODE_STACK]
+    cdef char* dbuf = NULL
+    cdef const char* d
+    cdef object result
     if path_p == NULL:
         path_p = ""
         path_n = 0
@@ -287,7 +309,7 @@ cdef object _resolve_tree_n(
             while dot >= 0 and host_p[dot] != 46:
                 dot -= 1
             seg_start = dot + 1
-            child = _match_exact(node, host_p, seg_start, end, &unused)
+            child = _match_exact(node, host_p + seg_start, end - seg_start)
             if child is None:
                 params = _params(params)
                 if node.catchall is not None:
@@ -323,51 +345,100 @@ cdef object _resolve_tree_n(
             node = child
     nf_before = nf_hit
     custom_before = cust
-    if not (path_n == 1 and path_p[0] == 47):
-        i = 1
-        while i <= path_n:
-            if i == path_n:
-                if path_p[path_n - 1] != 47:
-                    break
-                end = path_n
-                nxt = path_n + 1
+    if path_n == 0 or (path_n == 1 and path_p[0] == 47):
+        custom[0] = cust
+        return _finish(node, method, params, nf_hit, method_na, status)
+    # Segments of the raw path, split on raw '/' only. ``d`` holds the bytes
+    # the trie compares: the arena itself, or each segment decoded and joined
+    # with '/' (a decoded %2F stays inside its segment).
+    cap = 1
+    for i in range(path_n):
+        if path_p[i] == 47:
+            cap += 1
+    try:
+        if cap > SEG_STACK:
+            seg_off = <Py_ssize_t*>malloc(<size_t>cap * sizeof(Py_ssize_t))
+            seg_len = <Py_ssize_t*>malloc(<size_t>cap * sizeof(Py_ssize_t))
+            if seg_off == NULL or seg_len == NULL:
+                raise MemoryError()
+        if decode:
+            if path_n <= DECODE_STACK:
+                dbuf = decode_stack
             else:
-                slash = i
-                while slash < path_n and path_p[slash] != 47:
-                    slash += 1
-                end = slash
-                nxt = end + 1
-            child = _match_exact(node, path_p, i, end, &nxt)
+                dbuf = <char*>malloc(<size_t>path_n)
+                if dbuf == NULL:
+                    raise MemoryError()
+        i = 1 if path_p[0] == 47 else 0
+        w = 0
+        while True:
+            seg_start = i
+            while i < path_n and path_p[i] != 47:
+                i += 1
+            if decode:
+                dn = _pct_decode_into(path_p + seg_start, i - seg_start, dbuf + w)
+                if dn < 0:
+                    status[0] = 2
+                    custom[0] = custom_before
+                    return nf_before if nf_before is not None else _NF_HIT
+                seg_off[nseg] = w
+                seg_len[nseg] = dn
+                w += dn
+                if i < path_n:
+                    dbuf[w] = 47
+                    w += 1
+            else:
+                seg_off[nseg] = seg_start
+                seg_len[nseg] = i - seg_start
+            nseg += 1
+            if i >= path_n:
+                break
+            i += 1
+        if decode:
+            d = dbuf
+            dn = w
+        else:
+            d = path_p
+            dn = path_n
+        for k in range(nseg):
+            child = _match_exact(node, d + seg_off[k], seg_len[k])
             if child is None:
                 params = _params(params)
                 if node.catchall is not None:
                     child = _take_param(
                         node,
-                        path_p + i,
-                        end - i,
-                        path_p + i,
-                        path_n - i,
+                        d + seg_off[k],
+                        seg_len[k],
+                        d + seg_off[k],
+                        dn - seg_off[k],
                         params,
                     )
                 else:
                     child = _take_param(
-                        node, path_p + i, end - i, NULL, -1, params
+                        node, d + seg_off[k], seg_len[k], NULL, -1, params
                     )
                 if child is None:
                     status[0] = 2
                     custom[0] = custom_before
                     return nf_before if nf_before is not None else _NF_HIT
-                if child is node.catchall:
-                    nxt = path_n + 1
             if child.not_found is not None:
                 nf_hit = child.nf_hit
                 cust = True
             if child.method_na is not None:
                 method_na = child.method_na
+            if child is node.catchall:
+                node = child
+                break
             node = child
-            i = nxt
-    custom[0] = cust
-    return _finish(node, method, params, nf_hit, method_na, status)
+        custom[0] = cust
+        result = _finish(node, method, params, nf_hit, method_na, status)
+        return result
+    finally:
+        if seg_off != seg_stack_off:
+            free(seg_off)
+        if seg_len != seg_stack_len:
+            free(seg_len)
+        if dbuf != NULL and dbuf != decode_stack:
+            free(dbuf)
 
 
 cdef object _router_lookup_n(
@@ -375,6 +446,7 @@ cdef object _router_lookup_n(
     object host,
     const char* path_p,
     Py_ssize_t path_n,
+    bint decode,
     object method,
 ):
     cdef object host_hit
@@ -393,12 +465,12 @@ cdef object _router_lookup_n(
         hroot = self.hosts_exact.get(host)
         if hroot is not None:
             host_hit = _resolve_tree_n(
-                <CNode>hroot, path_p, path_n, NULL, 0, method,
+                <CNode>hroot, path_p, path_n, decode, NULL, 0, method,
                 &host_status, &host_custom,
             )
         elif self.has_param_hosts:
             host_hit = _resolve_tree_n(
-                self.hosts_param, path_p, path_n, host_p, host_n, method,
+                self.hosts_param, path_p, path_n, decode, host_p, host_n, method,
                 &host_status, &host_custom,
             )
         else:
@@ -408,7 +480,7 @@ cdef object _router_lookup_n(
         if host_status == 0:
             return host_hit
         path_hit = _resolve_tree_n(
-            self.path, path_p, path_n, NULL, 0, method,
+            self.path, path_p, path_n, decode, NULL, 0, method,
             &path_status, &path_custom,
         )
         if path_status == 0:
@@ -421,7 +493,8 @@ cdef object _router_lookup_n(
             return host_hit
         return path_hit
     return _resolve_tree_n(
-        self.path, path_p, path_n, NULL, 0, method, &path_status, &path_custom
+        self.path, path_p, path_n, decode, NULL, 0, method,
+        &path_status, &path_custom,
     )
 
 
@@ -438,28 +511,36 @@ cdef class CNode:
 @cython.final
 cdef class CRouter:
     def lookup(self, host, path, method):
+        """``path`` is the request path as sent (percent-encoded, no query)."""
         return self.c_lookup(host, path, method)
 
     cdef object c_lookup(self, object host, object path, object method):
         cdef const char* path_p
         cdef Py_ssize_t path_n
+        cdef bint decode = False
+        cdef Py_ssize_t i
         _router_symbols()
         if path is None:
             path = ""
         path_p = PyUnicode_AsUTF8AndSize(path, &path_n)
-        return _router_lookup_n(self, host, path_p, path_n, method)
+        for i in range(path_n):
+            if path_p[i] == 37:
+                decode = True
+                break
+        return _router_lookup_n(self, host, path_p, path_n, decode, method)
 
     cdef void c_lookup_into(
         self,
         object host,
         const char* path_p,
         Py_ssize_t path_n,
+        bint decode,
         object method,
         RequestExchange exchange,
     ):
         cdef object hit
         _router_symbols()
-        hit = _router_lookup_n(self, host, path_p, path_n, method)
+        hit = _router_lookup_n(self, host, path_p, path_n, decode, method)
         exchange._handler = (<tuple>hit)[0]
         exchange._route = (<tuple>hit)[1]
         exchange.match = (<tuple>hit)[2]

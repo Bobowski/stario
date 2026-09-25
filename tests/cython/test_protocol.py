@@ -219,13 +219,13 @@ async def test_plaintext_and_post_and_keepalive() -> None:
     writers = []
 
     async def plaintext(_c, w):
-        assert type(w).__name__ == "RequestExchange"
+        assert type(w).__name__ == "RequestHandle"
         assert _c is w
-        writers.append(w)
+        writers.append(w._exchange_id)
         responses.text(w, "Hello, World!")
 
     async def echo(c, w):
-        writers.append(w)
+        writers.append(w._exchange_id)
         body = await c.req.body()
         w.respond(body, b"text/plain; charset=utf-8", 200)
 
@@ -265,7 +265,8 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         await writer.drain()
         second = await read_response(reader)
         assert b"abcde" in second
-        assert writers[0] is writers[1]
+        # One pooled exchange serves both keep-alive requests.
+        assert writers[0] == writers[1]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -539,11 +540,11 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
     seen = []
 
     async def ignore(c, w):
-        seen.append(c)
+        seen.append(c._exchange_id)
         responses.text(w, "ignored")
 
     async def next_request(c, w):
-        seen.append(c)
+        seen.append(c._exchange_id)
         responses.text(w, c.req.path)
 
     app.post("/ignore", ignore)
@@ -580,7 +581,7 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
         await writer.drain()
         assert b"/next" in await read_response(reader)
         assert len(seen) == 2
-        assert seen[0] is seen[1]
+        assert seen[0] == seen[1]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -967,7 +968,7 @@ async def test_exchange_pool_reuses_across_connections() -> None:
 
     async def endpoint(c, w):
         assert c is w
-        exchanges.append(c)
+        exchanges.append(c._exchange_id)
         responses.text(w, "ok")
 
     app.get("/", endpoint)
@@ -997,7 +998,7 @@ async def test_exchange_pool_reuses_across_connections() -> None:
             writer.close()
             await writer.wait_closed()
             await asyncio.sleep(0)
-        assert exchanges[0] is exchanges[1]
+        assert exchanges[0] == exchanges[1]
     finally:
         server.close()
         await server.wait_closed()
