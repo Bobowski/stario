@@ -4,11 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
   workflow_call:
 
 jobs:
   test:
+    # cython-core is a compiled HTTP runtime. This workflow is the published
+    # Python package (uv sync / ruff / pyright / pytest) and does not build
+    # the extensions. Skip it on that PR so it does not gate the merge.
+    if: github.head_ref != 'cython-core'
     strategy:
       fail-fast: false
       matrix:
