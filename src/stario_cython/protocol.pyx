@@ -2713,7 +2713,7 @@ cdef class CHttpProtocol(Connection):
         )
         self._h2_send()
 
-    cpdef object get_buffer(self, Py_ssize_t sizehint):
+    cpdef object c_get_buffer(self, Py_ssize_t sizehint):
         """Reusable read bytearray. Consume it in buffer_updated before reuse."""
         cdef Py_ssize_t want = sizehint
         cdef RequestExchange ex
@@ -2731,7 +2731,7 @@ cdef class CHttpProtocol(Connection):
             self._in_buf = bytearray(want)
         return self._in_buf
 
-    cpdef void buffer_updated(self, Py_ssize_t nbytes):
+    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
         cdef const char* ptr
         if self.rejected or nbytes <= 0 or self._in_buf is None:
             return
@@ -2804,7 +2804,10 @@ cdef class CHttpProtocol(Connection):
 
 
 class HttpProtocol(CHttpProtocol, asyncio.BufferedProtocol):
-    """Python subclass so uvloop/asyncio can use BufferedProtocol.
+    """Python subclass so uvloop/asyncio can find BufferedProtocol methods."""
 
-    ``get_buffer`` / ``buffer_updated`` are ``cpdef`` on ``CHttpProtocol``.
-    """
+    def get_buffer(self, sizehint):
+        return self.c_get_buffer(sizehint)
+
+    def buffer_updated(self, nbytes):
+        self.c_buffer_updated(nbytes)

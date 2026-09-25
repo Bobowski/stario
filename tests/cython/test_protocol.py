@@ -15,6 +15,8 @@ from tests.helpers import assert_status_span
 
 
 class TrackingApp(App):
+    """Spy on App.create_task. Protocol dispatch uses asyncio.Task directly."""
+
     def __init__(self) -> None:
         super().__init__()
         self.eager_starts: list[bool] = []
@@ -157,7 +159,6 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
         assert b"404" in missing.split(b"\r\n", 1)[0]
         assert b"gone" in missing
         assert seen == ["404"]
-        assert app.eager_starts == [True]
 
         writer.write(b"POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
         await writer.drain()
@@ -166,7 +167,6 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
         assert b"nope" in denied
         assert b"allow: get" in denied.lower()
         assert seen == ["404", "405"]
-        assert app.eager_starts == [True, True]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -205,7 +205,6 @@ async def test_handler_exception_writes_500() -> None:
         response = await read_response(reader)
         assert b"500" in response.split(b"\r\n", 1)[0]
         assert b"Internal Server Error" in response
-        assert app.eager_starts == [True]
         writer.close()
         await writer.wait_closed()
     finally:
@@ -266,7 +265,6 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         await writer.drain()
         second = await read_response(reader)
         assert b"abcde" in second
-        assert app.eager_starts == [True, True]
         assert writers[0] is writers[1]
         writer.close()
         await writer.wait_closed()
