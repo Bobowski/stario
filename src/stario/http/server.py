@@ -300,7 +300,7 @@ class _LoopWorker:
 
     def _run(self) -> None:
         try:
-            self.loop_run(self.server._run_reuseport_worker(self))
+            self.loop_run(self.server.run_reuseport_worker(self))
         except BaseException as exc:
             self.error = exc
             with suppress(Exception):
@@ -929,7 +929,7 @@ class Server:
             with suppress(asyncio.CancelledError):
                 await task
 
-    async def _run_reuseport_worker(self, worker: _LoopWorker) -> None:
+    async def run_reuseport_worker(self, worker: _LoopWorker) -> None:
         """Extra thread: bind SO_REUSEPORT, serve until shutdown, then drain."""
         loop = asyncio.get_running_loop()
         kind = require_configured_loop(
@@ -942,7 +942,6 @@ class Server:
         worker.app.attach_loop(loop)
         unix = self.config.unix_socket is not None
         sock = self._bind_reuseport(leader=False) if unix else None
-        listener: asyncio.Server | None = None
         try:
             async with self._date_tick(worker.date_box, worker.connections):
                 listener = await self._create_listener(
@@ -958,10 +957,7 @@ class Server:
                 try:
                     await worker.app.shutdown
                 finally:
-                    if listener is not None:
-                        await self._drain_listener(
-                            listener, worker.app, worker.connections
-                        )
+                    await self._drain_listener(listener, worker.app, worker.connections)
         finally:
             if sock is not None:
                 sock.close()
@@ -980,11 +976,12 @@ class Server:
         ]
         if self._owns_loop:
             require_configured_loop(self.config.event_loop, where="Server.run")
-        unix = self.config.unix_socket is not None
+        unix_socket = self.config.unix_socket
+        unix = unix_socket is not None
         sock = self._bind_reuseport(leader=True) if unix else None
         unix_file_id: tuple[int, int] | None = None
-        if unix:
-            bound = os.stat(self.config.unix_socket)
+        if unix_socket is not None:
+            bound = os.stat(unix_socket)
             unix_file_id = (bound.st_dev, bound.st_ino)
         connections: set[Connection] = set()
         join_timeout = (

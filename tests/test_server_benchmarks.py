@@ -11,7 +11,7 @@ SERVER_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from apps.common import (  # noqa: E402
+from apps.common import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     PARAM_ID_COUNT,
     PLAINTEXT_BODY,
     REQUEST_HEADER,
@@ -58,7 +58,7 @@ def test_upload_lines_are_plain_text() -> None:
 @pytest.mark.asyncio
 async def test_stario_benchmark_app_route_shapes() -> None:
     pytest.importorskip("ujson")
-    from apps.stario_app import bootstrap
+    from apps.stario_app import bootstrap  # pyright: ignore[reportMissingImports]
 
     from stario.testing import TestClient
 

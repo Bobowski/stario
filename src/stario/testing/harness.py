@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import quote
 
 from stario.exceptions import RequestBodyError
-from stario.http.context import EMPTY_MATCH, Match, _Alive
+from stario.http.context import (
+    EMPTY_MATCH,
+    Match,
+    _Alive,  # pyright: ignore[reportPrivateUsage]
+)
 from stario.http.headers import Headers
 from stario.http.host import host_without_port
 from stario.http.query import ParsedQuery
@@ -243,7 +247,7 @@ class TestContext:
     req: Request
     span: Span
     _disconnect: asyncio.Future[None] = field(repr=False)
-    state: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict[str, Any])
     match: Match = field(default=EMPTY_MATCH)
 
     @property

@@ -12,7 +12,7 @@ import stario.responses as responses
 from stario import App, Relay
 from stario.datastar import SSE
 from stario.testing.tracer import TestTracer
-from stario_cython.request import Request
+from stario_cython.exchange import Request
 from tests.cython.http import (
     RecordingTransport,
     make_protocol,
@@ -33,7 +33,7 @@ class HoldingTransport(RecordingTransport):
 
     def write(self, data: bytes | bytearray | memoryview) -> None:
         assert not self._closing, "write after transport close"
-        self.writes.append(data)
+        self.writes.append(data)  # pyright: ignore[reportArgumentType]
 
 
 def _attach(app: App | None = None, **kwargs):
@@ -1126,10 +1126,7 @@ async def test_pipeline_cap_rejects_ninth_queued_request() -> None:
         await _drain(app)
 
 
-def test_request_shim_reexports_exchange_type() -> None:
-    from stario_cython.exchange import Request as ExchangeRequest
-
-    assert Request is ExchangeRequest
+def test_request_host_is_lowercased_without_port() -> None:
     req = Request(method="GET", path="/x", headers={"host": "Example.COM:80"})
     assert req.host == "example.com"
 

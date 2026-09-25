@@ -17,17 +17,23 @@ from stario.http.server import Server
 from stario.telemetry.noop import NoOpTracer
 
 
-def _uvloop_config(config: ServerConfig | None = None, **overrides) -> ServerConfig:
-    cfg = config if config is not None else server_config_from_env()
+def _uvloop_config(
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    backlog: int | None = None,
+    tcp: bool = False,
+) -> ServerConfig:
+    cfg = server_config_from_env()
     return ServerConfig(
-        host=overrides.get("host", cfg.host),
-        port=overrides.get("port", cfg.port),
-        unix_socket=overrides.get("unix_socket", cfg.unix_socket),
+        host=cfg.host if host is None else host,
+        port=cfg.port if port is None else port,
+        unix_socket=None if tcp else cfg.unix_socket,
         unix_socket_mode=cfg.unix_socket_mode,
         requests=cfg.requests,
         compression=cfg.compression,
         graceful_shutdown_timeout=cfg.graceful_shutdown_timeout,
-        backlog=overrides.get("backlog", cfg.backlog),
+        backlog=cfg.backlog if backlog is None else backlog,
         reuse_addr=cfg.reuse_addr,
         event_loop="uvloop",
         threads=cfg.threads,
@@ -45,7 +51,7 @@ async def serve(
     await Server(
         bootstrap,
         NoOpTracer(),
-        config=_uvloop_config(host=host, port=port, backlog=backlog, unix_socket=None),
+        config=_uvloop_config(host=host, port=port, backlog=backlog, tcp=True),
     ).serve()
 
 

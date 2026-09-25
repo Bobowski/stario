@@ -6,10 +6,13 @@ keeps the bytes already on the wire. Cancellation still aborts.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Any
 
 from stario.http.context import Context
 from stario.http.writer import Writer
+from stario.telemetry.core import Span
 from stario.telemetry.spans import NoOpSpan
 
 _log = logging.getLogger("stario.http")
@@ -31,7 +34,7 @@ def _finish_incomplete(w: Writer) -> None:
 
 
 def finish_request_span(
-    span: object,
+    span: Span | None,
     *,
     status: int | None = None,
     method: str | None = None,
@@ -53,7 +56,7 @@ def finish_request_span(
     span.end()
 
 
-def on_handler_done(c: Context, w: Writer, task) -> None:
+def on_handler_done(c: Context, w: Writer, task: asyncio.Task[Any]) -> None:
     """Run after the handler task finishes (success, failure, or cancel)."""
     if not task.done():
         return

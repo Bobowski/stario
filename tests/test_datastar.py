@@ -38,16 +38,6 @@ def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
     return writer, writer.sink.buf, _ClosedLoop()
 
 
-class _ClosedLoop:
-    def close(self) -> None:
-        return None
-
-
-def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
-    writer = TestWriter()
-    return writer, writer.sink.buf, _ClosedLoop()
-
-
 def _sse_body(writer: TestWriter) -> bytes:
     return writer.body
 

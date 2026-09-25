@@ -5,8 +5,8 @@ import pytest
 from stario.exceptions import RequestBodyError
 from stario.http.headers import Headers
 from stario.http.host import host_without_port
-from stario.http.request import Request
 from stario.testing.harness import TestRequest
+from stario_cython.exchange import Request
 from tests.helpers import make_request as _make_request
 
 
