@@ -6,6 +6,8 @@ import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
+
+from stario_cython.exchange import compile_router
 from typing import Literal
 
 from typing_extensions import deprecated
@@ -426,6 +428,7 @@ class Router:
         "_host_routing",
         "_hosts_exact",
         "_hosts_param",
+        "_cy_router",
         "_lookup",
         "_path",
     )
@@ -437,13 +440,8 @@ class Router:
         self._has_param_hosts = False
         self._host_routing = False
         self._exact: dict[tuple[str, str, str], RouteMatch] = {}
-
-        @lru_cache(maxsize=1024)
-        def lookup(host: str, path: str, method: str) -> RouteMatch:
-            return self._resolve_handler(host, path, method)
-
-        # The protocol binds this cache directly (one Python call per request).
-        self._lookup = lookup
+        self._cy_router = compile_router(self)
+        self._lookup = self._cy_router.lookup
 
     @property
     def host_routing(self) -> bool:
@@ -454,10 +452,15 @@ class Router:
         return self._lookup(host, path, method)
 
     def _invalidate_lookup(self) -> None:
-        self._lookup.cache_clear()
+        self._cy_router = compile_router(self)
+        self._lookup = self._cy_router.lookup
+        state = getattr(self, "_app_state", None)
+        if state is not None:
+            state.host_routing = self._host_routing
+            state.router = self._cy_router
 
     def _resolve_handler(self, host: str, path: str, method: str) -> RouteMatch:
-        """Static exact map, then trie. Cached by `find_handler`."""
+        """Static exact map, then compiled trie. Used by tests and fallbacks."""
         hit = self._exact.get((host, path, method))
         if hit is not None:
             return hit

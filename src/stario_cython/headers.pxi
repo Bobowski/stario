@@ -1,9 +1,5 @@
 """Headers pair list. Included into ``exchange.pyx`` (one extension)."""
 
-cdef bytes _VALID_VALUE = bytes(
-    b for b in range(256) if b == 0x09 or (b >= 0x20 and b != 0x7F)
-)
-
 cdef enum:
     INTERN_MAX = 36
     INTERN_TABLE_SIZE = 64
@@ -15,6 +11,7 @@ cdef extern from *:
     #include <stdint.h>
 
     static uint8_t stario_hdr_lower[256];
+    static uint8_t stario_hdr_value_ok[256];
     static int stario_hdr_lower_ready;
 
     static void stario_hdr_lower_init(void) {
@@ -29,6 +26,7 @@ cdef extern from *:
         }
         for (i = 0; i < 256; i++) {
             stario_hdr_lower[i] = 0;
+            stario_hdr_value_ok[i] = (uint8_t)(i == 0x09 || (i >= 0x20 && i != 0x7F));
         }
         for (p = (const unsigned char*)valid; *p; p++) {
             unsigned char c = *p;
@@ -80,6 +78,17 @@ cdef extern from *:
         *out_n = n;
         return 0;
     }
+
+    static int stario_header_value_ok(const unsigned char* p, Py_ssize_t n) {
+        Py_ssize_t i;
+        stario_hdr_lower_init();
+        for (i = 0; i < n; i++) {
+            if (!stario_hdr_value_ok[p[i]]) {
+                return 0;
+            }
+        }
+        return 1;
+    }
     """
     int stario_fold_header_name(
         object name,
@@ -87,6 +96,7 @@ cdef extern from *:
         Py_ssize_t cap,
         Py_ssize_t* out_n,
     ) except -1
+    int stario_header_value_ok(const unsigned char* p, Py_ssize_t n) noexcept
 
 
 cdef const char* _INTERN_C[INTERN_MAX]
@@ -296,7 +306,10 @@ cdef object _encode_value(str value):
         raw = value.encode("latin-1")
     except UnicodeEncodeError:
         raise ValueError(f"Invalid header value: {value}")
-    if raw.translate(None, _VALID_VALUE):
+    if not stario_header_value_ok(
+        <const unsigned char*>PyBytes_AS_STRING(raw),
+        PyBytes_GET_SIZE(raw),
+    ):
         raise ValueError(f"Invalid header value: {value}")
     return raw
 
@@ -308,7 +321,10 @@ cdef object _encode_value_bytes(object value):
     if not isinstance(value, bytes):
         raise ValueError("Invalid header value")
     raw = <bytes>value
-    if raw.translate(None, _VALID_VALUE):
+    if not stario_header_value_ok(
+        <const unsigned char*>PyBytes_AS_STRING(raw),
+        PyBytes_GET_SIZE(raw),
+    ):
         raise ValueError("Invalid header value")
     return raw
 
@@ -318,6 +334,7 @@ def encode_header_value(str value):
     return _encode_value(value)
 
 
+@cython.final
 cdef class Headers:
     def __init__(self, raw_header_data=None):
         cdef object key

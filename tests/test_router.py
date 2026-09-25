@@ -37,15 +37,15 @@ class TestFindHandler:
         with pytest.raises(TypeError):
             hit.params["user_id"] = "9"  # type: ignore[index]
 
-    def test_param_find_reuses_the_same_match(self):
+    def test_param_find_is_stable_without_result_cache(self):
         router = Router()
         router.add(Route("GET /users/{user_id}"), noop_handler)
 
         _, _, first = router.find_handler("", "/users/42", "GET")
         _, _, second = router.find_handler("", "/users/42", "GET")
 
-        assert first is second
-        assert dict(first.params) == {"user_id": "42"}
+        assert first.pattern == second.pattern
+        assert dict(first.params) == dict(second.params) == {"user_id": "42"}
 
     def test_add_after_miss_is_visible(self):
         router = Router()

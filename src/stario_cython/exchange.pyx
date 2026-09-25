@@ -7,6 +7,8 @@ allocates a new one when the message is ready to dispatch. Query and cookies
 stay unset until the handler reads them.
 """
 
+cimport cython
+
 import asyncio
 import http
 import threading
@@ -15,7 +17,7 @@ from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc, realloc
 from libc.stdio cimport sprintf
-from libc.string cimport memcmp, memcpy
+from libc.string cimport memcmp, memcpy, memmove
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_GET_SIZE,
@@ -23,6 +25,7 @@ from cpython.bytearray cimport (
 )
 from cpython.bytes cimport (
     PyBytes_AS_STRING,
+    PyBytes_Check,
     PyBytes_FromStringAndSize,
     PyBytes_GET_SIZE,
 )
@@ -64,6 +67,56 @@ from stario_cython.compression_buf cimport (
     stario_gzip_release,
 )
 include "headers.pxi"
+include "router.pxi"
+
+cdef class Connection:
+    """Default stubs. The HTTP protocol overrides every cpdef entry."""
+
+    def __cinit__(self):
+        self.timeout_cleanup = 0
+
+    cpdef void release_exchange(self, RequestExchange exchange):
+        raise NotImplementedError("release_exchange")
+
+    cpdef void response_completed(self, RequestExchange exchange):
+        raise NotImplementedError("response_completed")
+
+    cpdef void set_body_paused(self, RequestExchange exchange, bint paused):
+        raise NotImplementedError("set_body_paused")
+
+    cpdef object ensure_disconnect(self):
+        raise NotImplementedError("ensure_disconnect")
+
+    cpdef void h2_respond(
+        self,
+        RequestExchange ex,
+        object nva,
+        object body,
+        bint skip_ce=False,
+        bint skip_cl=True,
+        bint skip_ct=True,
+    ):
+        raise NotImplementedError("h2_respond")
+
+    cpdef void h2_write_headers(
+        self,
+        RequestExchange ex,
+        object nva,
+        bint skip_ce=False,
+        bint skip_cl=False,
+        bint skip_ct=False,
+        bint skip_user=False,
+    ):
+        raise NotImplementedError("h2_write_headers")
+
+    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end):
+        raise NotImplementedError("h2_write_data")
+
+    cpdef void h2_end(self, RequestExchange ex):
+        raise NotImplementedError("h2_end")
+
+    cpdef void h2_abort(self, RequestExchange ex):
+        raise NotImplementedError("h2_abort")
 
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
@@ -594,6 +647,7 @@ cdef bint _query_name_matches(
     return _decode_query_component(name, nlen) == key_obj
 
 
+@cython.final
 cdef class ParsedQuery:
     """Query index. First read fills C name/value spans.
 
@@ -1145,6 +1199,7 @@ cdef void _parse_cookie_line(
         )
 
 
+@cython.final
 cdef class ParsedCookies:
     """Cookie scan. ``get`` walks C pairs and decodes only the name you ask for.
 
@@ -1482,6 +1537,7 @@ cdef object _host_without_port_n(const char* s, Py_ssize_t n):
     return _ascii_lower_latin1(s + start, end - start)
 
 
+@cython.final
 cdef class Request:
     """One HTTP request. New object per dispatch; not pooled with the exchange."""
 
@@ -1681,6 +1737,7 @@ cdef Request make_request(
     return req
 
 
+@cython.final
 cdef class RequestExchange:
     def __cinit__(self):
         self._req_arena = NULL
@@ -1693,16 +1750,15 @@ cdef class RequestExchange:
         self._brotli = NULL
         self._gzip = NULL
         self._out_buf = None
-        self._out_hold = None
         self._out_len = 0
         self._status_code = -1
         self._declared_length = -1
         self._bytes_written = 0
         self._completed = False
         self._date_box = None
-        self._body_tail = None
-        self._tail_used = 0
-        self._tail_cap = 0
+        self._body_buf = None
+        self._body_used = 0
+        self._body_cap = 0
         self._expected_size = -1
         self._http2 = False
         self._h2_stream_id = 0
@@ -1728,7 +1784,6 @@ cdef class RequestExchange:
         self.headers = Headers()
         self.request_headers = RequestHeaders(self)
         self.req = None
-        self._chunks = None
         self._cached = None
         self._data_ready = None
         self._stall_deadline = 0.0
@@ -1988,21 +2043,18 @@ cdef class RequestExchange:
         self._done()
 
     cdef void _flush(self):
-        cdef object view
-        cdef object done
+        cdef object payload
         if self._out_len == 0:
             return
-        done = self._out_buf
-        self._out_buf = self._out_hold
-        self._out_hold = done
-        if self._out_buf is None:
-            self._out_buf = bytearray(256)
-        view = memoryview(done)[:self._out_len]
+        payload = PyBytes_FromStringAndSize(
+            PyByteArray_AS_STRING(self._out_buf),
+            self._out_len,
+        )
         self._out_len = 0
         if self._http2:
-            self._connection.h2_write_data(self, view, False)
+            self._connection.h2_write_data(self, payload, False)
             return
-        self._transport.write(view)
+        self._transport.write(payload)
 
     @property
     def status_code(self):
@@ -2414,7 +2466,7 @@ cdef class RequestExchange:
 
     cdef void reset(
         self,
-        object connection,
+        Connection connection,
         object app,
         object transport,
         list date_box,
@@ -2576,11 +2628,6 @@ cdef class RequestExchange:
             and PyByteArray_GET_SIZE(self._out_buf) > OUTPUT_BUFFER_RETAIN_MAX
         ):
             self._out_buf = None
-        if (
-            self._out_hold is not None
-            and PyByteArray_GET_SIZE(self._out_hold) > OUTPUT_BUFFER_RETAIN_MAX
-        ):
-            self._out_hold = None
 
     cdef void recycle(self):
         """Return to this thread's spare list, or drop if the list is full."""
@@ -2651,50 +2698,36 @@ cdef class RequestExchange:
         if self._http2:
             self._h2_respond(body, content_type, status, nbytes)
             return
-        # Empty headers + no compression: writelines of interned pieces
-        # (status, Date, type, length, body). No join, no cross-request cache.
+        # Empty headers + no compression: one assembled head (plus a small
+        # body when it fits). Large bodies stay a second write so we do not
+        # copy MiB payloads into the output buffer.
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
         ):
+            self._buf_bytes(_status_line(status))
+            self._buf_bytes(self._date_box[0])
             if not _may_have_body(status):
-                self._transport.writelines(
-                    (_status_line(status), self._date_box[0], ZERO_CL)
-                )
-            elif isinstance(body, (list, tuple)):
-                self._transport.writelines((
-                    _status_line(status),
-                    self._date_box[0],
-                    CT_PREFIX,
-                    content_type,
-                    CL_PREFIX,
-                    _dec(<size_t>nbytes),
-                    CRLF2,
-                ))
-                if body and not self._head_request:
-                    self._transport.writelines(body)
+                self._buf_bytes(ZERO_CL)
+                self._flush()
             else:
-                if self._head_request or not nbytes:
-                    self._transport.writelines((
-                        _status_line(status),
-                        self._date_box[0],
-                        CT_PREFIX,
-                        content_type,
-                        CL_PREFIX,
-                        _dec(<size_t>nbytes),
-                        CRLF2,
-                    ))
+                self._buf_bytes(CT_PREFIX)
+                self._buf_bytes(content_type)
+                self._buf_bytes(CL_PREFIX)
+                self._buf_bytes(_dec(<size_t>nbytes))
+                self._buf_bytes(CRLF2)
+                if nbytes and not self._head_request:
+                    if nbytes <= OUTPUT_BUFFER_RETAIN_MAX:
+                        self._buf_body(body)
+                        self._flush()
+                    else:
+                        self._flush()
+                        if isinstance(body, (list, tuple)):
+                            self._transport.writelines(body)
+                        else:
+                            self._transport.write(body)
                 else:
-                    self._transport.writelines((
-                        _status_line(status),
-                        self._date_box[0],
-                        CT_PREFIX,
-                        content_type,
-                        CL_PREFIX,
-                        _dec(<size_t>nbytes),
-                        CRLF2,
-                        body,
-                    ))
+                    self._flush()
         else:
             existing_ce = None
             existing_cl = None
@@ -3068,140 +3101,81 @@ cdef class RequestExchange:
         self._expected_size = 0
 
     cdef void _clear_body_storage(self) noexcept:
-        if self._chunks is not None:
-            self._chunks.clear()
-        self._body_tail = None
-        self._tail_used = 0
-        self._tail_cap = 0
+        self._body_buf = None
+        self._body_used = 0
+        self._body_cap = 0
         self._buffered = 0
 
-    cdef int _ensure_body_tail(self, Py_ssize_t received_before) noexcept:
+    cdef int _body_reserve(self, Py_ssize_t need) noexcept:
+        cdef object buf
         cdef Py_ssize_t cap
-        cdef Py_ssize_t remaining
-        cdef object tail
-        if self._body_tail is not None:
+        if need <= 0:
             return 0
-        cap = self._stream_max_chunk
-        # Buffered body() wants one Content-Length-sized object so complete
-        # does not b"".join ~32x64KiB tails. Do not wait for CONSUMED_BODY:
-        # the first body bytes often win that race (same llhttp_execute as
-        # headers-complete, or a pipelined request still queued). stream()
-        # sets CONSUMED_STREAM before feeding so it keeps stream-sized tails.
-        if (
-            self._consumed_as != CONSUMED_STREAM
-            and self._expected_size > 0
-            and received_before == 0
-        ):
-            cap = self._expected_size
-            if cap > STREAM_CHUNK_CL:
-                cap = STREAM_CHUNK_CL
-        elif self._consumed_as != CONSUMED_STREAM:
+        if self._body_buf is not None and need <= self._body_cap:
+            return 0
+        if self._body_buf is None:
             cap = DEFAULT_STREAM_CHUNK
-        if self._expected_size >= 0:
-            remaining = self._expected_size - received_before
-            if 0 < remaining < cap:
-                cap = remaining
-        tail = PyBytes_FromStringAndSize(NULL, cap)
-        if tail is None:
+            if (
+                self._consumed_as != CONSUMED_STREAM
+                and self._expected_size > 0
+            ):
+                cap = self._expected_size
+            elif self._consumed_as == CONSUMED_STREAM:
+                cap = self._stream_max_chunk
+            if cap < need:
+                cap = need
+            buf = bytearray()
+            if PyByteArray_Resize(buf, cap) < 0:
+                PyErr_Clear()
+                return -1
+            self._body_buf = buf
+            self._body_cap = cap
+            return 0
+        cap = self._body_cap * 2
+        if cap < need:
+            cap = need
+        if PyByteArray_Resize(self._body_buf, cap) < 0:
+            self._clear_body_storage()
             PyErr_Clear()
             return -1
-        self._body_tail = tail
-        self._tail_used = 0
-        self._tail_cap = cap
+        self._body_cap = cap
         return 0
 
     cdef int _adopt_expected_body_buffer(self) noexcept:
-        """Compact already-fed stream-sized tails into one Content-Length buffer.
-
-        Used when body() starts after some bytes already landed in stream-sized
-        pieces. Later c_feed memcpy's into this tail; complete skips join.
-        """
-        cdef Py_ssize_t have
-        cdef Py_ssize_t offset
-        cdef object dest
-        cdef object chunk
-        cdef object chunks
+        """Grow the one body buffer to the declared Content-Length."""
         if self._expected_size <= 0 or self._consumed_as == CONSUMED_STREAM:
             return 0
         if self._body_complete:
             return 0
-        if self._expected_size > STREAM_CHUNK_CL:
+        if self._body_used > self._expected_size:
             return 0
-        have = self._buffered + self._tail_used
-        if have > self._expected_size:
-            return 0
-        if (
-            self._body_tail is not None
-            and self._tail_cap == self._expected_size
-            and (self._chunks is None or not self._chunks)
-        ):
-            return 0
-        dest = PyBytes_FromStringAndSize(NULL, self._expected_size)
-        if dest is None:
-            PyErr_Clear()
-            return -1
-        offset = 0
-        chunks = self._chunks
-        if chunks is not None:
-            for chunk in chunks:
-                memcpy(
-                    PyBytes_AS_STRING(dest) + offset,
-                    PyBytes_AS_STRING(chunk),
-                    <size_t>len(chunk),
-                )
-                offset += len(chunk)
-            chunks.clear()
-        if self._body_tail is not None and self._tail_used > 0:
-            memcpy(
-                PyBytes_AS_STRING(dest) + offset,
-                PyBytes_AS_STRING(self._body_tail),
-                <size_t>self._tail_used,
-            )
-            offset += self._tail_used
-        self._body_tail = dest
-        self._tail_used = offset
-        self._tail_cap = self._expected_size
-        self._buffered = 0
-        return 0
-
-    cdef int _seal_body_tail(self) noexcept:
-        cdef object chunk
-        cdef object chunks
-        if self._body_tail is None or self._tail_used == 0:
-            return 0
-        if self._tail_used == self._tail_cap:
-            chunk = self._body_tail
-        else:
-            chunk = PyBytes_FromStringAndSize(
-                PyBytes_AS_STRING(self._body_tail),
-                self._tail_used,
-            )
-            if chunk is None:
-                PyErr_Clear()
-                return -1
-        chunks = self._chunks
-        if chunks is None:
-            chunks = []
-            self._chunks = chunks
-        chunks.append(chunk)
-        self._buffered += self._tail_used
-        self._body_tail = None
-        self._tail_used = 0
-        self._tail_cap = 0
-        return 0
+        return self._body_reserve(self._expected_size)
 
     cdef object _body_to_bytes(self):
         cdef object out
-        if self._seal_body_tail() != 0:
-            raise MemoryError()
-        if self._chunks is None or not self._chunks:
+        cdef Py_ssize_t used = self._body_used
+        if used <= 0 or self._body_buf is None:
+            self._clear_body_storage()
             return b""
-        if len(self._chunks) == 1:
-            out = self._chunks[0]
-        else:
-            out = b"".join(self._chunks)
-        self._chunks.clear()
-        self._buffered = 0
+        out = PyBytes_FromStringAndSize(PyByteArray_AS_STRING(self._body_buf), used)
+        self._clear_body_storage()
+        if out is None:
+            raise MemoryError()
+        return out
+
+    cdef object _body_take(self, Py_ssize_t max_n):
+        cdef Py_ssize_t take
+        cdef object out
+        cdef char* src
+        if self._body_used <= 0 or self._body_buf is None:
+            return b""
+        take = self._body_used if max_n <= 0 or max_n > self._body_used else max_n
+        src = PyByteArray_AS_STRING(self._body_buf)
+        out = PyBytes_FromStringAndSize(src, take)
+        if take < self._body_used:
+            memmove(src, src + take, <size_t>(self._body_used - take))
+        self._body_used -= take
+        self._buffered = self._body_used
         return out
 
     cdef void _raise_abort(self):
@@ -3269,21 +3243,18 @@ cdef class RequestExchange:
 
     cdef void _maybe_pause(self):
         if self._consumed_as == CONSUMED_STREAM:
-            if self._buffered + self._tail_used > HIGH_WATER:
+            if self._body_used > HIGH_WATER:
                 self._connection.set_body_paused(self, True)
             return
         if (
             self._consumed_as == CONSUMED_BODY
-            and self._buffered + self._tail_used > BODY_HIGH_WATER
+            and self._body_used > BODY_HIGH_WATER
         ):
             self._connection.set_body_paused(self, True)
 
     cdef int c_feed(self, const char* at, size_t length) noexcept:
         cdef Py_ssize_t new_total
-        cdef Py_ssize_t offset
-        cdef Py_ssize_t available
-        cdef Py_ssize_t take
-        cdef bint emitted
+        cdef Py_ssize_t used
         if not self._body_active:
             self.reset_body(False, -1)
         new_total = self._total_read + <Py_ssize_t>length
@@ -3319,30 +3290,20 @@ cdef class RequestExchange:
         if self._discard_body:
             self._total_read = new_total
             return 0
-        emitted = False
-        offset = 0
-        while offset < <Py_ssize_t>length:
-            if self._ensure_body_tail(self._total_read + offset) != 0:
-                return -1
-            available = self._tail_cap - self._tail_used
-            take = <Py_ssize_t>length - offset
-            if take > available:
-                take = available
+        used = self._body_used + <Py_ssize_t>length
+        if self._body_reserve(used) != 0:
+            return -1
+        if length:
             memcpy(
-                PyBytes_AS_STRING(self._body_tail) + self._tail_used,
-                at + offset,
-                <size_t>take,
+                PyByteArray_AS_STRING(self._body_buf) + self._body_used,
+                at,
+                length,
             )
-            self._tail_used += take
-            offset += take
-            if self._tail_used == self._tail_cap:
-                if self._seal_body_tail() != 0:
-                    return -1
-                emitted = True
+        self._body_used = used
+        self._buffered = used
         self._total_read = new_total
         if self._consumed_as == CONSUMED_STREAM:
-            if emitted:
-                self._wake()
+            self._wake()
             if self._waiting:
                 self._reset_stall_timer()
             self._maybe_pause()
@@ -3357,7 +3318,7 @@ cdef class RequestExchange:
         if (
             self._consumed_as == CONSUMED_BODY
             and self._waiting
-            and self._buffered + self._tail_used > BODY_HIGH_WATER
+            and self._body_used > BODY_HIGH_WATER
         ):
             self._wake()
         return 0
@@ -3373,8 +3334,6 @@ cdef class RequestExchange:
             self._clear_body_storage()
             self._maybe_recycle()
             return 0
-        if self._seal_body_tail() != 0:
-            return -1
         if self._consumed_as == CONSUMED_STREAM:
             self._wake()
             self._maybe_recycle()
@@ -3430,13 +3389,8 @@ cdef class RequestExchange:
             self._raise_abort()
 
     async def stream(self, max_chunk=None):
-        cdef int index
-        cdef object chunk
         cdef object out
         cdef Py_ssize_t chunk_size
-        cdef Py_ssize_t offset
-        cdef Py_ssize_t remaining
-        cdef Py_ssize_t consumed
         if self._discard_body:
             raise StarioRuntime(
                 "Request body is no longer available after its handler finished."
@@ -3472,38 +3426,18 @@ cdef class RequestExchange:
                 )
         self._stream_max_chunk = chunk_size
         self._consumed_as = CONSUMED_STREAM
-        if (
-            self._body_tail is not None
-            and self._tail_cap != chunk_size
-            and self._seal_body_tail() != 0
-        ):
-            raise MemoryError()
         if self._cached is not None:
             yield self._cached
             return
         self._maybe_continue()
-        index = 0
-        offset = 0
         while True:
-            while self._chunks is not None and index < len(self._chunks):
-                chunk = self._chunks[index]
-                remaining = len(chunk) - offset
-                if remaining <= chunk_size:
-                    out = chunk if offset == 0 else chunk[offset:]
-                    consumed = remaining
-                    index += 1
-                    offset = 0
-                else:
-                    out = chunk[offset : offset + chunk_size]
-                    consumed = chunk_size
-                    offset += chunk_size
-                self._buffered -= consumed
-                if self._buffered < LOW_WATER:
+            while self._body_used >= chunk_size or (
+                self._body_complete and self._body_used > 0
+            ):
+                out = self._body_take(chunk_size)
+                if self._body_used < LOW_WATER:
                     self._connection.set_body_paused(self, False)
                 yield out
-            if index:
-                self._chunks.clear()
-                index = 0
             if self._body_complete:
                 return
             await self._wait_for_body_data()
@@ -3556,6 +3490,7 @@ cdef class RequestExchange:
         return self._cached
 
 
+@cython.final
 cdef class RequestHeaders:
     """Read-only request headers backed by the owning exchange arena."""
 
@@ -3763,7 +3698,7 @@ cdef class RequestHeaders:
 
 
 cdef RequestExchange acquire_exchange(
-    object connection,
+    Connection connection,
     object app,
     object transport,
     list date_box,

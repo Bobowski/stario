@@ -1,11 +1,12 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
+# cython: auto_pickle=False
 """asyncio Protocol: llhttp for HTTP/1, nghttp2 for HTTP/2.
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
 H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). URL bytes
 and header fragments go into the current exchange arena. When the message
 is ready, dispatch allocates a new ``Request`` (query/cookies/host stay
-lazy). Path decoding is cached here because it is connection-parse work.
+lazy). Path decoding walks the URL bytes once (no process-wide cache).
 
 Header, idle, and body-stall timeouts share one cleanup path. Under Server
 that path is the Date-header tick (once a second): one ``loop.time()``, then
@@ -53,6 +54,9 @@ from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport (
     ABORT_TOO_LARGE,
+    AppState,
+    CRouter,
+    Connection,
     Headers,
     Request,
     RequestExchange,
@@ -61,6 +65,25 @@ from stario_cython.exchange cimport (
     make_request,
     _status_line,
 )
+
+cdef extern from *:
+    """
+    #if defined(__linux__)
+    #include <malloc.h>
+    static void stario_malloc_tune(void) {
+        static int once;
+        if (once) {
+            return;
+        }
+        once = 1;
+        mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
+    }
+    #else
+    static void stario_malloc_tune(void) {}
+    #endif
+    """
+    void stario_malloc_tune() noexcept
 from stario_cython.llhttp cimport *
 from stario_cython.nghttp2 cimport (
     ssize_t,
@@ -133,8 +156,6 @@ from stario_cython.timeouts import (
 )
 
 cdef enum:
-    URL_CACHE_CAP = 256
-    URL_CACHE_MAX_KEY = 512
     # 256 KiB sits above API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
     # body() is then already bytes when the handler starts. File uploads
     # (MiB) still dispatch at headers-complete so stream() can start early.
@@ -159,109 +180,9 @@ cdef enum:
     # intermediaries reject; 4KiB is the spec default.
     H2_HEADER_TABLE_SIZE = 4096
 
-cdef char* _UC_KEY[256]
-cdef Py_ssize_t _UC_LEN[256]
-cdef uint32_t _UC_HASH[256]
-cdef Py_ssize_t _UC_QOFF[256]
-cdef Py_ssize_t _UC_QLEN[256]
-cdef list _UC_PATH = None
 cdef object PATH_EMPTY = ""
 cdef bytes H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-cdef object _url_lock = Lock()
 cdef object _settings_lock = Lock()
-
-
-cdef uint32_t _url_hash(const char* s, Py_ssize_t n) noexcept:
-    cdef uint32_t value = <uint32_t>2166136261
-    cdef Py_ssize_t i
-    for i in range(n):
-        value = (value ^ <unsigned char>s[i]) * <uint32_t>16777619
-    return value
-
-
-cdef void _url_cache_init():
-    global _UC_PATH
-    cdef int i
-    if _UC_PATH is not None:
-        return
-    _UC_PATH = [None] * URL_CACHE_CAP
-    for i in range(URL_CACHE_CAP):
-        _UC_KEY[i] = NULL
-        _UC_LEN[i] = 0
-        _UC_HASH[i] = 0
-        _UC_QOFF[i] = 0
-        _UC_QLEN[i] = 0
-
-
-cdef void _url_cache_clear():
-    cdef int i
-    for i in range(URL_CACHE_CAP):
-        if _UC_KEY[i] != NULL:
-            free(_UC_KEY[i])
-            _UC_KEY[i] = NULL
-        _UC_LEN[i] = 0
-        _UC_HASH[i] = 0
-        _UC_QOFF[i] = 0
-        _UC_QLEN[i] = 0
-        _UC_PATH[i] = None
-
-
-cdef int _url_find(const char* url, Py_ssize_t n, uint32_t h) noexcept:
-    cdef int slot = <int>(h & (URL_CACHE_CAP - 1))
-    cdef int i
-    for i in range(URL_CACHE_CAP):
-        if _UC_KEY[slot] == NULL:
-            return -1
-        if (
-            _UC_HASH[slot] == h
-            and _UC_LEN[slot] == n
-            and memcmp(_UC_KEY[slot], url, <size_t>n) == 0
-        ):
-            return slot
-        slot = (slot + 1) & (URL_CACHE_CAP - 1)
-    return -1
-
-
-cdef void _url_store(
-    const char* url,
-    Py_ssize_t n,
-    uint32_t h,
-    object path,
-    Py_ssize_t qoff,
-    Py_ssize_t qlen,
-):
-    cdef int slot
-    cdef int i
-    cdef char* copy
-    slot = <int>(h & (URL_CACHE_CAP - 1))
-    for i in range(URL_CACHE_CAP):
-        if _UC_KEY[slot] == NULL:
-            copy = <char*>malloc(<size_t>n if n > 0 else 1)
-            if copy == NULL:
-                return
-            if n:
-                memcpy(copy, url, <size_t>n)
-            _UC_KEY[slot] = copy
-            _UC_LEN[slot] = n
-            _UC_HASH[slot] = h
-            _UC_PATH[slot] = path
-            _UC_QOFF[slot] = qoff
-            _UC_QLEN[slot] = qlen
-            return
-        slot = (slot + 1) & (URL_CACHE_CAP - 1)
-    _url_cache_clear()
-    slot = <int>(h & (URL_CACHE_CAP - 1))
-    copy = <char*>malloc(<size_t>n if n > 0 else 1)
-    if copy == NULL:
-        return
-    if n:
-        memcpy(copy, url, <size_t>n)
-    _UC_KEY[slot] = copy
-    _UC_LEN[slot] = n
-    _UC_HASH[slot] = h
-    _UC_PATH[slot] = path
-    _UC_QOFF[slot] = qoff
-    _UC_QLEN[slot] = qlen
 
 
 cdef object _decode_path_n(const char* s, Py_ssize_t n):
@@ -283,45 +204,18 @@ cdef object _path_for_url(
     Py_ssize_t* qlen,
 ):
     """Decoded path; query is a span inside the current URL (no copy)."""
-    cdef Py_ssize_t question = -1
     cdef Py_ssize_t i
-    cdef Py_ssize_t path_end
-    cdef uint32_t h = 0
-    cdef int slot
-    cdef object path
     qoff[0] = 0
     qlen[0] = 0
     if n <= 0:
         return PATH_EMPTY
-    if n <= URL_CACHE_MAX_KEY:
-        h = _url_hash(url, n)
-        with _url_lock:
-            slot = _url_find(url, n, h)
-            if slot >= 0:
-                qoff[0] = _UC_QOFF[slot]
-                qlen[0] = _UC_QLEN[slot]
-                return _UC_PATH[slot]
     for i in range(n):
         if url[i] == 63:
-            question = i
-            break
-    if question < 0:
-        path = _decode_path_n(url, n)
-        path_end = n
-    else:
-        path_end = question
-        path = _decode_path_n(url, question)
-        if question + 1 < n:
-            qoff[0] = question + 1
-            qlen[0] = n - question - 1
-    # Trailing-slash requests 308; don't spend a URL-cache slot on them.
-    if (
-        n <= URL_CACHE_MAX_KEY
-        and not (path_end > 1 and url[path_end - 1] == 47)
-    ):
-        with _url_lock:
-            _url_store(url, n, h, path, qoff[0], qlen[0])
-    return path
+            if i + 1 < n:
+                qoff[0] = i + 1
+                qlen[0] = n - i - 1
+            return _decode_path_n(url, i)
+    return _decode_path_n(url, n)
 
 cdef inline bint _as_buf(object data, const char** ptr, Py_ssize_t* n) noexcept:
     if PyBytes_Check(data):
@@ -472,7 +366,6 @@ cdef void _bind_settings():
     try:
         if _SETTINGS != NULL:
             return
-        _url_cache_init()
         settings = stario_settings_new()
         if settings == NULL:
             raise MemoryError()
@@ -485,54 +378,55 @@ cdef void _bind_settings():
         settings.on_body = _cb_body
         settings.on_message_complete = _cb_message_complete
         _SETTINGS = settings
+        stario_malloc_tune()
     finally:
         _settings_lock.release()
 
 
 cdef int _cb_message_begin(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_message_begin()
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_url(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_url(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_header_field(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_header_field(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_header_value(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_header_value(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_header_value_complete(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_header_value_complete()
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_headers_complete(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_headers_complete()
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_body(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_body(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_message_complete(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_message_complete()
     return -1 if proto.rejected else 0
 
@@ -542,11 +436,11 @@ cdef int _h2_on_begin_headers(
     const nghttp2_frame* frame,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto
+    cdef CHttpProtocol proto
     try:
         if frame.hd.type != NGHTTP2_HEADERS:
             return 0
-        proto = <HttpProtocol>user_data
+        proto = <CHttpProtocol>user_data
         proto._h2_begin_stream(frame.hd.stream_id)
         return 0
     except Exception:
@@ -563,7 +457,7 @@ cdef int _h2_on_header(
     uint8_t flags,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     proto._h2_on_header(frame.hd.stream_id, name, namelen, value, valuelen)
     return 0
 
@@ -576,7 +470,7 @@ cdef int _h2_on_data(
     size_t length,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     proto._h2_on_data(stream_id, data, length)
     return 0
 
@@ -586,10 +480,10 @@ cdef int _h2_on_frame_recv(
     const nghttp2_frame* frame,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto
+    cdef CHttpProtocol proto
     cdef uint8_t ftype
     try:
-        proto = <HttpProtocol>user_data
+        proto = <CHttpProtocol>user_data
         ftype = frame.hd.type
         if ftype == NGHTTP2_HEADERS:
             proto._h2_headers_frame(
@@ -608,9 +502,9 @@ cdef int _h2_on_stream_close(
     uint32_t error_code,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto
+    cdef CHttpProtocol proto
     try:
-        proto = <HttpProtocol>user_data
+        proto = <CHttpProtocol>user_data
         proto._h2_stream_closed(stream_id)
         return 0
     except Exception:
@@ -626,7 +520,7 @@ cdef ssize_t _h2_data_source_read(
     nghttp2_data_source* source,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     cdef RequestExchange ex
     if source != NULL and source.ptr != NULL:
         ex = <RequestExchange>source.ptr
@@ -642,7 +536,7 @@ cdef int _h2_send_data(
     nghttp2_data_source* source,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     return proto._h2_send_data_frame(frame, framehd, length, source)
 
 
@@ -695,7 +589,7 @@ def _stop_timeout_sweeper(loop, connections):
         task.cancel()
 
 
-cdef class HttpProtocol:
+cdef class CHttpProtocol(Connection):
     cdef llhttp_t* parser
     cdef public object loop
     cdef object app
@@ -718,7 +612,6 @@ cdef class HttpProtocol:
     cdef double header_timeout
     cdef double keep_alive_timeout
     cdef double body_timeout
-    cdef public int timeout_cleanup
     cdef double timeout_sweep_interval
     cdef int timeout_kind
     cdef double timeout_deadline
@@ -732,7 +625,9 @@ cdef class HttpProtocol:
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
     cdef object _create_task
-    cdef object _find_handler
+    cdef AppState _app_state
+    cdef object _in_buf
+    cdef Py_ssize_t _in_want
     cdef public int parse_mode
     cdef bytearray preface_hold
     cdef nghttp2_session* h2
@@ -772,6 +667,9 @@ cdef class HttpProtocol:
         self.h2_out_used = 0
         self.h2_in_recv = False
         self.h1_headers_too_large = False
+        self._app_state = None
+        self._in_buf = None
+        self._in_want = 0
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -808,8 +706,7 @@ cdef class HttpProtocol:
         self.compression = compression
         self.connections = connections
         self._create_task = app.create_task
-        # The LRU match cache, not the Router wrapper method.
-        self._find_handler = app._lookup
+        self._app_state = getattr(app, "_app_state", None)
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -880,7 +777,7 @@ cdef class HttpProtocol:
                 self.loop, self.connections, self.timeout_sweep_interval
             )
 
-    def ensure_disconnect(self):
+    cpdef object ensure_disconnect(self):
         if self.disconnect is None:
             self.disconnect = self.loop.create_future()
             if self.closed and not self.disconnect.done():
@@ -925,7 +822,7 @@ cdef class HttpProtocol:
         self.pump_scheduled = False
         self.transport = None
 
-    def release_exchange(self, RequestExchange exchange):
+    cpdef void release_exchange(self, RequestExchange exchange):
         """Detach, then keep one idle on this connection or recycle on this thread."""
         cdef int32_t stream_id
         if exchange._http2 and self.h2 != NULL:
@@ -1165,19 +1062,7 @@ cdef class HttpProtocol:
             ptr = <const char*>data
         if offset >= n:
             return
-        if self.parse_mode == PARSE_H2:
-            self._h2_recv(ptr + offset, <size_t>(n - offset))
-            return
-        if self.parse_mode == PARSE_NONE:
-            if not self._maybe_start_h2(ptr + offset, n - offset):
-                return
-            if self.parse_mode == PARSE_H2:
-                self._h2_recv(ptr + offset, <size_t>(n - offset))
-                return
-            if self.preface_hold:
-                self._h1_execute_held()
-                return
-        self._h1_execute(data, offset)
+        self._pump_ptr(ptr + offset, n - offset)
 
     cdef bint _maybe_start_h2(self, const char* p, Py_ssize_t n) noexcept:
         """Detect the H2 preface before llhttp sees the first bytes.
@@ -1290,7 +1175,7 @@ cdef class HttpProtocol:
             if transport is not None and not transport.is_closing():
                 transport.resume_reading()
 
-    def set_body_paused(self, exchange, paused):
+    cpdef void set_body_paused(self, RequestExchange exchange, bint paused):
         if paused:
             self.body_pause_owner = exchange
             self._set_pause_reason(PAUSE_BODY, True)
@@ -1654,6 +1539,9 @@ cdef class HttpProtocol:
         cdef Py_ssize_t path_end
         cdef Py_ssize_t start
         cdef Py_ssize_t end
+        cdef AppState state
+        cdef CRouter router
+        cdef bint host_routing
         if not exchange._http2:
             self.active_exchange = exchange
         req = exchange.req
@@ -1684,12 +1572,24 @@ cdef class HttpProtocol:
         if span is not None and self.noop_span is None:
             span.start()
             span.attrs({"request.method": method, "request.path": path})
-        if self.app.host_routing:
+        state = self._app_state
+        router = None
+        host_routing = False
+        if state is not None:
+            host_routing = state.host_routing
+            if state.router is not None:
+                router = <CRouter>state.router
+        elif self.app.host_routing:
+            host_routing = True
+        if host_routing:
             req.prefetch_host()
             host = req.host
         else:
             host = ""
-        handler, route, match = self._find_handler(host, path, method)
+        if router is not None:
+            handler, route, match = router.c_lookup(host, path, method)
+        else:
+            handler, route, match = self.app.find_handler(host, path, method)
         exchange.match = match
         if span is not None and self.noop_span is None and match.pattern:
             span.rename(match.pattern)
@@ -1700,6 +1600,7 @@ cdef class HttpProtocol:
             eager_start=eager_start,
         )
         exchange._handler_task = task
+        # Always the same done path. Task() is intentional: middleware may await.
         if task.done():
             # Skip only a clean NoOp success. Write-then-raise / cancel / an
             # incomplete response must still hit on_handler_done (log + abort).
@@ -1709,8 +1610,9 @@ cdef class HttpProtocol:
                 or task.cancelled()
                 or task.exception() is not None
             ):
-                on_handler_done(exchange, exchange, task)
-            exchange.handler_finished()
+                exchange.on_handler_done(task)
+            else:
+                exchange.handler_finished()
         else:
             task.add_done_callback(exchange.on_handler_done)
 
@@ -1734,7 +1636,7 @@ cdef class HttpProtocol:
             exchange.cancel_before_start()
         self.pending_exchanges.clear()
 
-    def response_completed(self, RequestExchange exchange):
+    cpdef void response_completed(self, RequestExchange exchange):
         """Advance the connection after the response is fully sent.
 
         Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
@@ -1770,7 +1672,11 @@ cdef class HttpProtocol:
             keep = req.keep_alive
         else:
             keep = self.request_keep_alive
-        if not keep or self.app.shutting_down:
+        if not keep or (
+            self._app_state.shutting_down
+            if self._app_state is not None
+            else self.app.shutting_down
+        ):
             transport.close()
             self._drop_pending()
             return
@@ -2483,18 +2389,28 @@ cdef class HttpProtocol:
             frame != NULL and ex._h2_stream_id != frame.hd.stream_id
         ):
             return NGHTTP2_ERR_CALLBACK_FAILURE
-        if self._h2_out_append(<const char*>framehd, 9) != 0:
+        self._h2_flush_out()
+        pending = PyBytes_FromStringAndSize(<const char*>framehd, 9)
+        if self.transport is None:
             return NGHTTP2_ERR_CALLBACK_FAILURE
         if length == 0:
+            self.transport.write(pending)
             return 0
-        pending = ex._h2_pending
         off = ex._h2_pending_off
-        if not _as_buf(pending, &src, &n):
+        if not _as_buf(ex._h2_pending, &src, &n):
             return NGHTTP2_ERR_CALLBACK_FAILURE
         if off < 0 or off + <Py_ssize_t>length > n:
             return NGHTTP2_ERR_CALLBACK_FAILURE
-        if self._h2_out_append(src + off, <Py_ssize_t>length) != 0:
-            return NGHTTP2_ERR_CALLBACK_FAILURE
+        if PyBytes_Check(ex._h2_pending):
+            self.transport.writelines((
+                pending,
+                memoryview(ex._h2_pending)[off:off + <Py_ssize_t>length],
+            ))
+        else:
+            self.transport.writelines((
+                pending,
+                PyBytes_FromStringAndSize(src + off, <Py_ssize_t>length),
+            ))
         ex._h2_pending_off = off + <Py_ssize_t>length
         if ex._h2_pending_off >= n:
             ex._h2_pending = b""
@@ -2579,7 +2495,7 @@ cdef class HttpProtocol:
             filled += 1
         return filled
 
-    def h2_respond(
+    cpdef void h2_respond(
         self,
         RequestExchange ex,
         object nva,
@@ -2650,7 +2566,7 @@ cdef class HttpProtocol:
             if heap:
                 free(nvs)
 
-    def h2_write_headers(
+    cpdef void h2_write_headers(
         self,
         RequestExchange ex,
         object nva,
@@ -2767,7 +2683,7 @@ cdef class HttpProtocol:
             ex._h2_pending_off = 0
         pending.extend(data)
 
-    def h2_write_data(self, RequestExchange ex, object data, bint end):
+    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end):
         if self.h2 == NULL or ex is None or ex.in_pool:
             return
         if data:
@@ -2777,13 +2693,118 @@ cdef class HttpProtocol:
         nghttp2_session_resume_data(self.h2, ex._h2_stream_id)
         self._h2_send()
 
-    def h2_end(self, RequestExchange ex):
+    cpdef void h2_end(self, RequestExchange ex):
         self.h2_write_data(ex, None, True)
 
-    def h2_abort(self, RequestExchange ex):
+    cpdef void h2_abort(self, RequestExchange ex):
         if self.h2 == NULL or ex is None:
             return
         nghttp2_submit_rst_stream(
             self.h2, NGHTTP2_FLAG_NONE, ex._h2_stream_id, NGHTTP2_INTERNAL_ERROR
         )
         self._h2_send()
+
+    cpdef object c_get_buffer(self, Py_ssize_t sizehint):
+        """Reusable read buffer. Consume it in buffer_updated before reuse."""
+        cdef Py_ssize_t want = sizehint
+        cdef RequestExchange ex
+        cdef Py_ssize_t remaining
+        if want < 64 * 1024:
+            want = 64 * 1024
+        if want > 256 * 1024:
+            want = 256 * 1024
+        ex = self.reading_exchange
+        if ex is not None and ex._expected_size >= 0:
+            remaining = ex._expected_size - ex._total_read
+            if remaining > 0:
+                if remaining < want:
+                    want = remaining
+                elif remaining <= 256 * 1024:
+                    want = remaining
+        if want < 1:
+            want = 1
+        if self._in_buf is None or PyByteArray_GET_SIZE(self._in_buf) < want:
+            self._in_buf = bytearray(want)
+        self._in_want = want
+        return memoryview(self._in_buf)[:want]
+
+    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
+        cdef const char* ptr
+        if self.rejected or nbytes <= 0 or self._in_buf is None:
+            return
+        if self.parse_mode != PARSE_H2 and self.parser == NULL:
+            return
+        if self.timeout_kind == TIMEOUT_IDLE:
+            if not (
+                self.parse_mode == PARSE_H1
+                and self.reading_exchange is not None
+                and (
+                    self.reading_exchange._discard_body
+                    or self.h1_headers_too_large
+                )
+            ):
+                self.timeout_kind = TIMEOUT_NONE
+                self.timeout_deadline = 0.0
+        ptr = PyByteArray_AS_STRING(self._in_buf)
+        if self.held_data is not None:
+            self._held_append(PyBytes_FromStringAndSize(ptr, nbytes))
+            return
+        if self.pause_reasons:
+            self.held_data = PyBytes_FromStringAndSize(ptr, nbytes)
+            self.held_offset = 0
+            return
+        self._pump_ptr(ptr, nbytes)
+        self._after_pump()
+
+    cdef void _pump_ptr(self, const char* ptr, Py_ssize_t n) noexcept:
+        if n <= 0:
+            return
+        if self.parse_mode == PARSE_H2:
+            self._h2_recv(ptr, <size_t>n)
+            return
+        if self.parse_mode == PARSE_NONE:
+            if not self._maybe_start_h2(ptr, n):
+                return
+            if self.parse_mode == PARSE_H2:
+                self._h2_recv(ptr, <size_t>n)
+                return
+            if self.preface_hold:
+                self._h1_execute_held()
+                return
+        self._h1_execute_ptr(ptr, n)
+
+    cdef void _h1_execute_ptr(self, const char* ptr, Py_ssize_t n) noexcept:
+        cdef Py_ssize_t offset = 0
+        cdef Py_ssize_t end
+        cdef int err
+        if self.parser == NULL or n <= 0:
+            return
+        if n <= PARSER_QUANTUM:
+            err = llhttp_execute(self.parser, ptr, <size_t>n)
+            if err != HPE_OK:
+                self._protocol_error(400, "Invalid HTTP request")
+            return
+        while offset < n:
+            end = offset + PARSER_QUANTUM
+            if end > n:
+                end = n
+            err = llhttp_execute(self.parser, ptr + offset, <size_t>(end - offset))
+            if err != HPE_OK:
+                self._protocol_error(400, "Invalid HTTP request")
+                return
+            offset = end
+            if self.pause_reasons:
+                if offset < n:
+                    self.held_data = PyBytes_FromStringAndSize(ptr + offset, n - offset)
+                    self.held_offset = 0
+                return
+
+
+class HttpProtocol(CHttpProtocol, asyncio.BufferedProtocol):
+    """Python subclass so uvloop/asyncio can use BufferedProtocol."""
+
+    def get_buffer(self, sizehint):
+        return self.c_get_buffer(sizehint)
+
+    def buffer_updated(self, nbytes):
+        self.c_buffer_updated(nbytes)

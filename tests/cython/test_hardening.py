@@ -28,6 +28,14 @@ _WAIT = 0.40
 _TRICKLE_PAUSE = 0.08
 
 
+class HoldingTransport(RecordingTransport):
+    """Keep write buffers as-is so a reused bytearray would corrupt later copies."""
+
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        assert not self._closing, "write after transport close"
+        self.writes.append(data)
+
+
 def _attach(app: App | None = None, **kwargs):
     loop = asyncio.get_running_loop()
     if app is None:
@@ -41,6 +49,40 @@ def _attach(app: App | None = None, **kwargs):
 async def _drain(app: App) -> None:
     await asyncio.sleep(0)
     await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_chunked_writes_stay_stable_if_transport_holds_buffers() -> None:
+    """uvloop may keep a memoryview of the last write; each flush must be bytes."""
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def stream(_c, w) -> None:
+        w.headers.set("content-type", "text/plain")
+        w.write_headers(200)
+        w.write(b"alpha")
+        w.write(b"bravo")
+        w.write(b"charlie")
+        w.end()
+
+    app.get("/", stream)
+    proto = make_protocol(loop, app)
+    transport = HoldingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        raw = b"".join(bytes(chunk) for chunk in transport.writes)
+        assert b"5\r\nalpha\r\n" in raw
+        assert b"5\r\nbravo\r\n" in raw
+        assert b"7\r\ncharlie\r\n" in raw
+        assert raw.count(b"alpha") == 1
+        assert raw.count(b"bravo") == 1
+        assert raw.count(b"charlie") == 1
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
 
 
 @pytest.mark.asyncio

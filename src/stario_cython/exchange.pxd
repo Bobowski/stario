@@ -105,6 +105,79 @@ cdef Request make_request(
     object body,
 )
 
+cdef class RequestExchange
+
+cdef class Connection:
+    """Typed protocol surface used by RequestExchange (cpdef = virtual)."""
+    cdef public int timeout_cleanup
+    cpdef void release_exchange(self, RequestExchange exchange)
+    cpdef void response_completed(self, RequestExchange exchange)
+    cpdef void set_body_paused(self, RequestExchange exchange, bint paused)
+    cpdef object ensure_disconnect(self)
+    cpdef void h2_respond(
+        self,
+        RequestExchange ex,
+        object nva,
+        object body,
+        bint skip_ce=*,
+        bint skip_cl=*,
+        bint skip_ct=*,
+    )
+    cpdef void h2_write_headers(
+        self,
+        RequestExchange ex,
+        object nva,
+        bint skip_ce=*,
+        bint skip_cl=*,
+        bint skip_ct=*,
+        bint skip_user=*,
+    )
+    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end)
+    cpdef void h2_end(self, RequestExchange ex)
+    cpdef void h2_abort(self, RequestExchange ex)
+
+cdef class AppState:
+    cdef public bint host_routing
+    cdef public bint shutting_down
+    cdef public object router
+
+cdef class CNode
+
+cdef class CEdge:
+    cdef object key
+    cdef const char* key_p
+    cdef Py_ssize_t key_n
+    cdef object rest
+    cdef const char* rest_p
+    cdef Py_ssize_t rest_n
+    cdef CNode child
+
+cdef class CNode:
+    cdef list edges
+    cdef Py_ssize_t n_edges
+    cdef int edge_start[256]
+    cdef int edge_count[256]
+    cdef object wildcard_name
+    cdef CNode wildcard
+    cdef object catchall_name
+    cdef CNode catchall
+    cdef dict endpoints
+    cdef object method_set
+    cdef object not_found
+    cdef object method_na
+    cdef bint not_found_custom
+
+cdef class CRouter:
+    cdef dict exact
+    cdef CNode path
+    cdef dict hosts_exact
+    cdef CNode hosts_param
+    cdef bint host_routing
+    cdef bint has_param_hosts
+    cdef object c_lookup(self, object host, object path, object method)
+
+cpdef CRouter compile_router(object router)
+
 cdef class RequestExchange:
     cdef object _transport
     cdef list _date_box
@@ -138,7 +211,6 @@ cdef class RequestExchange:
     cdef StarioBrotli* _brotli
     cdef StarioGzip* _gzip
     cdef object _out_buf
-    cdef object _out_hold
     cdef Py_ssize_t _out_len
     cdef int _status_code
     cdef Py_ssize_t _declared_length
@@ -155,7 +227,7 @@ cdef class RequestExchange:
     cdef public object app
     cdef public object span
     cdef public object match
-    cdef object _connection
+    cdef Connection _connection
     cdef object _state
     cdef public object request_headers
     cdef public Request req
@@ -163,7 +235,6 @@ cdef class RequestExchange:
     cdef bint handler_started
     cdef bint in_pool
 
-    cdef object _chunks
     cdef object _cached
     cdef object _data_ready
     cdef double _stall_deadline
@@ -202,15 +273,15 @@ cdef class RequestExchange:
     cdef bint _expect_continue
     cdef bint _waiting
     cdef bint _discard_body
-    cdef object _body_tail
-    cdef Py_ssize_t _tail_used
-    cdef Py_ssize_t _tail_cap
+    cdef object _body_buf
+    cdef Py_ssize_t _body_used
+    cdef Py_ssize_t _body_cap
     cdef Py_ssize_t _expected_size
     cdef Py_ssize_t _stream_max_chunk
 
     cdef void reset(
         self,
-        object connection,
+        Connection connection,
         object app,
         object transport,
         list date_box,
@@ -262,10 +333,10 @@ cdef class RequestExchange:
     cdef int c_complete(self) noexcept
     cdef void c_abort(self)
     cdef void _clear_body_storage(self) noexcept
-    cdef int _ensure_body_tail(self, Py_ssize_t received_before) noexcept
+    cdef int _body_reserve(self, Py_ssize_t need) noexcept
     cdef int _adopt_expected_body_buffer(self) noexcept
-    cdef int _seal_body_tail(self) noexcept
     cdef object _body_to_bytes(self)
+    cdef object _body_take(self, Py_ssize_t max_n)
     cdef void reset_response(self, int encoding)
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
@@ -310,7 +381,7 @@ cdef class RequestHeaders:
     cdef void c_parse_cookies(self, dict out) except *
 
 cdef RequestExchange acquire_exchange(
-    object connection,
+    Connection connection,
     object app,
     object transport,
     list date_box,
