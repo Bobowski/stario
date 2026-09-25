@@ -218,7 +218,7 @@ cdef inline dict _params(dict params):
     return params
 
 
-cdef object _finish(
+cdef inline object _finish(
     CNode node,
     object method,
     dict params,
@@ -256,7 +256,6 @@ cdef object _finish(
 
 
 cdef enum:
-    SEG_STACK = 32
     DECODE_STACK = 512
 
 
@@ -284,15 +283,7 @@ cdef object _resolve_tree_n(
     cdef Py_ssize_t dot
     cdef Py_ssize_t seg_start
     cdef Py_ssize_t i
-    cdef Py_ssize_t k
-    cdef Py_ssize_t nseg = 0
-    cdef Py_ssize_t cap
-    cdef Py_ssize_t w
     cdef Py_ssize_t dn
-    cdef Py_ssize_t seg_stack_off[SEG_STACK]
-    cdef Py_ssize_t seg_stack_len[SEG_STACK]
-    cdef Py_ssize_t* seg_off = seg_stack_off
-    cdef Py_ssize_t* seg_len = seg_stack_len
     cdef char decode_stack[DECODE_STACK]
     cdef char* dbuf = NULL
     cdef const char* d
@@ -348,19 +339,9 @@ cdef object _resolve_tree_n(
     if path_n == 0 or (path_n == 1 and path_p[0] == 47):
         custom[0] = cust
         return _finish(node, method, params, nf_hit, method_na, status)
-    # Segments of the raw path, split on raw '/' only. ``d`` holds the bytes
-    # the trie compares: the arena itself, or each segment decoded and joined
-    # with '/' (a decoded %2F stays inside its segment).
-    cap = 1
-    for i in range(path_n):
-        if path_p[i] == 47:
-            cap += 1
+    # Split the raw path on raw '/' only, decoding each segment on its own
+    # into ``dbuf`` when the path has '%'. A decoded %2F stays in its segment.
     try:
-        if cap > SEG_STACK:
-            seg_off = <Py_ssize_t*>malloc(<size_t>cap * sizeof(Py_ssize_t))
-            seg_len = <Py_ssize_t*>malloc(<size_t>cap * sizeof(Py_ssize_t))
-            if seg_off == NULL or seg_len == NULL:
-                raise MemoryError()
         if decode:
             if path_n <= DECODE_STACK:
                 dbuf = decode_stack
@@ -369,53 +350,40 @@ cdef object _resolve_tree_n(
                 if dbuf == NULL:
                     raise MemoryError()
         i = 1 if path_p[0] == 47 else 0
-        w = 0
         while True:
             seg_start = i
             while i < path_n and path_p[i] != 47:
                 i += 1
             if decode:
-                dn = _pct_decode_into(path_p + seg_start, i - seg_start, dbuf + w)
+                dn = _pct_decode_into(path_p + seg_start, i - seg_start, dbuf)
                 if dn < 0:
                     status[0] = 2
                     custom[0] = custom_before
                     return nf_before if nf_before is not None else _NF_HIT
-                seg_off[nseg] = w
-                seg_len[nseg] = dn
-                w += dn
-                if i < path_n:
-                    dbuf[w] = 47
-                    w += 1
+                d = dbuf
             else:
-                seg_off[nseg] = seg_start
-                seg_len[nseg] = i - seg_start
-            nseg += 1
-            if i >= path_n:
-                break
-            i += 1
-        if decode:
-            d = dbuf
-            dn = w
-        else:
-            d = path_p
-            dn = path_n
-        for k in range(nseg):
-            child = _match_exact(node, d + seg_off[k], seg_len[k])
+                d = path_p + seg_start
+                dn = i - seg_start
+            child = _match_exact(node, d, dn)
             if child is None:
                 params = _params(params)
-                if node.catchall is not None:
-                    child = _take_param(
-                        node,
-                        d + seg_off[k],
-                        seg_len[k],
-                        d + seg_off[k],
-                        dn - seg_off[k],
-                        params,
-                    )
+                if node.wildcard is None and node.catchall is not None:
+                    # ``{path...}`` takes the rest of the path, decoded.
+                    if decode:
+                        dn = _pct_decode_into(
+                            path_p + seg_start, path_n - seg_start, dbuf
+                        )
+                        if dn < 0:
+                            status[0] = 2
+                            custom[0] = custom_before
+                            return nf_before if nf_before is not None else _NF_HIT
+                        d = dbuf
+                    else:
+                        d = path_p + seg_start
+                        dn = path_n - seg_start
+                    child = _take_param(node, d, dn, d, dn, params)
                 else:
-                    child = _take_param(
-                        node, d + seg_off[k], seg_len[k], NULL, -1, params
-                    )
+                    child = _take_param(node, d, dn, NULL, -1, params)
                 if child is None:
                     status[0] = 2
                     custom[0] = custom_before
@@ -429,14 +397,13 @@ cdef object _resolve_tree_n(
                 node = child
                 break
             node = child
+            if i >= path_n:
+                break
+            i += 1
         custom[0] = cust
         result = _finish(node, method, params, nf_hit, method_na, status)
         return result
     finally:
-        if seg_off != seg_stack_off:
-            free(seg_off)
-        if seg_len != seg_stack_len:
-            free(seg_len)
         if dbuf != NULL and dbuf != decode_stack:
             free(dbuf)
 

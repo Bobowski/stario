@@ -1502,12 +1502,14 @@ cdef class CHttpProtocol(Connection):
             exchange._path_flags = PATH_BAD
             return
         url = exchange._req_arena + exchange._req_url_offset
-        if memchr(url, 35, <size_t>n) != NULL:
-            exchange._path_flags = PATH_BAD
-            return
         q = <const char*>memchr(url, 63, <size_t>n)
         path_end = n if q == NULL else <Py_ssize_t>(q - url)
         if q != NULL and path_end + 1 < n:
+            # A fragment is never part of a request-target (the path scan
+            # rejects '#' too).
+            if memchr(q + 1, 35, <size_t>(n - path_end - 1)) != NULL:
+                exchange._path_flags = PATH_BAD
+                return
             exchange._query_off = exchange._req_url_offset + path_end + 1
             exchange._query_len = n - path_end - 1
         if url[0] == 47:

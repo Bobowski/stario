@@ -179,6 +179,13 @@ cdef object STARTED_ERROR = (
 
 cdef object _POOL_LOCAL = threading.local()
 cdef object _UNBOUND = object()
+# Recycles that found a per-request object still referenced (tests pin this
+# to zero for plain requests so the refcount baselines cannot drift).
+cdef Py_ssize_t _RETAINED_DETACHES = 0
+
+
+def _retained_detach_count():
+    return _RETAINED_DETACHES
 
 
 cdef inline list _thread_pool():
@@ -345,14 +352,18 @@ cdef inline bint _may_have_body(int status) noexcept:
     return not (100 <= status < 200)
 
 
+cdef int _raise_bad_status(int status) except -1:
+    raise StarioError(
+        "Invalid response status",
+        context={"status": status},
+        help_text="Send a final status between 200 and 599.",
+    )
+
+
 cdef inline int _require_final_status(int status) except -1:
     # RFC 9110 §15: final responses are 200-599 (1xx is interim, >599 invalid).
     if status < 200 or status > 599:
-        raise StarioError(
-            "Invalid response status",
-            context={"status": status},
-            help_text="Send a final status between 200 and 599.",
-        )
+        return _raise_bad_status(status)
     return 0
 
 
@@ -468,6 +479,35 @@ cdef inline int _utf8_step(
     return 0
 
 
+cdef enum:
+    PC_PLAIN = 0
+    PC_SLASH = 1
+    PC_PCT = 2
+    PC_DOT = 3
+    PC_BAD = 4
+    PC_HIGH = 5
+
+# Wire byte classes for request paths. BAD: space, controls, DEL, '#', '?'.
+cdef unsigned char _PATH_CLASS[256]
+
+
+cdef void _init_path_class() noexcept:
+    cdef int c
+    for c in range(256):
+        if c <= 32 or c == 127 or c == 35 or c == 63:
+            _PATH_CLASS[c] = PC_BAD
+        elif c >= 128:
+            _PATH_CLASS[c] = PC_HIGH
+        else:
+            _PATH_CLASS[c] = PC_PLAIN
+    _PATH_CLASS[47] = PC_SLASH
+    _PATH_CLASS[37] = PC_PCT
+    _PATH_CLASS[46] = PC_DOT
+
+
+_init_path_class()
+
+
 cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noexcept:
     """Validate an origin-form path (no query) and classify it.
 
@@ -488,23 +528,34 @@ cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noe
     cdef int h2
     cdef unsigned char c
     cdef unsigned char d
+    cdef unsigned char k
+    cdef Py_ssize_t start
     if n <= 0 or p[0] != 47:
         return -1
     i = 1
-    while True:
-        if i == n or p[i] == 47:
+    while i < n:
+        c = <unsigned char>p[i]
+        k = _PATH_CLASS[c]
+        if k == PC_PLAIN and need == 0:
+            start = i
+            i += 1
+            while i < n and _PATH_CLASS[<unsigned char>p[i]] == PC_PLAIN:
+                i += 1
+            seg_len += i - start
+            seg_dots = False
+            continue
+        if k == PC_SLASH:
             if need != 0:
                 return -1
             if seg_dots and (seg_len == 1 or seg_len == 2):
                 flags |= PATH_REDIRECT
-            if i == n:
-                break
             seg_len = 0
             seg_dots = True
             i += 1
             continue
-        c = <unsigned char>p[i]
-        if c == 37:
+        if k == PC_BAD:
+            return -1
+        if k == PC_PCT:
             if i + 2 >= n:
                 return -1
             h1 = _hex_nibble(<unsigned char>p[i + 1])
@@ -514,22 +565,24 @@ cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noe
             d = <unsigned char>(h1 * 16 + h2)
             flags |= PATH_HAS_PCT
             i += 3
-        else:
-            if c <= 32 or c == 127 or c == 35 or c == 63:
+            if d < 32 or d == 127:
                 return -1
-            if c >= 128:
+        else:
+            if k == PC_HIGH:
                 if not allow_raw_utf8:
                     return -1
                 flags |= PATH_RAW_UTF8
             d = c
             i += 1
-        if d < 32 or d == 127:
-            return -1
-        if _utf8_step(&need, &lo, &hi, d) != 0:
+        if (d >= 0x80 or need != 0) and _utf8_step(&need, &lo, &hi, d) != 0:
             return -1
         seg_len += 1
         if d != 46:
             seg_dots = False
+    if need != 0:
+        return -1
+    if seg_dots and (seg_len == 1 or seg_len == 2):
+        flags |= PATH_REDIRECT
     if n > 1 and p[n - 1] == 47:
         flags |= PATH_REDIRECT
     return flags
@@ -1797,6 +1850,7 @@ cdef object BODY_GONE_ERROR = (
 
 
 @cython.final
+@cython.freelist(64)
 cdef class Request:
     """One HTTP request. New object per dispatch; not pooled with the exchange.
 
@@ -2087,6 +2141,8 @@ cdef class RequestExchange:
         self.headers = Headers()
         self._req_view = None
         self._handle = None
+        self._spare_view = None
+        self._spare_handle = None
         self._clear_request_binding()
         self._cached = None
         self._data_ready = None
@@ -2929,7 +2985,11 @@ cdef class RequestExchange:
     cdef RequestHeaders _ensure_view(self):
         cdef RequestHeaders view = self._req_view
         if view is None:
-            view = RequestHeaders.__new__(RequestHeaders)
+            view = self._spare_view
+            if view is None:
+                view = RequestHeaders.__new__(RequestHeaders)
+            else:
+                self._spare_view = None
             view._ex = self
             self._req_view = view
         return view
@@ -2964,13 +3024,18 @@ cdef class RequestExchange:
 
     cdef RequestHandle start_handle(self):
         """Fresh ``c`` / ``w`` for this dispatch. Stale once the exchange recycles."""
-        cdef RequestHandle handle = RequestHandle.__new__(RequestHandle)
+        cdef RequestHandle handle = self._spare_handle
+        if handle is None:
+            handle = RequestHandle.__new__(RequestHandle)
+        else:
+            self._spare_handle = None
         handle._ex = self
         handle._conn = self._connection
         handle.app = self.app
         handle.span = self.span
         handle.match = self.match
         handle._final_status = -1
+        handle._req = None
         self._handle = handle
         return handle
 
@@ -2986,29 +3051,44 @@ cdef class RequestExchange:
         cdef RequestHandle handle = self._handle
         cdef Request request
         cdef RequestHeaders view
+        cdef Headers headers
+        global _RETAINED_DETACHES
         self._handle = None
         if handle is not None:
             if Py_REFCNT(handle) > 1:
+                _RETAINED_DETACHES += 1
                 handle._req = self.ensure_request()
                 handle._final_status = self._status_code
-            handle._ex = None
+                handle._ex = None
+            else:
+                # Only this local refers to it: nobody can tell it is reused.
+                # start_handle() rebinds every field.
+                handle._ex = None
+                handle._state = None
+                self._spare_handle = handle
             handle = None
         request = self._req
         self._req = None
         if request is not None:
             if Py_REFCNT(request) > 1:
+                _RETAINED_DETACHES += 1
                 request.detach_body(self)
             request = None
         view = self._req_view
         self._req_view = None
         if view is not None:
             if Py_REFCNT(view) > 1:
+                _RETAINED_DETACHES += 1
                 view._take_ownership()
             else:
                 view._ex = None
+                self._spare_view = view
             view = None
-        if Py_REFCNT(self.headers) > 1:
-            # A task kept ``w.headers``; give the next response its own list.
+        headers = self.headers
+        # The field and this local are ours; any more means a task kept
+        # ``w.headers``. Give the next response its own list.
+        if Py_REFCNT(headers) > 2:
+            _RETAINED_DETACHES += 1
             self.headers = Headers()
 
     def on_handler_done(self, task):
@@ -3087,6 +3167,11 @@ cdef class RequestExchange:
         self.app = None
         self._connection = None
         self._transport = None
+        if self._spare_handle is not None:
+            self._spare_handle._conn = None
+            self._spare_handle.app = None
+            self._spare_handle.span = None
+            self._spare_handle.match = None
         pool = _thread_pool()
         if len(pool) < POOL_MAX:
             pool.append(self)
@@ -3932,6 +4017,7 @@ cdef class RequestExchange:
 
 
 @cython.final
+@cython.freelist(64)
 cdef class RequestHeaders:
     """Read-only request headers for one request.
 
@@ -4246,6 +4332,7 @@ cdef inline void _raise_finished() except *:
 
 
 @cython.final
+@cython.freelist(64)
 cdef class RequestHandle:
     """``c`` and ``w`` for one handler call (one object implements both).
 

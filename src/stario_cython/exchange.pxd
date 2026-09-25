@@ -258,6 +258,9 @@ cdef class RequestExchange:
     cdef Connection _connection
     cdef RequestHeaders _req_view
     cdef RequestHandle _handle
+    # Unreferenced leftovers from the previous request, reused as-is.
+    cdef RequestHeaders _spare_view
+    cdef RequestHandle _spare_handle
     cdef Request _req
     cdef object _method
     cdef object _path
