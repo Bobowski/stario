@@ -794,6 +794,68 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
 
 
 @pytest.mark.asyncio
+async def test_handler_after_respond_stays_on_app_tasks_and_next_request_starts() -> None:
+    """4.3: respond() frees the connection; the handler Task drains on app.tasks."""
+    loop = asyncio.get_running_loop()
+    app = App()
+    release = asyncio.Event()
+    first_responded = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def first(c, w):
+        responses.text(w, "first")
+        first_responded.set()
+        assert any(not task.done() for task in c.app.tasks)
+        await release.wait()
+
+    async def second(c, w):
+        second_started.set()
+        responses.text(w, "second")
+
+    app.get("/first", first)
+    app.get("/second", second)
+    connections: set[HttpProtocol] = set()
+    server = await loop.create_server(
+        lambda: HttpProtocol(
+            loop,
+            app,
+            NoOpTracer(),
+            [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"],
+            CompressionConfig(),
+            connections,
+        ),
+        "127.0.0.1",
+        free_port(),
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        assert b"first" in await read_response(reader)
+        await asyncio.wait_for(first_responded.wait(), timeout=1.0)
+        assert any(not task.done() for task in app.tasks)
+
+        writer.write(b"GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        assert b"second" in await read_response(reader)
+
+        drain = asyncio.create_task(app.drain_tasks())
+        await asyncio.sleep(0)
+        assert not drain.done()
+        release.set()
+        await asyncio.wait_for(drain, timeout=1.0)
+        assert not app.tasks
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_large_single_read_pipeline_is_bounded() -> None:
     loop = asyncio.get_running_loop()
     app = App()

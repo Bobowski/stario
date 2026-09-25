@@ -155,6 +155,7 @@ cdef class CEdge:
 cdef class CNode:
     cdef list edges
     cdef Py_ssize_t n_edges
+    cdef CEdge one_edge
     cdef int edge_start[256]
     cdef int edge_count[256]
     cdef object wildcard_name
@@ -162,14 +163,16 @@ cdef class CNode:
     cdef object catchall_name
     cdef CNode catchall
     cdef dict endpoints
+    cdef object one_method
+    cdef object one_hit
+    cdef object nf_hit
+    cdef object mna_hit
     cdef object method_set
     cdef object not_found
     cdef object method_na
     cdef bint not_found_custom
 
 cdef class CRouter:
-    cdef dict exact_paths
-    cdef dict exact_hosts
     cdef CNode path
     cdef dict hosts_exact
     cdef CNode hosts_param

@@ -1601,8 +1601,10 @@ cdef class CHttpProtocol(Connection):
         if span is not None and self.noop_span is None and match.pattern:
             span.rename(match.pattern)
             span.attr("http.route", route.path)
-        # asyncio.Task, not app.create_task: skip the Python wrapper. Still a
-        # real Task so middleware can await. Incomplete work joins app.tasks.
+        # 4.3 contract: a real asyncio.Task at dispatch (headers-complete for
+        # large/chunked/expect-continue, else message-complete). respond()/end()
+        # frees the connection via response_completed; the Task may outlive the
+        # response. Incomplete work joins app.tasks so shutdown drain sees it.
         task = _asyncio_Task(
             handler(exchange, exchange),
             loop=self.loop,

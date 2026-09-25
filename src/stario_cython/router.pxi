@@ -1,17 +1,23 @@
-"""Compiled text trie for route lookup. No result cache — walk is the hit path."""
+"""Compiled path/host trie. Walk UTF-8 bytes; intern results on the leaves.
 
-from cpython.unicode cimport PyUnicode_AsUTF8AndSize
+No exact-map sidecar and no per-lookup walk object. Static hits return the
+3-tuple stored at compile time (same Match identity). Param hits allocate
+one Match + one params dict. 404/405 tuples are interned on the node.
+"""
+
+from cpython.unicode cimport PyUnicode_AsUTF8AndSize, PyUnicode_DecodeUTF8
 
 cdef object _ROUTER_EMPTY_ROUTE = None
 cdef object _ROUTER_EMPTY_MATCH = None
 cdef object _ROUTER_DEFAULT_NF = None
 cdef object _ROUTER_DEFAULT_MNA = None
 cdef object _ROUTER_MATCH_CLS = None
+cdef object _NF_HIT = None
 
 
 cdef void _router_symbols():
     global _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH
-    global _ROUTER_DEFAULT_NF, _ROUTER_DEFAULT_MNA, _ROUTER_MATCH_CLS
+    global _ROUTER_DEFAULT_NF, _ROUTER_DEFAULT_MNA, _ROUTER_MATCH_CLS, _NF_HIT
     if _ROUTER_EMPTY_ROUTE is not None:
         return
     from stario.http.context import EMPTY_MATCH, Match
@@ -22,6 +28,11 @@ cdef void _router_symbols():
     _ROUTER_DEFAULT_NF = default_not_found
     _ROUTER_DEFAULT_MNA = method_not_allowed_handler
     _ROUTER_MATCH_CLS = Match
+    _NF_HIT = (default_not_found, EMPTY_ROUTE, EMPTY_MATCH)
+
+
+cdef object _pack(object handler, object route, object match):
+    return (handler, route, match)
 
 
 cdef CNode _compile_node(object node):
@@ -35,6 +46,8 @@ cdef CNode _compile_node(object node):
     cdef object endpoints
     cdef object method
     cdef object endpoint
+    cdef object hit
+    cdef object match
     cdef bytes key_b
     cdef bytes rest_b
     cdef Py_ssize_t i
@@ -46,6 +59,11 @@ cdef CNode _compile_node(object node):
     out.catchall_name = None
     out.catchall = None
     out.endpoints = None
+    out.one_method = None
+    out.one_hit = None
+    out.one_edge = None
+    out.nf_hit = None
+    out.mna_hit = None
     out.method_set = None
     out.not_found = node.not_found_handler
     out.not_found_custom = node.not_found_handler is not None
@@ -78,6 +96,8 @@ cdef CNode _compile_node(object node):
     ))
     out.edges = edges
     out.n_edges = <Py_ssize_t>len(edges)
+    if out.n_edges == 1:
+        out.one_edge = <CEdge>edges[0]
     last_first = -1
     run_start = 0
     for i in range(out.n_edges):
@@ -103,17 +123,92 @@ cdef CNode _compile_node(object node):
     if node.catchall is not None:
         out.catchall_name = node.catchall_name
         out.catchall = _compile_node(node.catchall)
+    if out.not_found is not None:
+        out.nf_hit = _pack(out.not_found, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH)
     endpoints = node.endpoints
     if endpoints:
         out.endpoints = {}
         for method, endpoint in endpoints.items():
-            out.endpoints[method] = (endpoint.handler, endpoint.route)
+            match = _ROUTER_MATCH_CLS(endpoint.route.pattern)
+            hit = _pack(endpoint.handler, endpoint.route, match)
+            out.endpoints[method] = hit
+            if out.one_method is None:
+                out.one_method = method
+                out.one_hit = hit
+            else:
+                out.one_method = None
+                out.one_hit = None
         out.method_set = frozenset(endpoints)
+        out.mna_hit = _pack(
+            (out.method_na or _ROUTER_DEFAULT_MNA)(out.method_set),
+            _ROUTER_EMPTY_ROUTE,
+            _ROUTER_EMPTY_MATCH,
+        )
     return out
 
 
-cdef inline void _set_param(dict params, object name, object value):
-    params[name] = value
+cdef inline CNode _match_edge(
+    CEdge edge,
+    const char* path,
+    Py_ssize_t n,
+    Py_ssize_t i,
+    Py_ssize_t end,
+    Py_ssize_t* nxt,
+):
+    cdef Py_ssize_t seglen = end - i
+    cdef Py_ssize_t after
+    cdef Py_ssize_t bound
+    if edge.key_n != seglen:
+        return None
+    if seglen and memcmp(edge.key_p, path + i, <size_t>seglen) != 0:
+        return None
+    if edge.rest_n == 0:
+        nxt[0] = end + 1
+        return edge.child
+    after = end + 1
+    bound = after + edge.rest_n
+    if (
+        end >= n
+        or path[end] != 47
+        or bound > n
+        or memcmp(path + after, edge.rest_p, <size_t>edge.rest_n) != 0
+        or (bound < n and path[bound] != 47)
+    ):
+        return None
+    nxt[0] = bound + 1 if bound < n else bound
+    return edge.child
+
+
+cdef CNode _match_exact(
+    CNode node,
+    const char* path,
+    Py_ssize_t n,
+    Py_ssize_t i,
+    Py_ssize_t end,
+    Py_ssize_t* nxt,
+):
+    cdef CEdge edge
+    cdef int first
+    cdef int start
+    cdef int count
+    cdef int j
+    cdef CNode child
+    if node.n_edges == 1:
+        return _match_edge(node.one_edge, path, n, i, end, nxt)
+    if end == i:
+        first = 0
+    else:
+        first = <int><unsigned char>path[i]
+    start = node.edge_start[first]
+    if start < 0:
+        return None
+    count = node.edge_count[first]
+    for j in range(count):
+        edge = <CEdge>node.edges[start + j]
+        child = _match_edge(edge, path, n, i, end, nxt)
+        if child is not None:
+            return child
+    return None
 
 
 cdef CNode _take_param(
@@ -127,7 +222,7 @@ cdef CNode _take_param(
     cdef object decoded
     if node.wildcard is not None and node.wildcard_name is not None:
         decoded = PyUnicode_DecodeUTF8(seg, seglen, "surrogatepass")
-        _set_param(params, node.wildcard_name, decoded)
+        params[node.wildcard_name] = decoded
         return node.wildcard
     if node.catchall is not None:
         if node.catchall_name is not None:
@@ -135,315 +230,213 @@ cdef CNode _take_param(
                 decoded = PyUnicode_DecodeUTF8(rest, restlen, "surrogatepass")
             else:
                 decoded = PyUnicode_DecodeUTF8(seg, seglen, "surrogatepass")
-            _set_param(params, node.catchall_name, decoded)
+            params[node.catchall_name] = decoded
         return node.catchall
     return None
 
 
-cdef CNode _match_exact(
+cdef inline dict _params(dict params):
+    if params is None:
+        return {}
+    return params
+
+
+cdef object _finish(
     CNode node,
-    const char* path,
-    Py_ssize_t n,
-    Py_ssize_t i,
-    Py_ssize_t end,
-    Py_ssize_t* nxt,
+    object method,
+    dict params,
+    object nf_hit,
+    object mna_hit,
+    int* status,
 ):
-    cdef CEdge edge
-    cdef Py_ssize_t seglen = end - i
-    cdef Py_ssize_t after
-    cdef Py_ssize_t bound
-    cdef int first
-    cdef int start
-    cdef int count
-    cdef int j
-    if seglen == 0:
-        first = 0
+    cdef object endpoints
+    cdef object hit
+    cdef object packed
+    endpoints = node.endpoints
+    if endpoints is None:
+        status[0] = 2
+        return nf_hit if nf_hit is not None else _NF_HIT
+    if node.one_method is not None and method is node.one_method:
+        hit = node.one_hit
     else:
-        first = <int><unsigned char>path[i]
-    start = node.edge_start[first]
-    if start < 0:
-        return None
-    count = node.edge_count[first]
-    for j in range(count):
-        edge = <CEdge>node.edges[start + j]
-        if edge.key_n != seglen:
-            continue
-        if seglen and memcmp(edge.key_p, path + i, <size_t>seglen) != 0:
-            continue
-        if edge.rest_n == 0:
-            nxt[0] = end + 1
-            return edge.child
-        after = end + 1
-        bound = after + edge.rest_n
-        if (
-            end >= n
-            or path[end] != 47
-            or bound > n
-            or memcmp(path + after, edge.rest_p, <size_t>edge.rest_n) != 0
-            or (bound < n and path[bound] != 47)
-        ):
-            continue
-        nxt[0] = bound + 1 if bound < n else bound
-        return edge.child
-    return None
+        hit = endpoints.get(method)
+    if hit is not None:
+        status[0] = 0
+        if params is not None:
+            packed = <tuple>hit
+            return _pack(
+                packed[0],
+                packed[1],
+                _ROUTER_MATCH_CLS(packed[2].pattern, params),
+            )
+        return hit
+    if mna_hit is not None:
+        status[0] = 1
+        return mna_hit
+    status[0] = 2
+    return nf_hit if nf_hit is not None else _NF_HIT
 
 
-cdef class _WalkCur:
-    cdef CNode node
-    cdef object not_found
-    cdef object method_na
-    cdef bint custom
-    cdef dict params
-
-
-cdef inline void _enter_node(_WalkCur cur, CNode child):
-    if child.not_found is not None:
-        cur.not_found = child.not_found
-        cur.custom = True
-    if child.method_na is not None:
-        cur.method_na = child.method_na
-    cur.node = child
-
-
-cdef bint _walk_path(_WalkCur cur, const char* path, Py_ssize_t n):
-    cdef Py_ssize_t i
-    cdef Py_ssize_t end
-    cdef Py_ssize_t nxt
-    cdef Py_ssize_t slash
-    cdef CNode node
+cdef object _resolve_tree(
+    CNode root,
+    object path,
+    object method,
+    object host,
+    int* status,
+    bint* custom,
+):
+    cdef CNode node = root
     cdef CNode child
-    if n == 1 and path[0] == 47:
-        return True
-    i = 1
-    while i <= n:
-        node = cur.node
-        if i == n:
-            if path[n - 1] != 47:
-                break
-            end = n
-            nxt = n + 1
-        else:
-            slash = i
-            while slash < n and path[slash] != 47:
-                slash += 1
-            end = slash
-            nxt = end + 1
-        child = _match_exact(node, path, n, i, end, &nxt)
-        if child is None:
-            if node.catchall is not None:
-                child = _take_param(
-                    node,
-                    path + i,
-                    end - i,
-                    path + i,
-                    n - i,
-                    cur.params,
-                )
-            else:
-                child = _take_param(
-                    node,
-                    path + i,
-                    end - i,
-                    NULL,
-                    -1,
-                    cur.params,
-                )
-            if child is None:
-                return False
-            if child is node.catchall:
-                nxt = n + 1
-        _enter_node(cur, child)
-        i = nxt
-    return True
-
-
-cdef bint _walk_host(_WalkCur cur, const char* host, Py_ssize_t n):
-    cdef Py_ssize_t end = n
-    cdef Py_ssize_t dot
-    cdef Py_ssize_t seg_start
-    cdef CNode node
-    cdef CNode child
-    cdef Py_ssize_t unused = 0
-    if n == 0:
-        return True
-    while end > 0:
-        node = cur.node
-        dot = end - 1
-        while dot >= 0 and host[dot] != 46:
-            dot -= 1
-        seg_start = dot + 1
-        child = _match_exact(node, host, n, seg_start, end, &unused)
-        if child is None:
-            if node.catchall is not None:
-                child = _take_param(
-                    node,
-                    host + seg_start,
-                    end - seg_start,
-                    host,
-                    end,
-                    cur.params,
-                )
-            else:
-                child = _take_param(
-                    node,
-                    host + seg_start,
-                    end - seg_start,
-                    NULL,
-                    -1,
-                    cur.params,
-                )
-            if child is None:
-                return False
-            if child is node.catchall:
-                end = 0
-            elif dot >= 0:
-                end = dot
-            else:
-                end = 0
-        else:
-            end = dot if dot >= 0 else 0
-        _enter_node(cur, child)
-    return True
-
-
-cdef object _resolve_tagged(CNode root, object path, object method, object host):
-    """Return ``(route_match, status, custom)``.
-
-    status: 0 found, 1 method_not_allowed, 2 not_found
-    """
-    cdef _WalkCur cur = _WalkCur.__new__(_WalkCur)
+    cdef dict params = None
+    cdef object nf_hit = root.nf_hit
+    cdef object mna_hit = root.mna_hit
+    cdef bint cust = root.not_found_custom
     cdef const char* path_p
     cdef const char* host_p = NULL
     cdef Py_ssize_t path_n
     cdef Py_ssize_t host_n = 0
     cdef object nf_before
     cdef bint custom_before
-    cdef object endpoints
-    cdef object hit
-    cdef object handler
-    cdef object route
-    cur.node = root
-    cur.not_found = root.not_found if root.not_found is not None else _ROUTER_DEFAULT_NF
-    cur.custom = root.not_found_custom
-    cur.method_na = root.method_na
-    cur.params = {}
+    cdef Py_ssize_t i
+    cdef Py_ssize_t end
+    cdef Py_ssize_t nxt
+    cdef Py_ssize_t slash
+    cdef Py_ssize_t dot
+    cdef Py_ssize_t seg_start
+    cdef Py_ssize_t unused = 0
     path_p = PyUnicode_AsUTF8AndSize(path, &path_n)
     if host:
         host_p = PyUnicode_AsUTF8AndSize(host, &host_n)
-        nf_before = cur.not_found
-        custom_before = cur.custom
-        if not _walk_host(cur, host_p, host_n):
-            return (
-                (nf_before, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-                2,
-                custom_before,
-            )
-    nf_before = cur.not_found
-    custom_before = cur.custom
-    if not _walk_path(cur, path_p, path_n):
-        return (
-            (nf_before, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-            2,
-            custom_before,
-        )
-    endpoints = cur.node.endpoints
-    if endpoints is None:
-        return (
-            (cur.not_found, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-            2,
-            cur.custom,
-        )
-    hit = endpoints.get(method)
-    if hit is None:
-        if endpoints:
-            handler = (cur.method_na or _ROUTER_DEFAULT_MNA)(cur.node.method_set)
-            return (
-                (handler, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-                1,
-                cur.custom,
-            )
-        return (
-            (cur.not_found, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-            2,
-            cur.custom,
-        )
-    handler = hit[0]
-    route = hit[1]
-    if cur.params:
-        return (
-            (handler, route, _ROUTER_MATCH_CLS(route.pattern, cur.params)),
-            0,
-            cur.custom,
-        )
-    return (
-        (handler, route, _ROUTER_MATCH_CLS(route.pattern)),
-        0,
-        cur.custom,
-    )
-
-
-cdef inline object _exact_hit(dict table, object path, object method):
-    """path -> method -> hit. No (host, path, method) tuple on the lookup."""
-    cdef object methods
-    if table is None:
-        return None
-    methods = table.get(path)
-    if methods is None:
-        return None
-    return methods.get(method)
+        nf_before = nf_hit
+        custom_before = cust
+        end = host_n
+        while end > 0:
+            dot = end - 1
+            while dot >= 0 and host_p[dot] != 46:
+                dot -= 1
+            seg_start = dot + 1
+            child = _match_exact(node, host_p, host_n, seg_start, end, &unused)
+            if child is None:
+                params = _params(params)
+                if node.catchall is not None:
+                    child = _take_param(
+                        node,
+                        host_p + seg_start,
+                        end - seg_start,
+                        host_p,
+                        end,
+                        params,
+                    )
+                else:
+                    child = _take_param(
+                        node, host_p + seg_start, end - seg_start, NULL, -1, params
+                    )
+                if child is None:
+                    status[0] = 2
+                    custom[0] = custom_before
+                    return nf_before if nf_before is not None else _NF_HIT
+                if child is node.catchall:
+                    end = 0
+                elif dot >= 0:
+                    end = dot
+                else:
+                    end = 0
+            else:
+                end = dot if dot >= 0 else 0
+            if child.not_found is not None:
+                nf_hit = child.nf_hit
+                cust = True
+            if child.mna_hit is not None:
+                mna_hit = child.mna_hit
+            node = child
+    nf_before = nf_hit
+    custom_before = cust
+    if not (path_n == 1 and path_p[0] == 47):
+        i = 1
+        while i <= path_n:
+            if i == path_n:
+                if path_p[path_n - 1] != 47:
+                    break
+                end = path_n
+                nxt = path_n + 1
+            else:
+                slash = i
+                while slash < path_n and path_p[slash] != 47:
+                    slash += 1
+                end = slash
+                nxt = end + 1
+            child = _match_exact(node, path_p, path_n, i, end, &nxt)
+            if child is None:
+                params = _params(params)
+                if node.catchall is not None:
+                    child = _take_param(
+                        node,
+                        path_p + i,
+                        end - i,
+                        path_p + i,
+                        path_n - i,
+                        params,
+                    )
+                else:
+                    child = _take_param(
+                        node, path_p + i, end - i, NULL, -1, params
+                    )
+                if child is None:
+                    status[0] = 2
+                    custom[0] = custom_before
+                    return nf_before if nf_before is not None else _NF_HIT
+                if child is node.catchall:
+                    nxt = path_n + 1
+            if child.not_found is not None:
+                nf_hit = child.nf_hit
+                cust = True
+            if child.mna_hit is not None:
+                mna_hit = child.mna_hit
+            node = child
+            i = nxt
+    custom[0] = cust
+    return _finish(node, method, params, nf_hit, mna_hit, status)
 
 
 cdef object _router_lookup(CRouter self, object host, object path, object method):
-    cdef object hit
-    cdef object host_pack
-    cdef object path_pack
+    cdef object host_hit
+    cdef object path_hit
     cdef object hroot
-    cdef object host_map
     cdef int host_status
     cdef int path_status
     cdef bint host_custom
+    cdef bint path_custom
     if host is None:
         host = ""
-    if host:
-        host_map = self.exact_hosts.get(host)
-        if host_map is not None:
-            hit = _exact_hit(<dict>host_map, path, method)
-            if hit is not None:
-                return hit
-        if self.host_routing:
-            hroot = self.hosts_exact.get(host)
-            if hroot is not None:
-                host_pack = _resolve_tagged(<CNode>hroot, path, method, "")
-            elif self.has_param_hosts:
-                host_pack = _resolve_tagged(self.hosts_param, path, method, host)
-            else:
-                host_pack = (
-                    (_ROUTER_DEFAULT_NF, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-                    2,
-                    False,
-                )
-            host_status = <int>host_pack[1]
-            host_custom = <bint>host_pack[2]
-            if host_status == 0:
-                return host_pack[0]
-            hit = _exact_hit(self.exact_paths, path, method)
-            if hit is not None:
-                return hit
-            path_pack = _resolve_tagged(self.path, path, method, "")
-            path_status = <int>path_pack[1]
-            if path_status == 0:
-                return path_pack[0]
-            if host_status == 1:
-                return host_pack[0]
-            if path_status == 1:
-                return path_pack[0]
-            if host_custom:
-                return host_pack[0]
-            return path_pack[0]
-    hit = _exact_hit(self.exact_paths, path, method)
-    if hit is not None:
-        return hit
-    return _resolve_tagged(self.path, path, method, "")[0]
+    if self.host_routing and host:
+        hroot = self.hosts_exact.get(host)
+        if hroot is not None:
+            host_hit = _resolve_tree(
+                <CNode>hroot, path, method, "", &host_status, &host_custom
+            )
+        elif self.has_param_hosts:
+            host_hit = _resolve_tree(
+                self.hosts_param, path, method, host, &host_status, &host_custom
+            )
+        else:
+            host_hit = _NF_HIT
+            host_status = 2
+            host_custom = False
+        if host_status == 0:
+            return host_hit
+        path_hit = _resolve_tree(
+            self.path, path, method, "", &path_status, &path_custom
+        )
+        if path_status == 0:
+            return path_hit
+        if host_status == 1:
+            return host_hit
+        if path_status == 1:
+            return path_hit
+        if host_custom:
+            return host_hit
+        return path_hit
+    return _resolve_tree(self.path, path, method, "", &path_status, &path_custom)
 
 
 @cython.final
@@ -474,39 +467,12 @@ cdef class AppState:
         self.router = None
 
 
-cdef void _index_exact(dict dest, object path, object method, object hit):
-    cdef object methods = dest.get(path)
-    if methods is None:
-        methods = {}
-        dest[path] = methods
-    (<dict>methods)[method] = hit
-
-
 cpdef CRouter compile_router(object router):
     cdef CRouter compiled = CRouter.__new__(CRouter)
     cdef dict hosts
-    cdef dict exact_paths
-    cdef dict exact_hosts
-    cdef dict host_map
     cdef object host
     cdef object tree
-    cdef object key
-    cdef object hit
     _router_symbols()
-    exact_paths = {}
-    exact_hosts = {}
-    for key, hit in router._exact.items():
-        host = key[0]
-        if host:
-            host_map = exact_hosts.get(host)
-            if host_map is None:
-                host_map = {}
-                exact_hosts[host] = host_map
-            _index_exact(<dict>host_map, key[1], key[2], hit)
-        else:
-            _index_exact(exact_paths, key[1], key[2], hit)
-    compiled.exact_paths = exact_paths
-    compiled.exact_hosts = exact_hosts
     compiled.host_routing = router._host_routing
     compiled.has_param_hosts = router._has_param_hosts
     compiled.path = _compile_node(router._path)
