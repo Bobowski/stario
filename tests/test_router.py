@@ -68,7 +68,7 @@ class TestFindHandler:
         assert route is curly
         assert hit.pattern == "GET /curly/{id}"
 
-    def test_radix_exact_chain_and_split(self):
+    def test_static_chain_and_prefix(self):
         router = Router()
         deep = Route("GET /a/b/c/d/e")
         other = Route("GET /a/b/c/d/f")
@@ -84,6 +84,72 @@ class TestFindHandler:
         assert route_e is deep
         assert route_f is other
         assert route_b is prefix
+
+    def test_add_order_does_not_change_static_matches(self):
+        deep = Route("GET /a/b/c/d/e")
+        other = Route("GET /a/b/c/d/f")
+        prefix = Route("GET /a/b")
+
+        def hits(order: list[Route]) -> tuple[Route, Route, Route]:
+            router = Router()
+            for route in order:
+                router.add(route, noop_handler)
+            return (
+                router.find_handler("", "/a/b/c/d/e", "GET")[1],
+                router.find_handler("", "/a/b/c/d/f", "GET")[1],
+                router.find_handler("", "/a/b", "GET")[1],
+            )
+
+        assert hits([deep, other, prefix]) == (deep, other, prefix)
+        assert hits([prefix, other, deep]) == (deep, other, prefix)
+        assert hits([other, prefix, deep]) == (deep, other, prefix)
+
+    def test_add_order_does_not_change_exact_vs_param(self):
+        users = Route("GET", "/t/{tenant}/users/{id}")
+        acme = Route("GET", "/t/acme/users/{id}")
+
+        def hit(first: Route, second: Route) -> tuple[str, str]:
+            router = Router()
+            router.add(first, noop_handler)
+            router.add(second, noop_handler)
+            return (
+                router.find_handler("", "/t/acme/users/1", "GET")[1].target,
+                router.find_handler("", "/t/beta/users/1", "GET")[1].target,
+            )
+
+        assert hit(acme, users) == ("/t/acme/users/{id}", "/t/{tenant}/users/{id}")
+        assert hit(users, acme) == ("/t/acme/users/{id}", "/t/{tenant}/users/{id}")
+
+    def test_add_order_does_not_change_exact_vs_catchall(self):
+        catchall = Route("GET", "/files/{path...}")
+        readme = Route("GET", "/files/readme")
+
+        def hit(first: Route, second: Route) -> tuple[str, dict[str, str]]:
+            router = Router()
+            router.add(first, noop_handler)
+            router.add(second, noop_handler)
+            _, route, match = router.find_handler("", "/files/readme", "GET")
+            _, _, other = router.find_handler("", "/files/docs/a.txt", "GET")
+            assert dict(other.params) == {"path": "docs/a.txt"}
+            return route.target, dict(match.params)
+
+        assert hit(catchall, readme) == ("/files/readme", {})
+        assert hit(readme, catchall) == ("/files/readme", {})
+
+    def test_add_order_does_not_change_host_vs_hostless(self):
+        host = Route("GET //api.example.com/api")
+        hostless = Route("POST", "/api")
+
+        def hit(first: Route, second: Route) -> tuple[str, str]:
+            router = Router()
+            router.add(first, noop_handler)
+            router.add(second, noop_handler)
+            get_route = router.find_handler("api.example.com", "/api", "GET")[1]
+            post_route = router.find_handler("api.example.com", "/api", "POST")[1]
+            return get_route.target, post_route.target
+
+        assert hit(host, hostless) == ("//api.example.com/api", "/api")
+        assert hit(hostless, host) == ("//api.example.com/api", "/api")
 
     def test_matches_catchall_params(self):
         router = Router()

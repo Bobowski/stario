@@ -147,9 +147,6 @@ cdef class CEdge:
     cdef object key
     cdef const char* key_p
     cdef Py_ssize_t key_n
-    cdef object rest
-    cdef const char* rest_p
-    cdef Py_ssize_t rest_n
     cdef CNode child
 
 cdef class CNode:

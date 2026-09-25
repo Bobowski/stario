@@ -1,6 +1,7 @@
-"""Compiled path/host trie. Walk UTF-8 bytes; intern results on the leaves.
+"""Compiled path/host trie. One node per segment; walk UTF-8 bytes.
 
-No exact-map sidecar and no per-lookup walk object. The protocol feeds
+No radix ``rest`` compression (insert order cannot change the tree),
+no exact-map sidecar, no per-lookup walk object. The protocol feeds
 arena path bytes for ASCII (no ``%``) so static GET never allocates a
 path ``str``. Static hits return the 3-tuple stored at compile time
 (same Match identity). Param hits allocate one Match + one params dict.
@@ -43,15 +44,12 @@ cdef CNode _compile_node(object node):
     cdef list edges = []
     cdef object key
     cdef object child
-    cdef object extra
-    cdef object rest_map
     cdef object endpoints
     cdef object method
     cdef object endpoint
     cdef object hit
     cdef object match
     cdef bytes key_b
-    cdef bytes rest_b
     cdef Py_ssize_t i
     cdef int first
     cdef int last_first
@@ -73,23 +71,12 @@ cdef CNode _compile_node(object node):
     for i in range(256):
         out.edge_start[i] = -1
         out.edge_count[i] = 0
-    rest_map = node.rest
     for key, child in node.exact.items():
         edge = CEdge.__new__(CEdge)
         key_b = key.encode("utf-8") if not isinstance(key, bytes) else key
         edge.key = key_b
         edge.key_n = PyBytes_GET_SIZE(key_b)
         edge.key_p = PyBytes_AS_STRING(key_b)
-        extra = rest_map.get(key, "") if rest_map is not None else ""
-        if extra:
-            rest_b = extra.encode("utf-8") if not isinstance(extra, bytes) else extra
-            edge.rest = rest_b
-            edge.rest_n = PyBytes_GET_SIZE(rest_b)
-            edge.rest_p = PyBytes_AS_STRING(rest_b)
-        else:
-            edge.rest = None
-            edge.rest_n = 0
-            edge.rest_p = NULL
         edge.child = _compile_node(child)
         edges.append(edge)
     edges.sort(key=lambda item: (
@@ -152,39 +139,22 @@ cdef CNode _compile_node(object node):
 cdef inline CNode _match_edge(
     CEdge edge,
     const char* path,
-    Py_ssize_t n,
     Py_ssize_t i,
     Py_ssize_t end,
     Py_ssize_t* nxt,
 ):
     cdef Py_ssize_t seglen = end - i
-    cdef Py_ssize_t after
-    cdef Py_ssize_t bound
     if edge.key_n != seglen:
         return None
     if seglen and memcmp(edge.key_p, path + i, <size_t>seglen) != 0:
         return None
-    if edge.rest_n == 0:
-        nxt[0] = end + 1
-        return edge.child
-    after = end + 1
-    bound = after + edge.rest_n
-    if (
-        end >= n
-        or path[end] != 47
-        or bound > n
-        or memcmp(path + after, edge.rest_p, <size_t>edge.rest_n) != 0
-        or (bound < n and path[bound] != 47)
-    ):
-        return None
-    nxt[0] = bound + 1 if bound < n else bound
+    nxt[0] = end + 1
     return edge.child
 
 
 cdef CNode _match_exact(
     CNode node,
     const char* path,
-    Py_ssize_t n,
     Py_ssize_t i,
     Py_ssize_t end,
     Py_ssize_t* nxt,
@@ -196,7 +166,7 @@ cdef CNode _match_exact(
     cdef int j
     cdef CNode child
     if node.n_edges == 1:
-        return _match_edge(node.one_edge, path, n, i, end, nxt)
+        return _match_edge(node.one_edge, path, i, end, nxt)
     if end == i:
         first = 0
     else:
@@ -207,7 +177,7 @@ cdef CNode _match_exact(
     count = node.edge_count[first]
     for j in range(count):
         edge = <CEdge>node.edges[start + j]
-        child = _match_edge(edge, path, n, i, end, nxt)
+        child = _match_edge(edge, path, i, end, nxt)
         if child is not None:
             return child
     return None
@@ -317,7 +287,7 @@ cdef object _resolve_tree_n(
             while dot >= 0 and host_p[dot] != 46:
                 dot -= 1
             seg_start = dot + 1
-            child = _match_exact(node, host_p, host_n, seg_start, end, &unused)
+            child = _match_exact(node, host_p, seg_start, end, &unused)
             if child is None:
                 params = _params(params)
                 if node.catchall is not None:
@@ -367,7 +337,7 @@ cdef object _resolve_tree_n(
                     slash += 1
                 end = slash
                 nxt = end + 1
-            child = _match_exact(node, path_p, path_n, i, end, &nxt)
+            child = _match_exact(node, path_p, i, end, &nxt)
             if child is None:
                 params = _params(params)
                 if node.catchall is not None:

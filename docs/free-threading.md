@@ -141,7 +141,7 @@ That cannot be shared as-is.
 
 | Stay on the shared `App` / `Router` | Move per worker loop |
 | --- | --- |
-| Trie, `_exact`, `_lookup` LRU (read-only after bootstrap) | `shutdown` Future |
+| Compiled trie (read-only after bootstrap) | `shutdown` Future |
 | Registered handlers / middleware | `tasks` set (or drop it and use `asyncio.all_tasks()`) |
 | `host_routing` | `connections` set |
 | | Date-header box + 1s timeout sweep |
