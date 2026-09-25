@@ -3,6 +3,8 @@
 import asyncio
 import logging
 
+import pytest
+
 import stario.responses as responses
 from stario.http.app import App
 from stario.http.context import Context
@@ -50,7 +52,7 @@ def test_find_handler_is_the_resolve_step() -> None:
 
 
 def test_on_handler_done_writes_500_on_exception(
-    caplog: logging.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def run() -> None:
         app = App()
@@ -72,7 +74,7 @@ def test_on_handler_done_writes_500_on_exception(
 
 
 def test_on_handler_done_writes_500_when_handler_writes_nothing(
-    caplog: logging.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def run() -> None:
         app = App()
@@ -94,7 +96,7 @@ def test_on_handler_done_writes_500_when_handler_writes_nothing(
 
 
 def test_on_handler_done_aborts_if_headers_already_started(
-    caplog: logging.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def run() -> None:
         app = App()
@@ -117,7 +119,7 @@ def test_on_handler_done_aborts_if_headers_already_started(
 
 
 def test_on_handler_done_logs_exception_after_completed_response(
-    caplog: logging.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def run() -> None:
         app = App()

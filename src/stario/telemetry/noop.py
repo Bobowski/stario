@@ -1,5 +1,7 @@
 """No-op telemetry backend for high-throughput or benchmark runs."""
 
+from __future__ import annotations
+
 from types import TracebackType
 from uuid import UUID
 

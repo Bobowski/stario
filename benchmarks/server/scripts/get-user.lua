@@ -1,5 +1,5 @@
 -- Vary path, query, and X-Request-Id together so the case cannot collapse
--- to one cached URL. Working set is larger than Stario's 1024-entry LRU.
+-- to one static URL. Working set is 4096 distinct param paths.
 -- Reads: path param user_id, query q, header x-request-id.
 local n = 4096
 local i = 0

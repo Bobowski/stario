@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable
 from typing import cast
 
-from stario._env import env_optional_str, env_str
+from stario._env import env_str
 from stario.cli.errors import CliError
 from stario.cli.imports import load_symbol
 from stario.exceptions import StarioError
@@ -22,11 +22,6 @@ from stario.telemetry.sqlite import sqlite_tracer_from_env
 from stario.telemetry.tty import TTYTracer
 
 _CUSTOM_TRACER_FACTORY = "make_tracer"
-
-
-def unix_socket_from_env() -> str | None:
-    """Read `STARIO_UNIX_SOCKET` without validating the full server config."""
-    return env_optional_str("STARIO_UNIX_SOCKET")
 
 
 def tracer_from_env() -> Tracer:

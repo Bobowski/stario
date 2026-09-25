@@ -141,11 +141,11 @@ That cannot be shared as-is.
 
 | Stay on the shared `App` / `Router` | Move per worker loop |
 | --- | --- |
-| Trie, `_exact`, `_lookup` LRU (read-only after bootstrap) | `shutdown` Future |
+| Compiled trie (read-only after bootstrap) | `shutdown` Future |
 | Registered handlers / middleware | `tasks` set (or drop it and use `asyncio.all_tasks()`) |
 | `host_routing` | `connections` set |
 | | Date-header box + 1s timeout sweep |
-| | `HttpProtocol.loop` / `_create_task` |
+| | `HttpProtocol.loop` |
 
 Concrete shutdown:
 
@@ -271,7 +271,7 @@ not add locks.
 
 | Site | Why it is unsafe today |
 | --- | --- |
-| `exchange.pyx` `cdef list _POOL` | `acquire_exchange` / `release_global` pop/append a process-global list from every connection. Two threads recycle at once: double-use of an exchange (cross-talk of bodies/headers) or a lost object. Builtin list locks are per-op; pop-then-reset is not atomic. |
+| `exchange.pyx` exchange spare | Done. One idle `RequestExchange` stays on the connection (keep-alive). Overflow goes to a small `threading.local()` list (`POOL_MAX=16`) via `release_exchange` → `detach` / `recycle`. Same-OS-thread only — 3.14t never shares an exchange across loops. No process-global list. |
 | `vendor/compression_buf.c` `brotli_pool[]` / `gzip_pool[]` | Plain C arrays + `pool_count`. No mutex. Classic use-after-free / double-free. |
 | `protocol.pyx` URL cache `_UC_KEY[]` … `_UC_PATH` | Open-addressed C table, `malloc`/`free`, no lock. Parser threads will corrupt it. |
 | `_bind_settings()` / `_SETTINGS` | First two `HttpProtocol`s on two threads can both see `NULL` and both allocate. Init once under a `PyMutex` / `threading.Lock`, then treat as immutable. |
@@ -378,7 +378,7 @@ event-loop thread.” Other threads raise. Need
 Stay single-loop. Do not require 3.14t to run the suite. Add a
 **gated** module (skip unless `Py_GIL_DISABLED` and GIL actually off)
 that: two loops, shared `Relay`, shared frozen `App`, fake protocols or
-real sockets, recycle `_POOL`, hit compression.
+real sockets, recycle the thread-local exchange spare, hit compression.
 
 ## Races, leaks, locks — checklist
 
@@ -467,9 +467,9 @@ connections, making `Writer` thread-safe, multiprocess + Relay.
 ## References (code in this tree)
 
 - Server / one loop: `src/stario/http/server.py`, `src/stario/http/app.py`
-- Protocol dispatch: `src/stario_cython/protocol.pyx` (`_create_task`,
-  `_find_handler`, `connections`, `date_box`)
-- Pools: `src/stario_cython/exchange.pyx` (`_POOL`),
+- Protocol dispatch: `src/stario_cython/protocol.pyx` (`asyncio.Task`,
+  compiled trie lookup, `connections`, `date_box`)
+- Pools: `src/stario_cython/exchange.pyx` (`_thread_pool`, `release_exchange`),
   `vendor/compression_buf.c`
 - Relay: `src/stario/relay.py`, `tests/test_relay.py`
 - Alive/shutdown: `src/stario/http/context.py`

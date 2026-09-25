@@ -21,18 +21,6 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
   instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
   the Cython protocol (no handler task).
-- `c.route` (`RouteMatch`) is gone. Use `c.match` (`Match`).
-- `stario.routing` is gone. Import `Route` and `UrlPath` from `stario` or
-  `stario.http`.
-
-### Fixed
-
-- `Assets.load()` re-hashes files already pinned by `href()`, so same-size
-  content changes are detected even when mtime does not move.
-- TTY tracer live footer — skip terminal writes when the text and width do not
-  change. Cap the live block to `terminal_rows - 2` so cursor-up erase cannot
-  clear scrollback. Tall trees keep the root header and the newest lines.
-  The footer is removed when no roots are open.
 
 ### Added
 
@@ -44,23 +32,14 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   address (Unix sockets on many kernels, Windows), Stario stays at one
   thread. Requires free-threaded Python 3.14t unless
   `STARIO_THREADS_ALLOW_GIL=1`. See `docs/free-threading.md`.
-- `Assets` and `Files` — one filesystem root plus a URL prefix. `href()`
-  is lazy. `await attach(app)` registers GET/HEAD and loads the tree
-  (`register()` and `load()` stay available). A later `attach()` on a
-  new `App` re-adds GET/HEAD and reuses the loaded tree. `load()` still
-  runs once. `Assets` hashes names and 307s logical paths. Both send
-  strong ETags, 304, and `X-Content-Type-Options: nosniff`. Pass
-  `content_types=` at construction to add or override MIME types.
-- `stario.json` — one process-wide codec for JSON responses, Datastar signals,
-  telemetry, and the test client. `dumps()` and `dumps_bytes()` preserve fast
-  text and byte paths; `loads()` accepts text, bytes, and byte arrays. The
-  standard-library default emits strict compact JSON. Replace it explicitly
-  with `set_codec()`.
 - `stario.http.middleware.catch_errors` — wrap handlers so listed exceptions
   become HTTP responses when nothing was sent yet. Presets:
   `catch_request_body_errors()` and `respond_request_body_error`.
-- Cython HTTP/2 via nghttp2 on the same connection class. Switch once per socket (TLS ALPN `h2` or the cleartext connection preface). Responses go out as frames, not HTTP/1.1 text.
-- Direct TLS: `ServerConfig(ssl=…)` or `STARIO_SSL_CERTFILE` / `STARIO_SSL_KEYFILE`. Context is TLS 1.2+ with ALPN `h2`, `http/1.1`.
+- Cython HTTP/2 via nghttp2 on the same connection class. Switch once per
+  socket (TLS ALPN `h2` or the cleartext connection preface). Responses go
+  out as frames, not HTTP/1.1 text.
+- Direct TLS: `ServerConfig(ssl=…)` or `STARIO_SSL_CERTFILE` /
+  `STARIO_SSL_KEYFILE`. Context is TLS 1.2+ with ALPN `h2`, `http/1.1`.
 
 ### Changed
 
@@ -69,11 +48,7 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   and reuses that `Match`. Parameterized paths reuse the resolved
   `(handler, route, Match)` while they stay in the cache. Exact hosts
   have their own path trie. Exact-only path chains are radix-compressed.
-  One cursor walks the trie on a miss. The matcher does not lowercase
-  `host` — pass `Request.host` (already folded).
-- File streaming (`Assets`, `Files`, and `stario.staticassets`) reads
-  already-open file descriptors with `os.pread` in a worker thread.
-  The `aiofiles` dependency is gone.
+  One cursor walks the trie on a miss.
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, write 500
   if nothing was sent, abort if a body was started but not finished, close
   the span. No auto-`end()`. A write-then-raise still logs (`Handler failed`);
@@ -95,28 +70,82 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   [llhttp](https://github.com/nodejs/llhttp).
 - HTTP/2 receive window is 1MiB per stream / 4MiB per connection. RST-stream
   flood is rate-limited. Header budget 431 / body 413 apply per stream.
+- Cython request headers are a standalone read-only arena view (no unused
+  `Headers` pair list). Timeout cleanup is chosen in `HttpProtocol.__init__`
+  (`timeout_cleanup=`, env as default). Cookie `as_dict()` is cached. H1/H2
+  methods share one byte table. Compressibility uses the Python helper.
+
+## 4.3.0 - 2026-09-25
+
+### Added
+
+- `stario.serve(bootstrap, …)` — run the HTTP server on a loop you start:
+  `asyncio.run(stario.serve(bootstrap, port=9000))` or `uvloop.run(...)`.
+  Listen settings are keywords (`host`, `port`, `unix_socket`, …) or a
+  prepared `config=`. After shutdown the coroutine finishes and the caller
+  can continue. Omit `tracer` to get a TTY or JSON tracer for the call.
+
+### Changed
+
+- Python 3.12 and 3.13 are supported. The package requires Python 3.12 or newer.
+- zstd uses the `zstandard` package on every Python. Stario no longer imports
+  stdlib `compression.zstd`.
+- Span and trace ids use the CPython 3.14 UUIDv7 bit layout
+  (RFC 9562 Method 1) in `RecordingSpan.create`.
+- `Server` raises if `unix_socket` is set and the platform has no `AF_UNIX`.
+  `stario serve` / `stario watch` no longer check this before start.
+- Startup span `server.event_loop` is the loop that is running, not
+  `ServerConfig.event_loop`.
+
+## 4.2.0 - 2026-09-21
+
+### Added
+
+- `Assets` and `Files` — a directory at a URL prefix. Call `href()` at import.
+  Call `await attach(app)` in bootstrap to register GET/HEAD and load the tree.
+  `register()` and `load()` stay available. `Assets` hashes names and 307s the
+  logical path. Both send strong ETags, 304, and `nosniff`. Pass
+  `content_types=` to add or override MIME types.
+- `stario.json` — one process-wide codec for JSON responses, Datastar signals,
+  telemetry, and the test client. Replace the standard-library default with
+  `set_codec()`.
+
+### Changed
+
+- `Route` is the HTTP address: `Route("GET /home")` or
+  `Route("POST", ROOM + "/send")`. After a match, read `c.match`. Matching
+  lives in `stario.http`.
+- Static routes hit an exact map. Parameterized routes walk a compressed trie.
+  Pass `Request.host` (already folded). The matcher does not lowercase host.
+- File streaming uses `os.pread` in a worker thread. The `aiofiles`
+  dependency is gone.
+
+### Fixed
+
+- TTY tracer live footer — skip the write when text and width do not change.
+  Cap the live block so erase cannot clear scrollback.
+- `Assets.load()` re-hashes files already pinned by `href()`, so a same-size
+  content edit is not missed.
 
 ### Deprecated
 
 These still work. They will be removed in 5.0.
 
-Prefer `Route("GET /home")` or `Route("POST", ROOM + "/send")` and
-`app.add(route, handler)`. Host is `//host/path` or `host=`. Paths
-start with `/` or `//`. `{name}` and `{name...}` must be a whole path
-segment or host label. `{{name}}` is a literal `{name}`. Query and
-fragment go to `href()` only. After a match, read `c.match`.
-
-- `UrlPath` — prefer `Route` or a `/` / `//` string. `href()` and `/`
-  composition still work. `app.use`, `not_found`, `Files`, and `Assets`
+- `UrlPath` — prefer `Route` or a `/` / `//` string. `Files` and `Assets`
   take strings.
-- `app.get` / `app.post` / `app.handle` and `Route.get` / `Route.post`
-  / … — register with `app.add(Route("GET /"), handler)`.
-  `Route.query(path)` stays as the HTTP QUERY factory until 5.0;
-  `Route("QUERY /feed")` is the replacement.
-- `at.fetch` — build the URL with `route.href()` and name the verb at
-  the call site (`at.get(...)`, `at.post(...)`).
-- `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use
-  `Assets(...)` or `Files(...)` and `await attach(app)`.
+- `app.get` / `app.post` / `app.handle` and `Route.get` / `Route.post` / …
+  — use `app.add(Route("GET /"), handler)`. `Route.query(path)` stays until
+  5.0; `Route("QUERY /feed")` is the replacement.
+- `at.fetch` — build the URL with `route.href()` and name the verb at the
+  call site (`at.get(...)`, `at.post(...)`).
+- `stario.staticassets` (`AssetManifest`, `StaticAssets`) — use `Assets` or
+  `Files` and `await attach(app)`.
+
+### Removed
+
+- `c.route` (`RouteMatch`) — use `c.match` (`Match`).
+- `stario.routing` — import `Route` and `UrlPath` from `stario` or
+  `stario.http`.
 
 ## 4.1.1 - 2026-08-31
 
@@ -219,7 +248,7 @@ Major release from 3.4. Delete old `stario-traces.sqlite3` files before upgradin
 ### Added
 
 - `ServerConfig` and `RequestPolicy` — listen, compression, shutdown, and request limits (`stario.http.config`).
-- `AssetManifest`, `Asset`, and `StaticAssets.stats`.
+- `AssetManifest` and `StaticAssets.stats`.
 - Static serving — `precompress=` codec selection, per-instance `content_types=` overrides, and `Range: bytes=…` on large streamed files (206 / 416; one range per request).
 - `STARIO_REUSE_ADDR` — TCP `SO_REUSEADDR` (default `1`).
 - `normalized_location` — shared redirect URL safety for `responses.redirect` and SSE navigation.

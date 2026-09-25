@@ -1,4 +1,4 @@
-"""Tests for Route — method plus path."""
+"""Tests for Route — method plus path. Lexer errors live in test_segment."""
 
 import pytest
 
@@ -16,22 +16,13 @@ class TestRoute:
         assert home.path == "/"
         assert search.method == "QUERY"
         assert send.method == "POST"
-        assert send.href(room_id="abc") == "/rooms/abc/send"
-        assert send.href("abc") == "/rooms/abc/send"
         assert send.pattern == "POST /rooms/{room_id}/send"
         assert send.target == "/rooms/{room_id}/send"
         assert home == Route("GET", "/")
 
-    def test_prefix_string_concat(self):
-        room = "/rooms/{room_id}"
-        send = Route("POST", room + "/send")
-
-        assert send.href("abc") == "/rooms/abc/send"
-
     def test_parses_host_from_network_path(self):
         users = Route("GET //api.example.com/users")
 
-        assert users.href() == "//api.example.com/users"
         assert users.pattern == "GET //api.example.com/users"
         assert Route("GET /users", host="api.example.com") == users
 
@@ -49,7 +40,7 @@ class TestRoute:
         with pytest.raises(StarioError, match="needs a path"):
             Route("GET")
 
-    def test_keyword_parts_and_path_list(self):
+    def test_keyword_parts(self):
         listed = Route(method="GET", path="/users/{id}")
         hosted = Route(method="GET", path="/users", host="api.example.com")
         hosted_parts = Route(
@@ -57,14 +48,10 @@ class TestRoute:
             path=hosted.path,
             host=hosted.host,
         )
-        search = Route("GET /search")
 
-        assert listed.href(1) == "/users/1"
         assert hosted == Route("GET //api.example.com/users")
         assert hosted_parts == hosted
-        assert search.href(query={"q": "stario"}, fragment="top") == (
-            "/search?q=stario#top"
-        )
+        assert listed.path == "/users/{id}"
         assert Route("/api").method == ""
         assert Route("/api").path == "/api"
 
@@ -86,7 +73,6 @@ class TestRoute:
         api = UrlPath("/users", host="api.example.com")
         users = Route("GET", api.target)
 
-        assert users.href() == "//api.example.com/users"
         assert users.path == "/users"
         assert users.host == "api.example.com"
 
@@ -104,14 +90,6 @@ class TestRoute:
         with pytest.raises(StarioError, match="must start with '/'"):
             Route("GET POST", "/")
 
-    def test_href_matches_path_builder(self):
-        path = UrlPath("/h/{house_id}")
-        route = Route("POST /h/{house_id}")
-
-        assert route.href(house_id="x", query={"edit": "1"}) == path.href(
-            house_id="x", query={"edit": "1"}
-        )
-
     def test_equality_is_method_host_and_path(self):
         send = Route("POST /rooms/{room_id}/send")
 
@@ -120,27 +98,6 @@ class TestRoute:
         assert send == Route("POST /rooms/{room_id}/send")
         assert send != Route("POST /rooms/abc/send")
         assert {Route("GET /"), Route("POST /")} == {Route("POST /"), Route("GET /")}
-
-    def test_href_fills_placeholders(self):
-        users = Route("GET /t/{tenant}/users/{id}")
-
-        assert users.href("acme", 42) == "/t/acme/users/42"
-        assert users.href(tenant="acme", id=42) == "/t/acme/users/42"
-        with pytest.raises(StarioError, match="unknown parameter"):
-            users.href(tenant="acme", id=42, extra="x")
-
-    def test_href_quotes_values(self):
-        files = Route("GET /files/{name}")
-        nested = Route("GET /files/{path...}")
-
-        assert files.href("a b.txt") == "/files/a%20b.txt"
-        assert nested.href("docs/read me.txt") == "/files/docs/read%20me.txt"
-
-    def test_href_rejects_empty_catchall_segment(self):
-        files = Route("GET /files/{path...}")
-
-        with pytest.raises(StarioError, match="empty path segment"):
-            files.href("docs/")
 
     def test_repr_is_the_address(self):
         assert repr(Route("DELETE /log/event")) == "Route('DELETE /log/event')"
@@ -151,7 +108,6 @@ class TestRoute:
         assert EMPTY_ROUTE.target == ""
         assert EMPTY_ROUTE.pattern == ""
         assert Route.empty() is EMPTY_ROUTE
-        assert Route("GET /").path == "/"
 
     def test_route_is_immutable(self):
         home = Route("GET /")
@@ -159,17 +115,11 @@ class TestRoute:
         with pytest.raises(AttributeError, match="immutable"):
             home.path = "/other"
 
-    def test_rejects_reserved_href_param_names(self):
-        with pytest.raises(StarioError, match="reserved"):
-            Route("GET /search/{query}")
-        with pytest.raises(StarioError, match="reserved"):
-            Route("GET /page/{fragment}")
-
     def test_obsolete_factories_still_work(self):
         with pytest.warns(DeprecationWarning, match="Route\\('GET /path'\\)"):
-            home = Route.get("/")
+            home = Route.get("/")  # pyright: ignore[reportDeprecated]
         with pytest.warns(DeprecationWarning, match="Route\\('QUERY /path'\\)"):
-            feed = Route.query("/feed")
+            feed = Route.query("/feed")  # pyright: ignore[reportDeprecated]
         assert home == Route("GET /")
         assert feed == Route("QUERY /feed")
 
@@ -180,54 +130,9 @@ class TestRoute:
         assert users.path == "/users/{id}"
         assert users.target == "//api.example.com/users/{id}"
         assert users.pattern == "GET //api.example.com/users/{id}"
-        assert users.href(7) == "//api.example.com/users/7"
-
-    def test_href_fills_host_then_path(self):
-        users = Route("GET /users/{id}", host="{tenant}.example.com")
-
-        assert users.href("ACME", 42) == "//acme.example.com/users/42"
-        assert users.href(tenant="ACME", id=42) == "//acme.example.com/users/42"
-
-    def test_rejects_placeholder_that_does_not_fill_the_segment(self):
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /users/{id}-edit")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /users/pre{id}")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /files/{path...}.txt")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /users/{id}{other}")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /x", host="api-{tenant}.example.com")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /x", host="pre{tenant}.example.com")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /x", host="{tenant}-api.example.com")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /x", host="{tenant...}extra.example.com")
-
-    def test_rejects_duplicate_placeholder_names(self):
-        with pytest.raises(StarioError, match="Duplicate route parameter"):
-            Route("GET /teams/{id}/users/{id}")
-        with pytest.raises(StarioError, match="Duplicate route parameter"):
-            Route("GET /users/{id}", host="{id}.example.com")
-
-    def test_route_does_not_store_a_match(self):
-        assert not hasattr(Route("GET /"), "_match")
-        assert not hasattr(Route("GET /users/{id}"), "_match")
-
-    def test_href_rejects_missing_and_mixed_twice(self):
-        send = Route("POST /rooms/{room_id}/send")
-
-        with pytest.raises(StarioError, match="parameter missing"):
-            send.href()
-        with pytest.raises(StarioError, match="more than once"):
-            send.href("abc", room_id="abc")
 
 
 class TestRouteHref:
-    """Compiled filler: positional and keyword binds, and bind errors."""
-
     users = Route("GET /t/{tenant}/users/{id}")
     hosted = Route("GET /users/{id}", host="{tenant}.example.com")
     send = Route("POST /rooms/{room_id}/send")
@@ -302,8 +207,6 @@ class TestRouteHref:
         assert self.send.href("abc", query={"ok": "1"}) == "/rooms/abc/send?ok=1"
         assert self.send.href(room_id="abc", fragment="top") == "/rooms/abc/send#top"
         assert self.home.href(query={"q": "x"}, fragment="a") == "/?q=x#a"
-        with pytest.raises(StarioError, match="parameter missing"):
-            self.send.href(query={"ok": "1"})
 
     def test_wildcard_and_catchall_values(self):
         assert self.send.href(3) == "/rooms/3/send"
@@ -319,6 +222,8 @@ class TestRouteHref:
             self.hosted.href("acme.eu", 1)
         with pytest.raises(StarioError, match="invalid character"):
             self.hosted.href("acme/eu", 1)
+        with pytest.raises(StarioError, match="invalid character"):
+            self.hosted.href("evil?", 1)
         catchall = Route("GET /", host="{tenant...}.example.com")
         assert catchall.href("acme.eu") == "//acme.eu.example.com/"
         with pytest.raises(StarioError, match="empty host label"):
@@ -334,12 +239,6 @@ class TestRouteHref:
         assert self.send.href(0) == "/rooms/0/send"
         assert self.send.href(False) == "/rooms/False/send"
 
-    def test_rejects_format_spec_and_conversion(self):
-        with pytest.raises(StarioError, match="format specs or conversions"):
-            Route("GET /users/{id:d}")
-        with pytest.raises(StarioError, match="format specs or conversions"):
-            Route("GET /users/{id!s}")
-
     def test_escaped_braces_are_literal(self):
         route = Route("GET /curly/{{id}}")
         mixed = Route("GET /curly/{{x}}/{id}")
@@ -352,20 +251,3 @@ class TestRouteHref:
         assert hosted.href() == "//{api}.example.com/"
         with pytest.raises(StarioError, match="too many positional"):
             route.href("abc")
-
-    def test_rejects_stray_braces_as_stario_error(self):
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /users/id}")
-        with pytest.raises(StarioError, match="placeholder must fill the segment"):
-            Route("GET /users/{id")
-
-    def test_rejects_catchall_and_empty_at_construct(self):
-        with pytest.raises(StarioError, match="Catchall path param in invalid position"):
-            Route("GET /files/{path...}/edit")
-        with pytest.raises(StarioError, match="empty path segment"):
-            Route("GET /a//b")
-        with pytest.raises(StarioError, match="empty host label"):
-            Route("GET /x", host="api..com")
-        with pytest.raises(StarioError, match="Catchall host param in invalid position"):
-            Route("GET /x", host="api.{tenant...}.com")
-

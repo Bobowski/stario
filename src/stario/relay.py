@@ -20,18 +20,20 @@ Cross-loop delivery always uses `loop.call_soon_threadsafe`.
 consume with `receive()` or `async for`.
 """
 
+from __future__ import annotations
+
 from asyncio import AbstractEventLoop, Future, get_running_loop
 from collections import deque
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from threading import Lock
 from types import TracebackType
-from typing import Any, Self
+from typing import Self
 
 from stario.exceptions import StarioError, StarioRuntime
 
 # Message: (subject, data)
-type Msg[T = Any] = tuple[str, T]
+type Msg[T] = tuple[str, T]
 
 
 def _pattern_covers(broad: str, narrow: str) -> bool:
@@ -106,7 +108,7 @@ def _deduplicate_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(kept)
 
 
-class RelaySubscription[T = Any]:
+class RelaySubscription[T]:
     """Opaque `Relay.subscribe` handle — enter before receiving messages."""
 
     __slots__ = (
@@ -248,7 +250,7 @@ class RelaySubscription[T = Any]:
             yield await self.receive()
 
 
-class Relay[T = Any]:
+class Relay[T]:
     """In-process publish/subscribe registry.
 
     Use `async with relay.subscribe(...) as sub:`, then consume with

@@ -59,6 +59,17 @@ class TestSegmentParse:
         with pytest.raises(StarioError, match="reserved"):
             Segment.parse(f"/{{{name}}}", f"{{{name}}}")
 
+    @pytest.mark.parametrize("name", ["class", "for", "def", "return", "async"])
+    def test_rejects_python_keyword_names(self, name: str):
+        with pytest.raises(StarioError, match="Python keyword"):
+            Segment.parse(f"/{{{name}}}", f"{{{name}}}")
+
+    def test_rejects_format_spec_and_conversion(self):
+        with pytest.raises(StarioError, match="format specs or conversions"):
+            Segment.parse("/users/{id:d}", "{id:d}")
+        with pytest.raises(StarioError, match="format specs or conversions"):
+            Segment.parse("/users/{id!s}", "{id!s}")
+
     def test_is_frozen(self):
         segment = Segment.parse("/users", "users")
 

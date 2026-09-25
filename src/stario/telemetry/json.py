@@ -1,5 +1,7 @@
 """Emits finished spans as newline-delimited JSON for log pipelines and collectors."""
 
+from __future__ import annotations
+
 import sys
 import threading
 from typing import Any, TextIO

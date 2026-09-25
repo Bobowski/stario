@@ -1,11 +1,20 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
+# cython: auto_pickle=False
 """asyncio Protocol: llhttp for HTTP/1, nghttp2 for HTTP/2.
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
 H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). URL bytes
-and header fragments go into the current exchange arena. When the message
-is ready, dispatch allocates a new ``Request`` (query/cookies/host stay
-lazy). Path decoding is cached here because it is connection-parse work.
+and header fragments go into the current exchange arena. Dispatch walks
+the compiled trie from those bytes (ASCII paths never become a ``str``).
+``Request`` is built only if the handler reads ``c.req``. Query, cookies,
+and host stay lazy on that object.
+
+Lifecycle split (keep-alive GET):
+Cython / C — ``get_buffer`` (reusable bytearray), llhttp/nghttp2, header
+arena, trie walk, ``asyncio.Task`` construction, ``respond()`` writelines
+(compression / content-type), timeouts, recycle.
+Python — ``async def`` handler, ``on_handler_done`` on failure, ``app.tasks``
+when the handler actually suspends. Writes re-enter C via ``respond()``.
 
 Header, idle, and body-stall timeouts share one cleanup path. Under Server
 that path is the Date-header tick (once a second): one ``loop.time()``, then
@@ -20,7 +29,7 @@ from threading import Lock
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
-from libc.string cimport memcmp, memcpy, memmove
+from libc.string cimport memcmp, memcpy, memmove, strlen
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_Check,
@@ -35,6 +44,7 @@ from cpython.bytes cimport (
 )
 from cpython.exc cimport PyErr_Clear
 from cpython.unicode cimport (
+    PyUnicode_AsUTF8AndSize,
     PyUnicode_DecodeASCII,
     PyUnicode_DecodeLatin1,
     PyUnicode_GET_LENGTH,
@@ -53,14 +63,34 @@ from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport (
     ABORT_TOO_LARGE,
+    AppState,
+    CRouter,
+    Connection,
     Headers,
-    Request,
     RequestExchange,
     acquire_exchange,
     host_value_ok,
-    make_request,
     _status_line,
 )
+
+cdef extern from *:
+    """
+    #if defined(__linux__)
+    #include <malloc.h>
+    static void stario_malloc_tune(void) {
+        static int once;
+        if (once) {
+            return;
+        }
+        once = 1;
+        mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 64 * 1024 * 1024);
+    }
+    #else
+    static void stario_malloc_tune(void) {}
+    #endif
+    """
+    void stario_malloc_tune() noexcept
 from stario_cython.llhttp cimport *
 from stario_cython.nghttp2 cimport (
     ssize_t,
@@ -128,13 +158,11 @@ from stario_cython.nghttp2 cimport (
 )
 from stario_cython.timeouts import (
     DATE_TICK_SWEEP_ATTR as _PY_DATE_TICK_SWEEP_ATTR,
-    TIMEOUT_MODE as _PY_TIMEOUT_MODE,
+    parse_timeout_mode,
     sweep_interval as _py_sweep_interval,
 )
 
 cdef enum:
-    URL_CACHE_CAP = 256
-    URL_CACHE_MAX_KEY = 512
     # 256 KiB sits above API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
     # body() is then already bytes when the handler starts. File uploads
     # (MiB) still dispatch at headers-complete so stream() can start early.
@@ -159,109 +187,10 @@ cdef enum:
     # intermediaries reject; 4KiB is the spec default.
     H2_HEADER_TABLE_SIZE = 4096
 
-cdef char* _UC_KEY[256]
-cdef Py_ssize_t _UC_LEN[256]
-cdef uint32_t _UC_HASH[256]
-cdef Py_ssize_t _UC_QOFF[256]
-cdef Py_ssize_t _UC_QLEN[256]
-cdef list _UC_PATH = None
 cdef object PATH_EMPTY = ""
 cdef bytes H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-cdef object _url_lock = Lock()
 cdef object _settings_lock = Lock()
-
-
-cdef uint32_t _url_hash(const char* s, Py_ssize_t n) noexcept:
-    cdef uint32_t value = <uint32_t>2166136261
-    cdef Py_ssize_t i
-    for i in range(n):
-        value = (value ^ <unsigned char>s[i]) * <uint32_t>16777619
-    return value
-
-
-cdef void _url_cache_init():
-    global _UC_PATH
-    cdef int i
-    if _UC_PATH is not None:
-        return
-    _UC_PATH = [None] * URL_CACHE_CAP
-    for i in range(URL_CACHE_CAP):
-        _UC_KEY[i] = NULL
-        _UC_LEN[i] = 0
-        _UC_HASH[i] = 0
-        _UC_QOFF[i] = 0
-        _UC_QLEN[i] = 0
-
-
-cdef void _url_cache_clear():
-    cdef int i
-    for i in range(URL_CACHE_CAP):
-        if _UC_KEY[i] != NULL:
-            free(_UC_KEY[i])
-            _UC_KEY[i] = NULL
-        _UC_LEN[i] = 0
-        _UC_HASH[i] = 0
-        _UC_QOFF[i] = 0
-        _UC_QLEN[i] = 0
-        _UC_PATH[i] = None
-
-
-cdef int _url_find(const char* url, Py_ssize_t n, uint32_t h) noexcept:
-    cdef int slot = <int>(h & (URL_CACHE_CAP - 1))
-    cdef int i
-    for i in range(URL_CACHE_CAP):
-        if _UC_KEY[slot] == NULL:
-            return -1
-        if (
-            _UC_HASH[slot] == h
-            and _UC_LEN[slot] == n
-            and memcmp(_UC_KEY[slot], url, <size_t>n) == 0
-        ):
-            return slot
-        slot = (slot + 1) & (URL_CACHE_CAP - 1)
-    return -1
-
-
-cdef void _url_store(
-    const char* url,
-    Py_ssize_t n,
-    uint32_t h,
-    object path,
-    Py_ssize_t qoff,
-    Py_ssize_t qlen,
-):
-    cdef int slot
-    cdef int i
-    cdef char* copy
-    slot = <int>(h & (URL_CACHE_CAP - 1))
-    for i in range(URL_CACHE_CAP):
-        if _UC_KEY[slot] == NULL:
-            copy = <char*>malloc(<size_t>n if n > 0 else 1)
-            if copy == NULL:
-                return
-            if n:
-                memcpy(copy, url, <size_t>n)
-            _UC_KEY[slot] = copy
-            _UC_LEN[slot] = n
-            _UC_HASH[slot] = h
-            _UC_PATH[slot] = path
-            _UC_QOFF[slot] = qoff
-            _UC_QLEN[slot] = qlen
-            return
-        slot = (slot + 1) & (URL_CACHE_CAP - 1)
-    _url_cache_clear()
-    slot = <int>(h & (URL_CACHE_CAP - 1))
-    copy = <char*>malloc(<size_t>n if n > 0 else 1)
-    if copy == NULL:
-        return
-    if n:
-        memcpy(copy, url, <size_t>n)
-    _UC_KEY[slot] = copy
-    _UC_LEN[slot] = n
-    _UC_HASH[slot] = h
-    _UC_PATH[slot] = path
-    _UC_QOFF[slot] = qoff
-    _UC_QLEN[slot] = qlen
+cdef object _asyncio_Task = asyncio.Task
 
 
 cdef object _decode_path_n(const char* s, Py_ssize_t n):
@@ -283,45 +212,18 @@ cdef object _path_for_url(
     Py_ssize_t* qlen,
 ):
     """Decoded path; query is a span inside the current URL (no copy)."""
-    cdef Py_ssize_t question = -1
     cdef Py_ssize_t i
-    cdef Py_ssize_t path_end
-    cdef uint32_t h = 0
-    cdef int slot
-    cdef object path
     qoff[0] = 0
     qlen[0] = 0
     if n <= 0:
         return PATH_EMPTY
-    if n <= URL_CACHE_MAX_KEY:
-        h = _url_hash(url, n)
-        with _url_lock:
-            slot = _url_find(url, n, h)
-            if slot >= 0:
-                qoff[0] = _UC_QOFF[slot]
-                qlen[0] = _UC_QLEN[slot]
-                return _UC_PATH[slot]
     for i in range(n):
         if url[i] == 63:
-            question = i
-            break
-    if question < 0:
-        path = _decode_path_n(url, n)
-        path_end = n
-    else:
-        path_end = question
-        path = _decode_path_n(url, question)
-        if question + 1 < n:
-            qoff[0] = question + 1
-            qlen[0] = n - question - 1
-    # Trailing-slash requests 308; don't spend a URL-cache slot on them.
-    if (
-        n <= URL_CACHE_MAX_KEY
-        and not (path_end > 1 and url[path_end - 1] == 47)
-    ):
-        with _url_lock:
-            _url_store(url, n, h, path, qoff[0], qlen[0])
-    return path
+            if i + 1 < n:
+                qoff[0] = i + 1
+                qlen[0] = n - i - 1
+            return _decode_path_n(url, i)
+    return _decode_path_n(url, n)
 
 cdef inline bint _as_buf(object data, const char** ptr, Py_ssize_t* n) noexcept:
     if PyBytes_Check(data):
@@ -384,8 +286,6 @@ cdef int TIMEOUT_HEADER = 1
 cdef int TIMEOUT_IDLE = 2
 cdef int CLEANUP_OFF = 0
 cdef int CLEANUP_SWEEP = 1
-cdef int TIMEOUT_MODE = 1
-cdef double TIMEOUT_SWEEP_INTERVAL = 1.0
 cdef object _SWEEPS_ATTR = "_stario_timeout_sweeps"
 # Empty / small bodies finish before the handler runs so body() is cached.
 # Large, chunked, and 100-continue still dispatch at headers.
@@ -405,28 +305,6 @@ cdef object VER_11 = "1.1"
 cdef object VER_20 = "2"
 
 cdef llhttp_settings_t* _SETTINGS = NULL
-
-
-cdef object _method_str(int method):
-    if method == 1:
-        return METH_GET
-    if method == 3:
-        return METH_POST
-    if method == 4:
-        return METH_PUT
-    if method == 0:
-        return METH_DELETE
-    if method == 2:
-        return METH_HEAD
-    if method == 6:
-        return METH_OPTIONS
-    if method == 28:
-        return METH_PATCH
-    if method == 5:
-        return METH_CONNECT
-    if method == 7:
-        return METH_TRACE
-    return llhttp_method_name(method).decode("ascii")
 
 
 cdef object _version_str(int major, int minor):
@@ -480,6 +358,12 @@ cdef object _method_from_bytes(const char* p, size_t n) noexcept:
     return PyUnicode_DecodeLatin1(p, <Py_ssize_t>n, NULL)
 
 
+cdef object _method_str(int method):
+    cdef const char* name = llhttp_method_name(method)
+    if name == NULL:
+        return METH_GET
+    return _method_from_bytes(name, strlen(name))
+
 
 cdef void _bind_settings():
     global _SETTINGS
@@ -490,7 +374,6 @@ cdef void _bind_settings():
     try:
         if _SETTINGS != NULL:
             return
-        _url_cache_init()
         settings = stario_settings_new()
         if settings == NULL:
             raise MemoryError()
@@ -503,54 +386,55 @@ cdef void _bind_settings():
         settings.on_body = _cb_body
         settings.on_message_complete = _cb_message_complete
         _SETTINGS = settings
+        stario_malloc_tune()
     finally:
         _settings_lock.release()
 
 
 cdef int _cb_message_begin(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_message_begin()
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_url(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_url(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_header_field(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_header_field(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_header_value(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_header_value(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_header_value_complete(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_header_value_complete()
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_headers_complete(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_headers_complete()
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_body(llhttp_t* parser, const char* at, size_t length) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_body(at, length)
     return -1 if proto.rejected else 0
 
 
 cdef int _cb_message_complete(llhttp_t* parser) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>stario_parser_get_data(parser)
+    cdef CHttpProtocol proto = <CHttpProtocol>stario_parser_get_data(parser)
     proto._on_message_complete()
     return -1 if proto.rejected else 0
 
@@ -560,11 +444,11 @@ cdef int _h2_on_begin_headers(
     const nghttp2_frame* frame,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto
+    cdef CHttpProtocol proto
     try:
         if frame.hd.type != NGHTTP2_HEADERS:
             return 0
-        proto = <HttpProtocol>user_data
+        proto = <CHttpProtocol>user_data
         proto._h2_begin_stream(frame.hd.stream_id)
         return 0
     except Exception:
@@ -581,7 +465,7 @@ cdef int _h2_on_header(
     uint8_t flags,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     proto._h2_on_header(frame.hd.stream_id, name, namelen, value, valuelen)
     return 0
 
@@ -594,7 +478,7 @@ cdef int _h2_on_data(
     size_t length,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     proto._h2_on_data(stream_id, data, length)
     return 0
 
@@ -604,10 +488,10 @@ cdef int _h2_on_frame_recv(
     const nghttp2_frame* frame,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto
+    cdef CHttpProtocol proto
     cdef uint8_t ftype
     try:
-        proto = <HttpProtocol>user_data
+        proto = <CHttpProtocol>user_data
         ftype = frame.hd.type
         if ftype == NGHTTP2_HEADERS:
             proto._h2_headers_frame(
@@ -626,9 +510,9 @@ cdef int _h2_on_stream_close(
     uint32_t error_code,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto
+    cdef CHttpProtocol proto
     try:
-        proto = <HttpProtocol>user_data
+        proto = <CHttpProtocol>user_data
         proto._h2_stream_closed(stream_id)
         return 0
     except Exception:
@@ -644,7 +528,7 @@ cdef ssize_t _h2_data_source_read(
     nghttp2_data_source* source,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     cdef RequestExchange ex
     if source != NULL and source.ptr != NULL:
         ex = <RequestExchange>source.ptr
@@ -660,23 +544,13 @@ cdef int _h2_send_data(
     nghttp2_data_source* source,
     void* user_data,
 ) noexcept:
-    cdef HttpProtocol proto = <HttpProtocol>user_data
+    cdef CHttpProtocol proto = <CHttpProtocol>user_data
     return proto._h2_send_data_frame(frame, framehd, length, source)
 
 
-def _bind_timeout_policy():
-    global TIMEOUT_MODE, TIMEOUT_SWEEP_INTERVAL
-    TIMEOUT_MODE = <int>_PY_TIMEOUT_MODE
-    TIMEOUT_SWEEP_INTERVAL = <double>_py_sweep_interval()
-
-
-_bind_timeout_policy()
-
-
-async def _timeout_sweep_loop(loop, connections, key):
+async def _timeout_sweep_loop(loop, connections, key, interval):
     """One ``loop.time()`` per wake, then compare every live connection."""
     sleep = asyncio.sleep
-    interval = TIMEOUT_SWEEP_INTERVAL
     try:
         while True:
             await sleep(interval)
@@ -692,9 +566,7 @@ async def _timeout_sweep_loop(loop, connections, key):
         raise
 
 
-def _ensure_timeout_sweeper(loop, connections):
-    if TIMEOUT_MODE != CLEANUP_SWEEP:
-        return
+def _ensure_timeout_sweeper(loop, connections, interval):
     # Server Date tick already walks this loop's connections once a second.
     if getattr(loop, _PY_DATE_TICK_SWEEP_ATTR, False):
         return
@@ -706,7 +578,7 @@ def _ensure_timeout_sweeper(loop, connections):
     task = sweeps.get(key)
     if task is not None and not task.done():
         return
-    coro = _timeout_sweep_loop(loop, connections, key)
+    coro = _timeout_sweep_loop(loop, connections, key, interval)
     try:
         task = loop.create_task(coro, name="stario-timeout-sweep")
     except TypeError:
@@ -725,7 +597,7 @@ def _stop_timeout_sweeper(loop, connections):
         task.cancel()
 
 
-cdef class HttpProtocol:
+cdef class CHttpProtocol(Connection):
     cdef llhttp_t* parser
     cdef public object loop
     cdef object app
@@ -748,6 +620,7 @@ cdef class HttpProtocol:
     cdef double header_timeout
     cdef double keep_alive_timeout
     cdef double body_timeout
+    cdef double timeout_sweep_interval
     cdef int timeout_kind
     cdef double timeout_deadline
     cdef bint header_timeout_reset
@@ -759,8 +632,9 @@ cdef class HttpProtocol:
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
-    cdef object _create_task
-    cdef object _find_handler
+    cdef AppState _app_state
+    cdef object _in_buf
+    cdef object _in_view
     cdef public int parse_mode
     cdef bytearray preface_hold
     cdef nghttp2_session* h2
@@ -789,6 +663,8 @@ cdef class HttpProtocol:
         self.pump_scheduled = False
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
+        self.timeout_cleanup = CLEANUP_SWEEP
+        self.timeout_sweep_interval = 1.0
         self.header_timeout_reset = False
         self.parse_mode = PARSE_NONE
         self.preface_hold = bytearray()
@@ -798,6 +674,9 @@ cdef class HttpProtocol:
         self.h2_out_used = 0
         self.h2_in_recv = False
         self.h1_headers_too_large = False
+        self._app_state = None
+        self._in_buf = None
+        self._in_view = None
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -821,6 +700,8 @@ cdef class HttpProtocol:
         keep_alive_timeout=DEFAULT_KEEP_ALIVE_TIMEOUT,
         body_timeout=DEFAULT_BODY_TIMEOUT,
         max_pipelined_requests=DEFAULT_MAX_PIPELINED_REQUESTS,
+        timeout_cleanup=None,
+        timeout_sweep_interval=None,
     ):
         self.loop = loop
         self.app = app
@@ -831,9 +712,7 @@ cdef class HttpProtocol:
         self.date_box = date_box
         self.compression = compression
         self.connections = connections
-        self._create_task = app.create_task
-        # The LRU match cache, not the Router wrapper method.
-        self._find_handler = app._lookup
+        self._app_state = getattr(app, "_app_state", None)
         self.transport = None
         self.pending_exchanges = deque()
         self.head_bytes = 0
@@ -843,6 +722,19 @@ cdef class HttpProtocol:
         self.header_timeout = header_timeout
         self.keep_alive_timeout = keep_alive_timeout
         self.body_timeout = body_timeout
+        if timeout_cleanup is None:
+            self.timeout_cleanup = parse_timeout_mode()
+        elif isinstance(timeout_cleanup, str):
+            self.timeout_cleanup = parse_timeout_mode(timeout_cleanup)
+        else:
+            self.timeout_cleanup = (
+                CLEANUP_OFF if timeout_cleanup == 0 else CLEANUP_SWEEP
+            )
+        self.timeout_sweep_interval = (
+            _py_sweep_interval()
+            if timeout_sweep_interval is None
+            else float(timeout_sweep_interval)
+        )
         self.rejected = False
         self.request_dispatched = False
         self.request_keep_alive = True
@@ -886,9 +778,12 @@ cdef class HttpProtocol:
         # First request: header deadline only. Keep-alive stores a
         # deadline; the sweeper compares it. No TimerHandle per request.
         self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
-        _ensure_timeout_sweeper(self.loop, self.connections)
+        if self.timeout_cleanup == CLEANUP_SWEEP:
+            _ensure_timeout_sweeper(
+                self.loop, self.connections, self.timeout_sweep_interval
+            )
 
-    def ensure_disconnect(self):
+    cpdef object ensure_disconnect(self):
         if self.disconnect is None:
             self.disconnect = self.loop.create_future()
             if self.closed and not self.disconnect.done():
@@ -910,7 +805,7 @@ cdef class HttpProtocol:
                 exchange.cancel_before_start()
         self.h2_streams.clear()
         if self.idle_exchange is not None:
-            self.idle_exchange.release_global()
+            self.idle_exchange.recycle()
             self.idle_exchange = None
         if self.reading_exchange is not None:
             self.reading_exchange.c_abort()
@@ -933,18 +828,19 @@ cdef class HttpProtocol:
         self.pump_scheduled = False
         self.transport = None
 
-    def recycle_exchange(self, RequestExchange exchange):
+    cpdef void release_exchange(self, RequestExchange exchange):
+        """Detach, then keep one idle on this connection or recycle on this thread."""
         cdef int32_t stream_id
         if exchange._http2 and self.h2 != NULL:
             stream_id = exchange._h2_stream_id
             if stream_id != 0:
                 nghttp2_session_set_stream_user_data(self.h2, stream_id, NULL)
                 self.h2_streams.pop(stream_id, None)
-        exchange.park()
+        exchange.detach()
         if not self.closed and self.idle_exchange is None:
             self.idle_exchange = exchange
         else:
-            exchange.release_global()
+            exchange.recycle()
 
     def eof_received(self):
         return False
@@ -1038,7 +934,7 @@ cdef class HttpProtocol:
         per wake. wrk keep-alive is a double store, not ``call_later``.
         """
         cdef object transport
-        if TIMEOUT_MODE == CLEANUP_OFF:
+        if self.timeout_cleanup == CLEANUP_OFF:
             return
         transport = self.transport
         if transport is None or transport.is_closing() or seconds <= 0:
@@ -1108,7 +1004,7 @@ cdef class HttpProtocol:
             ex is None
             or ex._h2_dispatched
             or self.header_timeout <= 0.0
-            or TIMEOUT_MODE == CLEANUP_OFF
+            or self.timeout_cleanup == CLEANUP_OFF
         ):
             return
         if ex._h2_header_deadline <= 0.0:
@@ -1172,19 +1068,7 @@ cdef class HttpProtocol:
             ptr = <const char*>data
         if offset >= n:
             return
-        if self.parse_mode == PARSE_H2:
-            self._h2_recv(ptr + offset, <size_t>(n - offset))
-            return
-        if self.parse_mode == PARSE_NONE:
-            if not self._maybe_start_h2(ptr + offset, n - offset):
-                return
-            if self.parse_mode == PARSE_H2:
-                self._h2_recv(ptr + offset, <size_t>(n - offset))
-                return
-            if self.preface_hold:
-                self._h1_execute_held()
-                return
-        self._h1_execute(data, offset)
+        self._pump_ptr(ptr + offset, n - offset)
 
     cdef bint _maybe_start_h2(self, const char* p, Py_ssize_t n) noexcept:
         """Detect the H2 preface before llhttp sees the first bytes.
@@ -1197,7 +1081,7 @@ cdef class HttpProtocol:
         cdef bint from_hold = False
         if self.preface_hold:
             if _preface_append(self.preface_hold, p, n) != 0:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return False
             p = PyByteArray_AS_STRING(self.preface_hold)
             n = PyByteArray_GET_SIZE(self.preface_hold)
@@ -1212,7 +1096,7 @@ cdef class HttpProtocol:
         if n > 0 and n < H2_PREFACE_LEN and memcmp(p, pref, <size_t>n) == 0:
             if not from_hold:
                 if _preface_append(self.preface_hold, p, n) != 0:
-                    self._close_error(500, "Internal Server Error")
+                    self._protocol_error(500, "Internal Server Error")
             return False
         self.parse_mode = PARSE_H1
         return True
@@ -1235,7 +1119,7 @@ cdef class HttpProtocol:
         if n <= PARSER_QUANTUM:
             err = llhttp_execute(self.parser, ptr + offset, <size_t>(n - offset))
             if err != HPE_OK:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
             return
         while offset < n:
             end = offset + PARSER_QUANTUM
@@ -1247,7 +1131,7 @@ cdef class HttpProtocol:
                 <size_t>(end - offset),
             )
             if err != HPE_OK:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             offset = end
             if self.pause_reasons:
@@ -1297,7 +1181,7 @@ cdef class HttpProtocol:
             if transport is not None and not transport.is_closing():
                 transport.resume_reading()
 
-    def set_body_paused(self, exchange, paused):
+    cpdef void set_body_paused(self, RequestExchange exchange, bint paused):
         if paused:
             self.body_pause_owner = exchange
             self._set_pause_reason(PAUSE_BODY, True)
@@ -1342,7 +1226,7 @@ cdef class HttpProtocol:
         return False
 
     cdef inline RequestExchange _take_exchange(self):
-        """Reuse the idle exchange or take one from this thread's pool."""
+        """Reuse this connection's idle exchange, else this thread's spare."""
         cdef RequestExchange ex = self.idle_exchange
         if ex is not None:
             self.idle_exchange = None
@@ -1374,7 +1258,7 @@ cdef class HttpProtocol:
         try:
             self.reading_exchange = self._take_exchange()
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         self.head_bytes = 40
         self.request_dispatched = False
@@ -1396,7 +1280,7 @@ cdef class HttpProtocol:
         if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_header_name(at, length) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
@@ -1404,14 +1288,14 @@ cdef class HttpProtocol:
         if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_header_value(at, length) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value_complete(self) noexcept:
         if self.h1_headers_too_large or self.rejected:
             return
         if self.reading_exchange is not None:
             if self.reading_exchange.finish_request_header() != 0:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_headers_complete(self) noexcept:
         cdef RequestExchange exchange
@@ -1443,23 +1327,23 @@ cdef class HttpProtocol:
             )
         )
         if http_major != 1:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if llhttp_get_upgrade(self.parser):
-            self._close_error(400, "Upgrade not supported")
+            self._protocol_error(400, "Upgrade not supported")
             return
         # RFC 7230 3.3.3: TE without chunked as the final coding — body
         # length is undefined. Reject before dispatch (llhttp errors after
         # on_headers_complete, which would otherwise 404 then 400).
         if (flags & F_TRANSFER_ENCODING) and not (flags & F_CHUNKED):
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
             # after oversize headers would be a read-DoS if we stayed open.
             # Trust llhttp when it says this message cannot be keep-alive
             # (TE-without-chunked is already rejected above).
-            self._h1_protocol_status(
+            self._protocol_error(
                 431,
                 "Request header fields too large",
                 has_body
@@ -1469,10 +1353,10 @@ cdef class HttpProtocol:
             )
             return
         if exchange.finish_request_header() != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if http_minor == 1 and exchange._req_host_index < 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             # Keep-alive only when the declared body is small enough to drain.
@@ -1482,14 +1366,14 @@ cdef class HttpProtocol:
                 and self.request_keep_alive
             ):
                 self.h1_headers_too_large = True
-                self._h1_protocol_status(
+                self._protocol_error(
                     413,
                     "Request body too large",
                     False,
                     <Py_ssize_t>content_length,
                 )
             else:
-                self._close_error(413, "Request body too large")
+                self._protocol_error(413, "Request body too large")
             return
         exchange.cache_hot_request_headers()
         if self.request_dispatched or self.rejected:
@@ -1518,15 +1402,16 @@ cdef class HttpProtocol:
                     return
             else:
                 exchange.mark_nobody()
-            self._dispatch(exchange, self._build_request(exchange, exchange))
+            self._bind_request(exchange)
+            self._dispatch(exchange)
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_body(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
         if self.reading_exchange.c_feed(at, length) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_message_complete(self) noexcept:
         cdef RequestExchange exchange
@@ -1538,7 +1423,7 @@ cdef class HttpProtocol:
             if exchange is not None:
                 if exchange._body_active and not exchange._body_complete:
                     if exchange.c_complete() != 0:
-                        self._close_error(400, "Invalid HTTP request")
+                        self._protocol_error(400, "Invalid HTTP request")
                         self.reading_exchange = None
                         self.h1_headers_too_large = False
                         return
@@ -1554,7 +1439,7 @@ cdef class HttpProtocol:
             return
         if exchange is not None and exchange._body_active:
             if exchange.c_complete() != 0:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 self.reading_exchange = None
                 return
         if (
@@ -1566,62 +1451,78 @@ cdef class HttpProtocol:
                 if self.transport is None or self.transport.is_closing():
                     self.reading_exchange = None
                     return
-                self._dispatch(
-                    exchange,
-                    self._build_request(exchange, exchange),
-                )
+                self._bind_request(exchange)
+                self._dispatch(exchange)
             except Exception:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 self.reading_exchange = None
                 return
         self.reading_exchange = None
 
-    cdef Request _build_request(self, RequestExchange exchange, object body):
-        """New Request for this message. Query/cookies/host stay lazy."""
+    cdef void _bind_request(self, RequestExchange exchange):
+        """Bind method/version/query span. Decode the path only if it has
+        ``%`` or non-ASCII (those can change the route). ASCII paths stay
+        arena bytes until a handler reads ``c.req``.
+        """
         cdef object method
         cdef object version
-        cdef object path
+        cdef const char* url
+        cdef Py_ssize_t n
+        cdef Py_ssize_t i
+        cdef Py_ssize_t path_n
         cdef Py_ssize_t qoff = 0
         cdef Py_ssize_t qlen = 0
-        cdef Request request
-        if exchange._req_url_length > 0:
-            path = _path_for_url(
-                exchange._req_arena + exchange._req_url_offset,
-                exchange._req_url_length,
-                &qoff,
-                &qlen,
-            )
-        else:
-            path = PATH_EMPTY
+        cdef unsigned char c
+        cdef bint needs_decode = False
         if exchange._http2:
             method = exchange._h2_method or METH_GET
             version = VER_20
+            exchange._keep_alive = True
         else:
             method = _method_str(<int>llhttp_get_method(self.parser))
             version = _version_str(
                 <int>llhttp_get_http_major(self.parser),
                 <int>llhttp_get_http_minor(self.parser),
             )
+            exchange._keep_alive = self.request_keep_alive
+        exchange._method = method
+        exchange._version = version
         if method is METH_HEAD:
             exchange._head_request = True
-        request = make_request(
-            method,
-            path,
-            version,
-            True if exchange._http2 else self.request_keep_alive,
-            exchange.request_headers,
-            body,
-        )
-        exchange.req = request
-        if qlen > 0:
-            request.bind_query_span(
-                exchange,
-                exchange._req_url_offset + qoff,
-                qlen,
-            )
-        return request
+        n = exchange._req_url_length
+        if n > 0 and exchange._req_arena != NULL:
+            url = exchange._req_arena + exchange._req_url_offset
+            path_n = n
+            for i in range(n):
+                if url[i] == 63:
+                    path_n = i
+                    if i + 1 < n:
+                        qoff = i + 1
+                        qlen = n - i - 1
+                    break
+            exchange._path_n = path_n
+            if qlen > 0:
+                exchange._query_off = exchange._req_url_offset + qoff
+                exchange._query_len = qlen
+            else:
+                exchange._query_off = 0
+                exchange._query_len = 0
+            for i in range(path_n):
+                c = <unsigned char>url[i]
+                if c == 37 or c >= 128:
+                    needs_decode = True
+                    break
+            if needs_decode:
+                exchange._path = _decode_path_n(url, path_n)
+            else:
+                exchange._path = None
+        else:
+            exchange._path = PATH_EMPTY
+            exchange._path_n = 0
+            exchange._query_off = 0
+            exchange._query_len = 0
 
-    cdef void _dispatch(self, RequestExchange exchange, Request request):
+    cdef void _dispatch(self, RequestExchange exchange):
         cdef object span
         self.request_dispatched = True
         if self.timeout_kind == TIMEOUT_HEADER:
@@ -1639,38 +1540,41 @@ cdef class HttpProtocol:
             self._start_exchange(exchange, True)
         else:
             if len(self.pending_exchanges) >= self.max_pipelined_requests:
-                self._close_error(429, "Too many pipelined requests")
+                self._protocol_error(429, "Too many pipelined requests")
                 return
             self.pending_exchanges.append(exchange)
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
-        cdef Request req
         cdef object path
         cdef object handler
         cdef object route
         cdef object match
         cdef object task
+        cdef object tasks
         cdef object span
         cdef object host
         cdef object method
         cdef object loc
         cdef const char* url
+        cdef const char* path_p
         cdef Py_ssize_t n
-        cdef Py_ssize_t plen
+        cdef Py_ssize_t path_n
         cdef Py_ssize_t path_end
         cdef Py_ssize_t start
         cdef Py_ssize_t end
+        cdef AppState state
+        cdef CRouter router
+        cdef bint host_routing
         if not exchange._http2:
             self.active_exchange = exchange
-        req = exchange.req
-        path = req.path
-        method = req.method
-        # Trailing-slash 308: the decoded path already ends with /. Only then
-        # walk the raw URL for Location (strip extra slashes, keep query).
-        plen = PyUnicode_GET_LENGTH(path) if path is not None else 0
-        if plen > 1 and PyUnicode_READ_CHAR(path, plen - 1) == 47:
-            n = exchange._req_url_length
+        method = exchange._method
+        # Trailing-slash 308 from the raw URL. Percent-decoded slashes stay
+        # encoded (%2F), so a decoded path ends with / only when the wire
+        # path does.
+        n = exchange._req_url_length
+        url = NULL
+        if n > 0 and exchange._req_arena != NULL:
             url = exchange._req_arena + exchange._req_url_offset
             if _trailing_slash_redirect(url, n, &start, &end, &path_end):
                 loc = b"/"
@@ -1682,6 +1586,9 @@ cdef class HttpProtocol:
                     )
                 exchange.start_response()
                 exchange.headers.set("location", loc.decode("latin-1"))
+                path = exchange._path
+                if self.noop_span is None:
+                    path = exchange.decode_request_path()
                 self._finish_protocol_span(308, exchange.span, method, path)
                 exchange.respond(b"", b"text/plain; charset=utf-8", 308)
                 exchange.handler_finished()
@@ -1689,20 +1596,44 @@ cdef class HttpProtocol:
         exchange.start_response()
         span = exchange.span
         if span is not None and self.noop_span is None:
+            path = exchange.decode_request_path()
             span.start()
             span.attrs({"request.method": method, "request.path": path})
-        if self.app.host_routing:
-            req.prefetch_host()
-            host = req.host
+        state = self._app_state
+        router = None
+        host_routing = False
+        if state is not None:
+            host_routing = state.host_routing
+            if state.router is not None:
+                router = <CRouter>state.router
+        elif self.app.host_routing:
+            host_routing = True
+        if host_routing:
+            host = exchange.host_from_arena()
         else:
             host = ""
-        handler, route, match = self._find_handler(host, path, method)
-        exchange.match = match
-        if span is not None and self.noop_span is None and match.pattern:
-            span.rename(match.pattern)
-            span.attr("http.route", route.path)
-        task = self._create_task(
-            handler(exchange, exchange),
+        if router is not None:
+            if exchange._path is None:
+                path_p = url
+                path_n = exchange._path_n
+            else:
+                path_p = PyUnicode_AsUTF8AndSize(exchange._path, &path_n)
+            router.c_lookup_into(host, path_p, path_n, method, exchange)
+        else:
+            path = exchange.decode_request_path()
+            handler, route, match = self.app.find_handler(host, path, method)
+            exchange._handler = handler
+            exchange._route = route
+            exchange.match = match
+        if span is not None and self.noop_span is None and exchange.match.pattern:
+            span.rename(exchange.match.pattern)
+            span.attr("http.route", exchange._route.path)
+        # 4.3 contract: a real asyncio.Task at dispatch (headers-complete for
+        # large/chunked/expect-continue, else message-complete). respond()/end()
+        # frees the connection via response_completed; the Task may outlive the
+        # response. Incomplete work joins app.tasks so shutdown drain sees it.
+        task = _asyncio_Task(
+            exchange._handler(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
         )
@@ -1716,32 +1647,34 @@ cdef class HttpProtocol:
                 or task.cancelled()
                 or task.exception() is not None
             ):
-                on_handler_done(exchange, exchange, task)
-            exchange.handler_finished()
+                exchange.on_handler_done(task)
+            else:
+                exchange.handler_finished()
         else:
+            tasks = self.app.tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
             task.add_done_callback(exchange.on_handler_done)
 
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
         cdef object span
-        cdef object req
         for exchange in self.pending_exchanges:
             if self.noop_span is None:
                 span = exchange.span
                 if span is not None:
-                    req = exchange.req
                     try:
                         finish_request_span(
                             span,
-                            method=req.method if req is not None else None,
-                            path=req.path if req is not None else None,
+                            method=exchange._method,
+                            path=exchange._path,
                         )
                     except Exception:
                         pass
             exchange.cancel_before_start()
         self.pending_exchanges.clear()
 
-    def response_completed(self, RequestExchange exchange):
+    cpdef void response_completed(self, RequestExchange exchange):
         """Advance the connection after the response is fully sent.
 
         Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
@@ -1752,7 +1685,6 @@ cdef class HttpProtocol:
         cdef object transport = self.transport
         cdef object conn
         cdef RequestExchange next_exchange
-        cdef Request req
         cdef bint keep
         if exchange._http2:
             # Keep the stream mapped until on_stream_close so the DATA
@@ -1772,12 +1704,12 @@ cdef class HttpProtocol:
             transport.close()
             self._drop_pending()
             return
-        req = exchange.req
-        if req is not None:
-            keep = req.keep_alive
-        else:
-            keep = self.request_keep_alive
-        if not keep or self.app.shutting_down:
+        keep = exchange._keep_alive
+        if not keep or (
+            self._app_state.shutting_down
+            if self._app_state is not None
+            else self.app.shutting_down
+        ):
             transport.close()
             self._drop_pending()
             return
@@ -1806,131 +1738,73 @@ cdef class HttpProtocol:
         except Exception:
             pass
 
-    cdef void _h1_protocol_status(
+    cdef void _abort_reading_and_pending(self) noexcept:
+        cdef RequestExchange exchange = self.reading_exchange
+        if exchange is not None:
+            exchange.c_abort()
+            if not exchange.handler_started:
+                exchange.cancel_before_start()
+        self._drop_pending()
+
+    cdef void _write_h1_error(self, int status, object body, bint head_only) noexcept:
+        cdef object transport = self.transport
+        cdef object date
+        if transport is None or transport.is_closing():
+            return
+        date = self.date_box[0]
+        if head_only:
+            transport.write(
+                b"".join((
+                    _status_line(status),
+                    date,
+                    b"content-type: text/plain; charset=utf-8\r\n",
+                    b"content-length: %d\r\n" % len(body),
+                    b"connection: close\r\n",
+                    b"\r\n",
+                ))
+            )
+        else:
+            transport.write(
+                b"".join((
+                    _status_line(status),
+                    date,
+                    b"content-type: text/plain; charset=utf-8\r\n",
+                    b"content-length: %d\r\n" % len(body),
+                    b"connection: close\r\n",
+                    b"\r\n",
+                    body,
+                ))
+            )
+
+    cdef void _protocol_error(
         self,
         int status,
         object message,
-        bint close_conn,
-        Py_ssize_t drain_len,
+        bint close_conn=True,
+        Py_ssize_t drain_len=-1,
     ) noexcept:
-        """Write a protocol HTTP status without dispatch. Close only if asked.
+        """Write a protocol HTTP status without dispatch.
 
-        ``drain_len >= 0`` keeps the connection and discards that many body
-        bytes so llhttp stays synced (keep-alive 413 with a small CL).
+        Keep-alive 413/431 (``close_conn=False``) uses ``respond()`` so the
+        connection stays open. ``drain_len >= 0`` discards that many body
+        bytes so llhttp stays synced. Close writes Connection: close (HTTP/1
+        only, and only if nothing is already on the wire) then hangs up.
         """
         cdef RequestExchange exchange
         cdef object body
-        cdef object date
-        cdef object method
-        cdef object path
-        cdef Py_ssize_t qoff
-        cdef Py_ssize_t qlen
-        cdef object transport
-        if self.request_dispatched or self.rejected:
-            if close_conn:
-                transport = self.transport
-                if transport is not None and not transport.is_closing():
-                    transport.close()
-                self.rejected = True
-            return
-        self.request_dispatched = True
-        if not close_conn and self.timeout_kind == TIMEOUT_HEADER:
-            # Same as _dispatch: this request is answered. _after_pump
-            # re-arms HEADER if a keep-alive 413 body still needs draining.
-            self.timeout_kind = TIMEOUT_NONE
-            self.timeout_deadline = 0.0
-        exchange = self.reading_exchange
-        method = None
-        path = None
-        qoff = 0
-        qlen = 0
-        try:
-            if exchange is not None and exchange._req_url_length > 0:
-                path = _path_for_url(
-                    exchange._req_arena + exchange._req_url_offset,
-                    exchange._req_url_length,
-                    &qoff,
-                    &qlen,
-                )
-                if self.parser != NULL:
-                    method = _method_str(<int>llhttp_get_method(self.parser))
-        except Exception:
-            method = None
-            path = None
-        try:
-            body = message.encode("utf-8")
-            transport = self.transport
-            if exchange is not None:
-                if drain_len >= 0 and not close_conn:
-                    exchange.reset_body(False, drain_len)
-                    exchange._discard_body = True
-                else:
-                    exchange.mark_nobody()
-                exchange.start_response()
-            self._finish_protocol_span(
-                status,
-                exchange.span if exchange is not None else None,
-                method,
-                path,
-            )
-            if close_conn:
-                date = self.date_box[0]
-                if transport is not None and not transport.is_closing():
-                    if exchange is not None and exchange._head_request:
-                        transport.write(
-                            b"".join((
-                                _status_line(status),
-                                date,
-                                b"content-type: text/plain; charset=utf-8\r\n",
-                                b"content-length: %d\r\n" % len(body),
-                                b"connection: close\r\n",
-                                b"\r\n",
-                            ))
-                        )
-                    else:
-                        transport.write(
-                            b"".join((
-                                _status_line(status),
-                                date,
-                                b"content-type: text/plain; charset=utf-8\r\n",
-                                b"content-length: %d\r\n" % len(body),
-                                b"connection: close\r\n",
-                                b"\r\n",
-                                body,
-                            ))
-                        )
-                self.rejected = True
-                if exchange is not None:
-                    exchange._completed = True
-                    exchange.handler_finished()
-                self.reading_exchange = None
-                if transport is not None and not transport.is_closing():
-                    transport.close()
-            elif exchange is not None:
-                exchange.respond(body, b"text/plain; charset=utf-8", status)
-        except Exception:
-            self.rejected = True
-            transport = self.transport
-            if transport is not None:
-                try:
-                    transport.close()
-                except Exception:
-                    pass
-
-    cdef void _close_error(self, int status, object message) noexcept:
-        cdef object transport
-        cdef object body
-        cdef object date
         cdef object span
         cdef object method
         cdef object path
         cdef Py_ssize_t qoff
         cdef Py_ssize_t qlen
-        cdef RequestExchange exchange
+        cdef object transport
+
         if self.rejected:
             return
-        self.rejected = True
-        self._cancel_timeout()
+        # Keep-alive: never write a second status for this request.
+        if not close_conn and self.request_dispatched:
+            return
+
         transport = self.transport
         exchange = self.reading_exchange
         span = None
@@ -1952,59 +1826,69 @@ cdef class HttpProtocol:
                         method = exchange._h2_method or METH_GET
                     elif self.parser != NULL:
                         method = _method_str(<int>llhttp_get_method(self.parser))
-                elif self.request_dispatched and exchange.req is not None:
-                    method = exchange.req.method
-                    path = exchange.req.path
+                elif self.request_dispatched and exchange._method is not None:
+                    method = exchange._method
+                    path = exchange._path
             except Exception:
                 method = None
                 path = None
+
+        self.request_dispatched = True
+        if not close_conn:
+            if self.timeout_kind == TIMEOUT_HEADER:
+                self.timeout_kind = TIMEOUT_NONE
+                self.timeout_deadline = 0.0
+            try:
+                body = message.encode("utf-8")
+                if exchange is not None:
+                    if drain_len >= 0:
+                        exchange.reset_body(False, drain_len)
+                        exchange._discard_body = True
+                    else:
+                        exchange.mark_nobody()
+                    exchange.start_response()
+                self._finish_protocol_span(status, span, method, path)
+                if exchange is not None:
+                    exchange.respond(body, b"text/plain; charset=utf-8", status)
+            except Exception:
+                self.rejected = True
+                if transport is not None:
+                    try:
+                        transport.close()
+                    except Exception:
+                        pass
+            return
+
+        self.rejected = True
+        self._cancel_timeout()
         try:
             if transport is None or transport.is_closing():
+                self._abort_reading_and_pending()
                 return
-            if exchange is not None:
-                exchange.c_abort()
-                if not exchange.handler_started:
-                    exchange.cancel_before_start()
-            self._drop_pending()
-            if self.parse_mode == PARSE_H2:
-                self._finish_protocol_span(status, span, method, path)
-                transport.close()
-                return
+            # HTTP/2 setup failures must not emit HTTP/1 text. A response
+            # already on the wire must not get a second status spliced in.
             if (
-                self.active_exchange is not None
-                and self.active_exchange._status_code >= 0
+                self.parse_mode == PARSE_H2
+                or (
+                    self.active_exchange is not None
+                    and self.active_exchange._status_code >= 0
+                )
             ):
-                # A response is already on the wire. Do not splice a second
-                # status line into that stream.
+                self._abort_reading_and_pending()
                 self._finish_protocol_span(status, span, method, path)
                 transport.close()
                 return
             body = message.encode("utf-8")
-            date = self.date_box[0]
-            if exchange is not None and exchange._head_request:
-                transport.write(
-                    b"".join((
-                        _status_line(status),
-                        date,
-                        b"content-type: text/plain; charset=utf-8\r\n",
-                        b"content-length: %d\r\n" % len(body),
-                        b"connection: close\r\n",
-                        b"\r\n",
-                    ))
-                )
-            else:
-                transport.write(
-                    b"".join((
-                        _status_line(status),
-                        date,
-                        b"content-type: text/plain; charset=utf-8\r\n",
-                        b"content-length: %d\r\n" % len(body),
-                        b"connection: close\r\n",
-                        b"\r\n",
-                        body,
-                    ))
-                )
+            # Write before abort so recycle cannot reuse the exchange
+            # (or clear _head_request) while we still need it.
+            self._write_h1_error(
+                status,
+                body,
+                exchange is not None and exchange._head_request,
+            )
             self._finish_protocol_span(status, span, method, path)
+            self._abort_reading_and_pending()
+            self.reading_exchange = None
             transport.close()
         except Exception:
             try:
@@ -2027,7 +1911,7 @@ cdef class HttpProtocol:
         self.parse_mode = PARSE_H2
         rv = nghttp2_session_callbacks_new(&cbs)
         if rv != 0:
-            self._close_error(500, "Internal Server Error")
+            self._protocol_error(500, "Internal Server Error")
             return
         nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, _h2_on_begin_headers)
         nghttp2_session_callbacks_set_on_header_callback(cbs, _h2_on_header)
@@ -2038,7 +1922,7 @@ cdef class HttpProtocol:
         rv = nghttp2_option_new(&opt)
         if rv != 0:
             nghttp2_session_callbacks_del(cbs)
-            self._close_error(500, "Internal Server Error")
+            self._protocol_error(500, "Internal Server Error")
             return
         nghttp2_option_set_no_auto_window_update(opt, 1)
         nghttp2_option_set_no_closed_streams(opt, 1)
@@ -2058,7 +1942,7 @@ cdef class HttpProtocol:
         nghttp2_session_callbacks_del(cbs)
         if rv != 0:
             self.h2 = NULL
-            self._close_error(500, "Internal Server Error")
+            self._protocol_error(500, "Internal Server Error")
             return
         iv[0].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE
         iv[0].value = <uint32_t>H2_STREAM_WINDOW
@@ -2088,7 +1972,7 @@ cdef class HttpProtocol:
         rv = nghttp2_session_mem_recv(self.h2, <const uint8_t*>data, n)
         self.h2_in_recv = False
         if rv < 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         self._h2_window_update(0, True)
         self._h2_send()
@@ -2174,10 +2058,10 @@ cdef class HttpProtocol:
             if n == 0:
                 break
             if n < 0:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             if self._h2_out_append(<const char*>data, n) != 0:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return
         self._h2_flush_out()
 
@@ -2195,10 +2079,11 @@ cdef class HttpProtocol:
         if self.transport is None or self.transport.is_closing():
             return
         try:
-            self._dispatch(ex, self._build_request(ex, ex))
+            self._bind_request(ex)
+            self._dispatch(ex)
             ex._h2_dispatched = True
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _h2_begin_stream(self, int32_t stream_id):
         cdef RequestExchange ex
@@ -2236,7 +2121,6 @@ cdef class HttpProtocol:
 
     cdef void _h2_protocol_status(self, RequestExchange ex, int status) noexcept:
         """Write a protocol HTTP status on this stream (431 / similar). No handler."""
-        cdef object req
         cdef object method
         cdef object path
         cdef Py_ssize_t qoff
@@ -2249,10 +2133,9 @@ cdef class HttpProtocol:
             ex._h2_headers_done = True
             ex.mark_nobody()
             ex.start_response()
-            req = ex.req
-            method = ex._h2_method
-            if req is not None:
-                path = req.path
+            method = ex._h2_method or ex._method
+            if ex._path is not None:
+                path = ex._path
             elif ex._req_url_length > 0:
                 qoff = 0
                 qlen = 0
@@ -2429,7 +2312,7 @@ cdef class HttpProtocol:
             if not ex._h2_dispatched and not self.rejected:
                 self._h2_dispatch_stream(ex)
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _h2_end_stream(self, int32_t stream_id):
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
@@ -2538,18 +2421,28 @@ cdef class HttpProtocol:
             frame != NULL and ex._h2_stream_id != frame.hd.stream_id
         ):
             return NGHTTP2_ERR_CALLBACK_FAILURE
-        if self._h2_out_append(<const char*>framehd, 9) != 0:
+        self._h2_flush_out()
+        pending = PyBytes_FromStringAndSize(<const char*>framehd, 9)
+        if self.transport is None:
             return NGHTTP2_ERR_CALLBACK_FAILURE
         if length == 0:
+            self.transport.write(pending)
             return 0
-        pending = ex._h2_pending
         off = ex._h2_pending_off
-        if not _as_buf(pending, &src, &n):
+        if not _as_buf(ex._h2_pending, &src, &n):
             return NGHTTP2_ERR_CALLBACK_FAILURE
         if off < 0 or off + <Py_ssize_t>length > n:
             return NGHTTP2_ERR_CALLBACK_FAILURE
-        if self._h2_out_append(src + off, <Py_ssize_t>length) != 0:
-            return NGHTTP2_ERR_CALLBACK_FAILURE
+        if PyBytes_Check(ex._h2_pending):
+            self.transport.writelines((
+                pending,
+                memoryview(ex._h2_pending)[off:off + <Py_ssize_t>length],
+            ))
+        else:
+            self.transport.writelines((
+                pending,
+                PyBytes_FromStringAndSize(src + off, <Py_ssize_t>length),
+            ))
         ex._h2_pending_off = off + <Py_ssize_t>length
         if ex._h2_pending_off >= n:
             ex._h2_pending = b""
@@ -2634,7 +2527,7 @@ cdef class HttpProtocol:
             filled += 1
         return filled
 
-    def h2_respond(
+    cpdef void h2_respond(
         self,
         RequestExchange ex,
         object nva,
@@ -2664,7 +2557,7 @@ cdef class HttpProtocol:
         else:
             nvs = <nghttp2_nv*>malloc(sizeof(nghttp2_nv) * <size_t>cap)
             if nvs == NULL:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return
             heap = 1
         try:
@@ -2698,14 +2591,14 @@ cdef class HttpProtocol:
                 )
             if rv != 0:
                 ex._h2_outbound = False
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             self._h2_send()
         finally:
             if heap:
                 free(nvs)
 
-    def h2_write_headers(
+    cpdef void h2_write_headers(
         self,
         RequestExchange ex,
         object nva,
@@ -2734,7 +2627,7 @@ cdef class HttpProtocol:
         else:
             nvs = <nghttp2_nv*>malloc(sizeof(nghttp2_nv) * <size_t>cap)
             if nvs == NULL:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return
             heap = 1
         try:
@@ -2766,7 +2659,7 @@ cdef class HttpProtocol:
                 )
             if rv != 0:
                 ex._h2_outbound = False
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             self._h2_send()
         finally:
@@ -2822,7 +2715,7 @@ cdef class HttpProtocol:
             ex._h2_pending_off = 0
         pending.extend(data)
 
-    def h2_write_data(self, RequestExchange ex, object data, bint end):
+    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end):
         if self.h2 == NULL or ex is None or ex.in_pool:
             return
         if data:
@@ -2832,13 +2725,126 @@ cdef class HttpProtocol:
         nghttp2_session_resume_data(self.h2, ex._h2_stream_id)
         self._h2_send()
 
-    def h2_end(self, RequestExchange ex):
+    cpdef void h2_end(self, RequestExchange ex):
         self.h2_write_data(ex, None, True)
 
-    def h2_abort(self, RequestExchange ex):
+    cpdef void h2_abort(self, RequestExchange ex):
         if self.h2 == NULL or ex is None:
             return
         nghttp2_submit_rst_stream(
             self.h2, NGHTTP2_FLAG_NONE, ex._h2_stream_id, NGHTTP2_INTERNAL_ERROR
         )
         self._h2_send()
+
+    cpdef object c_get_buffer(self, Py_ssize_t sizehint):
+        """Reusable read buffer. Consume it in buffer_updated before reuse.
+
+        SSL/uvloop want a writable memoryview. Cache one for the current
+        bytearray so a keep-alive GET does not allocate a view every read.
+        """
+        cdef Py_ssize_t want = sizehint
+        cdef RequestExchange ex
+        cdef Py_ssize_t remaining
+        cdef Py_ssize_t cap
+        if want < 64 * 1024:
+            want = 64 * 1024
+        if want > 256 * 1024:
+            want = 256 * 1024
+        ex = self.reading_exchange
+        if ex is not None and ex._expected_size >= 0:
+            remaining = ex._expected_size - ex._total_read
+            if remaining > 0:
+                if remaining < want:
+                    want = remaining
+                elif remaining <= 256 * 1024:
+                    want = remaining
+        if want < 1:
+            want = 1
+        if self._in_buf is None or PyByteArray_GET_SIZE(self._in_buf) < want:
+            self._in_buf = bytearray(want)
+            self._in_view = memoryview(self._in_buf)
+        cap = PyByteArray_GET_SIZE(self._in_buf)
+        if want == cap:
+            return self._in_view
+        return self._in_view[:want]
+
+    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
+        cdef const char* ptr
+        if self.rejected or nbytes <= 0 or self._in_buf is None:
+            return
+        if self.parse_mode != PARSE_H2 and self.parser == NULL:
+            return
+        if self.timeout_kind == TIMEOUT_IDLE:
+            if not (
+                self.parse_mode == PARSE_H1
+                and self.reading_exchange is not None
+                and (
+                    self.reading_exchange._discard_body
+                    or self.h1_headers_too_large
+                )
+            ):
+                self.timeout_kind = TIMEOUT_NONE
+                self.timeout_deadline = 0.0
+        ptr = PyByteArray_AS_STRING(self._in_buf)
+        if self.held_data is not None:
+            self._held_append(PyBytes_FromStringAndSize(ptr, nbytes))
+            return
+        if self.pause_reasons:
+            self.held_data = PyBytes_FromStringAndSize(ptr, nbytes)
+            self.held_offset = 0
+            return
+        self._pump_ptr(ptr, nbytes)
+        self._after_pump()
+
+    cdef void _pump_ptr(self, const char* ptr, Py_ssize_t n) noexcept:
+        if n <= 0:
+            return
+        if self.parse_mode == PARSE_H2:
+            self._h2_recv(ptr, <size_t>n)
+            return
+        if self.parse_mode == PARSE_NONE:
+            if not self._maybe_start_h2(ptr, n):
+                return
+            if self.parse_mode == PARSE_H2:
+                self._h2_recv(ptr, <size_t>n)
+                return
+            if self.preface_hold:
+                self._h1_execute_held()
+                return
+        self._h1_execute_ptr(ptr, n)
+
+    cdef void _h1_execute_ptr(self, const char* ptr, Py_ssize_t n) noexcept:
+        cdef Py_ssize_t offset = 0
+        cdef Py_ssize_t end
+        cdef int err
+        if self.parser == NULL or n <= 0:
+            return
+        if n <= PARSER_QUANTUM:
+            err = llhttp_execute(self.parser, ptr, <size_t>n)
+            if err != HPE_OK:
+                self._protocol_error(400, "Invalid HTTP request")
+            return
+        while offset < n:
+            end = offset + PARSER_QUANTUM
+            if end > n:
+                end = n
+            err = llhttp_execute(self.parser, ptr + offset, <size_t>(end - offset))
+            if err != HPE_OK:
+                self._protocol_error(400, "Invalid HTTP request")
+                return
+            offset = end
+            if self.pause_reasons:
+                if offset < n:
+                    self.held_data = PyBytes_FromStringAndSize(ptr + offset, n - offset)
+                    self.held_offset = 0
+                return
+
+
+class HttpProtocol(CHttpProtocol, asyncio.BufferedProtocol):
+    """Python subclass so uvloop/asyncio can find BufferedProtocol methods."""
+
+    def get_buffer(self, sizehint):
+        return self.c_get_buffer(sizehint)
+
+    def buffer_updated(self, nbytes):
+        self.c_buffer_updated(nbytes)

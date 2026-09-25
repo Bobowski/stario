@@ -1,3 +1,4 @@
+import platform
 import shlex
 import subprocess
 
@@ -42,6 +43,11 @@ if "z" not in codec_libraries:
     codec_libraries.append("z")
 codec_compile_args = _pkg_config(_CODEC_PACKAGES, "--cflags-only-other")
 codec_link_args = _pkg_config(_CODEC_PACKAGES, "--libs-only-other")
+_llhttp_sse = (
+    ["-msse4.2"]
+    if platform.machine().lower() in {"x86_64", "amd64"}
+    else []
+)
 
 extensions = [
     Extension(
@@ -67,7 +73,7 @@ extensions = [
         ],
         include_dirs=["vendor/llhttp/include", "vendor", "src"],
         libraries=["nghttp2"],
-        extra_compile_args=["-O3", "-fno-strict-aliasing"],
+        extra_compile_args=["-O3", "-fno-strict-aliasing", *_llhttp_sse],
     ),
 ]
 

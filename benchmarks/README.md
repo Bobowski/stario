@@ -234,7 +234,7 @@ Older committed baselines (`baseline-20260827.md` and later) used a single
 
 - `uv`
 - `wrk`
-- Python compatible with Stario (3.14+)
+- Python compatible with Stario (3.12+)
 - `libbrotli-dev` (or set `BROTLI_PKG_CONFIG`) for `stario-cython`
 
 Targets that support uvloop use it where applicable (Stario, Sanic, Granian

@@ -1,9 +1,10 @@
 """
 Application object: route table, shutdown-aware tasks, thin test entrypoint.
 
-The HTTP protocol does not call this class per request. It binds the Router
-LRU (`_lookup`) and `create_task(handler(c, w))`. `App.__call__` exists so
-tests and `TestClient` share that same path.
+The HTTP protocol does not call this class per request. It binds compiled
+trie lookup (`_cy_router`) and constructs `asyncio.Task(handler(c, w))`,
+registering incomplete tasks on `app.tasks` for shutdown drain. `App.__call__`
+and `create_task` exist so tests and `TestClient` share that same drain set.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.route import normalize_path
 from stario.telemetry.spans import NoOpSpan
+
+from stario_cython.exchange import AppState
 
 from .dispatch import Router
 from .writer import Writer
@@ -67,6 +70,9 @@ class App(Router):
         or async test code. `shutdown` completes when the runner begins draining.
         """
         super().__init__()
+        self._app_state = AppState()
+        self._app_state.host_routing = self._host_routing
+        self._app_state.router = self._cy_router
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as exc:
@@ -138,6 +144,7 @@ class App(Router):
     def signal_shutdown(self) -> None:
         """Complete shutdown on every attached loop."""
         self._shutdown_event.set()
+        self._app_state.shutting_down = True
         with self._shutdown_lock:
             items = list(self._loop_shutdown.items())
         try:

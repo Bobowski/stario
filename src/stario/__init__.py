@@ -19,6 +19,7 @@ Prefer `from stario import …` for:
 - **Per-handler:** `App`, `Context`, `Writer`, `Route`
 - **Control flow:** `RedirectException`, `catch_errors` middleware (`stario.http.middleware`)
 - **Bootstrap / filesystem:** `Assets`, `Files`, `Span`
+- **Process:** `serve` — async HTTP server; wrap with `asyncio.run` or `uvloop.run`
 - **Middleware / realtime:** `Handler`, `Middleware`, `Relay`
 
 Register endpoints on `App` with `app.add(Route("GET /"), home)`. Scope middleware
@@ -36,6 +37,7 @@ from stario.filesystem import Assets, Files
 from stario.http.app import App
 from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.route import Route, UrlPath
+from stario.http.server import serve
 from stario.http.writer import Writer
 from stario.relay import Relay
 from stario.staticassets import (
@@ -61,4 +63,5 @@ __all__ = [
     "UrlPath",
     "Writer",
     "__version__",
+    "serve",
 ]

@@ -6,6 +6,7 @@ Stario app: a `Route`, a handler that writes through `Writer`, and a
 `bootstrap` that registers the route.
 
 Run with: uv run stario watch main:bootstrap
+      or: uv run python main.py
       or: uv run stario serve main:bootstrap
 
 For Datastar, SSE, and shared state, see `examples/tiles`.
@@ -46,3 +47,11 @@ async def bootstrap(app: App, span: Span):
     span.attr("app.name", "hello-world")
     app.add(HOME, home)
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))

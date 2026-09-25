@@ -1,6 +1,6 @@
 [project]
 name = "stario"
-version = "4.1.1"
+version = "4.3.0"
 description = "Craft realtime hypermedia apps that are a joy to write and ship."
 readme = "README.md"
 license = "MIT"
@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 keywords = ["asyncio", "http", "hypermedia", "html", "sse", "framework"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -16,14 +16,18 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
     "Typing :: Typed",
 ]
 dependencies = [
     "brotli>=1.1.0,<2",
-    "xxhash>=3.5.0,<4",
+    "typing_extensions>=4.13.0,<5",
     "watchfiles>=1.1.0,<2",
+    "xxhash>=3.5.0,<4",
+    "zstandard>=0.25.0,<1",
 ]
 
 [project.urls]
@@ -60,7 +64,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.pyright]
-pythonVersion = "3.14"
+pythonVersion = "3.12"
 typeCheckingMode = "basic"
 reportPrivateUsage = false
 reportMissingTypeStubs = false
@@ -70,14 +74,14 @@ include = [
     "tests",
     "examples",
 ]
-exclude = ["benchmarks", "**/.venv", "**/__pycache__"]
+exclude = ["benchmarks", "examples/jinja", "**/.venv", "**/__pycache__"]
 
 [[tool.pyright.executionEnvironments]]
 root = "examples/chat-room"
 extraPaths = ["examples/chat-room"]
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py312"
 line-length = 88
 src = ["src", "tests", "examples"]
 exclude = [

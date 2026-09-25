@@ -6,6 +6,8 @@ context. ``Match`` and ``_Alive`` stay as small Python helpers.
 
 from __future__ import annotations
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping

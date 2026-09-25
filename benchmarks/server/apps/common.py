@@ -16,8 +16,8 @@ PLAINTEXT_BODY = HELLO.encode("utf-8")
 TEXT_CONTENT_TYPE = b"text/plain; charset=utf-8"
 TEXT_CONTENT_TYPE_STR = "text/plain; charset=utf-8"
 
-# wrk cycles this many unique /user/{id}?q=… paths. Stario's find_handler LRU
-# is 1024 entries, so 4096 forces matching instead of one cached URL.
+# wrk cycles this many unique /user/{id}?q=… paths so lookup cannot collapse
+# to one static URL (the compiled trie walks each param path).
 PARAM_ID_COUNT = 4096
 REQUEST_HEADER = "x-request-id"
 

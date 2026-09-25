@@ -27,6 +27,9 @@ class Segment:
 
     __slots__ = ("kind", "name")
 
+    kind: SegmentKind
+    name: str
+
     def __init__(self, kind: SegmentKind, name: str) -> None:
         if not name:
             raise StarioError("route segment name must not be empty")
