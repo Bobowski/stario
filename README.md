@@ -27,7 +27,7 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 ## Requirements
 
-Python 3.12 or newer is required.
+Python 3.12 or newer is required, on Linux (glibc) or macOS. The HTTP server is compiled: PyPI ships wheels for Linux x86_64/aarch64 and macOS arm64 with nghttp2 and Brotli bundled. Elsewhere `pip` builds from source and needs a C compiler, `pkg-config`, and the nghttp2 (1.61+) and Brotli development packages. Windows is not supported.
 
 **uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
 
