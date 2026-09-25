@@ -100,7 +100,7 @@ wheels = [
 
 [[package]]
 name = "stario"
-version = "4.2.0"
+version = "4.3.0"
 source = { directory = "../../" }
 dependencies = [
     { name = "brotli" },

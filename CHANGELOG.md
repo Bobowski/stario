@@ -6,6 +6,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 4.3.0 - 2026-09-25
+
 ### Added
 
 - `stario.serve(bootstrap, …)` — run the HTTP server on a loop you start:
