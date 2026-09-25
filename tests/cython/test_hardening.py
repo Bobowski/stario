@@ -12,7 +12,6 @@ import stario.responses as responses
 from stario import App, Relay
 from stario.datastar import SSE
 from stario.testing.tracer import TestTracer
-from tests.helpers import assert_status_span
 from stario_cython.request import Request
 from tests.cython.http import (
     RecordingTransport,
@@ -20,6 +19,7 @@ from tests.cython.http import (
     response_status,
     response_statuses,
 )
+from tests.helpers import assert_status_span
 
 # Production sweeps with the Date tick (1s). Tests force 50ms via conftest.
 # Timeouts here must exceed two periods; waits must exceed timeout + one period.
@@ -880,7 +880,7 @@ async def test_close_if_idle_skips_in_flight_handler() -> None:
 
 @pytest.mark.asyncio
 async def test_connection_with_no_data_times_out_headers() -> None:
-    proto, app, transport = _attach(header_timeout=_TIMEOUT)
+    _proto, app, transport = _attach(header_timeout=_TIMEOUT)
     try:
         await asyncio.sleep(_WAIT)
         assert transport.is_closing()
@@ -934,9 +934,7 @@ async def test_stalled_deferred_small_body_times_out() -> None:
     app.post("/", handler)
     proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
     try:
-        proto.data_received(
-            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\n"
-        )
+        proto.data_received(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\n")
         await asyncio.sleep(_WAIT)
         assert transport.is_closing()
         assert hits == 0
@@ -1030,9 +1028,7 @@ async def test_stalled_chunked_body_aborts_without_hanging() -> None:
         responses.text(w, "ok")
 
     app.post("/", handler)
-    proto, app, transport = _attach(
-        app=app, body_timeout=_TIMEOUT, header_timeout=5.0
-    )
+    proto, app, transport = _attach(app=app, body_timeout=_TIMEOUT, header_timeout=5.0)
     try:
         proto.data_received(
             b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -1054,12 +1050,14 @@ async def test_timeout_sweeper_is_one_task_per_connection_set() -> None:
 
     if timeout_cleanup_mode() != "sweep":
         pytest.skip("default cleanup is the connection sweeper")
-    proto, app, transport = _attach(header_timeout=5.0)
+    _proto, app, transport = _attach(header_timeout=5.0)
     try:
         loop = asyncio.get_running_loop()
         sweeps = getattr(loop, "_stario_timeout_sweeps", None)
         assert sweeps, "connection_made should start a sweeper"
-        live = [task for task in sweeps.values() if task is not None and not task.done()]
+        live = [
+            task for task in sweeps.values() if task is not None and not task.done()
+        ]
         assert len(live) == 1
     finally:
         if not transport.is_closing():
@@ -1075,11 +1073,13 @@ async def test_server_date_tick_skips_fallback_sweeper() -> None:
         pytest.skip("default cleanup is the connection sweeper")
     loop = asyncio.get_running_loop()
     setattr(loop, DATE_TICK_SWEEP_ATTR, True)
-    proto = app = transport = None
+    app = transport = None
     try:
-        proto, app, transport = _attach(header_timeout=5.0)
+        _proto, app, transport = _attach(header_timeout=5.0)
         sweeps = getattr(loop, "_stario_timeout_sweeps", None) or {}
-        live = [task for task in sweeps.values() if task is not None and not task.done()]
+        live = [
+            task for task in sweeps.values() if task is not None and not task.done()
+        ]
         assert live == []
     finally:
         setattr(loop, DATE_TICK_SWEEP_ATTR, False)
@@ -1193,8 +1193,7 @@ async def test_head_response_omits_body_and_keeps_pipeline_in_sync() -> None:
     proto, app, transport = _attach(app)
     try:
         proto.data_received(
-            b"HEAD / HTTP/1.1\r\nHost: t\r\n\r\n"
-            b"GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+            b"HEAD / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHost: t\r\n\r\n"
         )
         await _drain(app)
         raw = b"".join(transport.writes)
@@ -1226,8 +1225,7 @@ async def test_close_error_does_not_splice_status_into_started_response() -> Non
     proto, app, transport = _attach(app)
     try:
         proto.data_received(
-            b"GET / HTTP/1.1\r\nHost: t\r\n\r\n"
-            b"GET / HTTP/2.0\r\nHost: t\r\n\r\n"
+            b"GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/2.0\r\nHost: t\r\n\r\n"
         )
         await asyncio.wait_for(started, timeout=1)
         raw = b"".join(transport.writes)

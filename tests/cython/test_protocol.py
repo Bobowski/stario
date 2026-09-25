@@ -1,7 +1,6 @@
 import asyncio
 
 import pytest
-from stario_cython.protocol import HttpProtocol
 
 import stario.responses as responses
 from stario import App
@@ -10,6 +9,7 @@ from stario.http.compression import CompressionConfig
 from stario.http.route import UrlPath
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
+from stario_cython.protocol import HttpProtocol
 from tests.cython.http import free_port, read_response
 from tests.helpers import assert_status_span
 
@@ -52,9 +52,7 @@ async def test_trailing_slash_redirects_without_create_task() -> None:
     server = await loop.create_server(factory, "127.0.0.1", port)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(
-            b"GET /search/?q=cats&page=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
-        )
+        writer.write(b"GET /search/?q=cats&page=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         await writer.drain()
         first = await read_response(reader)
         assert b"308" in first.split(b"\r\n", 1)[0]
@@ -160,7 +158,9 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
         assert b"gone" in missing
         assert seen == ["404"]
 
-        writer.write(b"POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+        writer.write(
+            b"POST /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+        )
         await writer.drain()
         denied = await read_response(reader)
         assert b"405" in denied.split(b"\r\n", 1)[0]
@@ -256,11 +256,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         assert all(proto.disconnect is None for proto in connections)
 
         writer.write(
-            b"POST /echo HTTP/1.1\r\n"
-            b"Host: 127.0.0.1\r\n"
-            b"Content-Length: 5\r\n"
-            b"\r\n"
-            b"abcde"
+            b"POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nabcde"
         )
         await writer.drain()
         second = await read_response(reader)
@@ -412,8 +408,7 @@ async def test_request_headers_scan_arena_without_copy() -> None:
         await writer.drain()
         assert b"ok" in await read_response(reader)
         assert (b"cookie", b"a=1") in [
-            (name.encode("latin-1"), value.encode("latin-1"))
-            for name, value in seen[0]
+            (name.encode("latin-1"), value.encode("latin-1")) for name, value in seen[0]
         ]
         writer.close()
         await writer.wait_closed()
@@ -453,11 +448,7 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
         writer.write(b"GET / HTTP/1.1\r\nHost: first\r\nX-Local: one\r\n\r\n")
         await writer.drain()
         assert b"ok" in await read_response(reader)
-        writer.write(
-            b"GET / HTTP/1.1\r\n"
-            b"Host: second\r\n"
-            b"Connection: close\r\n\r\n"
-        )
+        writer.write(b"GET / HTTP/1.1\r\nHost: second\r\nConnection: close\r\n\r\n")
         await writer.drain()
         assert b"ok" in await read_response(reader)
         assert seen_local == ["one", None]
@@ -520,8 +511,7 @@ async def test_stream_large_and_chunked_upload() -> None:
             b"POST /upload HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Transfer-Encoding: chunked\r\n"
-            b"\r\n"
-            + b"".join(parts)
+            b"\r\n" + b"".join(parts)
         )
         await writer.drain()
         second = await read_response(reader)
@@ -795,7 +785,9 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
 
 
 @pytest.mark.asyncio
-async def test_handler_after_respond_stays_on_app_tasks_and_next_request_starts() -> None:
+async def test_handler_after_respond_stays_on_app_tasks_and_next_request_starts() -> (
+    None
+):
     """4.3: respond() frees the connection; the handler Task drains on app.tasks."""
     loop = asyncio.get_running_loop()
     app = App()
@@ -1043,9 +1035,7 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"
-            b"Content-Length: "
-            + str(len(payload)).encode("ascii")
-            + b"\r\n\r\n"
+            b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
         )
         await writer.drain()
         await asyncio.wait_for(started.wait(), timeout=1.0)
@@ -1092,9 +1082,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"
-            b"Content-Length: "
-            + str(len(payload)).encode("ascii")
-            + b"\r\n\r\n"
+            b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
         )
         await writer.drain()
         await asyncio.wait_for(started.wait(), timeout=1.0)
@@ -1144,9 +1132,7 @@ async def test_content_length_body_survives_many_64k_segments() -> None:
         writer.write(
             b"POST /echo HTTP/1.1\r\n"
             b"Host: localhost\r\n"
-            b"Content-Length: "
-            + str(len(payload)).encode("ascii")
-            + b"\r\n\r\n"
+            b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n"
         )
         await writer.drain()
         await asyncio.wait_for(started.wait(), timeout=1.0)
@@ -1300,10 +1286,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
-            b"POST /upload HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
-            b"Content-Length: 1\r\n\r\n"
-            b"x"
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx"
         )
         await writer.drain()
         try:
@@ -1500,7 +1483,9 @@ async def test_request_headers_are_read_only() -> None:
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"GET / HTTP/1.1\r\nHost: stario.test\r\nConnection: close\r\n\r\n")
+        writer.write(
+            b"GET / HTTP/1.1\r\nHost: stario.test\r\nConnection: close\r\n\r\n"
+        )
         await writer.drain()
         assert b"ok" in await read_response(reader)
         assert errors == ["raised"]
@@ -1555,7 +1540,7 @@ async def test_lazy_cookies_and_query_from_arena() -> None:
             b" HTTP/1.1\r\n"
             b"Host: stario.test\r\n"
             b"Authorization: Bearer abc\r\n"
-            b"Cookie: a=1; x=\"a;b\"\r\n"
+            b'Cookie: a=1; x="a;b"\r\n'
             b"Cookie: a=2; b=3\r\n"
             b"Connection: close\r\n\r\n"
         )
@@ -1641,9 +1626,7 @@ async def test_host_routing_normalizes_host_header() -> None:
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
-            b"GET / HTTP/1.1\r\n"
-            b"Host: Example.COM:80\r\n"
-            b"Connection: close\r\n\r\n"
+            b"GET / HTTP/1.1\r\nHost: Example.COM:80\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
         assert b"host:example.com" in await read_response(reader)

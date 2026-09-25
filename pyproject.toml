@@ -100,7 +100,7 @@ allowed-confusables = ["×"]
 # First-party roots aligned with pyright `include`. Multi-file examples use an
 # `app` package (see examples/chat-room); add other top-level example package
 # names here when a new layout needs it.
-known-first-party = ["stario", "tests", "app"]
+known-first-party = ["stario", "stario_cython", "tests", "app"]
 
 [tool.ruff.format]
 quote-style = "double"

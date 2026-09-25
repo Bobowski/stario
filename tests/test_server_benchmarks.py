@@ -40,7 +40,6 @@ def test_lua_varies_path_query_and_header() -> None:
 def test_request_line_includes_path_query_and_header() -> None:
     line = request_line("99", "term99", "h99")
     assert line == "user=99 q=term99 x=h99"
-    assert "99" in line and "term99" in line and "h99" in line
 
 
 def test_query_param_and_header_helpers() -> None:
@@ -60,6 +59,7 @@ def test_upload_lines_are_plain_text() -> None:
 async def test_stario_benchmark_app_route_shapes() -> None:
     pytest.importorskip("ujson")
     from apps.stario_app import bootstrap
+
     from stario.testing import TestClient
 
     async with TestClient(bootstrap) as client:

@@ -19,7 +19,6 @@ from stario.exceptions import StarioError
 from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
 from stario.telemetry.spans import NoOpSpan
-
 from stario_cython.exchange import AppState, canonical_request_path
 
 from .dispatch import Router

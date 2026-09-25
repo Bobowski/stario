@@ -7,8 +7,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 
-from stario_cython.exchange import compile_router
-
 from typing_extensions import deprecated
 
 import stario.responses as responses
@@ -17,6 +15,7 @@ from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.route import EMPTY_ROUTE, Route, UrlPath, as_target
 from stario.http.segment import Segment
 from stario.http.writer import Writer
+from stario_cython.exchange import compile_router
 
 type MethodNotAllowedHandler = Callable[[frozenset[str]], Handler]
 type RouteMatch = tuple[Handler, Route, Match]
@@ -43,7 +42,7 @@ def require_async_handler(handler: object, *, what: str = "Handler") -> None:
     if inspect.iscoroutinefunction(fn):
         return
 
-    call = getattr(fn, "__call__", None)
+    call = fn.__call__ if callable(fn) else None
     if call is not None and call is not fn:
         if inspect.isasyncgenfunction(call):
             raise StarioError(
@@ -108,9 +107,7 @@ def _param_child(current: Node, segment: Segment) -> Node | None:
     return current.wildcard
 
 
-def _step(
-    current: Node, segs: tuple[Segment, ...], i: int
-) -> tuple[Node, int] | None:
+def _step(current: Node, segs: tuple[Segment, ...], i: int) -> tuple[Node, int] | None:
     seg = segs[i]
     if seg.kind == "exact":
         child = current.exact.get(seg.name)
@@ -208,11 +205,11 @@ class Router:
     """Route table: host routes override hostless defaults when they fully match."""
 
     __slots__ = (
+        "_cy_router",
         "_has_param_hosts",
         "_host_routing",
         "_hosts_exact",
         "_hosts_param",
-        "_cy_router",
         "_lookup",
         "_path",
     )

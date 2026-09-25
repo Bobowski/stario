@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from stario_cython.exchange import _retained_detach_count
 
 import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioRuntime
+from stario_cython.exchange import _retained_detach_count
 from tests.cython.http import read_response, running_server
 
 

@@ -10,12 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from stario_cython.protocol import HttpProtocol
 
 import stario.responses as responses
 from stario import App
-from stario.http.tls import load_tls_context
 from stario.http.route import UrlPath
+from stario.http.tls import load_tls_context
+from stario_cython.protocol import HttpProtocol
 from tests.cython.h2wire import (
     FLAG_END_HEADERS,
     FLAG_END_STREAM,
@@ -44,7 +44,12 @@ from tests.cython.h2wire import (
     stream_ended,
     stream_headers_blob,
 )
-from tests.cython.http import RecordingTransport, free_port, make_protocol, response_status
+from tests.cython.http import (
+    RecordingTransport,
+    free_port,
+    make_protocol,
+    response_status,
+)
 
 
 async def _curl(*args: str) -> subprocess.CompletedProcess[str]:
@@ -294,7 +299,8 @@ async def test_h2_keep_alive_returns_window_credit() -> None:
             )
         assert result.returncode == 0, result.stderr
         assert f"{nreq} succeeded" in result.stdout, result.stdout
-        assert " 0 failed" in result.stdout and " 0 errored" in result.stdout
+        assert " 0 failed" in result.stdout
+        assert " 0 errored" in result.stdout
     finally:
         server.close()
         await server.wait_closed()

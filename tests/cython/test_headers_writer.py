@@ -3,13 +3,13 @@ import gzip
 
 import brotli
 import pytest
-from stario_cython.exchange import Headers
 
 import stario.cookies as cookies
 from stario import App
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.http.headers import Headers as PublicHeaders
+from stario_cython.exchange import Headers
 from tests.cython.http import read_chunk, read_response, running_server
 
 
@@ -105,9 +105,7 @@ async def test_exchange_respond_native_compression_round_trip(
             writer.write(
                 b"GET / HTTP/1.1\r\n"
                 b"Host: localhost\r\n"
-                b"Accept-Encoding: "
-                + encoding
-                + b"\r\n"
+                b"Accept-Encoding: " + encoding + b"\r\n"
                 b"Connection: close\r\n\r\n"
             )
             await writer.drain()
@@ -125,7 +123,9 @@ async def test_exchange_respond_native_compression_round_trip(
 
 
 @pytest.mark.asyncio
-async def test_one_shot_compression_writes_generated_headers_without_dict_roundtrip() -> None:
+async def test_one_shot_compression_writes_generated_headers_without_dict_roundtrip() -> (
+    None
+):
     app = App()
     state = {}
     body = b"direct generated response headers " * 32
@@ -363,9 +363,7 @@ async def test_exchange_sse_gzip_flushes_each_write() -> None:
             while chunk := await read_chunk(reader):
                 compressed.append(chunk)
 
-            assert gzip.decompress(b"".join(compressed)) == (
-                b"data: 0\n\ndata: 1\n\n"
-            )
+            assert gzip.decompress(b"".join(compressed)) == (b"data: 0\n\ndata: 1\n\n")
             assert state["exchange"].started
             assert state["exchange"].completed
         finally:
@@ -573,9 +571,7 @@ async def test_write_chunked_accepts_list_of_bytes_parts() -> None:
     async with running_server(
         app,
         date=b"date: now\r\n",
-        compression=CompressionConfig(
-            brotli_level=-1, zstd_level=-1, gzip_level=-1
-        ),
+        compression=CompressionConfig(brotli_level=-1, zstd_level=-1, gzip_level=-1),
     ) as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -686,7 +682,8 @@ async def test_respond_writes_extra_headers_before_derived_type_and_length() -> 
             assert b"content-length: 5\r\n" in block
             extra_at = block.find(b"x-custom: present\r\n")
             type_at = block.find(b"content-type: text/plain; charset=utf-8\r\n")
-            assert extra_at != -1 and extra_at < type_at
+            assert extra_at != -1
+            assert extra_at < type_at
         finally:
             writer.close()
             await writer.wait_closed()
@@ -730,7 +727,8 @@ async def test_respond_reads_input_headers_and_writes_cookies() -> None:
             assert b"content-length: 5\r\n" in block
             cookies_at = block.lower().find(b"set-cookie:")
             type_at = block.find(b"content-type: text/plain; charset=utf-8\r\n")
-            assert cookies_at != -1 and cookies_at < type_at
+            assert cookies_at != -1
+            assert cookies_at < type_at
         finally:
             writer.close()
             await writer.wait_closed()
@@ -803,7 +801,7 @@ async def test_respond_errors_when_owned_headers_conflict(
 
     app.get("/", bad)
     async with running_server(app, date=b"date: now\r\n") as port:
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
             writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             await writer.drain()

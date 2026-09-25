@@ -4,7 +4,7 @@ import logging
 
 import stario.responses as responses
 from stario.exceptions import RequestBodyError
-from stario.http.context import Context, Handler
+from stario.http.context import Context
 from stario.http.middleware import (
     catch_errors,
     catch_request_body_errors,
@@ -76,7 +76,9 @@ class TestCatchErrors:
             raise RequestBodyError(408, "slow")
 
         def setup(app) -> None:
-            app.use("/", catch_errors(RequestBodyError, respond=respond_request_body_error))
+            app.use(
+                "/", catch_errors(RequestBodyError, respond=respond_request_body_error)
+            )
             app.post("/upload", handler)
 
         _context, writer = run_with_app(setup, "/upload", method="POST")

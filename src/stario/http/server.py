@@ -23,12 +23,11 @@ from email.utils import format_datetime
 from types import FrameType
 from typing import Any, Unpack
 
-from stario_cython.protocol import HttpProtocol
-
 from stario._env import env_bool
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
 from stario.telemetry.spans import ProxySpan
+from stario_cython.protocol import HttpProtocol
 
 from .app import App
 from .bootstrap import (
@@ -77,6 +76,7 @@ def _make_http_protocol(
         body_timeout=requests.body_timeout,
         max_pipelined_requests=requests.max_pipelined_requests,
     )
+
 
 type SignalHandler = Callable[[int, FrameType | None], object]
 type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
