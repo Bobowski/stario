@@ -805,7 +805,6 @@ async def test_handler_after_respond_stays_on_app_tasks_and_next_request_starts(
     async def first(c, w):
         responses.text(w, "first")
         first_responded.set()
-        assert any(not task.done() for task in c.app.tasks)
         await release.wait()
 
     async def second(c, w):

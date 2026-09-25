@@ -246,12 +246,13 @@ cdef object _finish(
     object method,
     dict params,
     object nf_hit,
-    object mna_hit,
+    object method_na,
     int* status,
 ):
     cdef object endpoints
     cdef object hit
     cdef object packed
+    cdef object factory
     endpoints = node.endpoints
     if endpoints is None:
         status[0] = 2
@@ -270,11 +271,11 @@ cdef object _finish(
                 _ROUTER_MATCH_CLS(packed[2].pattern, params),
             )
         return hit
-    if mna_hit is not None:
-        status[0] = 1
-        return mna_hit
-    status[0] = 2
-    return nf_hit if nf_hit is not None else _NF_HIT
+    status[0] = 1
+    if method_na is None and node.mna_hit is not None:
+        return node.mna_hit
+    factory = method_na or node.method_na or _ROUTER_DEFAULT_MNA
+    return _pack(factory(node.method_set), _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH)
 
 
 cdef object _resolve_tree(
@@ -289,7 +290,7 @@ cdef object _resolve_tree(
     cdef CNode child
     cdef dict params = None
     cdef object nf_hit = root.nf_hit
-    cdef object mna_hit = root.mna_hit
+    cdef object method_na = root.method_na
     cdef bint cust = root.not_found_custom
     cdef const char* path_p
     cdef const char* host_p = NULL
@@ -346,8 +347,8 @@ cdef object _resolve_tree(
             if child.not_found is not None:
                 nf_hit = child.nf_hit
                 cust = True
-            if child.mna_hit is not None:
-                mna_hit = child.mna_hit
+            if child.method_na is not None:
+                method_na = child.method_na
             node = child
     nf_before = nf_hit
     custom_before = cust
@@ -390,12 +391,12 @@ cdef object _resolve_tree(
             if child.not_found is not None:
                 nf_hit = child.nf_hit
                 cust = True
-            if child.mna_hit is not None:
-                mna_hit = child.mna_hit
+            if child.method_na is not None:
+                method_na = child.method_na
             node = child
             i = nxt
     custom[0] = cust
-    return _finish(node, method, params, nf_hit, mna_hit, status)
+    return _finish(node, method, params, nf_hit, method_na, status)
 
 
 cdef object _router_lookup(CRouter self, object host, object path, object method):
