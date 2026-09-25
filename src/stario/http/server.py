@@ -28,6 +28,7 @@ from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
 from stario.telemetry.spans import ProxySpan
 from stario_cython.protocol import HttpProtocol
+from stario_cython.timeouts import DATE_TICK_SWEEP_ATTR
 
 from .app import App
 from .bootstrap import (
@@ -86,9 +87,6 @@ type LoopRun[T] = Callable[[Coroutine[Any, Any, T]], T]
 # Upper bound on the force-close loop after the graceful wait (see _drain_listener).
 _FORCE_CLOSE_CAP = 1.0
 
-# Keep in sync with ``stario_cython.protocol``: Cython skips its own sweeper
-# task when the Date tick already walks connections once a second.
-_DATE_TICK_SWEEPS_TIMEOUTS = "_stario_date_tick_sweeps_timeouts"
 
 # Yield to the event loop this many times while waiting for connection_made to register.
 _ACCEPT_REGISTER_YIELDS = 10
@@ -911,7 +909,7 @@ class Server:
             box[0] = b"date: %s\r\n" % format_datetime(now, usegmt=True).encode("ascii")
 
         loop = asyncio.get_running_loop()
-        setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, True)
+        setattr(loop, DATE_TICK_SWEEP_ATTR, True)
 
         async def tick() -> None:
             while True:
@@ -924,7 +922,7 @@ class Server:
         try:
             yield
         finally:
-            setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, False)
+            setattr(loop, DATE_TICK_SWEEP_ATTR, False)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task

@@ -731,13 +731,6 @@ cdef class Headers:
             ))
         return result
 
-    def unsafe_append_wire_lines(self, list parts):
-        """Append pre-baked ``name: `` / ``value\\r\\n`` pairs for the writer."""
-        cdef Py_ssize_t i
-        for i in range(self._n):
-            parts.append(self._names[i])
-            parts.append(self._values[i])
-
     def __contains__(self, name):
         cdef char buf[NAME_STACK]
         cdef Py_ssize_t n

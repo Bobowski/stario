@@ -26,12 +26,11 @@ from cpython.bytearray cimport (
 )
 from cpython.bytes cimport (
     PyBytes_AS_STRING,
-    PyBytes_Check,
     PyBytes_FromStringAndSize,
     PyBytes_GET_SIZE,
 )
-from cpython.list cimport PyList_GET_ITEM, PyList_GET_SIZE
-from cpython.exc cimport PyErr_Clear, PyErr_Occurred
+from cpython.list cimport PyList_GET_SIZE
+from cpython.exc cimport PyErr_Clear
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
 from cpython.ref cimport Py_REFCNT
 from cpython.unicode cimport (
@@ -56,7 +55,6 @@ from stario.http.compression import (
 )
 from stario.http.context import EMPTY_MATCH, _Alive
 from stario.http.invoke import on_handler_done
-from stario.http.wire import decode_path
 
 from stario_cython.compression_buf cimport (
     StarioBrotli,

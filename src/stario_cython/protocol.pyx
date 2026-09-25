@@ -46,13 +46,7 @@ from cpython.bytes cimport (
 )
 from cpython.exc cimport PyErr_Clear
 from cpython.object cimport PyObject_Call
-from cpython.unicode cimport (
-    PyUnicode_AsUTF8AndSize,
-    PyUnicode_DecodeASCII,
-    PyUnicode_DecodeLatin1,
-    PyUnicode_GET_LENGTH,
-    PyUnicode_READ_CHAR,
-)
+from cpython.unicode cimport PyUnicode_DecodeLatin1
 
 from stario.http.config import (
     DEFAULT_HEADER_TIMEOUT,
@@ -60,7 +54,11 @@ from stario.http.config import (
     DEFAULT_MAX_PIPELINED_REQUESTS,
 )
 from stario.http.invoke import finish_request_span, on_handler_done
-from stario.http.request import DEFAULT_BODY_TIMEOUT
+from stario.http.request import (
+    DEFAULT_BODY_TIMEOUT,
+    DEFAULT_MAX_BODY_SIZE,
+    DEFAULT_MAX_HEADER_BYTES,
+)
 from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport (
@@ -68,7 +66,6 @@ from stario_cython.exchange cimport (
     PATH_BAD,
     PATH_HAS_PCT,
     PATH_OPTIONS_STAR,
-    PATH_RAW_UTF8,
     PATH_REDIRECT,
     AppState,
     CRouter,
@@ -122,8 +119,6 @@ from stario_cython.nghttp2 cimport (
     NGHTTP2_ENHANCE_YOUR_CALM,
     NGHTTP2_NO_ERROR,
     NGHTTP2_NV_FLAG_NONE,
-    NGHTTP2_NV_FLAG_NO_COPY_NAME,
-    NGHTTP2_NV_FLAG_NO_COPY_VALUE,
     NGHTTP2_SETTINGS_ENABLE_PUSH,
     NGHTTP2_SETTINGS_HEADER_TABLE_SIZE,
     NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
@@ -739,8 +734,8 @@ cdef class CHttpProtocol(Connection):
         list date_box,
         compression,
         connections,
-        max_header_bytes=64 * 1024,
-        max_body_bytes=10 * 1024 * 1024,
+        max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
+        max_body_bytes=DEFAULT_MAX_BODY_SIZE,
         header_timeout=DEFAULT_HEADER_TIMEOUT,
         keep_alive_timeout=DEFAULT_KEEP_ALIVE_TIMEOUT,
         body_timeout=DEFAULT_BODY_TIMEOUT,
@@ -984,7 +979,6 @@ cdef class CHttpProtocol(Connection):
         The sweeper compares ``timeout_deadline`` to one ``loop.time()``
         per wake. wrk keep-alive is a double store, not ``call_later``.
         """
-        cdef object transport
         if self.timeout_cleanup == CLEANUP_OFF:
             return
         if seconds <= 0 or self._closing():
@@ -1258,8 +1252,7 @@ cdef class CHttpProtocol(Connection):
     def close_if_idle(self) -> bool:
         """Close the connection if it is waiting for a new request.
 
-        Matches the previous Python ``HttpProtocol.close_if_idle`` so the
-        shared ``Server`` drain path can reuse Cython connections.
+        Called by the ``Server`` drain path on shutdown.
         """
         cdef object transport
         if self.parse_mode == PARSE_H2 and self.h2 != NULL and not self.rejected:
@@ -2019,8 +2012,6 @@ cdef class CHttpProtocol(Connection):
         cdef object span
         cdef object method
         cdef object path
-        cdef Py_ssize_t qoff
-        cdef Py_ssize_t qlen
         cdef object transport
 
         if self.rejected:
@@ -2034,8 +2025,6 @@ cdef class CHttpProtocol(Connection):
         span = None
         method = None
         path = None
-        qoff = 0
-        qlen = 0
         if exchange is not None:
             span = exchange.span
             try:
@@ -2385,8 +2374,6 @@ cdef class CHttpProtocol(Connection):
         """Write a protocol HTTP status on this stream (431 / similar). No handler."""
         cdef object method
         cdef object path
-        cdef Py_ssize_t qoff
-        cdef Py_ssize_t qlen
         if ex is None or self.rejected:
             return
         ex._h2_awaiting_headers = False
@@ -3001,12 +2988,6 @@ cdef class CHttpProtocol(Connection):
             self.h2, NGHTTP2_FLAG_NONE, ex._h2_stream_id, NGHTTP2_INTERNAL_ERROR
         )
         self._h2_send()
-
-    cpdef object c_get_buffer(self, Py_ssize_t sizehint):
-        return self._get_buffer(sizehint)
-
-    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
-        self._buffer_updated(nbytes)
 
     cdef object _get_buffer(self, Py_ssize_t sizehint):
         """Reusable read buffer. Consume it in buffer_updated before reuse.
