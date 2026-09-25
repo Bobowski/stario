@@ -122,7 +122,31 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - HTTP/1.0 requests with `Transfer-Encoding` close after the response
   (RFC 9112 §6.1).
 - `Headers.unsafe_*` raise `TypeError` for non-`bytes` arguments instead of
-  reading invalid memory; `memoryview` bodies must have `itemsize` 1.
+  reading invalid memory. `memoryview` bodies must be flat, contiguous
+  bytes (`itemsize` 1, one dimension); others raise `TypeError` before
+  anything is sent.
+- Streaming to an HTTP/1.0 client without `Content-Length` sends a
+  close-delimited body with `Connection: close` instead of chunked framing
+  the client cannot parse.
+- Chunked and gzip writes accept `memoryview` parts, and gzip handles
+  inputs over 4 GiB.
+- HTTP/2: client PINGs no longer keep an idle connection open; a stream
+  whose response is done but whose request body is still open is reset
+  (`NO_ERROR`) once the handler finishes; paused streams no longer let the
+  connection window grow past its limit; fatal protocol errors flush the
+  GOAWAY before closing; exceptions in header/data callbacks reset the
+  stream instead of being ignored.
+- HTTP/2 drain is two-phase: a shutdown-notice GOAWAY and PING, then the
+  final GOAWAY on the PING ACK (or after 1 s), so requests in flight are
+  not refused.
+- HTTP/1: bare CRLFs between requests no longer keep an idle connection
+  open.
+- A body `stream()` or `body()` call that outlives its request raises
+  `StarioRuntime` instead of reading the next request's body on the
+  pooled exchange.
+- Failures swallowed inside the server (nghttp2 callbacks, dispatch,
+  exchange allocation, tracer spans, protocol error responses) are logged
+  with tracebacks.
 
 ### Changed
 
@@ -156,6 +180,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   `Headers` pair list). Timeout cleanup is chosen in `HttpProtocol.__init__`
   (`timeout_cleanup=`, env as default). Cookie `as_dict()` is cached. H1/H2
   methods share one byte table. Compressibility uses the Python helper.
+- `stario.http.host.host_without_port` re-exports the Cython Host parser
+  so request routing and the helper agree.
 
 ## 4.3.0 - 2026-09-25
 
