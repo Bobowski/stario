@@ -217,8 +217,8 @@ There is no autotag, and the build does not rewrite the version.
 3. Tag that commit and push:
 
 ```bash
-git tag v4.3.0
-git push origin v4.3.0
+git tag 4.3.0
+git push origin 4.3.0
 ```
 
 A GitHub Release with the same tag is the same event. The workflow tests
