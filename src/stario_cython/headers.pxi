@@ -662,13 +662,6 @@ cdef class Headers:
             ))
         return result
 
-    def respond_scan(self, content_type):
-        """One walk: Date/TE errors, Content-Type match, capture CE and CL."""
-        return self.c_scan_respond(content_type)
-
-    def require_respond_length(self, existing_cl, expected):
-        self.c_require_respond_length(existing_cl, expected)
-
     def unsafe_append_wire_lines(self, list parts):
         """Append pre-baked ``name: `` / ``value\\r\\n`` pairs for the writer."""
         cdef Py_ssize_t i

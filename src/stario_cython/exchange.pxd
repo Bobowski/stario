@@ -67,6 +67,7 @@ cdef object _status_line(int status)
 cdef class ParsedCookies:
     cdef object _headers
     cdef list _lines
+    cdef object _parsed
 
     cdef void bind_request_headers(self, object headers) noexcept
     cdef void _extend_lines(self, object lines) except *
@@ -225,7 +226,7 @@ cdef class RequestExchange:
     cdef void cancel_before_start(self)
     cdef void _maybe_recycle(self)
     cdef void park(self)
-    cdef void release_global(self)
+    cdef void return_to_pool(self)
     cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size) noexcept
     cdef void mark_nobody(self) noexcept
     cdef int _reserve_request_arena(self, Py_ssize_t bytes_needed) noexcept
@@ -297,7 +298,7 @@ cdef class RequestExchange:
     cdef void _done(self)
     cdef void _maybe_pause(self)
 
-cdef class RequestHeaders(Headers):
+cdef class RequestHeaders:
     cdef object _owner
 
     cdef object c_get(self, object name)
@@ -305,10 +306,6 @@ cdef class RequestHeaders(Headers):
     cdef object c_value_str(self, Py_ssize_t index)
     cdef object c_get_n(self, const char* query, Py_ssize_t query_length)
     cdef object c_getlist_n(self, const char* query, Py_ssize_t query_length)
-    cdef void c_set(self, object name, object value)
-    cdef void c_add(self, object name, object value)
-    cdef void c_remove(self, object name)
-    cdef void c_clear(self)
     cdef object c_request_indexed(self, Py_ssize_t index)
     cdef void c_parse_cookies(self, dict out) except *
 

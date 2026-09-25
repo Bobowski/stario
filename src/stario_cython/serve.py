@@ -1,21 +1,8 @@
 """Cython-backed HTTP server entry.
 
-Lifecycle (signal handling, graceful drain, date-header refresh) is the
-standard ``stario.http.server.Server``. This module injects the compiled
-protocol factory and keeps the Cython defaults (uvloop + NoOpTracer).
-
-Header, idle, and body-stall timeouts share one cleanup: a sweeper over the
-connection set calls ``loop.time()`` once per wake and compares stored
-deadlines. Header timeout is armed only while headers (or a deferred small
-body) are still arriving. Idle/keep-alive timeout is armed only when the
-connection has no in-flight request. Body stall is a generation counter on
-the exchange — chunks do not ``call_later``. ``RequestPolicy.max_pipelined_requests``
-(default 8) caps the pipeline queue.
-
-``STARIO_CYTHON_TIMEOUTS=off`` disables header/idle/body-stall cleanup
-(profiling hatch). Under Server the sweep rides the Date-header tick (1s).
-``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback sweeper period used
-without Server (default 1s).
+Lifecycle (signals, drain, Date tick) is ``stario.http.server.Server``.
+This module only injects uvloop + ``NoOpTracer`` for
+``python -m stario_cython``. Production CLI is ``stario serve``.
 """
 
 from __future__ import annotations
@@ -30,34 +17,21 @@ from stario.http.server import Server
 from stario.telemetry.noop import NoOpTracer
 
 
-def _uvloop_config(
-    config: ServerConfig | None = None,
-    **overrides,
-) -> ServerConfig:
+def _uvloop_config(config: ServerConfig | None = None, **overrides) -> ServerConfig:
     cfg = config if config is not None else server_config_from_env()
-    values = {
-        "host": cfg.host,
-        "port": cfg.port,
-        "unix_socket": cfg.unix_socket,
-        "unix_socket_mode": cfg.unix_socket_mode,
-        "requests": cfg.requests,
-        "compression": cfg.compression,
-        "graceful_shutdown_timeout": cfg.graceful_shutdown_timeout,
-        "backlog": cfg.backlog,
-        "reuse_addr": cfg.reuse_addr,
-        "event_loop": "uvloop",
-        "threads": cfg.threads,
-        "ssl": cfg.ssl,
-    }
-    values.update(overrides)
-    return ServerConfig(**values)
-
-
-def _server(bootstrap: Bootstrap, config: ServerConfig) -> Server:
-    return Server(
-        bootstrap,
-        NoOpTracer(),
-        config=config,
+    return ServerConfig(
+        host=overrides.get("host", cfg.host),
+        port=overrides.get("port", cfg.port),
+        unix_socket=overrides.get("unix_socket", cfg.unix_socket),
+        unix_socket_mode=cfg.unix_socket_mode,
+        requests=cfg.requests,
+        compression=cfg.compression,
+        graceful_shutdown_timeout=cfg.graceful_shutdown_timeout,
+        backlog=overrides.get("backlog", cfg.backlog),
+        reuse_addr=cfg.reuse_addr,
+        event_loop="uvloop",
+        threads=cfg.threads,
+        ssl=cfg.ssl,
     )
 
 
@@ -68,24 +42,19 @@ async def serve(
     backlog: int = 2048,
 ) -> None:
     """Run ``bootstrap`` behind the Cython HTTP protocol."""
-    await _server(
+    await Server(
         bootstrap,
-        _uvloop_config(
-            host=host,
-            port=port,
-            backlog=backlog,
-            unix_socket=None,
-        ),
+        NoOpTracer(),
+        config=_uvloop_config(host=host, port=port, backlog=backlog, unix_socket=None),
     ).serve()
 
 
 def run(bootstrap: Bootstrap) -> None:
     """CLI / ``python -m stario_cython`` entry."""
-    _server(bootstrap, _uvloop_config()).run()
+    Server(bootstrap, NoOpTracer(), config=_uvloop_config()).run()
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse ``MODULE:bootstrap`` and run the Cython server."""
     parser = argparse.ArgumentParser(prog="stario-cython")
     parser.add_argument(
         "app",

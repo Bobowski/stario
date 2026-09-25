@@ -374,16 +374,14 @@ async def test_request_headers_scan_arena_without_copy() -> None:
 
     async def inspect(c, w):
         headers = c.req.headers
-        assert headers.materialized is False
+        assert type(headers).__name__ == "RequestHeaders"
         assert headers.get("authorization") == "Bearer token"
         assert headers.get("Authorization") == "Bearer token"
         assert headers.get("x-missing") is None
         assert headers.getlist("cookie") == ["a=1", "b=2"]
         assert "X-Request-ID" in headers
         assert "authorization" in headers
-        assert headers.materialized is False
         seen.append(headers.items())
-        assert headers.materialized is False
         responses.text(w, "ok")
 
     app.get("/", inspect)
@@ -429,12 +427,10 @@ async def test_request_headers_scan_arena_without_copy() -> None:
 async def test_request_header_view_resets_when_exchange_is_reused() -> None:
     loop = asyncio.get_running_loop()
     app = App()
-    materialized_states = []
     seen_local = []
 
     async def inspect(c, w):
         headers = c.req.headers
-        materialized_states.append(headers.materialized)
         seen_local.append(headers.get("x-local"))
         responses.text(w, "ok")
 
@@ -465,7 +461,6 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
         )
         await writer.drain()
         assert b"ok" in await read_response(reader)
-        assert materialized_states == [False, False]
         assert seen_local == ["one", None]
         writer.close()
         await writer.wait_closed()
@@ -1457,7 +1452,7 @@ async def test_lazy_cookies_and_query_from_arena() -> None:
     seen: dict[str, object] = {}
 
     async def inspect(c, w):
-        assert c.req.headers.materialized is False
+        assert type(c.req.headers).__name__ == "RequestHeaders"
         assert c.req.cookies.get("a") == "2"
         assert c.req.cookies.get("x") == "a;b"
         assert c.req.cookies.get("b") == "3"
@@ -1469,7 +1464,6 @@ async def test_lazy_cookies_and_query_from_arena() -> None:
         assert c.req.query.get("bad") == "�"
         assert c.req.query.get("eq") == "1=2"
         assert c.req.headers.get("authorization") == "Bearer abc"
-        assert c.req.headers.materialized is False
         seen["ok"] = True
         responses.text(w, "ok")
 

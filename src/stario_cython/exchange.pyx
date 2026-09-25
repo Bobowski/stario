@@ -63,8 +63,6 @@ from stario_cython.compression_buf cimport (
     stario_gzip_finish_borrowed,
     stario_gzip_release,
 )
-from stario_cython.timeouts import TIMEOUT_MODE as _PY_TIMEOUT_MODE
-
 include "headers.pxi"
 
 cdef int LOW_WATER = 128 * 1024
@@ -94,17 +92,6 @@ cdef int CONSUMED_STREAM = 2
 cdef int ENCODING_NONE = 0
 cdef int ENCODING_BR = 1
 cdef int ENCODING_GZIP = 2
-
-cdef int _TIMEOUT_MODE = 1
-cdef int _TIMEOUT_OFF = 0
-
-
-def _bind_timeout_mode():
-    global _TIMEOUT_MODE
-    _TIMEOUT_MODE = <int>_PY_TIMEOUT_MODE
-
-
-_bind_timeout_mode()
 
 cdef bytes STATUS_200 = b"HTTP/1.1 200 OK\r\n"
 cdef bytes STATUS_204 = b"HTTP/1.1 204 No Content\r\n"
@@ -174,17 +161,6 @@ cdef inline bint _range_equals_ci(
         if c != <unsigned char>expected[i]:
             return False
     return True
-
-
-cdef inline bint _range_starts_ci(
-    const char* value,
-    Py_ssize_t length,
-    const char* prefix,
-    Py_ssize_t prefix_length,
-) noexcept:
-    if length < prefix_length:
-        return False
-    return _range_equals_ci(value, prefix_length, prefix, prefix_length)
 
 
 cdef inline bint _token_equals(
@@ -297,62 +273,6 @@ cdef int _parse_qvalue(
         q *= 10
         digits += 1
     return q
-
-
-cdef bint _content_type_is_compressible(object content_type):
-    cdef bytes raw
-    cdef const char* value
-    cdef Py_ssize_t start
-    cdef Py_ssize_t end
-    cdef Py_ssize_t i
-    if type(content_type) is not bytes:
-        return content_type_is_compressible(content_type)
-    raw = content_type
-    value = raw
-    end = len(raw)
-    for i in range(end):
-        if value[i] == <char>59:
-            end = i
-            break
-    start = 0
-    while start < end and (
-        value[start] == <char>32
-        or 9 <= <unsigned char>value[start] <= 13
-    ):
-        start += 1
-    while end > start and (
-        value[end - 1] == <char>32
-        or 9 <= <unsigned char>value[end - 1] <= 13
-    ):
-        end -= 1
-    value += start
-    end -= start
-    if end == 0:
-        return False
-    if (
-        _range_starts_ci(value, end, "image/", 6)
-        or _range_starts_ci(value, end, "audio/", 6)
-        or _range_starts_ci(value, end, "video/", 6)
-    ):
-        return False
-    if (
-        _range_equals_ci(value, end, "application/gzip", 16)
-        or _range_equals_ci(value, end, "application/x-gzip", 18)
-        or _range_equals_ci(value, end, "application/zip", 15)
-        or _range_equals_ci(value, end, "application/x-zip-compressed", 28)
-        or _range_equals_ci(value, end, "application/x-7z-compressed", 27)
-        or _range_equals_ci(value, end, "application/vnd.rar", 19)
-        or _range_equals_ci(value, end, "application/x-rar-compressed", 28)
-        or _range_equals_ci(value, end, "application/x-bzip", 18)
-        or _range_equals_ci(value, end, "application/x-bzip2", 19)
-        or _range_equals_ci(value, end, "application/x-xz", 16)
-        or _range_equals_ci(value, end, "application/zstd", 16)
-        or _range_equals_ci(value, end, "application/x-zstd", 18)
-        or _range_equals_ci(value, end, "font/woff", 9)
-        or _range_equals_ci(value, end, "font/woff2", 10)
-    ):
-        return False
-    return True
 
 
 cdef inline object _encoding_wire(int enc) noexcept:
@@ -1234,19 +1154,23 @@ cdef class ParsedCookies:
     def __cinit__(self):
         self._headers = None
         self._lines = None
+        self._parsed = None
 
     def __init__(self, lines=None):
         self._headers = None
         self._lines = []
+        self._parsed = None
         if lines:
             self._extend_lines(lines)
 
     cdef void bind_request_headers(self, object headers) noexcept:
         self._headers = headers
         self._lines = None
+        self._parsed = None
 
     cdef void _extend_lines(self, object lines) except *:
         cdef object line
+        self._parsed = None
         if self._lines is None:
             self._lines = []
         for line in lines:
@@ -1343,20 +1267,23 @@ cdef class ParsedCookies:
         return found
 
     def as_dict(self):
-        cdef dict out = {}
+        cdef dict out
         cdef RequestHeaders headers
         cdef bytes raw
-        cdef object value
+        if self._parsed is not None:
+            return self._parsed
+        out = {}
         if self._headers is not None and isinstance(self._headers, RequestHeaders):
             headers = <RequestHeaders>self._headers
             headers.c_parse_cookies(out)
-            return out
-        for raw in self._cookie_lines():
-            _parse_cookie_line(
-                PyBytes_AS_STRING(raw),
-                PyBytes_GET_SIZE(raw),
-                out,
-            )
+        else:
+            for raw in self._cookie_lines():
+                _parse_cookie_line(
+                    PyBytes_AS_STRING(raw),
+                    PyBytes_GET_SIZE(raw),
+                    out,
+                )
+        self._parsed = out
         return out
 
     def items(self):
@@ -2101,7 +2028,7 @@ cdef class RequestExchange:
         if not streaming:
             if data is None or nbytes < self._compress_min_size:
                 return False
-        if content_type is not None and not _content_type_is_compressible(content_type):
+        if content_type is not None and not content_type_is_compressible(content_type):
             return False
         return True
 
@@ -2652,7 +2579,7 @@ cdef class RequestExchange:
         ):
             self._out_hold = None
 
-    cdef void release_global(self):
+    cdef void return_to_pool(self):
         cdef list pool
         self._free_compressors()
         self.headers.c_clear()
@@ -3299,7 +3226,10 @@ cdef class RequestExchange:
         if not self._waiting or self._body_complete or self._timeout <= 0:
             self._cancel_stall_timer()
             return
-        if _TIMEOUT_MODE == _TIMEOUT_OFF:
+        if (
+            self._connection is None
+            or self._connection.timeout_cleanup == 0
+        ):
             self._cancel_stall_timer()
             return
         self._stall_touch += 1
@@ -3618,11 +3548,10 @@ cdef class RequestExchange:
         return self._cached
 
 
-cdef class RequestHeaders(Headers):
+cdef class RequestHeaders:
     """Read-only request headers backed by the owning exchange arena."""
 
     def __init__(self, RequestExchange owner):
-        Headers.__init__(self)
         self._owner = owner
 
     cdef object c_get(self, object name):
@@ -3714,18 +3643,6 @@ cdef class RequestHeaders(Headers):
                 )
         return result
 
-    cdef void c_set(self, object name, object value):
-        _raise_readonly_request_headers()
-
-    cdef void c_add(self, object name, object value):
-        _raise_readonly_request_headers()
-
-    cdef void c_remove(self, object name):
-        _raise_readonly_request_headers()
-
-    cdef void c_clear(self):
-        _raise_readonly_request_headers()
-
     cdef void c_parse_cookies(self, dict out) except *:
         cdef RequestExchange owner = <RequestExchange>self._owner
         cdef RawHeader* header
@@ -3762,37 +3679,20 @@ cdef class RequestHeaders(Headers):
             return default
         return value
 
+    def set(self, str name, str value):
+        _raise_readonly_request_headers()
+
+    def add(self, str name, str value):
+        _raise_readonly_request_headers()
+
+    def remove(self, str name):
+        _raise_readonly_request_headers()
+
     def getlist(self, str name):
         cdef char buf[HEADER_NAME_STACK]
         cdef Py_ssize_t n
-        cdef RequestExchange owner
-        cdef RawHeader* header
-        cdef Py_ssize_t index
-        cdef Py_ssize_t start
-        cdef list result
         _fold_header_name(name, buf, &n)
-        start = self.c_find_n(buf, n)
-        if start < 0:
-            return []
-        owner = <RequestExchange>self._owner
-        result = []
-        for index in range(start, owner._req_raw_count):
-            header = &owner._req_raw_headers[index]
-            if (
-                header.name_length == <uint32_t>n
-                and memcmp(
-                    owner._req_arena + header.name_offset,
-                    buf,
-                    <size_t>n,
-                ) == 0
-            ):
-                result.append(
-                    _decode_latin1(
-                        owner._req_arena + header.value_offset,
-                        <Py_ssize_t>header.value_length,
-                    )
-                )
-        return result
+        return [value.decode("latin-1") for value in self.c_getlist_n(buf, n)]
 
     def unsafe_getlist(self, name):
         cdef bytes key = name
@@ -3852,11 +3752,6 @@ cdef class RequestHeaders(Headers):
 
     def __repr__(self):
         return f"RequestHeaders({self.items()!r})"
-
-    @property
-    def materialized(self):
-        """Always false: request headers stay an arena scan (never copied to a dict)."""
-        return False
 
 
 cdef RequestExchange acquire_exchange(

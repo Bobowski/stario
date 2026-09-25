@@ -271,7 +271,7 @@ not add locks.
 
 | Site | Why it is unsafe today |
 | --- | --- |
-| `exchange.pyx` `cdef list _POOL` | `acquire_exchange` / `release_global` pop/append a process-global list from every connection. Two threads recycle at once: double-use of an exchange (cross-talk of bodies/headers) or a lost object. Builtin list locks are per-op; pop-then-reset is not atomic. |
+| `exchange.pyx` `cdef list _POOL` | `acquire_exchange` / `return_to_pool` pop/append a process-global list from every connection. Two threads recycle at once: double-use of an exchange (cross-talk of bodies/headers) or a lost object. Builtin list locks are per-op; pop-then-reset is not atomic. |
 | `vendor/compression_buf.c` `brotli_pool[]` / `gzip_pool[]` | Plain C arrays + `pool_count`. No mutex. Classic use-after-free / double-free. |
 | `protocol.pyx` URL cache `_UC_KEY[]` … `_UC_PATH` | Open-addressed C table, `malloc`/`free`, no lock. Parser threads will corrupt it. |
 | `_bind_settings()` / `_SETTINGS` | First two `HttpProtocol`s on two threads can both see `NULL` and both allocate. Init once under a `PyMutex` / `threading.Lock`, then treat as immutable. |

@@ -4,19 +4,16 @@ Header, idle, and body-stall timeouts share **one** mechanism: compare
 deadlines stored on the connection to ``loop.time()`` computed once per
 wake.
 
-Under ``stario.http.server.Server`` that wake is the Date-header tick
-(once a second). Header/idle/body-stall defaults are 5s/5s/30s, so 1s
-granularity is enough and adds no extra timer. Protocols constructed
-without Server (tests, raw ``create_server``) start a fallback sweeper
-with the same period.
+``HttpProtocol`` reads these helpers in ``__init__`` (env is the default
+source). Pass ``timeout_cleanup="off"`` to skip cleanup without env.
 
-``STARIO_CYTHON_TIMEOUTS`` (process env, read at import):
+Under ``stario.http.server.Server`` the wake is the Date-header tick
+(once a second). Protocols constructed without Server start a fallback
+sweeper at ``sweep_interval()``.
 
-- ``sweep`` (default)
-- ``off`` / ``0`` — no header, idle, or body-stall cleanup (profiling hatch)
-
-``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback sweeper period
-(default ``1``). Tests set ``0.05`` so slowloris cases finish quickly.
+``STARIO_CYTHON_TIMEOUTS``: ``sweep`` (default) or ``off`` / ``0``.
+``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback period (default
+``1``). Tests set ``0.05`` so slowloris cases finish quickly.
 """
 
 from __future__ import annotations

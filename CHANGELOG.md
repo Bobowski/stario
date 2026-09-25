@@ -70,6 +70,10 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   [llhttp](https://github.com/nodejs/llhttp).
 - HTTP/2 receive window is 1MiB per stream / 4MiB per connection. RST-stream
   flood is rate-limited. Header budget 431 / body 413 apply per stream.
+- Cython request headers are a standalone read-only arena view (no unused
+  `Headers` pair list). Timeout cleanup is chosen in `HttpProtocol.__init__`
+  (`timeout_cleanup=`, env as default). Cookie `as_dict()` is cached. H1/H2
+  methods share one byte table. Compressibility uses the Python helper.
 
 ## 4.3.0 - 2026-09-25
 

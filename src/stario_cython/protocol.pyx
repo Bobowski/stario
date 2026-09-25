@@ -20,7 +20,7 @@ from threading import Lock
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
-from libc.string cimport memcmp, memcpy, memmove
+from libc.string cimport memcmp, memcpy, memmove, strlen
 from cpython.bytearray cimport (
     PyByteArray_AS_STRING,
     PyByteArray_Check,
@@ -128,7 +128,7 @@ from stario_cython.nghttp2 cimport (
 )
 from stario_cython.timeouts import (
     DATE_TICK_SWEEP_ATTR as _PY_DATE_TICK_SWEEP_ATTR,
-    TIMEOUT_MODE as _PY_TIMEOUT_MODE,
+    parse_timeout_mode,
     sweep_interval as _py_sweep_interval,
 )
 
@@ -384,8 +384,6 @@ cdef int TIMEOUT_HEADER = 1
 cdef int TIMEOUT_IDLE = 2
 cdef int CLEANUP_OFF = 0
 cdef int CLEANUP_SWEEP = 1
-cdef int TIMEOUT_MODE = 1
-cdef double TIMEOUT_SWEEP_INTERVAL = 1.0
 cdef object _SWEEPS_ATTR = "_stario_timeout_sweeps"
 # Empty / small bodies finish before the handler runs so body() is cached.
 # Large, chunked, and 100-continue still dispatch at headers.
@@ -405,28 +403,6 @@ cdef object VER_11 = "1.1"
 cdef object VER_20 = "2"
 
 cdef llhttp_settings_t* _SETTINGS = NULL
-
-
-cdef object _method_str(int method):
-    if method == 1:
-        return METH_GET
-    if method == 3:
-        return METH_POST
-    if method == 4:
-        return METH_PUT
-    if method == 0:
-        return METH_DELETE
-    if method == 2:
-        return METH_HEAD
-    if method == 6:
-        return METH_OPTIONS
-    if method == 28:
-        return METH_PATCH
-    if method == 5:
-        return METH_CONNECT
-    if method == 7:
-        return METH_TRACE
-    return llhttp_method_name(method).decode("ascii")
 
 
 cdef object _version_str(int major, int minor):
@@ -479,6 +455,12 @@ cdef object _method_from_bytes(const char* p, size_t n) noexcept:
             return METH_CONNECT
     return PyUnicode_DecodeLatin1(p, <Py_ssize_t>n, NULL)
 
+
+cdef object _method_str(int method):
+    cdef const char* name = llhttp_method_name(method)
+    if name == NULL:
+        return METH_GET
+    return _method_from_bytes(name, strlen(name))
 
 
 cdef void _bind_settings():
@@ -664,19 +646,9 @@ cdef int _h2_send_data(
     return proto._h2_send_data_frame(frame, framehd, length, source)
 
 
-def _bind_timeout_policy():
-    global TIMEOUT_MODE, TIMEOUT_SWEEP_INTERVAL
-    TIMEOUT_MODE = <int>_PY_TIMEOUT_MODE
-    TIMEOUT_SWEEP_INTERVAL = <double>_py_sweep_interval()
-
-
-_bind_timeout_policy()
-
-
-async def _timeout_sweep_loop(loop, connections, key):
+async def _timeout_sweep_loop(loop, connections, key, interval):
     """One ``loop.time()`` per wake, then compare every live connection."""
     sleep = asyncio.sleep
-    interval = TIMEOUT_SWEEP_INTERVAL
     try:
         while True:
             await sleep(interval)
@@ -692,9 +664,7 @@ async def _timeout_sweep_loop(loop, connections, key):
         raise
 
 
-def _ensure_timeout_sweeper(loop, connections):
-    if TIMEOUT_MODE != CLEANUP_SWEEP:
-        return
+def _ensure_timeout_sweeper(loop, connections, interval):
     # Server Date tick already walks this loop's connections once a second.
     if getattr(loop, _PY_DATE_TICK_SWEEP_ATTR, False):
         return
@@ -706,7 +676,7 @@ def _ensure_timeout_sweeper(loop, connections):
     task = sweeps.get(key)
     if task is not None and not task.done():
         return
-    coro = _timeout_sweep_loop(loop, connections, key)
+    coro = _timeout_sweep_loop(loop, connections, key, interval)
     try:
         task = loop.create_task(coro, name="stario-timeout-sweep")
     except TypeError:
@@ -748,6 +718,8 @@ cdef class HttpProtocol:
     cdef double header_timeout
     cdef double keep_alive_timeout
     cdef double body_timeout
+    cdef public int timeout_cleanup
+    cdef double timeout_sweep_interval
     cdef int timeout_kind
     cdef double timeout_deadline
     cdef bint header_timeout_reset
@@ -789,6 +761,8 @@ cdef class HttpProtocol:
         self.pump_scheduled = False
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
+        self.timeout_cleanup = CLEANUP_SWEEP
+        self.timeout_sweep_interval = 1.0
         self.header_timeout_reset = False
         self.parse_mode = PARSE_NONE
         self.preface_hold = bytearray()
@@ -821,6 +795,8 @@ cdef class HttpProtocol:
         keep_alive_timeout=DEFAULT_KEEP_ALIVE_TIMEOUT,
         body_timeout=DEFAULT_BODY_TIMEOUT,
         max_pipelined_requests=DEFAULT_MAX_PIPELINED_REQUESTS,
+        timeout_cleanup=None,
+        timeout_sweep_interval=None,
     ):
         self.loop = loop
         self.app = app
@@ -843,6 +819,19 @@ cdef class HttpProtocol:
         self.header_timeout = header_timeout
         self.keep_alive_timeout = keep_alive_timeout
         self.body_timeout = body_timeout
+        if timeout_cleanup is None:
+            self.timeout_cleanup = parse_timeout_mode()
+        elif isinstance(timeout_cleanup, str):
+            self.timeout_cleanup = parse_timeout_mode(timeout_cleanup)
+        else:
+            self.timeout_cleanup = (
+                CLEANUP_OFF if timeout_cleanup == 0 else CLEANUP_SWEEP
+            )
+        self.timeout_sweep_interval = (
+            _py_sweep_interval()
+            if timeout_sweep_interval is None
+            else float(timeout_sweep_interval)
+        )
         self.rejected = False
         self.request_dispatched = False
         self.request_keep_alive = True
@@ -886,7 +875,10 @@ cdef class HttpProtocol:
         # First request: header deadline only. Keep-alive stores a
         # deadline; the sweeper compares it. No TimerHandle per request.
         self._arm_timeout(TIMEOUT_HEADER, self.header_timeout)
-        _ensure_timeout_sweeper(self.loop, self.connections)
+        if self.timeout_cleanup == CLEANUP_SWEEP:
+            _ensure_timeout_sweeper(
+                self.loop, self.connections, self.timeout_sweep_interval
+            )
 
     def ensure_disconnect(self):
         if self.disconnect is None:
@@ -910,7 +902,7 @@ cdef class HttpProtocol:
                 exchange.cancel_before_start()
         self.h2_streams.clear()
         if self.idle_exchange is not None:
-            self.idle_exchange.release_global()
+            self.idle_exchange.return_to_pool()
             self.idle_exchange = None
         if self.reading_exchange is not None:
             self.reading_exchange.c_abort()
@@ -944,7 +936,7 @@ cdef class HttpProtocol:
         if not self.closed and self.idle_exchange is None:
             self.idle_exchange = exchange
         else:
-            exchange.release_global()
+            exchange.return_to_pool()
 
     def eof_received(self):
         return False
@@ -1038,7 +1030,7 @@ cdef class HttpProtocol:
         per wake. wrk keep-alive is a double store, not ``call_later``.
         """
         cdef object transport
-        if TIMEOUT_MODE == CLEANUP_OFF:
+        if self.timeout_cleanup == CLEANUP_OFF:
             return
         transport = self.transport
         if transport is None or transport.is_closing() or seconds <= 0:
@@ -1108,7 +1100,7 @@ cdef class HttpProtocol:
             ex is None
             or ex._h2_dispatched
             or self.header_timeout <= 0.0
-            or TIMEOUT_MODE == CLEANUP_OFF
+            or self.timeout_cleanup == CLEANUP_OFF
         ):
             return
         if ex._h2_header_deadline <= 0.0:
