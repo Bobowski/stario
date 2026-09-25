@@ -94,26 +94,29 @@ class TestRequestHost:
         req = _make_request(headers={"Host": "  Example.COM:8080  "})
         assert req.host == "example.com"
 
-    def test_cython_request_host_matches_python(self):
-        cases = (
-            "",
-            "  ",
-            "Example.COM:8080",
-            "  Example.COM:8080  ",
-            "[::1]:8000",
-            "[::1]",
-            "localhost",
-            "example.com:",
-            "[::1]foo",
-            "Example.COM:80a",
-            "EXAMPLE.COM",
-        )
-        for raw in cases:
+    def test_request_host_normalization(self):
+        cases = {
+            "": "",
+            "  ": "",
+            "Example.COM:8080": "example.com",
+            "  Example.COM:8080  ": "example.com",
+            "[::1]:8000": "[::1]",
+            "[::1]": "[::1]",
+            "localhost": "localhost",
+            "example.com:": "example.com:",
+            "[::1]foo": "[::1]foo",
+            "Example.COM:80a": "example.com:80a",
+            "EXAMPLE.COM": "example.com",
+            "example.com.:443": "example.com",
+            "example.com..": "example.com..",
+        }
+        for raw, expected in cases.items():
             hdrs = Headers()
             if raw:
                 hdrs.set("Host", raw)
             req = Request(method="GET", path="/", headers=hdrs, body=b"")
-            assert req.host == host_without_port(raw), raw
+            assert req.host == expected, raw
+            assert host_without_port(raw) == expected, raw
 
     def test_host_is_lowercased_before_routing(self):
         req = _make_request(headers={"Host": "API.Example.COM"})

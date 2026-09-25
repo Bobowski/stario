@@ -699,6 +699,16 @@ def canonical_request_path(raw):
     return 200, None
 
 
+def host_without_port(str host):
+    """Lowercased Host value without a numeric port; IPv6 literals keep brackets.
+
+    One trailing dot is dropped: ``example.com.`` names ``example.com``.
+    """
+    cdef Py_ssize_t n = 0
+    cdef const char* p = PyUnicode_AsUTF8AndSize(host, &n)
+    return _host_without_port_n(p, n)
+
+
 def decode_request_path(raw):
     """Fully decoded ``str`` for a raw request path; ``ValueError`` if invalid."""
     cdef bytes data = bytes(raw)
@@ -1802,7 +1812,10 @@ cdef object _ascii_lower_latin1(const char* s, Py_ssize_t n):
 
 
 cdef object _host_without_port_n(const char* s, Py_ssize_t n):
-    """Match ``stario.http.host.host_without_port`` on a wire Host value."""
+    """Lowercased Host without a numeric port; IPv6 literals keep brackets.
+
+    One trailing dot is dropped: ``example.com.`` names ``example.com``.
+    """
     cdef object host = _host_without_port_raw(s, n)
     cdef Py_ssize_t m = len(host)
     # ``example.com.`` (fully qualified) is the same host as ``example.com``.

@@ -1511,3 +1511,26 @@ async def test_respond_rejects_crlf_in_content_type() -> None:
         if not transport.is_closing():
             transport.close()
         await _drain(app)
+
+
+class _ExplodingTracer:
+    def create(self, name: str):
+        raise RuntimeError("tracer is broken")
+
+
+@pytest.mark.asyncio
+async def test_protocol_span_failure_is_logged_with_traceback(caplog) -> None:
+    proto, app, transport = _attach(tracer=_ExplodingTracer())
+    try:
+        with caplog.at_level("ERROR", logger="stario.http"):
+            proto.data_received(b"GARBAGE\r\n\r\n")
+            await _drain(app)
+        assert response_status(transport.writes) == 400
+        records = [r for r in caplog.records if r.name == "stario.http"]
+        assert records
+        assert records[0].exc_info is not None
+        assert "tracer is broken" in str(records[0].exc_info[1])
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)

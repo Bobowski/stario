@@ -481,6 +481,7 @@ cdef int _h2_on_begin_headers(
         proto._h2_begin_stream(frame.hd.stream_id)
         return 0
     except Exception:
+        _log.exception("HTTP/2 callback failed; closing the connection")
         return NGHTTP2_ERR_CALLBACK_FAILURE
 
 
@@ -498,6 +499,7 @@ cdef int _h2_on_header(
     try:
         proto._h2_on_header(frame.hd.stream_id, name, namelen, value, valuelen)
     except Exception:
+        _log.exception("HTTP/2 stream callback failed; resetting the stream")
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
     return 0
 
@@ -514,6 +516,7 @@ cdef int _h2_on_data(
     try:
         proto._h2_on_data(stream_id, data, length)
     except Exception:
+        _log.exception("HTTP/2 stream callback failed; resetting the stream")
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
     return 0
 
@@ -542,6 +545,7 @@ cdef int _h2_on_frame_recv(
             proto._h2_final_goaway()
         return 0
     except Exception:
+        _log.exception("HTTP/2 callback failed; closing the connection")
         return NGHTTP2_ERR_CALLBACK_FAILURE
 
 
@@ -561,6 +565,7 @@ cdef int _h2_on_frame_send(
         proto._h2_response_sent(frame.hd.stream_id)
         return 0
     except Exception:
+        _log.exception("HTTP/2 callback failed; closing the connection")
         return NGHTTP2_ERR_CALLBACK_FAILURE
 
 
@@ -576,6 +581,7 @@ cdef int _h2_on_stream_close(
         proto._h2_stream_closed(stream_id)
         return 0
     except Exception:
+        _log.exception("HTTP/2 callback failed; closing the connection")
         return NGHTTP2_ERR_CALLBACK_FAILURE
 
 
@@ -1433,6 +1439,7 @@ cdef class CHttpProtocol(Connection):
         try:
             self.reading_exchange = self._take_exchange()
         except Exception:
+            _log.exception("Failed to allocate a request exchange")
             self._protocol_error(400, "Invalid HTTP request")
             return
         self.head_bytes = 40
@@ -1589,6 +1596,7 @@ cdef class CHttpProtocol(Connection):
             self._bind_request(exchange)
             self._dispatch(exchange)
         except Exception:
+            _log.exception("Failed to dispatch request")
             self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_body(self, const char* at, size_t length) noexcept:
@@ -1640,6 +1648,7 @@ cdef class CHttpProtocol(Connection):
                 self._bind_request(exchange)
                 self._dispatch(exchange)
             except Exception:
+                _log.exception("Failed to dispatch request")
                 self._protocol_error(400, "Invalid HTTP request")
                 self.reading_exchange = None
                 return
@@ -1839,6 +1848,7 @@ cdef class CHttpProtocol(Connection):
                 if exchange._handler_task is None:
                     exchange.handler_finished()
             except Exception:
+                _log.exception("Failed to start handler")
                 transport = self.transport
                 if transport is not None and not transport.is_closing():
                     transport.close()
@@ -2026,7 +2036,7 @@ cdef class CHttpProtocol(Connection):
                 span = self.tracer.create("request")
             finish_request_span(span, status=status, method=method, path=path)
         except Exception:
-            pass
+            _log.exception("Failed to finish the protocol span")
 
     cdef void _abort_reading_and_pending(self) noexcept:
         cdef RequestExchange exchange = self.reading_exchange
@@ -2133,6 +2143,7 @@ cdef class CHttpProtocol(Connection):
                 exchange._protocol_body = message.encode("utf-8")
                 self._dispatch(exchange)
             except Exception:
+                _log.exception("Failed to queue a protocol response")
                 self.rejected = True
                 if transport is not None:
                     try:
@@ -2190,6 +2201,7 @@ cdef class CHttpProtocol(Connection):
             self.reading_exchange = None
             transport.close()
         except Exception:
+            _log.exception("Failed to write a protocol error")
             try:
                 if transport is not None:
                     transport.close()
@@ -2423,6 +2435,7 @@ cdef class CHttpProtocol(Connection):
             self._dispatch(ex)
             ex._h2_dispatched = True
         except Exception:
+            _log.exception("Failed to dispatch request")
             self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _h2_begin_stream(self, int32_t stream_id):
@@ -2482,6 +2495,7 @@ cdef class CHttpProtocol(Connection):
             ex.respond(b"", b"text/plain; charset=utf-8", status)
             ex.handler_finished()
         except Exception:
+            _log.exception("Failed to write an HTTP/2 protocol status")
             self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_ENHANCE_YOUR_CALM)
 
     cdef void _h2_on_header(
@@ -2644,6 +2658,7 @@ cdef class CHttpProtocol(Connection):
             if not ex._h2_dispatched and not self.rejected:
                 self._h2_dispatch_stream(ex)
         except Exception:
+            _log.exception("Failed to dispatch request")
             self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _h2_end_stream(self, int32_t stream_id):
