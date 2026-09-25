@@ -1,5 +1,10 @@
 # Where 3.14t time actually goes
 
+> **Status (5.0):** items 1 and 3 below no longer exist. The Cython URL
+> cache and `_url_lock` are gone, and `find_handler` walks a compiled
+> `CRouter` trie with no `lru_cache` or exact map in front, so neither is
+> shared per-request state any more. The measurements predate that.
+
 `SO_REUSEPORT` is the right listen strategy for Linux TCP. The 1/2/4
 captures already show it: two loops are ~1.9× plaintext, and the older
 acceptor-handoff runtime landed in the same req/s band with worse
@@ -90,9 +95,7 @@ still shared, so they cap scaling after the loops exist:
 
 | Shared object | Taken on |
 | --- | --- |
-| `_url_lock` + `_UC_PATH` | every cacheable request |
-| `Router._lookup` lru_cache | every request |
-| `Router._exact` / trie dicts | lookup miss |
+| Compiled `CRouter` trie (read-only after bootstrap) | every request |
 | `App` shutdown flag read | every completed response (`response_completed`) |
 
 The request-fields row scales worse than plaintext (1.61× at two loops

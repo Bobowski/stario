@@ -311,18 +311,18 @@ import). `watchfiles` is the parent of `stario watch` only.
 
 ### 3. Router / caches — mostly OK if frozen
 
-`functools.lru_cache` is thread-safe in 3.14 (cache coherence; duplicate
-work on concurrent misses is allowed). `Router._lookup` and
-`method_not_allowed_handler` can be shared for **reads**.
+`find_handler` walks the `CRouter` trie compiled from the `Router` after
+bootstrap. It has no cache and is only read while serving, so every loop
+shares it safely.
 
-Unsafe: `app.add` / `use` / `cache_clear` concurrent with lookups.
-Freeze after bootstrap.
+Unsafe: `app.add` / `use` concurrent with lookups. Register routes in
+bootstrap.
 
 `stario.http.wire` path/accept-encoding LRUs and `markup.escape` caches
 are the same story — OK.
 
-Trie nodes (`Node.exact`, `endpoints`) are ordinary dicts. Concurrent
-read of a frozen trie is the 3.14t builtin-dict story (single ops lock).
+The compiled trie is C structs plus read-only dicts; concurrent reads
+need no lock.
 Do not mutate.
 
 ### 4. Telemetry
