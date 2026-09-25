@@ -42,7 +42,7 @@ a self-signed cert serves both. See
 
 `cython-core` after 4.2 (`Route` / `c.match` / `Assets` / `stario.json`)
 and the request hotpath (fresh `Request`, lazy query, Router `_lookup`).
-Python httptools stays on `main`. Production HTTP here is Cython:
+The Python httptools protocol is gone in 5.0. Production HTTP is Cython:
 `stario serve` and `python -m stario_cython` are the same protocol.
 
 Official wrk suite, one worker, `10s` × 5 measured + 1 warmup, 4 vCPU
@@ -156,7 +156,8 @@ Granian (LRU always hot). This capture is the honest one.
 
 ### Missing / not doing (on purpose)
 
-App and Router stay Python. Do not revive:
+`App` and `Router` stay Python; `find_handler` runs on the `CRouter` trie
+compiled from them. Do not revive:
 
 - a dual Cython App/Router
 - a contiguous serializer
@@ -164,8 +165,8 @@ App and Router stay Python. Do not revive:
 - static / pre-serialized handlers
 - pooled / reset `Request` objects
 
-Python httptools lives on `main`. Native zstd is not offered (Python
-response helpers still negotiate it for non-native writers). picohttpparser
+Native zstd is not offered (precompressed `Files` / `Assets` variants
+still serve it). picohttpparser
 is not the H1 parser: parser-only it is ~2.5–3.3× llhttp, but end-to-end
 GET was even and a tiny JSON POST was slower.
 
@@ -296,5 +297,5 @@ wrk: sweep ≈ callbacks on plaintext; timeouts-off ~+5% plaintext (keep
 timeouts); 10ms sweep −7% on 2MB stream; 50ms and 1s Date tick are a wash
 (129.3k / 130.8k / 128.0k). Callbacks were deleted.
 
-App/Router stay Python. Do not revive dual Cython App/Router, a contiguous
+`App` / `Router` stay Python (compiled to `CRouter`). Do not revive dual Cython App/Router, a contiguous
 serializer, pooled `asyncio.Event`, or static/pre-serialized handlers.

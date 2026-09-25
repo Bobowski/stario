@@ -4,12 +4,23 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 5.0.0 - Unreleased
 
 ### Breaking changes
 
 - Cython llhttp/nghttp2 is the production HTTP runtime. The Python httptools
   protocol is gone. `stario serve` uses the compiled protocol.
+- **Stario is a compiled package.** PyPI ships wheels for Linux (x86_64,
+  aarch64; glibc) and macOS (arm64) on CPython 3.12–3.14 and 3.14t, with
+  nghttp2 and Brotli bundled. Other platforms build from the sdist and need
+  a C compiler, `pkg-config`, and the nghttp2 (1.61+) and Brotli development
+  packages. Windows and musl are not supported.
+- `stario_cython.request` is gone; import `Request` from `stario.http.request`
+  (typing) or `stario_cython.exchange`.
+- `Headers`, `ParsedQuery`, and `ParsedCookies` are typed as the concrete
+  Cython classes (`stario_cython/*.pyi`), so `Headers()` / `ParsedQuery(b"")`
+  type-check. `Request` stays a structural `Protocol` that `TestRequest`
+  satisfies.
 - `App.on_error` and exception-type mapping are gone. Uncaught handler
   exceptions are logged. If the handler sent nothing, the framework writes
   **500**; a response already on the wire is not rewritten. Handlers must
@@ -56,6 +67,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - **HTTP/2 graceful drain.** Shutdown sends GOAWAY with the last processed
   stream; in-flight streams finish, new ones are refused, and the connection
   closes when nghttp2 is done (also after a client GOAWAY).
+- Dynamic responses compress with `br` or `gzip` only. `zstd` is still
+  served for precompressed `Files` / `Assets` variants; the `zstd_*`
+  `CompressionConfig` fields apply only there.
 - Idle keep-alive connections hold ~8 KiB instead of ~69 KiB (the read
   buffer is no longer zero-filled).
 - Each header field counts 32 bytes toward `max_header_bytes` (RFC 7541
@@ -90,14 +104,33 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - Direct TLS: `ServerConfig(ssl=…)` or `STARIO_SSL_CERTFILE` /
   `STARIO_SSL_KEYFILE`. Context is TLS 1.2+ with ALPN `h2`, `http/1.1`.
 
+### Fixed
+
+- HEAD requests with `Accept-Encoding` no longer get a compressed body
+  after the headers (which desynced keep-alive).
+- `write()` past a declared `Content-Length` raises `StarioRuntime` before
+  sending anything; previously the extra bytes went out and corrupted the
+  next response on the connection.
+- HTTP/1 chunked trailers are dropped (RFC 9110 §6.5) instead of being
+  merged into `c.req.headers` after the handler started.
+- HTTP/2 copies a caller's `bytearray` passed to `write()` / `respond()`;
+  mutating it afterwards no longer changes what is sent.
+- HTTP/2 `end()` no longer cancels a handler that keeps running after it,
+  and a client `RST_STREAM` is not echoed back.
+- A pipelined request trickling its headers now hits the header timeout
+  after the earlier response finishes (it used to get no deadline).
+- HTTP/1.0 requests with `Transfer-Encoding` close after the response
+  (RFC 9112 §6.1).
+- `Headers.unsafe_*` raise `TypeError` for non-`bytes` arguments instead of
+  reading invalid memory; `memoryview` bodies must have `itemsize` 1.
+
 ### Changed
 
-- `find_handler` keeps a 1024-entry LRU in front of the trie (same cap as
-  pre-4.2 Cython). Static `(host, path, method)` still hits an exact map
-  and reuses that `Match`. Parameterized paths reuse the resolved
-  `(handler, route, Match)` while they stay in the cache. Exact hosts
-  have their own path trie. One cursor walks the trie on a miss, one
-  segment per node, so route insertion order never changes a match.
+- `find_handler` walks a compiled trie with no cache in front. A static
+  route returns a prebuilt `(handler, route, Match)`; a parameterized route
+  allocates one `Match`. Exact hosts have their own path trie. One cursor
+  walks the trie, one segment per node, so route insertion order never
+  changes a match.
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, write 500
   if nothing was sent, abort if a body was started but not finished, close
   the span. No auto-`end()`. A write-then-raise still logs (`Handler failed`);
