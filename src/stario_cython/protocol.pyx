@@ -110,9 +110,11 @@ from stario_cython.nghttp2 cimport (
     NGHTTP2_ERR_CALLBACK_FAILURE,
     NGHTTP2_ERR_DEFERRED,
     NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE,
+    NGHTTP2_FLAG_ACK,
     NGHTTP2_FLAG_END_STREAM,
     NGHTTP2_FLAG_NONE,
     NGHTTP2_HEADERS,
+    NGHTTP2_PING,
     NGHTTP2_INTERNAL_ERROR,
     NGHTTP2_PROTOCOL_ERROR,
     NGHTTP2_CANCEL,
@@ -143,6 +145,7 @@ from stario_cython.nghttp2 cimport (
     nghttp2_session_callbacks_set_on_begin_headers_callback,
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback,
     nghttp2_session_callbacks_set_on_frame_recv_callback,
+    nghttp2_session_callbacks_set_on_frame_send_callback,
     nghttp2_session_callbacks_set_on_header_callback,
     nghttp2_session_callbacks_set_on_stream_close_callback,
     nghttp2_session_callbacks_set_send_data_callback,
@@ -160,13 +163,16 @@ from stario_cython.nghttp2 cimport (
     nghttp2_session_set_local_window_size,
     nghttp2_session_set_stream_user_data,
     nghttp2_session_want_read,
+    nghttp2_session_get_stream_remote_close,
     nghttp2_session_want_write,
     nghttp2_settings_entry,
     nghttp2_submit_goaway,
     nghttp2_submit_headers,
+    nghttp2_submit_ping,
     nghttp2_submit_response,
     nghttp2_submit_rst_stream,
     nghttp2_submit_settings,
+    nghttp2_submit_shutdown_notice,
     nghttp2_submit_window_update,
 )
 from stario_cython.timeouts import (
@@ -301,6 +307,8 @@ cdef int PAUSE_REJECTED = 8
 # Per-field overhead in the header budget (RFC 7541 §4.1 counts 32 octets),
 # so a byte limit also bounds how many fields a request can carry.
 cdef int HEADER_FIELD_OVERHEAD = 32
+# Wait for the shutdown-notice PING ACK before the final GOAWAY (one RTT).
+cdef double H2_GOAWAY_GRACE = 1.0
 cdef int PARSER_QUANTUM = 512 * 1024
 cdef int TIMEOUT_NONE = 0
 cdef int TIMEOUT_HEADER = 1
@@ -487,7 +495,10 @@ cdef int _h2_on_header(
     void* user_data,
 ) noexcept:
     cdef CHttpProtocol proto = <CHttpProtocol>user_data
-    proto._h2_on_header(frame.hd.stream_id, name, namelen, value, valuelen)
+    try:
+        proto._h2_on_header(frame.hd.stream_id, name, namelen, value, valuelen)
+    except Exception:
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
     return 0
 
 
@@ -500,7 +511,10 @@ cdef int _h2_on_data(
     void* user_data,
 ) noexcept:
     cdef CHttpProtocol proto = <CHttpProtocol>user_data
-    proto._h2_on_data(stream_id, data, length)
+    try:
+        proto._h2_on_data(stream_id, data, length)
+    except Exception:
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
     return 0
 
 
@@ -520,6 +534,31 @@ cdef int _h2_on_frame_recv(
             )
         elif ftype == NGHTTP2_DATA and (frame.hd.flags & NGHTTP2_FLAG_END_STREAM):
             proto._h2_end_stream(frame.hd.stream_id)
+        elif (
+            ftype == NGHTTP2_PING
+            and (frame.hd.flags & NGHTTP2_FLAG_ACK)
+            and proto.h2_goaway_pending
+        ):
+            proto._h2_final_goaway()
+        return 0
+    except Exception:
+        return NGHTTP2_ERR_CALLBACK_FAILURE
+
+
+cdef int _h2_on_frame_send(
+    nghttp2_session* session,
+    const nghttp2_frame* frame,
+    void* user_data,
+) noexcept:
+    cdef CHttpProtocol proto
+    cdef uint8_t ftype = frame.hd.type
+    if not (frame.hd.flags & NGHTTP2_FLAG_END_STREAM):
+        return 0
+    if ftype != NGHTTP2_HEADERS and ftype != NGHTTP2_DATA:
+        return 0
+    try:
+        proto = <CHttpProtocol>user_data
+        proto._h2_response_sent(frame.hd.stream_id)
         return 0
     except Exception:
         return NGHTTP2_ERR_CALLBACK_FAILURE
@@ -663,7 +702,14 @@ cdef class CHttpProtocol(Connection):
     cdef object h2_out
     cdef Py_ssize_t h2_out_used
     cdef bint h2_in_recv
+    # nghttp2 forbids mem_send from its own callbacks; the outer loop drains.
+    cdef bint h2_in_send
     cdef bint h2_goaway_sent
+    # Shutdown notice sent; the final GOAWAY waits for our PING's ACK.
+    cdef bint h2_goaway_pending
+    # Streams holding their WINDOW_UPDATE (body backpressure).
+    cdef int h2_paused_streams
+    cdef object h2_goaway_timer
     cdef bint h1_headers_too_large
     # Set at headers-complete: later header callbacks are chunked trailers.
     cdef bint h1_in_trailers
@@ -705,6 +751,7 @@ cdef class CHttpProtocol(Connection):
         self.h2_out = bytearray()
         self.h2_out_used = 0
         self.h2_in_recv = False
+        self.h2_in_send = False
         self.h2_goaway_sent = False
         self.h1_headers_too_large = False
         self.deferred_status = 0
@@ -838,6 +885,9 @@ cdef class CHttpProtocol(Connection):
         cdef RequestExchange exchange
         self.closed = True
         self._cancel_timeout()
+        if self.h2_goaway_timer is not None:
+            self.h2_goaway_timer.cancel()
+            self.h2_goaway_timer = None
         self.connections.discard(self)
         _stop_timeout_sweeper(self.loop, self.connections)
         if self.h2 != NULL:
@@ -897,18 +947,10 @@ cdef class CHttpProtocol(Connection):
         if self.parse_mode != PARSE_H2 and self.parser == NULL:
             return
         if self.timeout_kind == TIMEOUT_IDLE:
-            if not (
-                self.parse_mode == PARSE_H1
-                and self.reading_exchange is not None
-                and (
-                    self.reading_exchange._discard_body
-                    or self.h1_headers_too_large
-                )
-            ):
-                # Keep-alive traffic: drop the idle deadline. Bytes that
-                # only drain a leftover body must not refresh it.
-                self.timeout_kind = TIMEOUT_NONE
-                self.timeout_deadline = 0.0
+            if PyBytes_Check(data):
+                self._refresh_idle(PyBytes_AS_STRING(data), PyBytes_GET_SIZE(data))
+            else:
+                self._refresh_idle(NULL, 0)
         if self.held_data is not None:
             self._held_append(data)
             return
@@ -972,6 +1014,30 @@ cdef class CHttpProtocol(Connection):
             return
         self.held_data = held[off:] + data
         self.held_offset = 0
+
+    cdef void _refresh_idle(self, const char* data, Py_ssize_t n) noexcept:
+        """Keep-alive traffic drops the idle deadline.
+
+        Not refreshed by: bytes that only drain a leftover body, HTTP/2
+        control frames (a new stream clears it in ``_h2_begin_stream``), and
+        bare CRLFs between HTTP/1 requests.
+        """
+        cdef Py_ssize_t i
+        if self.parse_mode == PARSE_H2:
+            return
+        if self.reading_exchange is not None:
+            if self.parse_mode == PARSE_H1 and (
+                self.reading_exchange._discard_body or self.h1_headers_too_large
+            ):
+                return
+        elif n > 0:
+            for i in range(n):
+                if data[i] != 13 and data[i] != 10:
+                    break
+            else:
+                return
+        self.timeout_kind = TIMEOUT_NONE
+        self.timeout_deadline = 0.0
 
     cdef void _arm_timeout(self, int kind, double seconds):
         """Store a header or idle deadline on the connection.
@@ -1229,10 +1295,12 @@ cdef class CHttpProtocol(Connection):
         if exchange._http2:
             # HTTP/2: hold this stream's WINDOW_UPDATE instead of pausing the
             # socket, so one slow body consumer cannot stall other streams.
-            # The stream window (H2_STREAM_WINDOW) bounds what it buffers.
+            # The stream window (H2_STREAM_WINDOW) bounds what one stream
+            # buffers; the connection window (H2_CONN_WINDOW) bounds them all.
             if exchange._h2_flow_paused == paused:
                 return
             exchange._h2_flow_paused = paused
+            self.h2_paused_streams += 1 if paused else -1
             if (
                 not paused
                 and self.h2 != NULL
@@ -1240,6 +1308,7 @@ cdef class CHttpProtocol(Connection):
                 and exchange._h2_stream_id != 0
             ):
                 self._h2_window_update(exchange._h2_stream_id, True)
+                self._h2_window_update(0, True)
                 self._h2_send()
             return
         if paused:
@@ -1256,19 +1325,23 @@ cdef class CHttpProtocol(Connection):
         """
         cdef object transport
         if self.parse_mode == PARSE_H2 and self.h2 != NULL and not self.rejected:
-            # Graceful HTTP/2 drain: GOAWAY with the last stream we processed.
-            # The client opens no new streams; running ones finish; the
-            # connection closes once nghttp2 has nothing left to do.
+            # Graceful HTTP/2 drain (RFC 9113 6.8): a shutdown notice and a
+            # PING first, so streams the client opened in flight are not
+            # refused; the final GOAWAY follows the PING ACK. Running
+            # streams finish; the connection closes once nghttp2 is done.
             if not self.h2_goaway_sent:
                 self.h2_goaway_sent = True
-                nghttp2_submit_goaway(
-                    self.h2,
-                    NGHTTP2_FLAG_NONE,
-                    nghttp2_session_get_last_proc_stream_id(self.h2),
-                    NGHTTP2_NO_ERROR,
-                    NULL,
-                    0,
-                )
+                if (
+                    nghttp2_submit_shutdown_notice(self.h2) == 0
+                    and nghttp2_submit_ping(self.h2, NGHTTP2_FLAG_NONE, NULL) == 0
+                ):
+                    self.h2_goaway_pending = True
+                    # A client that never ACKs gets the final GOAWAY anyway.
+                    self.h2_goaway_timer = self.loop.call_later(
+                        H2_GOAWAY_GRACE, self._h2_goaway_expired
+                    )
+                else:
+                    self._h2_final_goaway()
                 self._h2_send()
             transport = self.transport
             return transport is None or transport.is_closing()
@@ -2160,6 +2233,7 @@ cdef class CHttpProtocol(Connection):
         nghttp2_session_callbacks_set_on_header_callback(cbs, _h2_on_header)
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, _h2_on_data)
         nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, _h2_on_frame_recv)
+        nghttp2_session_callbacks_set_on_frame_send_callback(cbs, _h2_on_frame_send)
         nghttp2_session_callbacks_set_on_stream_close_callback(cbs, _h2_on_stream_close)
         nghttp2_session_callbacks_set_send_data_callback(cbs, _h2_send_data)
         rv = nghttp2_option_new(&opt)
@@ -2215,6 +2289,8 @@ cdef class CHttpProtocol(Connection):
         rv = nghttp2_session_mem_recv(self.h2, <const uint8_t*>data, n)
         self.h2_in_recv = False
         if rv < 0:
+            # nghttp2 queues a GOAWAY for fatal errors: send it before closing.
+            self._h2_send()
             self._protocol_error(400, "Invalid HTTP request")
             return
         self._h2_window_update(0, True)
@@ -2229,10 +2305,19 @@ cdef class CHttpProtocol(Connection):
         cdef int32_t unacked
         cdef int32_t local = 0
         cdef int thresh
+        cdef RequestExchange ex
         if self.h2 == NULL:
             return
         if stream_id == 0:
             unacked = nghttp2_session_get_effective_recv_data_length(self.h2)
+            if self.h2_paused_streams > 0:
+                # Bytes buffered for a handler that is not reading stay
+                # unacked, so the connection window caps them.
+                for ex in self.h2_streams.values():
+                    if ex._h2_flow_paused:
+                        unacked -= nghttp2_session_get_stream_effective_recv_data_length(
+                            self.h2, ex._h2_stream_id
+                        )
             thresh = H2_CONN_UPDATE_THRESH
             if not force:
                 local = nghttp2_session_get_local_window_size(self.h2)
@@ -2292,20 +2377,24 @@ cdef class CHttpProtocol(Connection):
     cdef void _h2_send(self) noexcept:
         cdef const uint8_t* data = NULL
         cdef ssize_t n
-        if self.h2_in_recv:
+        if self.h2_in_recv or self.h2_in_send:
             return
         if self.h2 == NULL or self.transport is None:
             return
-        while True:
-            n = nghttp2_session_mem_send(self.h2, &data)
-            if n == 0:
-                break
-            if n < 0:
-                self._protocol_error(400, "Invalid HTTP request")
-                return
-            if self._h2_out_append(<const char*>data, n) != 0:
-                self._protocol_error(500, "Internal Server Error")
-                return
+        self.h2_in_send = True
+        try:
+            while True:
+                n = nghttp2_session_mem_send(self.h2, &data)
+                if n == 0:
+                    break
+                if n < 0:
+                    self._protocol_error(400, "Invalid HTTP request")
+                    return
+                if self._h2_out_append(<const char*>data, n) != 0:
+                    self._protocol_error(500, "Internal Server Error")
+                    return
+        finally:
+            self.h2_in_send = False
         self._h2_flush_out()
         if (
             self.h2 != NULL
@@ -2345,9 +2434,9 @@ cdef class CHttpProtocol(Connection):
         self.h2_streams[stream_id] = ex
         if self.h2 != NULL:
             nghttp2_session_set_stream_user_data(self.h2, stream_id, <void*>ex)
-        # Per-stream header deadline from here; do not close the connection
-        # because the first request's connection-level HEADER timer fired.
-        if self.timeout_kind == TIMEOUT_HEADER:
+        # Per-stream deadlines from here: the connection's HEADER or IDLE
+        # timer stops while a stream is open.
+        if self.timeout_kind != TIMEOUT_NONE:
             self._cancel_timeout()
 
     cdef bint _h2_header_oversize(
@@ -2402,7 +2491,7 @@ cdef class CHttpProtocol(Connection):
         size_t namelen,
         const uint8_t* value,
         size_t valuelen,
-    ) noexcept:
+    ) except *:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         cdef const char* hn = <const char*>name
         cdef const char* hv = <const char*>value
@@ -2473,7 +2562,7 @@ cdef class CHttpProtocol(Connection):
         if ex.append_request_header(hn, namelen, hv, valuelen, True) != 0:
             ex._h2_headers_too_large = True
 
-    cdef void _h2_on_data(self, int32_t stream_id, const uint8_t* data, size_t length) noexcept:
+    cdef void _h2_on_data(self, int32_t stream_id, const uint8_t* data, size_t length) except *:
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
         if ex is None or length == 0:
             return
@@ -2584,6 +2673,10 @@ cdef class CHttpProtocol(Connection):
                 self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
             return
         ex._h2_outbound = False
+        if ex._h2_flow_paused:
+            ex._h2_flow_paused = False
+            self.h2_paused_streams -= 1
+            self._h2_window_update(0, True)
         if not ex._completed:
             task = ex._handler_task
             ex.c_abort()
@@ -2603,6 +2696,52 @@ cdef class CHttpProtocol(Connection):
             ex._maybe_recycle()
         if not self.h2_streams and not self.rejected:
             self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
+
+    def _h2_goaway_expired(self):
+        self.h2_goaway_timer = None
+        if self.h2_goaway_pending:
+            self._h2_final_goaway()
+            self._h2_send()
+
+    cdef void _h2_final_goaway(self):
+        self.h2_goaway_pending = False
+        if self.h2_goaway_timer is not None:
+            self.h2_goaway_timer.cancel()
+            self.h2_goaway_timer = None
+        if self.h2 == NULL:
+            return
+        nghttp2_submit_goaway(
+            self.h2,
+            NGHTTP2_FLAG_NONE,
+            nghttp2_session_get_last_proc_stream_id(self.h2),
+            NGHTTP2_NO_ERROR,
+            NULL,
+            0,
+        )
+
+    cdef void _h2_response_sent(self, int32_t stream_id):
+        cdef RequestExchange ex = self.h2_streams.get(stream_id)
+        if ex is None:
+            return
+        ex._h2_end_sent = True
+        self._h2_reset_if_half_open(ex)
+
+    cdef void _h2_reset_if_half_open(self, RequestExchange ex):
+        # RFC 9113 8.1: the response is out and nobody will read the rest of
+        # the request, so stop the client sending it (and pinning the stream).
+        if self.h2 == NULL or not ex._h2_end_sent or not ex.handler_done:
+            return
+        if self.h2_streams.get(ex._h2_stream_id) is not ex:
+            return
+        if nghttp2_session_get_stream_remote_close(self.h2, ex._h2_stream_id) != 0:
+            return
+        nghttp2_submit_rst_stream(
+            self.h2, NGHTTP2_FLAG_NONE, ex._h2_stream_id, NGHTTP2_NO_ERROR
+        )
+
+    cdef void h2_handler_finished(self, RequestExchange ex):
+        self._h2_reset_if_half_open(ex)
+        self._h2_send()
 
     cdef void _h2_reject_stream(self, int32_t stream_id, uint32_t error_code) noexcept:
         cdef RequestExchange ex = self.h2_streams.get(stream_id)
@@ -3030,18 +3169,9 @@ cdef class CHttpProtocol(Connection):
             return
         if self.parse_mode != PARSE_H2 and self.parser == NULL:
             return
-        if self.timeout_kind == TIMEOUT_IDLE:
-            if not (
-                self.parse_mode == PARSE_H1
-                and self.reading_exchange is not None
-                and (
-                    self.reading_exchange._discard_body
-                    or self.h1_headers_too_large
-                )
-            ):
-                self.timeout_kind = TIMEOUT_NONE
-                self.timeout_deadline = 0.0
         ptr = PyByteArray_AS_STRING(self._in_buf)
+        if self.timeout_kind == TIMEOUT_IDLE:
+            self._refresh_idle(ptr, nbytes)
         if self.held_data is not None:
             self._held_append(PyBytes_FromStringAndSize(ptr, nbytes))
             return

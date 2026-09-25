@@ -214,16 +214,11 @@ async def test_h2_drain_sends_goaway_and_finishes_in_flight_streams() -> None:
         assert proto.close_if_idle() is False
         await asyncio.sleep(0.02)
         release.set()
-        data = buf
-        async with asyncio.timeout(2):
-            while chunk := await reader.read(65536):
-                data += chunk
+        frames = await h2.read_until_closed(reader, writer, buf)
         writer.close()
-        frames, _ = h2.parse_frames(data)
-        goaway = [f for f in frames if f.type == h2.TYPE_GOAWAY]
-        assert goaway
-        # last-stream-id 1: the in-flight stream is still served.
-        assert int.from_bytes(goaway[0].payload[:4], "big") == 1
+        # Shutdown notice first, then last-stream-id 1 after the PING ACK:
+        # the in-flight stream is still served.
+        assert h2.goaway_last_stream_ids(frames) == [0x7FFFFFFF, 1]
         assert h2.stream_data(frames, 1) == b"done"
     finally:
         server.close()
@@ -244,13 +239,31 @@ async def test_h2_idle_connection_closes_with_goaway_on_drain() -> None:
         reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
         await asyncio.sleep(0.02)
         (proto,) = list(connections)
-        assert proto.close_if_idle() is True
-        data = buf
-        async with asyncio.timeout(2):
-            while chunk := await reader.read(65536):
-                data += chunk
-        frames, _ = h2.parse_frames(data)
-        assert h2.has_goaway(frames)
+        proto.close_if_idle()
+        frames = await h2.read_until_closed(reader, writer, buf)
+        assert h2.goaway_last_stream_ids(frames) == [0x7FFFFFFF, 0]
+        writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_h2_drain_sends_final_goaway_without_ping_ack() -> None:
+    loop = asyncio.get_running_loop()
+    app = App()
+    connections: set = set()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, connections=connections), "127.0.0.1", 0
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
+        await asyncio.sleep(0.02)
+        (proto,) = list(connections)
+        proto.close_if_idle()
+        frames = await h2.read_until_closed(reader, writer, buf, ack_pings=False)
+        assert h2.goaway_last_stream_ids(frames) == [0x7FFFFFFF, 0]
         writer.close()
     finally:
         server.close()

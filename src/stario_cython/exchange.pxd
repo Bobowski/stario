@@ -127,7 +127,7 @@ cdef Request make_request(
 )
 
 cdef class Connection:
-    """Typed protocol surface used by RequestExchange (cpdef = virtual)."""
+    """Typed protocol surface used by RequestExchange (cdef methods dispatch virtually)."""
     cdef public int timeout_cleanup
     cdef void release_exchange(self, RequestExchange exchange)
     cdef void response_completed(self, RequestExchange exchange)
@@ -155,6 +155,7 @@ cdef class Connection:
     cdef void h2_write_data(self, RequestExchange ex, object data, bint end)
     cdef void h2_end(self, RequestExchange ex)
     cdef void h2_abort(self, RequestExchange ex)
+    cdef void h2_handler_finished(self, RequestExchange ex)
 
 cdef class AppState:
     cdef public bint host_routing
@@ -319,6 +320,8 @@ cdef class RequestExchange:
     cdef bint _h2_awaiting_headers
     cdef double _h2_header_deadline
     cdef bint _h2_outbound
+    # END_STREAM for the response has left nghttp2.
+    cdef bint _h2_end_sent
     # Body consumer is behind: hold this stream's WINDOW_UPDATE (HTTP/2).
     cdef bint _h2_flow_paused
     # ``w.drain()`` waiters for this stream's unsent DATA (HTTP/2).

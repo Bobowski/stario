@@ -124,6 +124,9 @@ cdef class Connection:
     cdef void h2_abort(self, RequestExchange ex):
         raise NotImplementedError("h2_abort")
 
+    cdef void h2_handler_finished(self, RequestExchange ex):
+        pass
+
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
@@ -2911,6 +2914,7 @@ cdef class RequestExchange:
         self._h2_awaiting_headers = False
         self._h2_header_deadline = 0.0
         self._h2_outbound = False
+        self._h2_end_sent = False
         self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
@@ -2926,6 +2930,7 @@ cdef class RequestExchange:
         self._h2_awaiting_headers = True
         self._h2_header_deadline = 0.0
         self._h2_outbound = False
+        self._h2_end_sent = False
         self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
@@ -3159,6 +3164,8 @@ cdef class RequestExchange:
             self._clear_body_storage()
             self._cancel_stall_timer()
             self._connection.set_body_paused(self, False)
+            if self._http2:
+                self._connection.h2_handler_finished(self)
         self._maybe_recycle()
 
     cdef void cancel_before_start(self):
