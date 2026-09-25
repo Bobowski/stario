@@ -2,9 +2,9 @@
 """One request's lifecycle: headers, arena-backed request, body, and response.
 
 ``Headers`` lives here (one extension). ``RequestExchange`` is pooled for its
-native buffers (arena, compressors, output). ``Request`` is not: the protocol
-allocates a new one when the message is ready to dispatch. Query and cookies
-stay unset until the handler reads them.
+native buffers (arena, compressors, output). ``Request`` is not pooled: it is
+built only if the handler reads ``c.req``. Query and cookies stay unset until
+the handler reads them.
 """
 
 cimport cython
@@ -34,6 +34,7 @@ from cpython.exc cimport PyErr_Clear, PyErr_Occurred
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
 from cpython.unicode cimport (
     PyUnicode_AsUTF8AndSize,
+    PyUnicode_DecodeASCII,
     PyUnicode_DecodeLatin1,
     PyUnicode_DecodeUTF8,
     PyUnicode_ReadChar,
@@ -53,6 +54,7 @@ from stario.http.compression import (
 )
 from stario.http.context import EMPTY_MATCH, _Alive
 from stario.http.invoke import on_handler_done
+from stario.http.wire import decode_path
 
 from stario_cython.compression_buf cimport (
     StarioBrotli,
@@ -1783,7 +1785,7 @@ cdef class RequestExchange:
     def __init__(self):
         self.headers = Headers()
         self.request_headers = RequestHeaders(self)
-        self.req = None
+        self._clear_request_binding()
         self._cached = None
         self._data_ready = None
         self._stall_deadline = 0.0
@@ -2487,7 +2489,7 @@ cdef class RequestExchange:
         self._timeout = body_timeout
         self.span = None
         self.match = EMPTY_MATCH
-        self.req = None
+        self._clear_request_binding()
         self._state = None
         self._clear_request_headers()
         self.handler_done = False
@@ -2574,6 +2576,70 @@ cdef class RequestExchange:
         self.handler_started = True
         self.reset_response(self._req_encoding)
 
+    cdef void _clear_request_binding(self) noexcept:
+        self._req = None
+        self._method = None
+        self._path = None
+        self._version = None
+        self._keep_alive = True
+        self._path_n = 0
+        self._query_off = 0
+        self._query_len = 0
+        self._handler = None
+        self._route = None
+
+    cdef object host_from_arena(self):
+        cdef RawHeader* header
+        if self._req_host_index < 0 or self._req_arena == NULL:
+            return ""
+        header = &self._req_raw_headers[self._req_host_index]
+        return _host_without_port_n(
+            self._req_arena + header.value_offset,
+            <Py_ssize_t>header.value_length,
+        )
+
+    cdef object decode_request_path(self):
+        cdef const char* url
+        cdef Py_ssize_t i
+        cdef Py_ssize_t n
+        cdef unsigned char c
+        if self._path is not None:
+            return self._path
+        n = self._path_n
+        if n <= 0 or self._req_arena == NULL:
+            self._path = ""
+            return self._path
+        url = self._req_arena + self._req_url_offset
+        for i in range(n):
+            c = <unsigned char>url[i]
+            if c == 37 or c >= 128:
+                self._path = decode_path(PyBytes_FromStringAndSize(url, n))
+                return self._path
+        self._path = PyUnicode_DecodeASCII(url, n, NULL)
+        return self._path
+
+    cdef Request ensure_request(self):
+        cdef Request request
+        if self._req is not None:
+            return self._req
+        request = make_request(
+            self._method if self._method is not None else "GET",
+            self.decode_request_path(),
+            self._version if self._version is not None else "1.1",
+            self._keep_alive,
+            self.request_headers,
+            self,
+        )
+        if self._query_len > 0:
+            request.bind_query_span(self, self._query_off, self._query_len)
+        self._req = request
+        return request
+
+    @property
+    def req(self):
+        """Lazy ``Request``. Built on first access; never pooled."""
+        return self.ensure_request()
+
     def on_handler_done(self, task):
         """Log/abort on failure, then recycle after the handler task."""
         on_handler_done(self, self, task)
@@ -2612,7 +2678,7 @@ cdef class RequestExchange:
         if self.in_pool:
             return
         self.in_pool = True
-        self.req = None
+        self._clear_request_binding()
         self._cached = None
         self._data_ready = None
         self._h2_pending = b""
@@ -2639,7 +2705,7 @@ cdef class RequestExchange:
         self._free_compressors()
         self.headers.c_clear()
         self._clear_request_headers()
-        self.req = None
+        self._clear_request_binding()
         self.span = None
         self.match = EMPTY_MATCH
         self._state = None
@@ -2654,7 +2720,7 @@ cdef class RequestExchange:
         self._connection.response_completed(self)
         self._maybe_recycle()
 
-    def respond(self, body, content_type, int status=200):
+    cpdef void respond(self, body, content_type, int status=200):
         cdef Headers h = self.headers
         cdef object encoding
         cdef object flat
@@ -2678,7 +2744,7 @@ cdef class RequestExchange:
                 ),
             )
         try:
-            content_type = _encode_value_bytes(content_type)
+            content_type = _content_type_bytes(content_type)
         except ValueError as exc:
             raise StarioError(
                 "Invalid Content-Type",

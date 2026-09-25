@@ -499,6 +499,57 @@ async def test_percent_encoded_path_reaches_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_percent_encoded_letter_matches_static_route() -> None:
+    """`%70` must decode before lookup so /%70laintext hits /plaintext."""
+    app = App()
+    seen: list[str] = []
+
+    async def plaintext(c, w) -> None:
+        seen.append(c.req.path)
+        responses.text(w, "plain")
+
+    app.get("/plaintext", plaintext)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET /%70laintext HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert seen == ["/plaintext"]
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_req_identity_stable_within_handler() -> None:
+    app = App()
+    ids: list[int] = []
+
+    async def handler(c, w) -> None:
+        first = c.req
+        second = c.req
+        ids.append(id(first))
+        ids.append(id(second))
+        assert first is second
+        assert first.path == "/stable"
+        assert first.method == "GET"
+        responses.text(w, "ok")
+
+    app.get("/stable", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(b"GET /stable HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert ids[0] == ids[1]
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
 async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
     app = App()
     seen: list[str] = []

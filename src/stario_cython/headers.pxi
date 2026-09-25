@@ -329,6 +329,58 @@ cdef object _encode_value_bytes(object value):
     return raw
 
 
+# Common content-types. Identity hits skip the CR/LF scan; equal-but-not-
+# identical bytes reuse the interned copy. [0] is last caller object, [1]
+# is the intern table — a list so the inline helper can mutate it.
+cdef object CT_TEXT_PLAIN = b"text/plain"
+cdef object CT_TEXT_PLAIN_UTF8 = b"text/plain; charset=utf-8"
+cdef object CT_JSON = b"application/json"
+cdef object CT_JSON_UTF8 = b"application/json; charset=utf-8"
+cdef object CT_HTML_UTF8 = b"text/html; charset=utf-8"
+cdef object CT_OCTET = b"application/octet-stream"
+cdef list _CT_STATE = [
+    CT_TEXT_PLAIN_UTF8,
+    {
+        CT_TEXT_PLAIN: CT_TEXT_PLAIN,
+        CT_TEXT_PLAIN_UTF8: CT_TEXT_PLAIN_UTF8,
+        CT_JSON: CT_JSON,
+        CT_JSON_UTF8: CT_JSON_UTF8,
+        CT_HTML_UTF8: CT_HTML_UTF8,
+        CT_OCTET: CT_OCTET,
+    },
+]
+
+
+cdef inline object _content_type_bytes(object value):
+    cdef object cached
+    cdef dict table
+    if value is _CT_STATE[0]:
+        return value
+    if (
+        value is CT_TEXT_PLAIN_UTF8
+        or value is CT_TEXT_PLAIN
+        or value is CT_JSON_UTF8
+        or value is CT_JSON
+        or value is CT_HTML_UTF8
+        or value is CT_OCTET
+    ):
+        _CT_STATE[0] = value
+        return value
+    if type(value) is bytes:
+        table = <dict>_CT_STATE[1]
+        cached = table.get(value)
+        if cached is not None:
+            _CT_STATE[0] = value
+            return cached
+    value = _encode_value_bytes(value)
+    if type(value) is bytes:
+        table = <dict>_CT_STATE[1]
+        if len(table) < 64:
+            table[value] = value
+    _CT_STATE[0] = value
+    return value
+
+
 def encode_header_value(str value):
     """Validate and return wire bytes for a header value."""
     return _encode_value(value)

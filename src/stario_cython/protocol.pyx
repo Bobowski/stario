@@ -4,16 +4,17 @@
 
 ``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
 H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). URL bytes
-and header fragments go into the current exchange arena. When the message
-is ready, dispatch allocates a new ``Request`` (query/cookies/host stay
-lazy). Path decoding walks the URL bytes once (no process-wide cache).
+and header fragments go into the current exchange arena. Dispatch walks
+the compiled trie from those bytes (ASCII paths never become a ``str``).
+``Request`` is built only if the handler reads ``c.req``. Query, cookies,
+and host stay lazy on that object.
 
 Lifecycle split (keep-alive GET):
 Cython / C — ``get_buffer`` (reusable bytearray), llhttp/nghttp2, header
-arena, ``Request`` + dispatch, compiled trie, ``respond()`` writelines,
-timeouts, recycle.
-Python — ``async def`` handler, ``asyncio.Task`` (eager), ``on_handler_done``
-on failure, ``app.tasks`` when the handler actually suspends.
+arena, trie walk, ``asyncio.Task`` construction, ``respond()`` writelines
+(compression / content-type), timeouts, recycle.
+Python — ``async def`` handler, ``on_handler_done`` on failure, ``app.tasks``
+when the handler actually suspends. Writes re-enter C via ``respond()``.
 
 Header, idle, and body-stall timeouts share one cleanup path. Under Server
 that path is the Date-header tick (once a second): one ``loop.time()``, then
@@ -43,6 +44,7 @@ from cpython.bytes cimport (
 )
 from cpython.exc cimport PyErr_Clear
 from cpython.unicode cimport (
+    PyUnicode_AsUTF8AndSize,
     PyUnicode_DecodeASCII,
     PyUnicode_DecodeLatin1,
     PyUnicode_GET_LENGTH,
@@ -65,11 +67,9 @@ from stario_cython.exchange cimport (
     CRouter,
     Connection,
     Headers,
-    Request,
     RequestExchange,
     acquire_exchange,
     host_value_ok,
-    make_request,
     _status_line,
 )
 
@@ -1402,7 +1402,8 @@ cdef class CHttpProtocol(Connection):
                     return
             else:
                 exchange.mark_nobody()
-            self._dispatch(exchange, self._build_request(exchange, exchange))
+            self._bind_request(exchange)
+            self._dispatch(exchange)
         except Exception:
             self._protocol_error(400, "Invalid HTTP request")
 
@@ -1450,62 +1451,78 @@ cdef class CHttpProtocol(Connection):
                 if self.transport is None or self.transport.is_closing():
                     self.reading_exchange = None
                     return
-                self._dispatch(
-                    exchange,
-                    self._build_request(exchange, exchange),
-                )
+                self._bind_request(exchange)
+                self._dispatch(exchange)
             except Exception:
                 self._protocol_error(400, "Invalid HTTP request")
                 self.reading_exchange = None
                 return
         self.reading_exchange = None
 
-    cdef Request _build_request(self, RequestExchange exchange, object body):
-        """New Request for this message. Query/cookies/host stay lazy."""
+    cdef void _bind_request(self, RequestExchange exchange):
+        """Bind method/version/query span. Decode the path only if it has
+        ``%`` or non-ASCII (those can change the route). ASCII paths stay
+        arena bytes until a handler reads ``c.req``.
+        """
         cdef object method
         cdef object version
-        cdef object path
+        cdef const char* url
+        cdef Py_ssize_t n
+        cdef Py_ssize_t i
+        cdef Py_ssize_t path_n
         cdef Py_ssize_t qoff = 0
         cdef Py_ssize_t qlen = 0
-        cdef Request request
-        if exchange._req_url_length > 0:
-            path = _path_for_url(
-                exchange._req_arena + exchange._req_url_offset,
-                exchange._req_url_length,
-                &qoff,
-                &qlen,
-            )
-        else:
-            path = PATH_EMPTY
+        cdef unsigned char c
+        cdef bint needs_decode = False
         if exchange._http2:
             method = exchange._h2_method or METH_GET
             version = VER_20
+            exchange._keep_alive = True
         else:
             method = _method_str(<int>llhttp_get_method(self.parser))
             version = _version_str(
                 <int>llhttp_get_http_major(self.parser),
                 <int>llhttp_get_http_minor(self.parser),
             )
+            exchange._keep_alive = self.request_keep_alive
+        exchange._method = method
+        exchange._version = version
         if method is METH_HEAD:
             exchange._head_request = True
-        request = make_request(
-            method,
-            path,
-            version,
-            True if exchange._http2 else self.request_keep_alive,
-            exchange.request_headers,
-            body,
-        )
-        exchange.req = request
-        if qlen > 0:
-            request.bind_query_span(
-                exchange,
-                exchange._req_url_offset + qoff,
-                qlen,
-            )
-        return request
+        n = exchange._req_url_length
+        if n > 0 and exchange._req_arena != NULL:
+            url = exchange._req_arena + exchange._req_url_offset
+            path_n = n
+            for i in range(n):
+                if url[i] == 63:
+                    path_n = i
+                    if i + 1 < n:
+                        qoff = i + 1
+                        qlen = n - i - 1
+                    break
+            exchange._path_n = path_n
+            if qlen > 0:
+                exchange._query_off = exchange._req_url_offset + qoff
+                exchange._query_len = qlen
+            else:
+                exchange._query_off = 0
+                exchange._query_len = 0
+            for i in range(path_n):
+                c = <unsigned char>url[i]
+                if c == 37 or c >= 128:
+                    needs_decode = True
+                    break
+            if needs_decode:
+                exchange._path = _decode_path_n(url, path_n)
+            else:
+                exchange._path = None
+        else:
+            exchange._path = PATH_EMPTY
+            exchange._path_n = 0
+            exchange._query_off = 0
+            exchange._query_len = 0
 
-    cdef void _dispatch(self, RequestExchange exchange, Request request):
+    cdef void _dispatch(self, RequestExchange exchange):
         cdef object span
         self.request_dispatched = True
         if self.timeout_kind == TIMEOUT_HEADER:
@@ -1529,7 +1546,6 @@ cdef class CHttpProtocol(Connection):
             self._set_pause_reason(PAUSE_PIPELINE, True)
 
     cdef void _start_exchange(self, RequestExchange exchange, bint eager_start):
-        cdef Request req
         cdef object path
         cdef object handler
         cdef object route
@@ -1541,8 +1557,9 @@ cdef class CHttpProtocol(Connection):
         cdef object method
         cdef object loc
         cdef const char* url
+        cdef const char* path_p
         cdef Py_ssize_t n
-        cdef Py_ssize_t plen
+        cdef Py_ssize_t path_n
         cdef Py_ssize_t path_end
         cdef Py_ssize_t start
         cdef Py_ssize_t end
@@ -1551,14 +1568,13 @@ cdef class CHttpProtocol(Connection):
         cdef bint host_routing
         if not exchange._http2:
             self.active_exchange = exchange
-        req = exchange.req
-        path = req.path
-        method = req.method
-        # Trailing-slash 308: the decoded path already ends with /. Only then
-        # walk the raw URL for Location (strip extra slashes, keep query).
-        plen = PyUnicode_GET_LENGTH(path) if path is not None else 0
-        if plen > 1 and PyUnicode_READ_CHAR(path, plen - 1) == 47:
-            n = exchange._req_url_length
+        method = exchange._method
+        # Trailing-slash 308 from the raw URL. Percent-decoded slashes stay
+        # encoded (%2F), so a decoded path ends with / only when the wire
+        # path does.
+        n = exchange._req_url_length
+        url = NULL
+        if n > 0 and exchange._req_arena != NULL:
             url = exchange._req_arena + exchange._req_url_offset
             if _trailing_slash_redirect(url, n, &start, &end, &path_end):
                 loc = b"/"
@@ -1570,6 +1586,9 @@ cdef class CHttpProtocol(Connection):
                     )
                 exchange.start_response()
                 exchange.headers.set("location", loc.decode("latin-1"))
+                path = exchange._path
+                if self.noop_span is None:
+                    path = exchange.decode_request_path()
                 self._finish_protocol_span(308, exchange.span, method, path)
                 exchange.respond(b"", b"text/plain; charset=utf-8", 308)
                 exchange.handler_finished()
@@ -1577,6 +1596,7 @@ cdef class CHttpProtocol(Connection):
         exchange.start_response()
         span = exchange.span
         if span is not None and self.noop_span is None:
+            path = exchange.decode_request_path()
             span.start()
             span.attrs({"request.method": method, "request.path": path})
         state = self._app_state
@@ -1589,24 +1609,31 @@ cdef class CHttpProtocol(Connection):
         elif self.app.host_routing:
             host_routing = True
         if host_routing:
-            req.prefetch_host()
-            host = req.host
+            host = exchange.host_from_arena()
         else:
             host = ""
         if router is not None:
-            handler, route, match = router.c_lookup(host, path, method)
+            if exchange._path is None:
+                path_p = url
+                path_n = exchange._path_n
+            else:
+                path_p = PyUnicode_AsUTF8AndSize(exchange._path, &path_n)
+            router.c_lookup_into(host, path_p, path_n, method, exchange)
         else:
+            path = exchange.decode_request_path()
             handler, route, match = self.app.find_handler(host, path, method)
-        exchange.match = match
-        if span is not None and self.noop_span is None and match.pattern:
-            span.rename(match.pattern)
-            span.attr("http.route", route.path)
+            exchange._handler = handler
+            exchange._route = route
+            exchange.match = match
+        if span is not None and self.noop_span is None and exchange.match.pattern:
+            span.rename(exchange.match.pattern)
+            span.attr("http.route", exchange._route.path)
         # 4.3 contract: a real asyncio.Task at dispatch (headers-complete for
         # large/chunked/expect-continue, else message-complete). respond()/end()
         # frees the connection via response_completed; the Task may outlive the
         # response. Incomplete work joins app.tasks so shutdown drain sees it.
         task = _asyncio_Task(
-            handler(exchange, exchange),
+            exchange._handler(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
         )
@@ -1632,17 +1659,15 @@ cdef class CHttpProtocol(Connection):
     cdef void _drop_pending(self):
         cdef RequestExchange exchange
         cdef object span
-        cdef object req
         for exchange in self.pending_exchanges:
             if self.noop_span is None:
                 span = exchange.span
                 if span is not None:
-                    req = exchange.req
                     try:
                         finish_request_span(
                             span,
-                            method=req.method if req is not None else None,
-                            path=req.path if req is not None else None,
+                            method=exchange._method,
+                            path=exchange._path,
                         )
                     except Exception:
                         pass
@@ -1660,7 +1685,6 @@ cdef class CHttpProtocol(Connection):
         cdef object transport = self.transport
         cdef object conn
         cdef RequestExchange next_exchange
-        cdef Request req
         cdef bint keep
         if exchange._http2:
             # Keep the stream mapped until on_stream_close so the DATA
@@ -1680,11 +1704,7 @@ cdef class CHttpProtocol(Connection):
             transport.close()
             self._drop_pending()
             return
-        req = exchange.req
-        if req is not None:
-            keep = req.keep_alive
-        else:
-            keep = self.request_keep_alive
+        keep = exchange._keep_alive
         if not keep or (
             self._app_state.shutting_down
             if self._app_state is not None
@@ -1806,9 +1826,9 @@ cdef class CHttpProtocol(Connection):
                         method = exchange._h2_method or METH_GET
                     elif self.parser != NULL:
                         method = _method_str(<int>llhttp_get_method(self.parser))
-                elif self.request_dispatched and exchange.req is not None:
-                    method = exchange.req.method
-                    path = exchange.req.path
+                elif self.request_dispatched and exchange._method is not None:
+                    method = exchange._method
+                    path = exchange._path
             except Exception:
                 method = None
                 path = None
@@ -2059,7 +2079,8 @@ cdef class CHttpProtocol(Connection):
         if self.transport is None or self.transport.is_closing():
             return
         try:
-            self._dispatch(ex, self._build_request(ex, ex))
+            self._bind_request(ex)
+            self._dispatch(ex)
             ex._h2_dispatched = True
         except Exception:
             self._protocol_error(400, "Invalid HTTP request")
@@ -2100,7 +2121,6 @@ cdef class CHttpProtocol(Connection):
 
     cdef void _h2_protocol_status(self, RequestExchange ex, int status) noexcept:
         """Write a protocol HTTP status on this stream (431 / similar). No handler."""
-        cdef object req
         cdef object method
         cdef object path
         cdef Py_ssize_t qoff
@@ -2113,10 +2133,9 @@ cdef class CHttpProtocol(Connection):
             ex._h2_headers_done = True
             ex.mark_nobody()
             ex.start_response()
-            req = ex.req
-            method = ex._h2_method
-            if req is not None:
-                path = req.path
+            method = ex._h2_method or ex._method
+            if ex._path is not None:
+                path = ex._path
             elif ex._req_url_length > 0:
                 qoff = 0
                 qlen = 0

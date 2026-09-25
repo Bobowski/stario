@@ -179,6 +179,14 @@ cdef class CRouter:
     cdef bint host_routing
     cdef bint has_param_hosts
     cdef object c_lookup(self, object host, object path, object method)
+    cdef void c_lookup_into(
+        self,
+        object host,
+        const char* path_p,
+        Py_ssize_t path_n,
+        object method,
+        RequestExchange exchange,
+    )
 
 cpdef CRouter compile_router(object router)
 
@@ -234,7 +242,16 @@ cdef class RequestExchange:
     cdef Connection _connection
     cdef object _state
     cdef public object request_headers
-    cdef public Request req
+    cdef Request _req
+    cdef object _method
+    cdef object _path
+    cdef object _version
+    cdef bint _keep_alive
+    cdef Py_ssize_t _path_n
+    cdef Py_ssize_t _query_off
+    cdef Py_ssize_t _query_len
+    cdef object _handler
+    cdef object _route
     cdef bint handler_done
     cdef bint handler_started
     cdef bint in_pool
@@ -297,6 +314,11 @@ cdef class RequestExchange:
     cdef object _h2_date_value(self)
     cdef void _h2_respond(self, object body, object content_type, int status, Py_ssize_t nbytes)
     cdef void start_response(self)
+    cdef void _clear_request_binding(self) noexcept
+    cdef Request ensure_request(self)
+    cdef object decode_request_path(self)
+    cdef object host_from_arena(self)
+    cpdef void respond(self, object body, object content_type, int status=*)
     cdef void handler_finished(self)
     cdef void cancel_before_start(self)
     cdef void _maybe_recycle(self)

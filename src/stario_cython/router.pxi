@@ -1,8 +1,10 @@
 """Compiled path/host trie. Walk UTF-8 bytes; intern results on the leaves.
 
-No exact-map sidecar and no per-lookup walk object. Static hits return the
-3-tuple stored at compile time (same Match identity). Param hits allocate
-one Match + one params dict. 404/405 tuples are interned on the node.
+No exact-map sidecar and no per-lookup walk object. The protocol feeds
+arena path bytes for ASCII (no ``%``) so static GET never allocates a
+path ``str``. Static hits return the 3-tuple stored at compile time
+(same Match identity). Param hits allocate one Match + one params dict.
+404/405 tuples are interned on the node.
 """
 
 from cpython.unicode cimport PyUnicode_AsUTF8AndSize, PyUnicode_DecodeUTF8
@@ -278,11 +280,13 @@ cdef object _finish(
     return _pack(factory(node.method_set), _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH)
 
 
-cdef object _resolve_tree(
+cdef object _resolve_tree_n(
     CNode root,
-    object path,
+    const char* path_p,
+    Py_ssize_t path_n,
+    const char* host_p,
+    Py_ssize_t host_n,
     object method,
-    object host,
     int* status,
     bint* custom,
 ):
@@ -292,10 +296,6 @@ cdef object _resolve_tree(
     cdef object nf_hit = root.nf_hit
     cdef object method_na = root.method_na
     cdef bint cust = root.not_found_custom
-    cdef const char* path_p
-    cdef const char* host_p = NULL
-    cdef Py_ssize_t path_n
-    cdef Py_ssize_t host_n = 0
     cdef object nf_before
     cdef bint custom_before
     cdef Py_ssize_t i
@@ -305,9 +305,10 @@ cdef object _resolve_tree(
     cdef Py_ssize_t dot
     cdef Py_ssize_t seg_start
     cdef Py_ssize_t unused = 0
-    path_p = PyUnicode_AsUTF8AndSize(path, &path_n)
-    if host:
-        host_p = PyUnicode_AsUTF8AndSize(host, &host_n)
+    if path_p == NULL:
+        path_p = ""
+        path_n = 0
+    if host_n > 0 and host_p != NULL:
         nf_before = nf_hit
         custom_before = cust
         end = host_n
@@ -399,10 +400,18 @@ cdef object _resolve_tree(
     return _finish(node, method, params, nf_hit, method_na, status)
 
 
-cdef object _router_lookup(CRouter self, object host, object path, object method):
+cdef object _router_lookup_n(
+    CRouter self,
+    object host,
+    const char* path_p,
+    Py_ssize_t path_n,
+    object method,
+):
     cdef object host_hit
     cdef object path_hit
     cdef object hroot
+    cdef const char* host_p = NULL
+    cdef Py_ssize_t host_n = 0
     cdef int host_status
     cdef int path_status
     cdef bint host_custom
@@ -410,14 +419,17 @@ cdef object _router_lookup(CRouter self, object host, object path, object method
     if host is None:
         host = ""
     if self.host_routing and host:
+        host_p = PyUnicode_AsUTF8AndSize(host, &host_n)
         hroot = self.hosts_exact.get(host)
         if hroot is not None:
-            host_hit = _resolve_tree(
-                <CNode>hroot, path, method, "", &host_status, &host_custom
+            host_hit = _resolve_tree_n(
+                <CNode>hroot, path_p, path_n, NULL, 0, method,
+                &host_status, &host_custom,
             )
         elif self.has_param_hosts:
-            host_hit = _resolve_tree(
-                self.hosts_param, path, method, host, &host_status, &host_custom
+            host_hit = _resolve_tree_n(
+                self.hosts_param, path_p, path_n, host_p, host_n, method,
+                &host_status, &host_custom,
             )
         else:
             host_hit = _NF_HIT
@@ -425,8 +437,9 @@ cdef object _router_lookup(CRouter self, object host, object path, object method
             host_custom = False
         if host_status == 0:
             return host_hit
-        path_hit = _resolve_tree(
-            self.path, path, method, "", &path_status, &path_custom
+        path_hit = _resolve_tree_n(
+            self.path, path_p, path_n, NULL, 0, method,
+            &path_status, &path_custom,
         )
         if path_status == 0:
             return path_hit
@@ -437,7 +450,9 @@ cdef object _router_lookup(CRouter self, object host, object path, object method
         if host_custom:
             return host_hit
         return path_hit
-    return _resolve_tree(self.path, path, method, "", &path_status, &path_custom)
+    return _resolve_tree_n(
+        self.path, path_p, path_n, NULL, 0, method, &path_status, &path_custom
+    )
 
 
 @cython.final
@@ -456,8 +471,28 @@ cdef class CRouter:
         return self.c_lookup(host, path, method)
 
     cdef object c_lookup(self, object host, object path, object method):
+        cdef const char* path_p
+        cdef Py_ssize_t path_n
         _router_symbols()
-        return _router_lookup(self, host, path, method)
+        if path is None:
+            path = ""
+        path_p = PyUnicode_AsUTF8AndSize(path, &path_n)
+        return _router_lookup_n(self, host, path_p, path_n, method)
+
+    cdef void c_lookup_into(
+        self,
+        object host,
+        const char* path_p,
+        Py_ssize_t path_n,
+        object method,
+        RequestExchange exchange,
+    ):
+        cdef object hit
+        _router_symbols()
+        hit = _router_lookup_n(self, host, path_p, path_n, method)
+        exchange._handler = (<tuple>hit)[0]
+        exchange._route = (<tuple>hit)[1]
+        exchange.match = (<tuple>hit)[2]
 
 
 @cython.final
