@@ -634,6 +634,7 @@ cdef class CHttpProtocol(Connection):
     cdef bint pump_scheduled
     cdef AppState _app_state
     cdef object _in_buf
+    cdef object _in_view
     cdef public int parse_mode
     cdef bytearray preface_hold
     cdef nghttp2_session* h2
@@ -675,6 +676,7 @@ cdef class CHttpProtocol(Connection):
         self.h1_headers_too_large = False
         self._app_state = None
         self._in_buf = None
+        self._in_view = None
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -2714,10 +2716,15 @@ cdef class CHttpProtocol(Connection):
         self._h2_send()
 
     cpdef object c_get_buffer(self, Py_ssize_t sizehint):
-        """Reusable read bytearray. Consume it in buffer_updated before reuse."""
+        """Reusable read buffer. Consume it in buffer_updated before reuse.
+
+        SSL/uvloop want a writable memoryview. Cache one for the current
+        bytearray so a keep-alive GET does not allocate a view every read.
+        """
         cdef Py_ssize_t want = sizehint
         cdef RequestExchange ex
         cdef Py_ssize_t remaining
+        cdef Py_ssize_t cap
         if want < 64 * 1024:
             want = 64 * 1024
         if want > 256 * 1024:
@@ -2725,11 +2732,20 @@ cdef class CHttpProtocol(Connection):
         ex = self.reading_exchange
         if ex is not None and ex._expected_size >= 0:
             remaining = ex._expected_size - ex._total_read
-            if remaining > want:
-                want = 256 * 1024 if remaining > 256 * 1024 else remaining
+            if remaining > 0:
+                if remaining < want:
+                    want = remaining
+                elif remaining <= 256 * 1024:
+                    want = remaining
+        if want < 1:
+            want = 1
         if self._in_buf is None or PyByteArray_GET_SIZE(self._in_buf) < want:
             self._in_buf = bytearray(want)
-        return self._in_buf
+            self._in_view = memoryview(self._in_buf)
+        cap = PyByteArray_GET_SIZE(self._in_buf)
+        if want == cap:
+            return self._in_view
+        return self._in_view[:want]
 
     cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
         cdef const char* ptr
