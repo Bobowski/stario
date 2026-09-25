@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from types import MappingProxyType
 from typing import Literal
 
-from stario import cookies as cookie_helpers
+import stario.cookies as cookie_helpers
 from stario.exceptions import ClientDisconnected, HttpException, StarioRuntime
 
 from .headers import Headers

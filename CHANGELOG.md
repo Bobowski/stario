@@ -6,6 +6,23 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- `stario.serve(bootstrap, …)` — async HTTP server entry. Pass listen
+  settings as keywords (`port=`, `host=`, …) or a prepared `ServerConfig`.
+  Wrap it with the loop implementation you want:
+  `asyncio.run(stario.serve(bootstrap, port=9000))` or
+  `uvloop.run(stario.serve(bootstrap))`. After shutdown the coroutine finishes
+  and the caller can continue. `Server` takes a `ServerConfig` and an
+  already-entered tracer. `serve()` creates a TTY or JSON tracer when none is
+  passed. `stario serve` calls `Server(...).run()`.
+
+### Changed
+
+- `Server` does not enter or exit the tracer. Pass an open tracer. `serve()`
+  still opens a default TTY or JSON tracer when none is passed.
+- Unix-socket support is checked when `Server` binds, not in the CLI.
+
 ## 4.2.0 - 2026-09-21
 
 ### Added

@@ -23,7 +23,7 @@ Full guides, API reference, and tutorials live at [stario.dev](https://stario.de
 
 ## Where Stario fits
 
-Stario is an asyncio-native HTTP stack: you write async handlers and register routes on an `App`, and the `stario` CLI runs a built-in HTTP server (TCP or a Unix domain socket). It is not an ASGI application you mount in Uvicorn or Hypercorn; wiring goes through the `bootstrap` hook, `Context`, and `Writer` instead.
+Stario is an asyncio-native HTTP stack: you write async handlers and register routes on an `App`, and you start the built-in HTTP server (TCP or a Unix domain socket) with `asyncio.run(stario.serve(bootstrap))` (or `uvloop.run(...)`) or the `stario` CLI. It is not an ASGI application you mount in Uvicorn or Hypercorn; wiring goes through the `bootstrap` hook, `Context`, and `Writer` instead.
 
 ## Requirements
 
@@ -147,6 +147,21 @@ async def bootstrap(app: App, span: Span):
 ```bash
 uv run stario watch main:bootstrap
 ```
+
+To start the same app from Python, await `serve` on a loop you start
+(and continue after shutdown):
+
+```python
+import asyncio
+from stario import serve
+
+if __name__ == "__main__":
+    asyncio.run(serve(bootstrap))
+```
+
+Use `uvloop.run(serve(bootstrap))` when you want uvloop. Pass listen
+settings as keywords: `serve(bootstrap, host="0.0.0.0", port=9000)`.
+`Server` takes a `ServerConfig` object.
 
 Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment, containers, and TLS](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
 

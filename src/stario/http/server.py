@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from types import FrameType
-from typing import Any, Literal
+from typing import Any, Literal, Unpack
 
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
@@ -29,7 +29,7 @@ from .bootstrap import (
     ShutdownTrigger,
     bootstrap_run,
 )
-from .config import ServerConfig
+from .config import EventLoopKind, ServerConfig, ServerOptions
 from .protocol import HttpProtocol
 
 type SignalHandler = Callable[[int, FrameType | None], object]
@@ -69,15 +69,62 @@ def resolve_loop_runner(event_loop: Literal["asyncio", "uvloop"]) -> LoopRun[Any
     return run
 
 
+def _running_event_loop() -> EventLoopKind:
+    """Loop that is actually running — not `config.event_loop`."""
+    module = type(asyncio.get_running_loop()).__module__
+    if module.startswith("uvloop"):
+        return "uvloop"
+    return "asyncio"
+
+
+async def serve(
+    bootstrap: Bootstrap,
+    tracer: Tracer | None = None,
+    *,
+    config: ServerConfig | None = None,
+    **options: Unpack[ServerOptions],
+) -> None:
+    """Serve HTTP until shutdown on the running event loop.
+
+    Start a loop with the implementation you want::
+
+        asyncio.run(serve(bootstrap, port=9000))
+        uvloop.run(serve(bootstrap))
+
+    Listen settings are `ServerConfig` fields (`host`, `port`, …). Pass a
+    prepared `config=` instead when you already have one. Do not mix the two.
+
+    A tracer you pass in must already be entered and is not closed here.
+    When omitted, a TTY or JSON tracer is created and scoped to this call.
+    """
+    if config is not None and options:
+        raise StarioError(
+            "Pass config= or listen fields, not both",
+            help_text="Use serve(bootstrap, config=cfg) or serve(bootstrap, port=9000).",
+        )
+    resolved = config if config is not None else ServerConfig(**options)
+    if tracer is None:
+        if sys.stdout.isatty():
+            from stario.telemetry.tty import TTYTracer
+
+            tracer = TTYTracer()
+        else:
+            from stario.telemetry.json import json_tracer_from_env
+
+            tracer = json_tracer_from_env()
+        with tracer:
+            await Server(bootstrap, tracer, config=resolved).serve()
+        return
+    await Server(bootstrap, tracer, config=resolved).serve()
+
+
 class Server:
     """Binds a listener, runs bootstrap on a fresh app, serves until SIGINT/SIGTERM, then drains.
 
     One instance, one `serve()` / `run()` — create a new `Server` to restart.
 
-    Typical embedding::
-
-        with tracer:
-            Server(bootstrap, tracer, config=config).run()
+    Typical embedding is `await stario.serve(bootstrap, port=9000)` or
+    `Server(bootstrap, tracer, config=cfg).run()`.
     """
 
     def __init__(
@@ -90,10 +137,9 @@ class Server:
         """Configure listening, bootstrap, telemetry, and per-connection compression.
 
         - `bootstrap`: Async generator `(app, span)` with a single `yield`.
-        - `tracer`: Telemetry backend implementing the `Tracer` protocol.
-        - `config`: Listen address, limits, compression, shutdown policy, and event loop.
+        - `tracer`: Telemetry backend. Must already be entered; not closed here.
+        - `config`: Listen address, limits, compression, shutdown, and event loop.
         """
-
         self.bootstrap = bootstrap
         self.config = config if config is not None else ServerConfig()
         self.tracer = tracer
@@ -103,16 +149,13 @@ class Server:
         self._urgent_drain = False
 
     def run(self) -> None:
-        """Block until shutdown; picks the event loop from `config.event_loop`.
-
-        The tracer must already be entered by the caller (see `cli/runtime.py`).
-        """
+        """Block until shutdown; picks the event loop from `config.event_loop`."""
         resolve_loop_runner(self.config.event_loop)(self.serve())
 
     async def serve(self) -> None:
         """Run until SIGINT/SIGTERM (or fatal error); requires a running event loop.
 
-        The tracer must already be entered by the caller (see `cli/runtime.py`).
+        The tracer must already be entered. This method does not enter or exit it.
         """
         if self._used:
             raise StarioError(
@@ -369,6 +412,11 @@ class Server:
         if path is None:
             yield None
             return
+        if not hasattr(socket, "AF_UNIX"):
+            raise StarioError(
+                "Unix domain sockets are not available on this platform",
+                help_text="Pass unix_socket=None or use host and port.",
+            )
 
         if os.path.exists(path):
             st_mode = os.stat(path).st_mode
@@ -467,7 +515,7 @@ class Server:
             "server.timeout.request_header": self.config.requests.header_timeout,
             "server.timeout.request_body": self.config.requests.body_timeout,
             "server.timeout.keep_alive": self.config.requests.keep_alive_timeout,
-            "server.event_loop": self.config.event_loop,
+            "server.event_loop": _running_event_loop(),
         }
         if self.config.compression.zstd_window_log is not None:
             attrs["server.compression.zstd_window_log"] = (

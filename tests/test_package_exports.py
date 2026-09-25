@@ -5,6 +5,25 @@ import importlib
 import pytest
 
 
+def test_from_stario_import_app_and_serve() -> None:
+    """Fresh interpreter: package root must bind App and serve without a cycle."""
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from stario import App, serve\n"
+            "import stario\n"
+            "assert 'serve' in vars(stario)\n"
+            "assert stario.serve is serve\n"
+            "assert stario.App is App\n",
+        ],
+        check=True,
+    )
+
+
 def test_core_modules_import() -> None:
     import stario
     import stario.datastar
@@ -38,6 +57,7 @@ def test_core_modules_import() -> None:
                 "StaticAssets",
                 "UrlPath",
                 "Writer",
+                "serve",
             ],
         ),
         (
