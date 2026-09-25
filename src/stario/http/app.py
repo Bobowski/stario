@@ -2,8 +2,9 @@
 Application object: route table, shutdown-aware tasks, thin test entrypoint.
 
 The HTTP protocol does not call this class per request. It binds compiled
-trie lookup (`_cy_router`) and `create_task(handler(c, w))`. `App.__call__`
-exists so tests and `TestClient` share that same path.
+trie lookup (`_cy_router`) and constructs `asyncio.Task(handler(c, w))`,
+registering incomplete tasks on `app.tasks` for shutdown drain. `App.__call__`
+and `create_task` exist so tests and `TestClient` share that same drain set.
 """
 
 from __future__ import annotations

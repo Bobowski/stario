@@ -145,7 +145,7 @@ That cannot be shared as-is.
 | Registered handlers / middleware | `tasks` set (or drop it and use `asyncio.all_tasks()`) |
 | `host_routing` | `connections` set |
 | | Date-header box + 1s timeout sweep |
-| | `HttpProtocol.loop` / `_create_task` |
+| | `HttpProtocol.loop` |
 
 Concrete shutdown:
 
@@ -467,8 +467,8 @@ connections, making `Writer` thread-safe, multiprocess + Relay.
 ## References (code in this tree)
 
 - Server / one loop: `src/stario/http/server.py`, `src/stario/http/app.py`
-- Protocol dispatch: `src/stario_cython/protocol.pyx` (`_create_task`,
-  `_find_handler`, `connections`, `date_box`)
+- Protocol dispatch: `src/stario_cython/protocol.pyx` (`asyncio.Task`,
+  compiled trie lookup, `connections`, `date_box`)
 - Pools: `src/stario_cython/exchange.pyx` (`_thread_pool`, `release_exchange`),
   `vendor/compression_buf.c`
 - Relay: `src/stario/relay.py`, `tests/test_relay.py`

@@ -382,49 +382,67 @@ cdef object _resolve_tagged(CNode root, object path, object method, object host)
     )
 
 
+cdef inline object _exact_hit(dict table, object path, object method):
+    """path -> method -> hit. No (host, path, method) tuple on the lookup."""
+    cdef object methods
+    if table is None:
+        return None
+    methods = table.get(path)
+    if methods is None:
+        return None
+    return methods.get(method)
+
+
 cdef object _router_lookup(CRouter self, object host, object path, object method):
     cdef object hit
     cdef object host_pack
     cdef object path_pack
     cdef object hroot
+    cdef object host_map
     cdef int host_status
     cdef int path_status
     cdef bint host_custom
     if host is None:
         host = ""
-    hit = self.exact.get((host, path, method))
+    if host:
+        host_map = self.exact_hosts.get(host)
+        if host_map is not None:
+            hit = _exact_hit(<dict>host_map, path, method)
+            if hit is not None:
+                return hit
+        if self.host_routing:
+            hroot = self.hosts_exact.get(host)
+            if hroot is not None:
+                host_pack = _resolve_tagged(<CNode>hroot, path, method, "")
+            elif self.has_param_hosts:
+                host_pack = _resolve_tagged(self.hosts_param, path, method, host)
+            else:
+                host_pack = (
+                    (_ROUTER_DEFAULT_NF, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
+                    2,
+                    False,
+                )
+            host_status = <int>host_pack[1]
+            host_custom = <bint>host_pack[2]
+            if host_status == 0:
+                return host_pack[0]
+            hit = _exact_hit(self.exact_paths, path, method)
+            if hit is not None:
+                return hit
+            path_pack = _resolve_tagged(self.path, path, method, "")
+            path_status = <int>path_pack[1]
+            if path_status == 0:
+                return path_pack[0]
+            if host_status == 1:
+                return host_pack[0]
+            if path_status == 1:
+                return path_pack[0]
+            if host_custom:
+                return host_pack[0]
+            return path_pack[0]
+    hit = _exact_hit(self.exact_paths, path, method)
     if hit is not None:
         return hit
-    if self.host_routing and host:
-        hroot = self.hosts_exact.get(host)
-        if hroot is not None:
-            host_pack = _resolve_tagged(<CNode>hroot, path, method, "")
-        elif self.has_param_hosts:
-            host_pack = _resolve_tagged(self.hosts_param, path, method, host)
-        else:
-            host_pack = (
-                (_ROUTER_DEFAULT_NF, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH),
-                2,
-                False,
-            )
-        host_status = <int>host_pack[1]
-        host_custom = <bint>host_pack[2]
-        if host_status == 0:
-            return host_pack[0]
-        hit = self.exact.get(("", path, method))
-        if hit is not None:
-            return hit
-        path_pack = _resolve_tagged(self.path, path, method, "")
-        path_status = <int>path_pack[1]
-        if path_status == 0:
-            return path_pack[0]
-        if host_status == 1:
-            return host_pack[0]
-        if path_status == 1:
-            return path_pack[0]
-        if host_custom:
-            return host_pack[0]
-        return path_pack[0]
     return _resolve_tagged(self.path, path, method, "")[0]
 
 
@@ -456,13 +474,39 @@ cdef class AppState:
         self.router = None
 
 
+cdef void _index_exact(dict dest, object path, object method, object hit):
+    cdef object methods = dest.get(path)
+    if methods is None:
+        methods = {}
+        dest[path] = methods
+    (<dict>methods)[method] = hit
+
+
 cpdef CRouter compile_router(object router):
     cdef CRouter compiled = CRouter.__new__(CRouter)
     cdef dict hosts
+    cdef dict exact_paths
+    cdef dict exact_hosts
+    cdef dict host_map
     cdef object host
     cdef object tree
+    cdef object key
+    cdef object hit
     _router_symbols()
-    compiled.exact = router._exact
+    exact_paths = {}
+    exact_hosts = {}
+    for key, hit in router._exact.items():
+        host = key[0]
+        if host:
+            host_map = exact_hosts.get(host)
+            if host_map is None:
+                host_map = {}
+                exact_hosts[host] = host_map
+            _index_exact(<dict>host_map, key[1], key[2], hit)
+        else:
+            _index_exact(exact_paths, key[1], key[2], hit)
+    compiled.exact_paths = exact_paths
+    compiled.exact_hosts = exact_hosts
     compiled.host_routing = router._host_routing
     compiled.has_param_hosts = router._has_param_hosts
     compiled.path = _compile_node(router._path)

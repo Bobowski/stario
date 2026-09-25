@@ -8,6 +8,13 @@ and header fragments go into the current exchange arena. When the message
 is ready, dispatch allocates a new ``Request`` (query/cookies/host stay
 lazy). Path decoding walks the URL bytes once (no process-wide cache).
 
+Lifecycle split (keep-alive GET):
+Cython / C — ``get_buffer`` (reusable bytearray), llhttp/nghttp2, header
+arena, ``Request`` + dispatch, compiled trie, ``respond()`` writelines,
+timeouts, recycle.
+Python — ``async def`` handler, ``asyncio.Task`` (eager), ``on_handler_done``
+on failure, ``app.tasks`` when the handler actually suspends.
+
 Header, idle, and body-stall timeouts share one cleanup path. Under Server
 that path is the Date-header tick (once a second): one ``loop.time()``, then
 compare stored deadlines. Tests and raw ``create_server`` use a fallback
@@ -183,6 +190,7 @@ cdef enum:
 cdef object PATH_EMPTY = ""
 cdef bytes H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 cdef object _settings_lock = Lock()
+cdef object _asyncio_Task = asyncio.Task
 
 
 cdef object _decode_path_n(const char* s, Py_ssize_t n):
@@ -624,10 +632,8 @@ cdef class CHttpProtocol(Connection):
     cdef object held_data
     cdef Py_ssize_t held_offset
     cdef bint pump_scheduled
-    cdef object _create_task
     cdef AppState _app_state
     cdef object _in_buf
-    cdef Py_ssize_t _in_want
     cdef public int parse_mode
     cdef bytearray preface_hold
     cdef nghttp2_session* h2
@@ -669,7 +675,6 @@ cdef class CHttpProtocol(Connection):
         self.h1_headers_too_large = False
         self._app_state = None
         self._in_buf = None
-        self._in_want = 0
 
     def __dealloc__(self):
         if self.parser != NULL:
@@ -705,7 +710,6 @@ cdef class CHttpProtocol(Connection):
         self.date_box = date_box
         self.compression = compression
         self.connections = connections
-        self._create_task = app.create_task
         self._app_state = getattr(app, "_app_state", None)
         self.transport = None
         self.pending_exchanges = deque()
@@ -1529,6 +1533,7 @@ cdef class CHttpProtocol(Connection):
         cdef object route
         cdef object match
         cdef object task
+        cdef object tasks
         cdef object span
         cdef object host
         cdef object method
@@ -1594,13 +1599,14 @@ cdef class CHttpProtocol(Connection):
         if span is not None and self.noop_span is None and match.pattern:
             span.rename(match.pattern)
             span.attr("http.route", route.path)
-        task = self._create_task(
+        # asyncio.Task, not app.create_task: skip the Python wrapper. Still a
+        # real Task so middleware can await. Incomplete work joins app.tasks.
+        task = _asyncio_Task(
             handler(exchange, exchange),
             loop=self.loop,
             eager_start=eager_start,
         )
         exchange._handler_task = task
-        # Always the same done path. Task() is intentional: middleware may await.
         if task.done():
             # Skip only a clean NoOp success. Write-then-raise / cancel / an
             # incomplete response must still hit on_handler_done (log + abort).
@@ -1614,6 +1620,9 @@ cdef class CHttpProtocol(Connection):
             else:
                 exchange.handler_finished()
         else:
+            tasks = self.app.tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
             task.add_done_callback(exchange.on_handler_done)
 
     cdef void _drop_pending(self):
@@ -2704,8 +2713,8 @@ cdef class CHttpProtocol(Connection):
         )
         self._h2_send()
 
-    cpdef object c_get_buffer(self, Py_ssize_t sizehint):
-        """Reusable read buffer. Consume it in buffer_updated before reuse."""
+    cpdef object get_buffer(self, Py_ssize_t sizehint):
+        """Reusable read bytearray. Consume it in buffer_updated before reuse."""
         cdef Py_ssize_t want = sizehint
         cdef RequestExchange ex
         cdef Py_ssize_t remaining
@@ -2716,19 +2725,13 @@ cdef class CHttpProtocol(Connection):
         ex = self.reading_exchange
         if ex is not None and ex._expected_size >= 0:
             remaining = ex._expected_size - ex._total_read
-            if remaining > 0:
-                if remaining < want:
-                    want = remaining
-                elif remaining <= 256 * 1024:
-                    want = remaining
-        if want < 1:
-            want = 1
+            if remaining > want:
+                want = 256 * 1024 if remaining > 256 * 1024 else remaining
         if self._in_buf is None or PyByteArray_GET_SIZE(self._in_buf) < want:
             self._in_buf = bytearray(want)
-        self._in_want = want
-        return memoryview(self._in_buf)[:want]
+        return self._in_buf
 
-    cpdef void c_buffer_updated(self, Py_ssize_t nbytes):
+    cpdef void buffer_updated(self, Py_ssize_t nbytes):
         cdef const char* ptr
         if self.rejected or nbytes <= 0 or self._in_buf is None:
             return
@@ -2801,10 +2804,7 @@ cdef class CHttpProtocol(Connection):
 
 
 class HttpProtocol(CHttpProtocol, asyncio.BufferedProtocol):
-    """Python subclass so uvloop/asyncio can use BufferedProtocol."""
+    """Python subclass so uvloop/asyncio can use BufferedProtocol.
 
-    def get_buffer(self, sizehint):
-        return self.c_get_buffer(sizehint)
-
-    def buffer_updated(self, nbytes):
-        self.c_buffer_updated(nbytes)
+    ``get_buffer`` / ``buffer_updated`` are ``cpdef`` on ``CHttpProtocol``.
+    """

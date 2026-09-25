@@ -2698,36 +2698,63 @@ cdef class RequestExchange:
         if self._http2:
             self._h2_respond(body, content_type, status, nbytes)
             return
-        # Empty headers + no compression: one assembled head (plus a small
-        # body when it fits). Large bodies stay a second write so we do not
-        # copy MiB payloads into the output buffer.
+        # Empty headers + no compression: interned fragments via writev.
+        # No assemble-into-bytearray + copy-to-bytes (uvloop may hold the
+        # last write; interned status/date/CL pieces are stable).
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
         ):
-            self._buf_bytes(_status_line(status))
-            self._buf_bytes(self._date_box[0])
             if not _may_have_body(status):
-                self._buf_bytes(ZERO_CL)
-                self._flush()
-            else:
-                self._buf_bytes(CT_PREFIX)
-                self._buf_bytes(content_type)
-                self._buf_bytes(CL_PREFIX)
-                self._buf_bytes(_dec(<size_t>nbytes))
-                self._buf_bytes(CRLF2)
-                if nbytes and not self._head_request:
-                    if nbytes <= OUTPUT_BUFFER_RETAIN_MAX:
-                        self._buf_body(body)
-                        self._flush()
-                    else:
-                        self._flush()
-                        if isinstance(body, (list, tuple)):
-                            self._transport.writelines(body)
-                        else:
-                            self._transport.write(body)
+                self._transport.writelines((
+                    _status_line(status),
+                    self._date_box[0],
+                    ZERO_CL,
+                ))
+            elif nbytes and not self._head_request:
+                if isinstance(body, (list, tuple)):
+                    self._transport.writelines((
+                        _status_line(status),
+                        self._date_box[0],
+                        CT_PREFIX,
+                        content_type,
+                        CL_PREFIX,
+                        _dec(<size_t>nbytes),
+                        CRLF2,
+                    ))
+                    self._transport.writelines(body)
+                elif nbytes <= OUTPUT_BUFFER_RETAIN_MAX:
+                    self._transport.writelines((
+                        _status_line(status),
+                        self._date_box[0],
+                        CT_PREFIX,
+                        content_type,
+                        CL_PREFIX,
+                        _dec(<size_t>nbytes),
+                        CRLF2,
+                        body,
+                    ))
                 else:
-                    self._flush()
+                    self._transport.writelines((
+                        _status_line(status),
+                        self._date_box[0],
+                        CT_PREFIX,
+                        content_type,
+                        CL_PREFIX,
+                        _dec(<size_t>nbytes),
+                        CRLF2,
+                    ))
+                    self._transport.write(body)
+            else:
+                self._transport.writelines((
+                    _status_line(status),
+                    self._date_box[0],
+                    CT_PREFIX,
+                    content_type,
+                    CL_PREFIX,
+                    _dec(<size_t>nbytes),
+                    CRLF2,
+                ))
         else:
             existing_ce = None
             existing_cl = None

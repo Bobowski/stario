@@ -168,7 +168,8 @@ cdef class CNode:
     cdef bint not_found_custom
 
 cdef class CRouter:
-    cdef dict exact
+    cdef dict exact_paths
+    cdef dict exact_hosts
     cdef CNode path
     cdef dict hosts_exact
     cdef CNode hosts_param
