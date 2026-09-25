@@ -902,7 +902,7 @@ cdef class HttpProtocol:
                 exchange.cancel_before_start()
         self.h2_streams.clear()
         if self.idle_exchange is not None:
-            self.idle_exchange.return_to_pool()
+            self.idle_exchange.recycle()
             self.idle_exchange = None
         if self.reading_exchange is not None:
             self.reading_exchange.c_abort()
@@ -925,18 +925,19 @@ cdef class HttpProtocol:
         self.pump_scheduled = False
         self.transport = None
 
-    def recycle_exchange(self, RequestExchange exchange):
+    def release_exchange(self, RequestExchange exchange):
+        """Detach, then keep one idle on this connection or recycle on this thread."""
         cdef int32_t stream_id
         if exchange._http2 and self.h2 != NULL:
             stream_id = exchange._h2_stream_id
             if stream_id != 0:
                 nghttp2_session_set_stream_user_data(self.h2, stream_id, NULL)
                 self.h2_streams.pop(stream_id, None)
-        exchange.park()
+        exchange.detach()
         if not self.closed and self.idle_exchange is None:
             self.idle_exchange = exchange
         else:
-            exchange.return_to_pool()
+            exchange.recycle()
 
     def eof_received(self):
         return False
@@ -1189,7 +1190,7 @@ cdef class HttpProtocol:
         cdef bint from_hold = False
         if self.preface_hold:
             if _preface_append(self.preface_hold, p, n) != 0:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return False
             p = PyByteArray_AS_STRING(self.preface_hold)
             n = PyByteArray_GET_SIZE(self.preface_hold)
@@ -1204,7 +1205,7 @@ cdef class HttpProtocol:
         if n > 0 and n < H2_PREFACE_LEN and memcmp(p, pref, <size_t>n) == 0:
             if not from_hold:
                 if _preface_append(self.preface_hold, p, n) != 0:
-                    self._close_error(500, "Internal Server Error")
+                    self._protocol_error(500, "Internal Server Error")
             return False
         self.parse_mode = PARSE_H1
         return True
@@ -1227,7 +1228,7 @@ cdef class HttpProtocol:
         if n <= PARSER_QUANTUM:
             err = llhttp_execute(self.parser, ptr + offset, <size_t>(n - offset))
             if err != HPE_OK:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
             return
         while offset < n:
             end = offset + PARSER_QUANTUM
@@ -1239,7 +1240,7 @@ cdef class HttpProtocol:
                 <size_t>(end - offset),
             )
             if err != HPE_OK:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             offset = end
             if self.pause_reasons:
@@ -1334,7 +1335,7 @@ cdef class HttpProtocol:
         return False
 
     cdef inline RequestExchange _take_exchange(self):
-        """Reuse the idle exchange or take one from this thread's pool."""
+        """Reuse this connection's idle exchange, else this thread's spare."""
         cdef RequestExchange ex = self.idle_exchange
         if ex is not None:
             self.idle_exchange = None
@@ -1366,7 +1367,7 @@ cdef class HttpProtocol:
         try:
             self.reading_exchange = self._take_exchange()
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         self.head_bytes = 40
         self.request_dispatched = False
@@ -1388,7 +1389,7 @@ cdef class HttpProtocol:
         if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_header_name(at, length) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
@@ -1396,14 +1397,14 @@ cdef class HttpProtocol:
         if self.h1_headers_too_large or self._header_too_large(length):
             return
         if self.reading_exchange.append_request_header_value(at, length) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value_complete(self) noexcept:
         if self.h1_headers_too_large or self.rejected:
             return
         if self.reading_exchange is not None:
             if self.reading_exchange.finish_request_header() != 0:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_headers_complete(self) noexcept:
         cdef RequestExchange exchange
@@ -1435,23 +1436,23 @@ cdef class HttpProtocol:
             )
         )
         if http_major != 1:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if llhttp_get_upgrade(self.parser):
-            self._close_error(400, "Upgrade not supported")
+            self._protocol_error(400, "Upgrade not supported")
             return
         # RFC 7230 3.3.3: TE without chunked as the final coding — body
         # length is undefined. Reject before dispatch (llhttp errors after
         # on_headers_complete, which would otherwise 404 then 400).
         if (flags & F_TRANSFER_ENCODING) and not (flags & F_CHUNKED):
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
             # after oversize headers would be a read-DoS if we stayed open.
             # Trust llhttp when it says this message cannot be keep-alive
             # (TE-without-chunked is already rejected above).
-            self._h1_protocol_status(
+            self._protocol_error(
                 431,
                 "Request header fields too large",
                 has_body
@@ -1461,10 +1462,10 @@ cdef class HttpProtocol:
             )
             return
         if exchange.finish_request_header() != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if http_minor == 1 and exchange._req_host_index < 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             # Keep-alive only when the declared body is small enough to drain.
@@ -1474,14 +1475,14 @@ cdef class HttpProtocol:
                 and self.request_keep_alive
             ):
                 self.h1_headers_too_large = True
-                self._h1_protocol_status(
+                self._protocol_error(
                     413,
                     "Request body too large",
                     False,
                     <Py_ssize_t>content_length,
                 )
             else:
-                self._close_error(413, "Request body too large")
+                self._protocol_error(413, "Request body too large")
             return
         exchange.cache_hot_request_headers()
         if self.request_dispatched or self.rejected:
@@ -1512,13 +1513,13 @@ cdef class HttpProtocol:
                 exchange.mark_nobody()
             self._dispatch(exchange, self._build_request(exchange, exchange))
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_body(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
         if self.reading_exchange.c_feed(at, length) != 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_message_complete(self) noexcept:
         cdef RequestExchange exchange
@@ -1530,7 +1531,7 @@ cdef class HttpProtocol:
             if exchange is not None:
                 if exchange._body_active and not exchange._body_complete:
                     if exchange.c_complete() != 0:
-                        self._close_error(400, "Invalid HTTP request")
+                        self._protocol_error(400, "Invalid HTTP request")
                         self.reading_exchange = None
                         self.h1_headers_too_large = False
                         return
@@ -1546,7 +1547,7 @@ cdef class HttpProtocol:
             return
         if exchange is not None and exchange._body_active:
             if exchange.c_complete() != 0:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 self.reading_exchange = None
                 return
         if (
@@ -1563,7 +1564,7 @@ cdef class HttpProtocol:
                     self._build_request(exchange, exchange),
                 )
             except Exception:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 self.reading_exchange = None
                 return
         self.reading_exchange = None
@@ -1631,7 +1632,7 @@ cdef class HttpProtocol:
             self._start_exchange(exchange, True)
         else:
             if len(self.pending_exchanges) >= self.max_pipelined_requests:
-                self._close_error(429, "Too many pipelined requests")
+                self._protocol_error(429, "Too many pipelined requests")
                 return
             self.pending_exchanges.append(exchange)
             self._set_pause_reason(PAUSE_PIPELINE, True)
@@ -1798,131 +1799,73 @@ cdef class HttpProtocol:
         except Exception:
             pass
 
-    cdef void _h1_protocol_status(
+    cdef void _abort_reading_and_pending(self) noexcept:
+        cdef RequestExchange exchange = self.reading_exchange
+        if exchange is not None:
+            exchange.c_abort()
+            if not exchange.handler_started:
+                exchange.cancel_before_start()
+        self._drop_pending()
+
+    cdef void _write_h1_error(self, int status, object body, bint head_only) noexcept:
+        cdef object transport = self.transport
+        cdef object date
+        if transport is None or transport.is_closing():
+            return
+        date = self.date_box[0]
+        if head_only:
+            transport.write(
+                b"".join((
+                    _status_line(status),
+                    date,
+                    b"content-type: text/plain; charset=utf-8\r\n",
+                    b"content-length: %d\r\n" % len(body),
+                    b"connection: close\r\n",
+                    b"\r\n",
+                ))
+            )
+        else:
+            transport.write(
+                b"".join((
+                    _status_line(status),
+                    date,
+                    b"content-type: text/plain; charset=utf-8\r\n",
+                    b"content-length: %d\r\n" % len(body),
+                    b"connection: close\r\n",
+                    b"\r\n",
+                    body,
+                ))
+            )
+
+    cdef void _protocol_error(
         self,
         int status,
         object message,
-        bint close_conn,
-        Py_ssize_t drain_len,
+        bint close_conn=True,
+        Py_ssize_t drain_len=-1,
     ) noexcept:
-        """Write a protocol HTTP status without dispatch. Close only if asked.
+        """Write a protocol HTTP status without dispatch.
 
-        ``drain_len >= 0`` keeps the connection and discards that many body
-        bytes so llhttp stays synced (keep-alive 413 with a small CL).
+        Keep-alive 413/431 (``close_conn=False``) uses ``respond()`` so the
+        connection stays open. ``drain_len >= 0`` discards that many body
+        bytes so llhttp stays synced. Close writes Connection: close (HTTP/1
+        only, and only if nothing is already on the wire) then hangs up.
         """
         cdef RequestExchange exchange
         cdef object body
-        cdef object date
-        cdef object method
-        cdef object path
-        cdef Py_ssize_t qoff
-        cdef Py_ssize_t qlen
-        cdef object transport
-        if self.request_dispatched or self.rejected:
-            if close_conn:
-                transport = self.transport
-                if transport is not None and not transport.is_closing():
-                    transport.close()
-                self.rejected = True
-            return
-        self.request_dispatched = True
-        if not close_conn and self.timeout_kind == TIMEOUT_HEADER:
-            # Same as _dispatch: this request is answered. _after_pump
-            # re-arms HEADER if a keep-alive 413 body still needs draining.
-            self.timeout_kind = TIMEOUT_NONE
-            self.timeout_deadline = 0.0
-        exchange = self.reading_exchange
-        method = None
-        path = None
-        qoff = 0
-        qlen = 0
-        try:
-            if exchange is not None and exchange._req_url_length > 0:
-                path = _path_for_url(
-                    exchange._req_arena + exchange._req_url_offset,
-                    exchange._req_url_length,
-                    &qoff,
-                    &qlen,
-                )
-                if self.parser != NULL:
-                    method = _method_str(<int>llhttp_get_method(self.parser))
-        except Exception:
-            method = None
-            path = None
-        try:
-            body = message.encode("utf-8")
-            transport = self.transport
-            if exchange is not None:
-                if drain_len >= 0 and not close_conn:
-                    exchange.reset_body(False, drain_len)
-                    exchange._discard_body = True
-                else:
-                    exchange.mark_nobody()
-                exchange.start_response()
-            self._finish_protocol_span(
-                status,
-                exchange.span if exchange is not None else None,
-                method,
-                path,
-            )
-            if close_conn:
-                date = self.date_box[0]
-                if transport is not None and not transport.is_closing():
-                    if exchange is not None and exchange._head_request:
-                        transport.write(
-                            b"".join((
-                                _status_line(status),
-                                date,
-                                b"content-type: text/plain; charset=utf-8\r\n",
-                                b"content-length: %d\r\n" % len(body),
-                                b"connection: close\r\n",
-                                b"\r\n",
-                            ))
-                        )
-                    else:
-                        transport.write(
-                            b"".join((
-                                _status_line(status),
-                                date,
-                                b"content-type: text/plain; charset=utf-8\r\n",
-                                b"content-length: %d\r\n" % len(body),
-                                b"connection: close\r\n",
-                                b"\r\n",
-                                body,
-                            ))
-                        )
-                self.rejected = True
-                if exchange is not None:
-                    exchange._completed = True
-                    exchange.handler_finished()
-                self.reading_exchange = None
-                if transport is not None and not transport.is_closing():
-                    transport.close()
-            elif exchange is not None:
-                exchange.respond(body, b"text/plain; charset=utf-8", status)
-        except Exception:
-            self.rejected = True
-            transport = self.transport
-            if transport is not None:
-                try:
-                    transport.close()
-                except Exception:
-                    pass
-
-    cdef void _close_error(self, int status, object message) noexcept:
-        cdef object transport
-        cdef object body
-        cdef object date
         cdef object span
         cdef object method
         cdef object path
         cdef Py_ssize_t qoff
         cdef Py_ssize_t qlen
-        cdef RequestExchange exchange
+        cdef object transport
+
         if self.rejected:
             return
-        self.rejected = True
-        self._cancel_timeout()
+        # Keep-alive: never write a second status for this request.
+        if not close_conn and self.request_dispatched:
+            return
+
         transport = self.transport
         exchange = self.reading_exchange
         span = None
@@ -1950,53 +1893,63 @@ cdef class HttpProtocol:
             except Exception:
                 method = None
                 path = None
+
+        self.request_dispatched = True
+        if not close_conn:
+            if self.timeout_kind == TIMEOUT_HEADER:
+                self.timeout_kind = TIMEOUT_NONE
+                self.timeout_deadline = 0.0
+            try:
+                body = message.encode("utf-8")
+                if exchange is not None:
+                    if drain_len >= 0:
+                        exchange.reset_body(False, drain_len)
+                        exchange._discard_body = True
+                    else:
+                        exchange.mark_nobody()
+                    exchange.start_response()
+                self._finish_protocol_span(status, span, method, path)
+                if exchange is not None:
+                    exchange.respond(body, b"text/plain; charset=utf-8", status)
+            except Exception:
+                self.rejected = True
+                if transport is not None:
+                    try:
+                        transport.close()
+                    except Exception:
+                        pass
+            return
+
+        self.rejected = True
+        self._cancel_timeout()
         try:
             if transport is None or transport.is_closing():
+                self._abort_reading_and_pending()
                 return
-            if exchange is not None:
-                exchange.c_abort()
-                if not exchange.handler_started:
-                    exchange.cancel_before_start()
-            self._drop_pending()
-            if self.parse_mode == PARSE_H2:
-                self._finish_protocol_span(status, span, method, path)
-                transport.close()
-                return
+            # HTTP/2 setup failures must not emit HTTP/1 text. A response
+            # already on the wire must not get a second status spliced in.
             if (
-                self.active_exchange is not None
-                and self.active_exchange._status_code >= 0
+                self.parse_mode == PARSE_H2
+                or (
+                    self.active_exchange is not None
+                    and self.active_exchange._status_code >= 0
+                )
             ):
-                # A response is already on the wire. Do not splice a second
-                # status line into that stream.
+                self._abort_reading_and_pending()
                 self._finish_protocol_span(status, span, method, path)
                 transport.close()
                 return
             body = message.encode("utf-8")
-            date = self.date_box[0]
-            if exchange is not None and exchange._head_request:
-                transport.write(
-                    b"".join((
-                        _status_line(status),
-                        date,
-                        b"content-type: text/plain; charset=utf-8\r\n",
-                        b"content-length: %d\r\n" % len(body),
-                        b"connection: close\r\n",
-                        b"\r\n",
-                    ))
-                )
-            else:
-                transport.write(
-                    b"".join((
-                        _status_line(status),
-                        date,
-                        b"content-type: text/plain; charset=utf-8\r\n",
-                        b"content-length: %d\r\n" % len(body),
-                        b"connection: close\r\n",
-                        b"\r\n",
-                        body,
-                    ))
-                )
+            # Write before abort so recycle cannot reuse the exchange
+            # (or clear _head_request) while we still need it.
+            self._write_h1_error(
+                status,
+                body,
+                exchange is not None and exchange._head_request,
+            )
             self._finish_protocol_span(status, span, method, path)
+            self._abort_reading_and_pending()
+            self.reading_exchange = None
             transport.close()
         except Exception:
             try:
@@ -2019,7 +1972,7 @@ cdef class HttpProtocol:
         self.parse_mode = PARSE_H2
         rv = nghttp2_session_callbacks_new(&cbs)
         if rv != 0:
-            self._close_error(500, "Internal Server Error")
+            self._protocol_error(500, "Internal Server Error")
             return
         nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, _h2_on_begin_headers)
         nghttp2_session_callbacks_set_on_header_callback(cbs, _h2_on_header)
@@ -2030,7 +1983,7 @@ cdef class HttpProtocol:
         rv = nghttp2_option_new(&opt)
         if rv != 0:
             nghttp2_session_callbacks_del(cbs)
-            self._close_error(500, "Internal Server Error")
+            self._protocol_error(500, "Internal Server Error")
             return
         nghttp2_option_set_no_auto_window_update(opt, 1)
         nghttp2_option_set_no_closed_streams(opt, 1)
@@ -2050,7 +2003,7 @@ cdef class HttpProtocol:
         nghttp2_session_callbacks_del(cbs)
         if rv != 0:
             self.h2 = NULL
-            self._close_error(500, "Internal Server Error")
+            self._protocol_error(500, "Internal Server Error")
             return
         iv[0].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE
         iv[0].value = <uint32_t>H2_STREAM_WINDOW
@@ -2080,7 +2033,7 @@ cdef class HttpProtocol:
         rv = nghttp2_session_mem_recv(self.h2, <const uint8_t*>data, n)
         self.h2_in_recv = False
         if rv < 0:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
             return
         self._h2_window_update(0, True)
         self._h2_send()
@@ -2166,10 +2119,10 @@ cdef class HttpProtocol:
             if n == 0:
                 break
             if n < 0:
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             if self._h2_out_append(<const char*>data, n) != 0:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return
         self._h2_flush_out()
 
@@ -2190,7 +2143,7 @@ cdef class HttpProtocol:
             self._dispatch(ex, self._build_request(ex, ex))
             ex._h2_dispatched = True
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _h2_begin_stream(self, int32_t stream_id):
         cdef RequestExchange ex
@@ -2421,7 +2374,7 @@ cdef class HttpProtocol:
             if not ex._h2_dispatched and not self.rejected:
                 self._h2_dispatch_stream(ex)
         except Exception:
-            self._close_error(400, "Invalid HTTP request")
+            self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _h2_end_stream(self, int32_t stream_id):
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
@@ -2656,7 +2609,7 @@ cdef class HttpProtocol:
         else:
             nvs = <nghttp2_nv*>malloc(sizeof(nghttp2_nv) * <size_t>cap)
             if nvs == NULL:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return
             heap = 1
         try:
@@ -2690,7 +2643,7 @@ cdef class HttpProtocol:
                 )
             if rv != 0:
                 ex._h2_outbound = False
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             self._h2_send()
         finally:
@@ -2726,7 +2679,7 @@ cdef class HttpProtocol:
         else:
             nvs = <nghttp2_nv*>malloc(sizeof(nghttp2_nv) * <size_t>cap)
             if nvs == NULL:
-                self._close_error(500, "Internal Server Error")
+                self._protocol_error(500, "Internal Server Error")
                 return
             heap = 1
         try:
@@ -2758,7 +2711,7 @@ cdef class HttpProtocol:
                 )
             if rv != 0:
                 ex._h2_outbound = False
-                self._close_error(400, "Invalid HTTP request")
+                self._protocol_error(400, "Invalid HTTP request")
                 return
             self._h2_send()
         finally:

@@ -76,7 +76,9 @@ cdef int STREAM_CHUNK_CL = 256 * 1024
 cdef int SMALL_BODY_DRAIN = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
-cdef int POOL_MAX = 1024
+# Same-OS-thread spare only. Keep-alive reuse is the connection idle slot.
+# 16 covers close-then-accept and H2 stream turnover without hoarding.
+cdef int POOL_MAX = 16
 cdef int REQUEST_NAME_MAX = 256
 cdef int REQUEST_ARENA_RETAIN_MAX = 8 * 1024
 cdef int REQUEST_HEADERS_RETAIN_MAX = 64
@@ -124,7 +126,7 @@ cdef object _UNBOUND = object()
 
 
 cdef inline list _thread_pool():
-    """Per-OS-thread exchange free-list (connection affinity + free-threading)."""
+    """Same-OS-thread spare list. Never share an exchange across threads."""
     cdef list pool
     pool = getattr(_POOL_LOCAL, "pool", None)
     if pool is None:
@@ -2551,9 +2553,10 @@ cdef class RequestExchange:
             and (not self._body_active or self._body_complete)
             and (not self._http2 or not self._h2_outbound)
         ):
-            self._connection.recycle_exchange(self)
+            self._connection.release_exchange(self)
 
-    cdef void park(self):
+    cdef void detach(self):
+        """Drop request-scoped state. May sit in the connection idle slot."""
         if self.in_pool:
             return
         self.in_pool = True
@@ -2579,8 +2582,13 @@ cdef class RequestExchange:
         ):
             self._out_hold = None
 
-    cdef void return_to_pool(self):
+    cdef void recycle(self):
+        """Return to this thread's spare list, or drop if the list is full."""
         cdef list pool
+        if not self.in_pool:
+            self.detach()
+        if self._connection is None:
+            return
         self._free_compressors()
         self.headers.c_clear()
         self._clear_request_headers()

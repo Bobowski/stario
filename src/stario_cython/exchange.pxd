@@ -225,8 +225,8 @@ cdef class RequestExchange:
     cdef void handler_finished(self)
     cdef void cancel_before_start(self)
     cdef void _maybe_recycle(self)
-    cdef void park(self)
-    cdef void return_to_pool(self)
+    cdef void detach(self)
+    cdef void recycle(self)
     cdef void reset_body(self, bint expect_continue, Py_ssize_t expected_size) noexcept
     cdef void mark_nobody(self) noexcept
     cdef int _reserve_request_arena(self, Py_ssize_t bytes_needed) noexcept
