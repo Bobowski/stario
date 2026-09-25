@@ -1111,10 +1111,15 @@ async def test_pipeline_cap_rejects_ninth_queued_request() -> None:
         ]
         proto.data_received(b"".join(chunks))
         await asyncio.sleep(0)
-        assert response_status(transport.writes) == 429
+        # Nothing may be written ahead of request 0's response.
+        assert transport.writes == []
         release.set()
         await _drain(app)
-        assert handled == [0]
+        # The nine queued requests are answered in order, then the tenth
+        # gets 429 and the connection closes.
+        assert response_statuses(transport.writes) == [200] * 9 + [429]
+        assert handled == list(range(9))
+        assert transport.is_closing()
     finally:
         if not transport.is_closing():
             transport.close()
@@ -1229,6 +1234,14 @@ async def test_close_error_does_not_splice_status_into_started_response() -> Non
         assert response_status(transport.writes) == 200
         assert b"HTTP/1.1 400" not in raw
         assert b"partial" in raw
+        # The bad second request waits behind the in-flight stream; it does
+        # not cut that response off.
+        assert not transport.is_closing()
+        for task in list(app.tasks):
+            task.cancel()
+        await _drain(app)
+        raw = b"".join(transport.writes)
+        assert b"HTTP/1.1 400" not in raw
         assert transport.is_closing()
     finally:
         for task in list(app.tasks):

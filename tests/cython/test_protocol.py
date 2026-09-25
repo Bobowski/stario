@@ -897,10 +897,16 @@ async def test_large_single_read_pipeline_is_bounded() -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"".join(requests))
         await writer.drain()
-        response = await read_response(reader)
-        assert response.startswith(b"HTTP/1.1 429")
+        await asyncio.sleep(0.05)
         release.set()
-        assert handled == [0]
+        # Request 0 plus the eight queued ones are answered in order, then
+        # 429 for the next one and the connection closes.
+        for index in range(9):
+            response = await read_response(reader)
+            assert response.startswith(b"HTTP/1.1 200")
+            assert response.endswith(str(index).encode("ascii"))
+        assert (await read_response(reader)).startswith(b"HTTP/1.1 429")
+        assert handled == list(range(9))
         assert await reader.read() == b""
         writer.close()
         await writer.wait_closed()

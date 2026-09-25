@@ -262,6 +262,9 @@ cdef extern from "nghttp2/nghttp2.h":
         int32_t stream_id,
         uint32_t error_code,
     )
+    int nghttp2_session_want_read(nghttp2_session* session)
+    int nghttp2_session_want_write(nghttp2_session* session)
+    int32_t nghttp2_session_get_last_proc_stream_id(nghttp2_session* session)
     int nghttp2_submit_goaway(
         nghttp2_session* session,
         uint8_t flags,

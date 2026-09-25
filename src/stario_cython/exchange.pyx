@@ -1799,6 +1799,15 @@ cdef object _ascii_lower_latin1(const char* s, Py_ssize_t n):
 
 cdef object _host_without_port_n(const char* s, Py_ssize_t n):
     """Match ``stario.http.host.host_without_port`` on a wire Host value."""
+    cdef object host = _host_without_port_raw(s, n)
+    cdef Py_ssize_t m = len(host)
+    # ``example.com.`` (fully qualified) is the same host as ``example.com``.
+    if m > 1 and host[m - 1] == "." and host[m - 2] != ".":
+        return host[: m - 1]
+    return host
+
+
+cdef object _host_without_port_raw(const char* s, Py_ssize_t n):
     cdef Py_ssize_t start = 0
     cdef Py_ssize_t end = n
     cdef Py_ssize_t i
@@ -2848,6 +2857,9 @@ cdef class RequestExchange:
         self.match = EMPTY_MATCH
         self._clear_request_binding()
         self._clear_request_headers()
+        # No response state may survive into the next request.
+        self._completed = False
+        self._status_code = -1
         self.handler_done = False
         self.handler_started = False
         self._http2 = False
@@ -2867,6 +2879,7 @@ cdef class RequestExchange:
         self._h2_awaiting_headers = False
         self._h2_header_deadline = 0.0
         self._h2_outbound = False
+        self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
 
@@ -2881,6 +2894,7 @@ cdef class RequestExchange:
         self._h2_awaiting_headers = True
         self._h2_header_deadline = 0.0
         self._h2_outbound = False
+        self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
 
@@ -2940,6 +2954,8 @@ cdef class RequestExchange:
         self._target_host = None
         self._keep_alive = True
         self._path_flags = 0
+        self._protocol_status = 0
+        self._protocol_body = None
         self._path_off = 0
         self._path_n = 0
         self._query_off = 0
@@ -3177,6 +3193,10 @@ cdef class RequestExchange:
             pool.append(self)
 
     cdef void _done(self):
+        if self._body_active and self._consumed_as == CONSUMED_NONE:
+            # Response is out; an unread body may buffer again (up to the cap)
+            # so the connection can move on, as before backpressure.
+            self._connection.set_body_paused(self, False)
         self._connection.response_completed(self)
         self._maybe_recycle()
 
@@ -3641,9 +3661,18 @@ cdef class RequestExchange:
             return 0
         if self._body_buf is None:
             cap = DEFAULT_STREAM_CHUNK
+            # Reserve the declared length only when it is small (the body
+            # completes before dispatch) or body() is reading it; a declared
+            # 10 MB that nobody reads yet must not allocate 10 MB.
             if (
-                self._consumed_as != CONSUMED_STREAM
-                and self._expected_size > 0
+                self._expected_size > 0
+                and (
+                    self._consumed_as == CONSUMED_BODY
+                    or (
+                        self._consumed_as == CONSUMED_NONE
+                        and self._expected_size <= SMALL_BODY_DRAIN
+                    )
+                )
             ):
                 cap = self._expected_size
             elif self._consumed_as == CONSUMED_STREAM:
@@ -3769,11 +3798,26 @@ cdef class RequestExchange:
 
     cdef void _maybe_pause(self):
         if self._consumed_as == CONSUMED_STREAM:
-            if self._body_used > HIGH_WATER:
+            if (
+                self._body_used > HIGH_WATER
+                and self._body_used >= self._stream_max_chunk
+            ):
                 self._connection.set_body_paused(self, True)
             return
         if (
             self._consumed_as == CONSUMED_BODY
+            and self._body_used > BODY_HIGH_WATER
+        ):
+            self._connection.set_body_paused(self, True)
+            return
+        # Handler started but has not asked for the body yet (e.g. it is
+        # doing auth first): stop reading instead of buffering up to the
+        # body cap. Small bodies that complete before dispatch never get
+        # here (handler_started is False until dispatch).
+        if (
+            self._consumed_as == CONSUMED_NONE
+            and self.handler_started
+            and not self._completed
             and self._body_used > BODY_HIGH_WATER
         ):
             self._connection.set_body_paused(self, True)
@@ -3966,6 +4010,8 @@ cdef class RequestExchange:
                 yield out
             if self._body_complete:
                 return
+            # About to wait for bytes: reading must be on, or nothing arrives.
+            self._connection.set_body_paused(self, False)
             await self._wait_for_body_data()
 
     async def read(self, max_size=None):

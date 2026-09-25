@@ -268,6 +268,9 @@ cdef class RequestExchange:
     cdef object _target_host
     cdef bint _keep_alive
     cdef int _path_flags
+    # Protocol-level answer (keep-alive 413/431) sent in order at dispatch.
+    cdef int _protocol_status
+    cdef object _protocol_body
     cdef Py_ssize_t _path_off
     cdef Py_ssize_t _path_n
     cdef Py_ssize_t _query_off
@@ -309,6 +312,8 @@ cdef class RequestExchange:
     cdef bint _h2_awaiting_headers
     cdef double _h2_header_deadline
     cdef bint _h2_outbound
+    # Body consumer is behind: hold this stream's WINDOW_UPDATE (HTTP/2).
+    cdef bint _h2_flow_paused
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef object _handler_task
