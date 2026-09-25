@@ -191,8 +191,17 @@ cdef inline list _thread_pool():
     return pool
 
 
-cdef inline bint _is_bytes_like(object obj) noexcept:
-    return isinstance(obj, (bytes, bytearray, memoryview))
+cdef inline bint _is_bytes_like(object obj) except -1:
+    if isinstance(obj, (bytes, bytearray)):
+        return True
+    if isinstance(obj, memoryview):
+        # Lengths are counted with len(): only byte views count bytes.
+        if (<memoryview>obj).itemsize != 1:
+            raise TypeError(
+                "memoryview body parts must have itemsize 1; use .cast('B')"
+            )
+        return True
+    return False
 
 
 cdef inline void _require_bytes_like(object part):
@@ -2434,7 +2443,7 @@ cdef class RequestExchange:
         bint streaming,
         Py_ssize_t nbytes,
     ):
-        if self._req_encoding == ENCODING_NONE:
+        if self._req_encoding == ENCODING_NONE or self._head_request:
             return False
         if not streaming:
             if data is None or nbytes < self._compress_min_size:
@@ -3101,6 +3110,9 @@ cdef class RequestExchange:
     def on_handler_done(self, task):
         """Log/abort on failure, then recycle after the handler task."""
         cdef RequestHandle handle = self._handle
+        if task is not self._handler_task:
+            # A callback from a request this exchange no longer serves.
+            return
         if handle is not None:
             on_handler_done(handle, handle, task)
             # Drop our reference before recycle counts who still holds ``c``.
@@ -3507,6 +3519,7 @@ cdef class RequestExchange:
             )
         if not data:
             return self
+        n = self._body_nbytes(data)
         if self._status_code < 0:
             self.write_headers(200)
         if self._status_code >= 0 and not _may_have_body(self._status_code):
@@ -3516,11 +3529,18 @@ cdef class RequestExchange:
                     "204/304 and 1xx responses must not include a message body."
                 ),
             )
-        if self._head_request:
+        if self._head_request or n == 0:
             return self
-        n = self._body_nbytes(data)
-        if n == 0:
-            return self
+        if self._declared_length >= 0 and self._bytes_written + n > self._declared_length:
+            raise StarioRuntime(
+                "Response body exceeds Content-Length: writing "
+                f"{n} bytes after {self._bytes_written}, Content-Length is "
+                f"{self._declared_length}",
+                help_text=(
+                    "When Content-Length is set, write exactly that many bytes. "
+                    "Nothing past it is sent."
+                ),
+            )
         if self._http2:
             self._bytes_written += n
             if isinstance(data, (list, tuple)):
@@ -3577,9 +3597,11 @@ cdef class RequestExchange:
         if data:
             self.write(data)
         if self._head_request:
+            # Completed first: END_STREAM can close the stream synchronously,
+            # and an incomplete close reads as a client abort.
+            self._completed = True
             if self._http2:
                 self._connection.h2_end(self)
-            self._completed = True
             self._done()
             return
         if self._declared_length >= 0 and self._bytes_written != self._declared_length:
@@ -3592,8 +3614,8 @@ cdef class RequestExchange:
                 ),
             )
         if self._http2:
-            self._connection.h2_end(self)
             self._completed = True
+            self._connection.h2_end(self)
             self._done()
             return
         if self._declared_length < 0:

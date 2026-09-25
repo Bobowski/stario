@@ -670,6 +670,8 @@ cdef class CHttpProtocol(Connection):
     cdef bint h2_in_recv
     cdef bint h2_goaway_sent
     cdef bint h1_headers_too_large
+    # Set at headers-complete: later header callbacks are chunked trailers.
+    cdef bint h1_in_trailers
     cdef int deferred_status
     cdef list _write_waiters
     # Bound once per connection: skips a method lookup on every request.
@@ -1372,6 +1374,7 @@ cdef class CHttpProtocol(Connection):
         self.request_keep_alive = True
         self.header_timeout_reset = True
         self.h1_headers_too_large = False
+        self.h1_in_trailers = False
 
     cdef void _on_url(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
@@ -1382,7 +1385,7 @@ cdef class CHttpProtocol(Connection):
             self.h1_headers_too_large = True
 
     cdef void _on_header_field(self, const char* at, size_t length) noexcept:
-        if self.rejected or self.reading_exchange is None:
+        if self.rejected or self.reading_exchange is None or self.h1_in_trailers:
             return
         if self.h1_headers_too_large or self._header_too_large(length):
             return
@@ -1390,7 +1393,7 @@ cdef class CHttpProtocol(Connection):
             self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value(self, const char* at, size_t length) noexcept:
-        if self.rejected or self.reading_exchange is None:
+        if self.rejected or self.reading_exchange is None or self.h1_in_trailers:
             return
         if self.h1_headers_too_large or self._header_too_large(length):
             return
@@ -1398,7 +1401,8 @@ cdef class CHttpProtocol(Connection):
             self._protocol_error(400, "Invalid HTTP request")
 
     cdef void _on_header_value_complete(self) noexcept:
-        if self.h1_headers_too_large or self.rejected:
+        # Trailers (RFC 9110 §6.5) are dropped, never merged into headers.
+        if self.h1_headers_too_large or self.rejected or self.h1_in_trailers:
             return
         if self._header_too_large(HEADER_FIELD_OVERHEAD):
             return
@@ -1417,6 +1421,7 @@ cdef class CHttpProtocol(Connection):
         if self.rejected or self.reading_exchange is None:
             return
         exchange = self.reading_exchange
+        self.h1_in_trailers = True
         flags = stario_parser_flags(self.parser)
         content_length = stario_parser_content_length(self.parser)
         http_major = <int>llhttp_get_http_major(self.parser)
@@ -2596,7 +2601,10 @@ cdef class CHttpProtocol(Connection):
                 ex.cancel_before_start()
             else:
                 ex._completed = True
-                ex.handler_finished()
+                # A finished task whose done-callback is still queued
+                # recycles from that callback, not here.
+                if task is None or ex.handler_done:
+                    ex.handler_finished()
         else:
             ex._maybe_recycle()
         if not self.h2_streams and not self.rejected:
@@ -2813,9 +2821,10 @@ cdef class CHttpProtocol(Connection):
             )
             if body is None:
                 payload = b""
-            elif PyBytes_Check(body) or PyByteArray_Check(body):
+            elif PyBytes_Check(body):
                 payload = body
             else:
+                # Sent after respond() returns: never alias a mutable buffer.
                 payload = bytes(body)
             if ex._head_request:
                 payload = b""
@@ -2920,7 +2929,9 @@ cdef class CHttpProtocol(Connection):
         cdef char* dst
         cdef const char* src
         if pending == b"" or pending is None:
-            if PyBytes_Check(data) or PyByteArray_Check(data):
+            # A caller's bytearray is copied: it is extended in place below
+            # and may be reused by the caller before nghttp2 sends it.
+            if PyBytes_Check(data):
                 ex._h2_pending = data
             else:
                 pending = bytearray()
