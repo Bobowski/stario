@@ -88,8 +88,8 @@ Granian (LRU always hot). This capture is the honest one.
   Python `__init__`). Keep-alive does not reuse the Request object.
 - **Lazy** `ParsedQuery` / cookies / host until first read. Plaintext and
   JSON GET never allocate them.
-- Protocol binds the Python Router **LRU** (`app._lookup`, max 1024)
-  directly. Trailing-slash **308** on the decoded path.
+- Protocol walks the compiled trie from the raw path (per-segment decode).
+  Trailing-slash and dot-segment **308** from the raw path.
 - 4.2 app APIs: `Route`, `c.match`, `Assets`, `stario.json`. Handlers are
   `async def(c, w)`.
 - Bodies with `Content-Length` ≤ **256 KiB** complete before the handler
@@ -103,6 +103,28 @@ Granian (LRU always hot). This capture is the honest one.
 - Official suite shape: static GET, one interpolating request-fields GET,
   async uploads (`await asyncio.sleep(0)`) from small JSON through 2MB
   buffer / stream / multipart. Both Stario runner targets are Cython.
+
+### Request lifetime and paths
+
+- **Handle per dispatch.** The exchange (arena, buffers, compressors) is
+  pooled; `c` / `w` is a small `RequestHandle` created per dispatch (one
+  object for both). When the exchange recycles, the handle is finished:
+  writes raise, `end()`/`abort()` no-op, reads still describe its request.
+  Recycle checks reference counts: if user code still holds the handle,
+  `c.req`, or its header view, those take a private copy of the arena; if
+  not, the handle and view are reused for the next request (no one can tell).
+  `tests/cython/test_request_lifetime.py` pins that plain HTTP/1, pipelined,
+  and HTTP/2 requests never take the copy path.
+- **Paths.** The router gets the raw path, splits on `/`, and decodes each
+  segment (no `str` for ASCII paths without `%`). `scan_request_path` does the
+  RFC 3986 checks once in C: 400 for bad escapes / invalid UTF-8 / decoded
+  controls / `#`; 308 for dot segments and trailing slashes. Invalid targets
+  are answered in order through the exchange, so HTTP/1 keep-alive survives
+  and HTTP/2 fails only that stream. `OPTIONS *` is 204; absolute-form uses
+  the URI authority as the host.
+- **Cost.** Versus the previous hot path, about +525 instructions per keep-alive
+  `GET /plaintext` and +660 per `GET /user/{id}` in-process (callgrind), i.e.
+  under ~1% of a request once kernel and event loop are included.
 
 ### Missing / not doing (on purpose)
 

@@ -36,7 +36,8 @@ def _echo_app() -> App:
     async def show(c, w) -> None:
         params = ",".join(f"{k}={v}" for k, v in sorted(c.match.params.items()))
         responses.text(
-            w, f"{c.req.method} {c.req.path} {c.req.raw_path.decode()} [{params}] {c.req.host}"
+            w,
+            f"{c.req.method} {c.req.path} {c.req.raw_path.decode()} [{params}] {c.req.host}",
         )
 
     for route in (
@@ -64,8 +65,14 @@ async def _get(port: int, target: bytes, host: bytes = b"t") -> bytes:
 async def test_encoded_slash_is_data_inside_one_fully_decoded_segment() -> None:
     async with running_server(_echo_app()) as port:
         assert _body(await _get(port, b"/a/x%2Fy")) == b"GET /a/x/y /a/x%2Fy [x=x/y] t"
-        assert _body(await _get(port, b"/a/x%252Fy")) == b"GET /a/x%2Fy /a/x%252Fy [x=x%2Fy] t"
-        assert _body(await _get(port, b"/%61/%C3%A9")) == "GET /a/é /%61/%C3%A9 [x=é] t".encode()
+        assert (
+            _body(await _get(port, b"/a/x%252Fy"))
+            == b"GET /a/x%2Fy /a/x%252Fy [x=x%2Fy] t"
+        )
+        assert (
+            _body(await _get(port, b"/%61/%C3%A9"))
+            == "GET /a/é /%61/%C3%A9 [x=é] t".encode()
+        )
         assert _body(await _get(port, b"/files/a%2Fb/c")) == (
             b"GET /files/a/b/c /files/a%2Fb/c [rest=a/b/c] t"
         )
@@ -96,9 +103,20 @@ async def test_dot_segments_and_trailing_slash_redirect_to_canonical_path(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "target",
-    [b"/a/%0D%0Ax", b"/a/%7F", b"/a/%00", b"/a#frag", b"/a?x=1#frag", b"/a/%zz", b"/a/%C3", b"*"],
+    [
+        b"/a/%0D%0Ax",
+        b"/a/%7F",
+        b"/a/%00",
+        b"/a#frag",
+        b"/a?x=1#frag",
+        b"/a/%zz",
+        b"/a/%C3",
+        b"*",
+    ],
 )
-async def test_invalid_targets_answer_400_and_keep_the_connection(target: bytes) -> None:
+async def test_invalid_targets_answer_400_and_keep_the_connection(
+    target: bytes,
+) -> None:
     async with running_server(_echo_app()) as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"GET " + target + b" HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -124,7 +142,9 @@ async def test_options_asterisk_is_answered_by_the_server() -> None:
 @pytest.mark.asyncio
 async def test_absolute_form_routes_on_path_and_uses_uri_authority_as_host() -> None:
     async with running_server(_echo_app()) as port:
-        response = await _get(port, b"HTTP://API.Example.com:8080/x/7?q=1", host=b"other.test")
+        response = await _get(
+            port, b"HTTP://API.Example.com:8080/x/7?q=1", host=b"other.test"
+        )
         assert _status(response) == 200
         assert _body(response).endswith(b"[id=7] api.example.com")
         assert _body(await _get(port, b"http://t")).startswith(b"GET / / []")
@@ -230,7 +250,8 @@ async def test_respond_rejects_non_final_status() -> None:
     app.add(Route("GET /"), informational)
     async with running_server(app) as port:
         assert _status(await _get(port, b"/")) == 200
-    assert errors and "Invalid response status" in errors[0]
+    assert errors
+    assert "Invalid response status" in errors[0]
 
 
 def test_find_handler_takes_the_raw_path() -> None:

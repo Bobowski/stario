@@ -1,6 +1,7 @@
 """Writer protocol: status, headers, and body for one response.
 
-The Cython ``RequestExchange`` implements this. TestClient has its own writer.
+The Cython ``RequestHandle`` implements this (one per handler call; it raises
+once the handler has returned). TestClient has its own writer.
 There is no Python production writer.
 """
 

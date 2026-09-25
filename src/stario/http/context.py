@@ -1,6 +1,7 @@
 """Request-scoped handler bundle: Protocol plus route match and ``alive()``.
 
-Production ``c`` is the Cython ``RequestExchange``. TestClient supplies its own
+Production ``c`` is the Cython ``RequestHandle`` (one per handler call, in front
+of the pooled ``RequestExchange``). TestClient supplies its own
 context. ``Match`` and ``_Alive`` stay as small Python helpers.
 """
 

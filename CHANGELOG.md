@@ -21,6 +21,27 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - The HTTP protocol schedules `find_handler` then `create_task(handler(c, w))`
   instead of `create_task(app(c, w))`. Trailing-slash 308 is written inline in
   the Cython protocol (no handler task).
+- **`c` / `w` belong to one handler call.** Each dispatch gets a fresh handle
+  (one object is both `c` and `w`). Once the handler has returned and the
+  response is complete, the handle is finished: `respond()`, `write()`,
+  `write_headers()`, and `w.headers` raise `StarioRuntime`; `end()` /
+  `abort()` are no-ops; `req`, `match`, `state`, `span`, and `status_code`
+  still describe that request. A `c.req` (or its headers, query, cookies)
+  kept past the handler keeps its own data. Its body is still readable if the
+  handler read it, otherwise `body()` raises `StarioRuntime`.
+- **Paths follow RFC 3986 / RFC 9112.** Routing splits the raw path on `/`
+  and percent-decodes each segment, so `%2F` is data inside one segment and
+  params are fully decoded (`/files/a%2Fb` → `name="a/b"`, `%252F` →
+  `"%2F"`). `req.path` is the fully decoded path and the new `req.raw_path`
+  is the path as sent. `find_handler(host, path, method)` takes the raw path.
+  Dot segments (`.`, `..`, `%2E` forms) 308 to the normalized path, like a
+  trailing slash. 400 (in order, keep-alive preserved, HTTP/2 stream only)
+  for a malformed `%XX`, invalid UTF-8, a decoded control byte, a `#`, or
+  `*` with any method but `OPTIONS`. `OPTIONS *` answers 204. HTTP/1
+  absolute-form (`GET http://host/path`) routes on its path and uses the URI
+  authority as the host. Route patterns reject `.` / `..` segments.
+- 204 and 304 responses no longer send `Content-Length` (or `Content-Type`).
+  `respond()` / `write_headers()` reject statuses outside 200–599.
 
 ### Added
 

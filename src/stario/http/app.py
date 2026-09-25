@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import threading
 from collections.abc import Coroutine
-from typing import Any
+from typing import Any, cast
 
 from stario.exceptions import StarioError
 from stario.http.context import Context
@@ -238,7 +238,9 @@ class App(Router):
         path = c.req.path
         raw_path = c.req.raw_path
         host = c.req.host if self.host_routing else ""
-        status, canonical = canonical_request_path(raw_path)
+        status, canonical = cast(
+            tuple[int, bytes | None], canonical_request_path(raw_path)
+        )
         if status == 400:
             w.respond(b"Invalid HTTP request", b"text/plain; charset=utf-8", 400)
             finish_request_span(c.span, status=400, method=c.req.method, path=path)

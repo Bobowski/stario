@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from stario_cython.exchange import _retained_detach_count
 
 import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioRuntime
-from stario_cython.exchange import _retained_detach_count
 from tests.cython.http import read_response, running_server
 
 
@@ -71,7 +71,9 @@ async def test_retained_request_views_survive_a_freed_arena() -> None:
     async with running_server(app) as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
-            b"GET /keep?" + query + b" HTTP/1.1\r\nHost: a\r\nX-Big: "
+            b"GET /keep?"
+            + query
+            + b" HTTP/1.1\r\nHost: a\r\nX-Big: "
             + b"b" * 9000
             + b"\r\nConnection: close\r\n\r\n"
         )
@@ -102,7 +104,9 @@ async def test_retained_request_body_is_cached_or_gone() -> None:
     app.add(Route("POST /ignore"), ignore_it)
     async with running_server(app) as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"POST /read HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello")
+        writer.write(
+            b"POST /read HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello"
+        )
         await read_response(reader)
         big = 300 * 1024
         writer.write(
@@ -251,8 +255,17 @@ async def test_plain_requests_never_take_the_retained_copy_path() -> None:
     before = _retained_detach_count()
     async with running_server(app) as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        for target in (b"/sync?q=1", b"/async", b"/post", b"/stream", b"/missing", b"/sync/"):
-            writer.write(b"GET " + target + b" HTTP/1.1\r\nHost: a\r\nCookie: a=1\r\n\r\n")
+        for target in (
+            b"/sync?q=1",
+            b"/async",
+            b"/post",
+            b"/stream",
+            b"/missing",
+            b"/sync/",
+        ):
+            writer.write(
+                b"GET " + target + b" HTTP/1.1\r\nHost: a\r\nCookie: a=1\r\n\r\n"
+            )
             if target == b"/stream":
                 await reader.readuntil(b"0\r\n\r\n")
             else:
@@ -260,7 +273,8 @@ async def test_plain_requests_never_take_the_retained_copy_path() -> None:
         writer.write(b"POST /body HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi")
         await read_response(reader)
         writer.write(
-            b"GET /async HTTP/1.1\r\nHost: a\r\n\r\n" b"GET /sync HTTP/1.1\r\nHost: a\r\n\r\n"
+            b"GET /async HTTP/1.1\r\nHost: a\r\n\r\n"
+            b"GET /sync HTTP/1.1\r\nHost: a\r\n\r\n"
         )
         await read_response(reader)
         await read_response(reader)
