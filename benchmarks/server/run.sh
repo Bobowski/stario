@@ -286,7 +286,7 @@ build_stario_cython() {
     exit 1
   fi
   echo "  building stario_cython extensions (PKG_CONFIG_PATH=$pkg_config_path)"
-  (cd "$ROOT" && PKG_CONFIG_PATH="$pkg_config_path" "$python" setup.py)
+  (cd "$ROOT" && PKG_CONFIG_PATH="$pkg_config_path" "$python" setup.py build_ext --inplace)
 }
 
 target_label() {
