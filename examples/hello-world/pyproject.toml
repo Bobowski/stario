@@ -2,7 +2,10 @@
 name = "hello-world"
 version = "0.0.0"
 description = "Stario hello world — one route, one HTML page (main:bootstrap)"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "stario>=4,<5",
 ]
+
+[tool.uv.sources]
+stario = { path = "../../" }

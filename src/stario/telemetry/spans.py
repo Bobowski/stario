@@ -1,12 +1,64 @@
 """Concrete `Span` implementations used by bundled tracers and tests."""
 
+from __future__ import annotations
+
+import os
 import time
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 from uuid import UUID
 
 from .core import Attributes, EventBody, Span, Tracer
 from .formatters import format_exception_for_telemetry, serialize_event_body
+
+# CPython 3.14 `uuid.uuid7` (RFC 9562 Method 1). stdlib uuid7 is 3.14-only.
+_RFC_4122_VERSION_7_FLAGS = 0x70008000000000000000
+_last_timestamp_v7: int | None = None
+_last_counter_v7 = 0
+_span_id_lock = Lock()
+
+
+def _uuid7_get_counter_and_tail() -> tuple[int, int]:
+    rand = int.from_bytes(os.urandom(10))
+    # 42-bit counter with MSB set to 0
+    counter = (rand >> 32) & 0x1FF_FFFF_FFFF
+    tail = rand & 0xFFFF_FFFF
+    return counter, tail
+
+
+def _span_id() -> UUID:
+    """UUIDv7 for span and trace ids. Same bits as CPython 3.14 `uuid.uuid7`."""
+    global _last_timestamp_v7, _last_counter_v7
+
+    # CPython uuid7 is not locked. Tracers allocate ids from several threads.
+    with _span_id_lock:
+        timestamp_ms = time.time_ns() // 1_000_000
+
+        if _last_timestamp_v7 is None or timestamp_ms > _last_timestamp_v7:
+            counter, tail = _uuid7_get_counter_and_tail()
+        else:
+            if timestamp_ms < _last_timestamp_v7:
+                timestamp_ms = _last_timestamp_v7 + 1
+            counter = _last_counter_v7 + 1
+            if counter > 0x3FF_FFFF_FFFF:
+                timestamp_ms += 1
+                counter, tail = _uuid7_get_counter_and_tail()
+            else:
+                tail = int.from_bytes(os.urandom(4))
+
+        unix_ts_ms = timestamp_ms & 0xFFFF_FFFF_FFFF
+        counter_hi = (counter >> 30) & 0x0FFF
+        counter_lo = counter & 0x3FFF_FFFF
+        value = unix_ts_ms << 80
+        value |= counter_hi << 64
+        value |= counter_lo << 32
+        value |= tail & 0xFFFF_FFFF
+        value |= _RFC_4122_VERSION_7_FLAGS
+        result = UUID(int=value)
+        _last_timestamp_v7 = timestamp_ms
+        _last_counter_v7 = counter
+        return result
 
 
 @dataclass(slots=True, eq=False)
@@ -222,6 +274,30 @@ class RecordingSpan:
     attributes: dict[str, Any] | None = None
     events: list[RecordedEvent] | None = None
     links: list[RecordedLink] | None = field(default=None, repr=False)
+
+    @classmethod
+    def create(
+        cls,
+        tracer: Tracer,
+        name: str,
+        attributes: Attributes | None = None,
+        /,
+        *,
+        parent: Span | None = None,
+    ) -> RecordingSpan:
+        span_id = _span_id()
+        if parent is None:
+            trace_id, parent_id = span_id, None
+        else:
+            trace_id, parent_id = parent.trace_id, parent.id
+        return cls(
+            span_id,
+            tracer,
+            trace_id,
+            parent_id,
+            name,
+            attributes=dict(attributes) if attributes else None,
+        )
 
     @property
     def started(self) -> bool:

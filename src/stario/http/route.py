@@ -9,10 +9,14 @@ join as `" ".join(parts)` → `<METHOD> <url>`. `method=`, `host=`, and
 `fragment=` to `href()` only. Host and path are parsed once at construct.
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
 from typing import NoReturn, cast
 from urllib.parse import quote, urlencode
-from warnings import deprecated, warn
+from warnings import warn
+
+from typing_extensions import deprecated
 
 from stario.exceptions import StarioError
 from stario.http.segment import Segment, parse_route

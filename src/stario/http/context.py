@@ -2,6 +2,8 @@
 Request-scoped bundle for handlers: app, request, telemetry, routing, state, and client lifetime.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping

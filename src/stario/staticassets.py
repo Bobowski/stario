@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal
-from warnings import deprecated
 
 import xxhash
+from typing_extensions import deprecated
 
 import stario.responses as responses
 from stario.exceptions import StarioError

@@ -727,7 +727,7 @@ class TestBakedAttributeSlots:
 
         with pytest.raises(
             StarioError,
-            match=r"cannot be used as attribute names|cannot use .* as a dict key",
+            match=r"cannot be used as attribute names|cannot use .* as a dict key|unhashable type",
         ):
             baked(bad)
 

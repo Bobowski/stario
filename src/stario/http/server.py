@@ -390,7 +390,7 @@ class Server:
                     loop.call_soon_threadsafe(on_signal)
 
                 signal.signal(sig, _on_signal)
-            except RuntimeError, ValueError:
+            except (RuntimeError, ValueError):
                 continue
 
         try:
@@ -402,7 +402,7 @@ class Server:
                         signal.signal(sig, signal.SIG_IGN)
                     else:
                         signal.signal(sig, previous)
-                except RuntimeError, ValueError:
+                except (RuntimeError, ValueError):
                     continue
 
     @contextmanager

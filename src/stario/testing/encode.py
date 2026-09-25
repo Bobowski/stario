@@ -2,12 +2,13 @@
 
 import zlib
 from collections.abc import Mapping, Sequence
-from compression import zstd
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from typing import Any
 from urllib.parse import urlencode
-from uuid import uuid7
+from uuid import uuid4
+
+import zstandard as zstd
 
 from stario.http.compression import brotli_decompress
 from stario.http.headers import Headers
@@ -41,7 +42,7 @@ def _encode_multipart(
             "Multipart requests accept mapping or sequence form `data` only."
         )
 
-    boundary = f"stario-boundary-{uuid7().hex}"
+    boundary = f"stario-boundary-{uuid4().hex}"
     parts: list[bytes] = []
 
     if data is not None:

@@ -8,7 +8,7 @@ so the refresh thread is not part of the assertions.
 
 import io
 import threading
-from uuid import UUID, uuid4, uuid7
+from uuid import UUID, uuid4
 
 from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.spans import RecordedEvent, RecordedLink, RecordingSpan
@@ -37,7 +37,7 @@ def make_span(
     events: list[RecordedEvent] | None = None,
     links: list[RecordedLink] | None = None,
 ) -> RecordingSpan:
-    span_id = uuid7()
+    span_id = uuid4()
     return RecordingSpan(
         id=span_id,
         tracer=_NOOP,

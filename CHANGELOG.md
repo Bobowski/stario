@@ -8,20 +8,23 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Added
 
-- `stario.serve(bootstrap, …)` — async HTTP server entry. Pass listen
-  settings as keywords (`port=`, `host=`, …) or a prepared `ServerConfig`.
-  Wrap it with the loop implementation you want:
-  `asyncio.run(stario.serve(bootstrap, port=9000))` or
-  `uvloop.run(stario.serve(bootstrap))`. After shutdown the coroutine finishes
-  and the caller can continue. `Server` takes a `ServerConfig` and an
-  already-entered tracer. `serve()` creates a TTY or JSON tracer when none is
-  passed. `stario serve` calls `Server(...).run()`.
+- `stario.serve(bootstrap, …)` — run the HTTP server on a loop you start:
+  `asyncio.run(stario.serve(bootstrap, port=9000))` or `uvloop.run(...)`.
+  Listen settings are keywords (`host`, `port`, `unix_socket`, …) or a
+  prepared `config=`. After shutdown the coroutine finishes and the caller
+  can continue. Omit `tracer` to get a TTY or JSON tracer for the call.
 
 ### Changed
 
-- `Server` does not enter or exit the tracer. Pass an open tracer. `serve()`
-  still opens a default TTY or JSON tracer when none is passed.
-- Unix-socket support is checked when `Server` binds, not in the CLI.
+- Python 3.12 and 3.13 are supported. The package requires Python 3.12 or newer.
+- zstd uses the `zstandard` package on every Python. Stario no longer imports
+  stdlib `compression.zstd`.
+- Span and trace ids use the CPython 3.14 UUIDv7 bit layout
+  (RFC 9562 Method 1) in `RecordingSpan.create`.
+- `Server` raises if `unix_socket` is set and the platform has no `AF_UNIX`.
+  `stario serve` / `stario watch` no longer check this before start.
+- Startup span `server.event_loop` is the loop that is running, not
+  `ServerConfig.event_loop`.
 
 ## 4.2.0 - 2026-09-21
 

@@ -10,6 +10,8 @@ the same output stream while the tracer is active.
 threads, or I/O.
 """
 
+from __future__ import annotations
+
 import shutil
 import sys
 import threading
@@ -20,7 +22,7 @@ from itertools import chain
 from types import TracebackType
 from typing import Any, TextIO, cast
 from unicodedata import combining, east_asian_width
-from uuid import UUID, uuid7
+from uuid import UUID
 
 from stario._terminal import RESET as _RESET
 from stario._terminal import SGR, color_enabled, enable_vt_for_stream
@@ -152,7 +154,7 @@ def _span_status_style(span: RecordingSpan) -> str:
             continue
         try:
             code = int(span.attributes[key])
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             continue
         if 200 <= code < 300:
             return "green"
@@ -515,21 +517,7 @@ class TTYTracer:
     ) -> RecordingSpan:
         if not self._running:
             raise RuntimeError("TTYTracer must be entered before creating spans.")
-        span_id = uuid7()
-        if parent is None:
-            trace_id = span_id
-            parent_id = None
-        else:
-            trace_id = parent.trace_id
-            parent_id = parent.id
-        span = RecordingSpan(
-            span_id,
-            self,
-            trace_id,
-            parent_id,
-            name,
-            attributes=dict(attributes) if attributes else None,
-        )
+        span = RecordingSpan.create(self, name, attributes, parent=parent)
         with self._lock:
             if span.parent_id is None:
                 self._roots[span.id] = span

@@ -6,6 +6,8 @@ follow RFC behavior even when common clients use parallel connections instead. A
 so shutdown can observe the same task set the app registered.
 """
 
+from __future__ import annotations
+
 import asyncio
 from collections import deque
 from collections.abc import Callable
@@ -296,7 +298,7 @@ class HttpProtocol(asyncio.Protocol):
         try:
             method = decode_method(parser.get_method())
             path_str = decode_path(parsed_url.path)
-        except UnicodeDecodeError, ValueError:
+        except (UnicodeDecodeError, ValueError):
             self._close_with_error(400, "Invalid request")
             return
 

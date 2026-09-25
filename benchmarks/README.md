@@ -90,7 +90,7 @@ they do not bundle a Pydantic-style request validation layer.
 
 - `uv`
 - `wrk`
-- Python compatible with Stario (3.14+)
+- Python compatible with Stario (3.12+)
 
 All targets run on `uvloop`: Stario uses `STARIO_LOOP=uvloop`, FastAPI/Uvicorn
 uses `--loop uvloop`, and Sanic uses its uvloop-backed default when installed.

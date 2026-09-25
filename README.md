@@ -27,7 +27,7 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 ## Requirements
 
-Python 3.14 or newer is required. The package tracks current Python and the standard library (including APIs the framework builds on) rather than supporting older runtimes.
+Python 3.12 or newer is required.
 
 **uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
 

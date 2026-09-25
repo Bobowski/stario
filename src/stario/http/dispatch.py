@@ -1,10 +1,13 @@
 """Route table: register `Route` values on a trie and resolve `(host, path, method)`."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
-from warnings import deprecated
+
+from typing_extensions import deprecated
 
 import stario.responses as responses
 from stario.exceptions import StarioError

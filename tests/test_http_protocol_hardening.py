@@ -7,7 +7,6 @@ exceptions from the protocol layer. See `SECURITY.md` for scope and limitations.
 
 import asyncio
 import random
-from typing import Any
 
 import pytest
 
@@ -32,7 +31,7 @@ class _RecordingTransport(asyncio.Transport):
         self._closing = False
         self.reading_calls: list[str] = []
 
-    def write(self, data: bytes | bytearray | memoryview[Any]) -> None:
+    def write(self, data: bytes | bytearray | memoryview) -> None:
         assert not self._closing, "write after transport close"
         self.writes.append(bytes(data))
 

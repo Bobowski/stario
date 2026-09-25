@@ -5,7 +5,6 @@ import sys
 import threading
 import time
 from typing import Any, Self, cast
-from uuid import uuid7
 
 from .core import Attributes, Span, TelemetryStats, Tracer
 from .spans import RecordingSpan
@@ -120,20 +119,11 @@ class _BufferedTracer:
             raise RuntimeError(
                 f"{self._tracer_type_name} must be entered before creating spans."
             )
-        span_id = uuid7()
-        if parent is None:
-            trace_id = span_id
-            parent_id = None
-        else:
-            trace_id = parent.trace_id
-            parent_id = parent.id
-        return RecordingSpan(
-            span_id,
+        return RecordingSpan.create(
             cast(Tracer, self),
-            trace_id,
-            parent_id,
             name,
-            attributes=dict(attributes) if attributes else None,
+            attributes,
+            parent=parent,
         )
 
     def on_end(self, span: Span) -> None:
