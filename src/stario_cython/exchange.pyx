@@ -3191,10 +3191,12 @@ cdef class RequestExchange:
         if self.in_pool:
             return
         self.in_pool = True
+        self._generation += 1
         wake_waiters(self._drain_waiters)
         self._detach_views()
         self._clear_request_binding()
         self._cached = None
+        self._wake()
         self._data_ready = None
         self._h2_pending = b""
         self._h2_pending_off = 0
@@ -4004,6 +4006,8 @@ cdef class RequestExchange:
         self._maybe_recycle()
 
     async def _wait_for_body_data(self):
+        cdef unsigned long generation = self._generation
+        cdef object ready
         if self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
             self._raise_abort()
@@ -4013,14 +4017,18 @@ cdef class RequestExchange:
             self._raise_abort()
         if self._data_ready is None:
             self._data_ready = asyncio.Event()
+        ready = self._data_ready
         self._waiting = True
         self._reset_stall_timer()
         try:
-            await self._data_ready.wait()
+            await ready.wait()
         finally:
-            self._waiting = False
-            self._cancel_stall_timer()
-        self._data_ready.clear()
+            if generation == self._generation:
+                self._waiting = False
+                self._cancel_stall_timer()
+        if generation != self._generation:
+            raise StarioRuntime(BODY_GONE_ERROR)
+        ready.clear()
         if self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
             self._raise_abort()
@@ -4028,6 +4036,7 @@ cdef class RequestExchange:
     async def stream(self, max_chunk=None):
         cdef object out
         cdef Py_ssize_t chunk_size
+        cdef unsigned long generation = self._generation
         if self._discard_body:
             raise StarioRuntime(
                 "Request body is no longer available after its handler finished."
@@ -4075,6 +4084,8 @@ cdef class RequestExchange:
                 if self._body_used < LOW_WATER:
                     self._connection.set_body_paused(self, False)
                 yield out
+                if generation != self._generation:
+                    raise StarioRuntime(BODY_GONE_ERROR)
             if self._body_complete:
                 return
             # About to wait for bytes: reading must be on, or nothing arrives.

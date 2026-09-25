@@ -291,6 +291,8 @@ cdef class RequestExchange:
 
     cdef object _cached
     cdef object _data_ready
+    # Bumped on detach: body readers from an earlier request stop reading.
+    cdef unsigned long _generation
     cdef double _stall_deadline
     cdef uint64_t _stall_touch
     cdef uint64_t _stall_seen
