@@ -96,8 +96,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   pre-4.2 Cython). Static `(host, path, method)` still hits an exact map
   and reuses that `Match`. Parameterized paths reuse the resolved
   `(handler, route, Match)` while they stay in the cache. Exact hosts
-  have their own path trie. Exact-only path chains are radix-compressed.
-  One cursor walks the trie on a miss.
+  have their own path trie. One cursor walks the trie on a miss, one
+  segment per node, so route insertion order never changes a match.
 - Handler-task finish is `stario.http.invoke.on_handler_done`: log, write 500
   if nothing was sent, abort if a body was started but not finished, close
   the span. No auto-`end()`. A write-then-raise still logs (`Handler failed`);

@@ -31,9 +31,9 @@ jobs:
             echo "Commit the version bump and changelog, then tag that commit."
             exit 1
           fi
-          if ! grep -q "^## ${version} " CHANGELOG.md; then
-            echo "CHANGELOG.md has no '## ${version}' heading."
-            echo "Move Unreleased notes into that section in the bump commit."
+          if ! grep -qE "^## ${version//./\\.} - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## ${version} - YYYY-MM-DD' heading."
+            echo "Date the release section in the bump commit."
             exit 1
           fi
 
