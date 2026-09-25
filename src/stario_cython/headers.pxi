@@ -657,13 +657,13 @@ cdef class Headers:
     def add(self, str name, str value):
         self.c_add(_encode_name(name), _encode_value(value))
 
-    def unsafe_add(self, name, value):
+    def unsafe_add(self, bytes name not None, bytes value not None):
         self.c_add(name, value)
 
     def set(self, str name, str value):
         self.c_set(_encode_name(name), _encode_value(value))
 
-    def unsafe_set(self, name, value):
+    def unsafe_set(self, bytes name not None, bytes value not None):
         self.c_set(name, value)
 
     def setdefault(self, str name, str value):
@@ -682,7 +682,7 @@ cdef class Headers:
             return default
         return wire.decode("latin-1")
 
-    def unsafe_get(self, name, default=None):
+    def unsafe_get(self, bytes name not None, default=None):
         cdef object value = self.c_get(name)
         if value is None:
             return default
@@ -694,8 +694,8 @@ cdef class Headers:
             for value in self.unsafe_getlist(_encode_name(name))
         ]
 
-    def unsafe_getlist(self, name):
-        cdef bytes key = <bytes>name
+    def unsafe_getlist(self, bytes name not None):
+        cdef bytes key = name
         cdef char buf[NAME_STACK]
         cdef const char* src = PyBytes_AS_STRING(key)
         cdef Py_ssize_t n = PyBytes_GET_SIZE(key)
@@ -712,7 +712,7 @@ cdef class Headers:
     def remove(self, str name):
         self.c_remove(_encode_name(name))
 
-    def unsafe_remove(self, name):
+    def unsafe_remove(self, bytes name not None):
         self.c_remove(name)
 
     def items(self):

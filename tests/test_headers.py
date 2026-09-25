@@ -106,6 +106,22 @@ class TestHeadersUnsafe:
         h.unsafe_remove(b"x-custom")
         assert h.unsafe_get(b"x-custom") is None
 
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("unsafe_set", ("content-type", b"text/html")),
+            ("unsafe_set", (b"content-type", "text/html")),
+            ("unsafe_add", (b"x", bytearray(b"v"))),
+            ("unsafe_get", ("x",)),
+            ("unsafe_getlist", (None,)),
+            ("unsafe_remove", (memoryview(b"x"),)),
+        ],
+    )
+    def test_unsafe_methods_reject_non_bytes(self, method: str, args: tuple) -> None:
+        h = Headers()
+        with pytest.raises(TypeError):
+            getattr(h, method)(*args)
+
 
 class TestHeaderMutators:
     """Test header mutators."""
