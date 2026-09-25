@@ -122,9 +122,25 @@ Granian (LRU always hot). This capture is the honest one.
   are answered in order through the exchange, so HTTP/1 keep-alive survives
   and HTTP/2 fails only that stream. `OPTIONS *` is 204; absolute-form uses
   the URI authority as the host.
-- **Cost.** Versus the previous hot path, about +525 instructions per keep-alive
-  `GET /plaintext` and +660 per `GET /user/{id}` in-process (callgrind), i.e.
-  under ~1% of a request once kernel and event loop are included.
+- **Cost.** The handle and path checks cost about +525 instructions per
+  keep-alive `GET /plaintext` in-process (callgrind). The hot-path cuts below
+  more than pay for it: versus `ca93709` (before any of this), plaintext is
+  14,580 → 13,498 instructions per request and `GET /user/{id}` 30,390 →
+  25,868.
+
+### Hot-path cuts (2026-09-25)
+
+- `Match(pattern, params)` is built in C (allocate + slot fill + mappingproxy)
+  instead of running `Match.__init__` in Python (~290 ns per param hit).
+- All 100–599 status lines are prebuilt (was an `HTTPStatus` lookup per
+  response for anything but ten codes).
+- Route methods are interned at compile time and looked up with
+  `PyDict_GetItem`; `Task(...)` gets a per-connection kwargs dict; transport
+  `is_closing` / `writelines` and `Task.done` are bound once.
+- The connection interface the exchange calls is `cdef` (no Python-override
+  check per call); `get_buffer` / `buffer_updated` call C directly.
+- `w.drain()`: write backpressure (transport `pause_writing`, HTTP/2 stream
+  window). Used by `Files` / `Assets`.
 
 ### Ordering, backpressure, drain
 

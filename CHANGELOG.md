@@ -65,6 +65,14 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Added
 
+- `await w.drain()` — write-side backpressure for streaming handlers.
+  `write()` never blocks; `drain()` waits while the transport has paused
+  writing or an HTTP/2 stream has more than 256 KiB of unsent DATA, and
+  returns immediately once the client is gone or the request has finished.
+  `Files` / `Assets` await it after each chunk, so a slow client no longer
+  makes the server read a whole file into memory. TestClient's writer and
+  the `Writer` protocol have it too.
+
 - `STARIO_THREADS` — opt-in worker count (`1` default). `N>1` runs N
   event-loop threads, each a full `create_server` on the same TCP port
   via `SO_REUSEPORT` (thread 0 also owns signals and shutdown). The
