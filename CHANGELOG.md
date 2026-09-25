@@ -42,6 +42,26 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   authority as the host. Route patterns reject `.` / `..` segments.
 - 204 and 304 responses no longer send `Content-Length` (or `Content-Type`).
   `respond()` / `write_headers()` reject statuses outside 200–599.
+- **Pipelined errors keep response order.** A protocol error (bad request,
+  429 over the pipeline cap) behind in-flight pipelined requests is written
+  only after their responses, then the connection closes. Keep-alive 413/431
+  are answered in order like any response. Previously the error could be
+  read as the answer to an earlier request whose handler still ran.
+- **Upload backpressure before the body is read.** If a handler has started
+  but not asked for the body, HTTP/1 reading pauses after 64 KiB instead of
+  buffering up to `max_body_bytes`; the declared `Content-Length` is only
+  reserved once `body()` reads it. HTTP/2 holds that stream's WINDOW_UPDATE
+  instead of pausing the socket, so one slow consumer no longer stalls
+  other streams.
+- **HTTP/2 graceful drain.** Shutdown sends GOAWAY with the last processed
+  stream; in-flight streams finish, new ones are refused, and the connection
+  closes when nghttp2 is done (also after a client GOAWAY).
+- Idle keep-alive connections hold ~8 KiB instead of ~69 KiB (the read
+  buffer is no longer zero-filled).
+- Each header field counts 32 bytes toward `max_header_bytes` (RFC 7541
+  §4.1), bounding the field count. `Host: example.com.` matches
+  `example.com`. A failure while starting a handler (e.g. a tracer error)
+  answers 500 instead of stalling the connection.
 
 ### Added
 

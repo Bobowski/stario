@@ -126,6 +126,17 @@ Granian (LRU always hot). This capture is the honest one.
   `GET /plaintext` and +660 per `GET /user/{id}` in-process (callgrind), i.e.
   under ~1% of a request once kernel and event loop are included.
 
+### Ordering, backpressure, drain
+
+- A connection-closing protocol error behind in-flight pipelined requests is
+  deferred: parsing stops, earlier responses go out, then the error and close.
+  Keep-alive 413/431 go through `_dispatch` like any request.
+- Body backpressure: HTTP/1 pauses the socket (bodies not yet read pause after
+  64 KiB once the handler started); HTTP/2 withholds per-stream WINDOW_UPDATE
+  (bounded by the 1 MiB stream window) and never pauses the socket.
+- `close_if_idle()` on HTTP/2 sends GOAWAY(last processed stream); the socket
+  closes when `nghttp2_session_want_read/write` both return 0.
+
 ### Missing / not doing (on purpose)
 
 App and Router stay Python. Do not revive:
