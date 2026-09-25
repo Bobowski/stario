@@ -83,6 +83,9 @@ class DummyWriter:
             self.body = data.decode("utf-8")
         return self
 
+    async def drain(self) -> None:
+        return None
+
     def end(self, data: bytes | None = None) -> None:
         if data is not None:
             self.body = data.decode("utf-8")

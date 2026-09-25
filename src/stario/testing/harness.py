@@ -210,6 +210,9 @@ class TestWriter:
             self._body.extend(data)
         return self
 
+    async def drain(self) -> None:
+        return None
+
     def end(self, data: bytes | None = None) -> None:
         if self._completed:
             return

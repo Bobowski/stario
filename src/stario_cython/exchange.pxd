@@ -40,6 +40,7 @@ cdef object _host_without_port_n(const char* s, Py_ssize_t n)
 cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noexcept
 cdef object decode_path_full(const char* p, Py_ssize_t n)
 cdef bytes canonical_path(const char* p, Py_ssize_t n)
+cdef void wake_waiters(list waiters) noexcept
 
 cdef class Headers:
     cdef list _names
@@ -128,11 +129,12 @@ cdef Request make_request(
 cdef class Connection:
     """Typed protocol surface used by RequestExchange (cpdef = virtual)."""
     cdef public int timeout_cleanup
-    cpdef void release_exchange(self, RequestExchange exchange)
-    cpdef void response_completed(self, RequestExchange exchange)
-    cpdef void set_body_paused(self, RequestExchange exchange, bint paused)
-    cpdef object ensure_disconnect(self)
-    cpdef void h2_respond(
+    cdef void release_exchange(self, RequestExchange exchange)
+    cdef void response_completed(self, RequestExchange exchange)
+    cdef void set_body_paused(self, RequestExchange exchange, bint paused)
+    cdef object ensure_disconnect(self)
+    cdef object drain_waiter(self, RequestExchange exchange)
+    cdef void h2_respond(
         self,
         RequestExchange ex,
         object nva,
@@ -141,7 +143,7 @@ cdef class Connection:
         bint skip_cl=*,
         bint skip_ct=*,
     )
-    cpdef void h2_write_headers(
+    cdef void h2_write_headers(
         self,
         RequestExchange ex,
         object nva,
@@ -150,9 +152,9 @@ cdef class Connection:
         bint skip_ct=*,
         bint skip_user=*,
     )
-    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end)
-    cpdef void h2_end(self, RequestExchange ex)
-    cpdef void h2_abort(self, RequestExchange ex)
+    cdef void h2_write_data(self, RequestExchange ex, object data, bint end)
+    cdef void h2_end(self, RequestExchange ex)
+    cdef void h2_abort(self, RequestExchange ex)
 
 cdef class AppState:
     cdef public bint host_routing
@@ -314,6 +316,8 @@ cdef class RequestExchange:
     cdef bint _h2_outbound
     # Body consumer is behind: hold this stream's WINDOW_UPDATE (HTTP/2).
     cdef bint _h2_flow_paused
+    # ``w.drain()`` waiters for this stream's unsent DATA (HTTP/2).
+    cdef list _drain_waiters
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef object _handler_task

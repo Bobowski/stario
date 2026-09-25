@@ -62,6 +62,16 @@ class Writer(Protocol):
         """Write one body chunk; sends default ``200`` headers if needed."""
         ...
 
+    async def drain(self) -> None:
+        """Wait until the client has taken enough of what was written.
+
+        ``write()`` never blocks, so a loop writing large chunks to a slow
+        client would buffer everything in memory. ``await w.drain()`` after
+        each chunk keeps that bounded. Returns immediately while the
+        connection keeps up, or once it is closed (check ``closing``).
+        """
+        ...
+
     def end(self, data: bytes | None = None) -> None:
         """Finish the response. Optional final body bytes."""
         ...

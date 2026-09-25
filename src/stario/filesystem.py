@@ -337,6 +337,8 @@ async def _stream(writer: Writer, fd: int, start: int, length: int) -> None:
         if writer.closing:
             return
         writer.write(chunk)
+        # Bound memory for slow clients: do not read ahead of the socket.
+        await writer.drain()
     writer.end()
 
 

@@ -79,19 +79,22 @@ cdef class Connection:
     def __cinit__(self):
         self.timeout_cleanup = 0
 
-    cpdef void release_exchange(self, RequestExchange exchange):
+    cdef void release_exchange(self, RequestExchange exchange):
         raise NotImplementedError("release_exchange")
 
-    cpdef void response_completed(self, RequestExchange exchange):
+    cdef void response_completed(self, RequestExchange exchange):
         raise NotImplementedError("response_completed")
 
-    cpdef void set_body_paused(self, RequestExchange exchange, bint paused):
+    cdef void set_body_paused(self, RequestExchange exchange, bint paused):
         raise NotImplementedError("set_body_paused")
 
-    cpdef object ensure_disconnect(self):
+    cdef object ensure_disconnect(self):
         raise NotImplementedError("ensure_disconnect")
 
-    cpdef void h2_respond(
+    cdef object drain_waiter(self, RequestExchange exchange):
+        return None
+
+    cdef void h2_respond(
         self,
         RequestExchange ex,
         object nva,
@@ -102,7 +105,7 @@ cdef class Connection:
     ):
         raise NotImplementedError("h2_respond")
 
-    cpdef void h2_write_headers(
+    cdef void h2_write_headers(
         self,
         RequestExchange ex,
         object nva,
@@ -113,13 +116,13 @@ cdef class Connection:
     ):
         raise NotImplementedError("h2_write_headers")
 
-    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end):
+    cdef void h2_write_data(self, RequestExchange ex, object data, bint end):
         raise NotImplementedError("h2_write_data")
 
-    cpdef void h2_end(self, RequestExchange ex):
+    cdef void h2_end(self, RequestExchange ex):
         raise NotImplementedError("h2_end")
 
-    cpdef void h2_abort(self, RequestExchange ex):
+    cdef void h2_abort(self, RequestExchange ex):
         raise NotImplementedError("h2_abort")
 
 cdef int LOW_WATER = 128 * 1024
@@ -2148,6 +2151,7 @@ cdef class RequestExchange:
 
     def __init__(self):
         self.headers = Headers()
+        self._drain_waiters = []
         self._req_view = None
         self._handle = None
         self._spare_view = None
@@ -3149,6 +3153,7 @@ cdef class RequestExchange:
         if self.in_pool:
             return
         self.in_pool = True
+        wake_waiters(self._drain_waiters)
         self._detach_views()
         self._clear_request_binding()
         self._cached = None
@@ -3924,6 +3929,7 @@ cdef class RequestExchange:
         return 0
 
     cdef void c_abort(self):
+        wake_waiters(self._drain_waiters)
         if self._abort_reason != ABORT_NONE:
             return
         self._free_compressors()
@@ -4353,6 +4359,20 @@ cdef class RequestHeaders:
         return f"RequestHeaders({self.items()!r})"
 
 
+cdef void wake_waiters(list waiters) noexcept:
+    """Resolve pending drain futures (skip ones a cancelled task left behind)."""
+    cdef object fut
+    if not waiters:
+        return
+    for fut in waiters:
+        try:
+            if not fut.done():
+                fut.set_result(None)
+        except Exception:
+            pass
+    waiters.clear()
+
+
 cdef bint _connection_gone(object connection) except -1:
     cdef object future
     if connection is None or connection.closed:
@@ -4486,6 +4506,27 @@ cdef class RequestHandle:
             _raise_finished()
         ex.write(data)
         return self
+
+    async def drain(self):
+        """Wait until the client has taken enough of what was written.
+
+        Returns at once while the connection accepts data. After a large
+        ``write()`` on a slow client it waits for the transport (and, on
+        HTTP/2, this stream's flow-control window) to drain. Returns
+        immediately if the connection is gone or the request has finished;
+        check ``w.closing`` to stop producing.
+        """
+        cdef RequestExchange ex = self._ex
+        cdef object waiter
+        if ex is None:
+            return
+        waiter = ex._connection.drain_waiter(ex)
+        while waiter is not None:
+            await waiter
+            ex = self._ex
+            if ex is None:
+                return
+            waiter = ex._connection.drain_waiter(ex)
 
     def end(self, data=None):
         cdef RequestExchange ex = self._ex

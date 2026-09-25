@@ -722,6 +722,8 @@ class StaticAssets:
                 if w.closing:
                     return
                 w.write(chunk)
+                # Bound memory for slow clients: do not read ahead of the socket.
+                await w.drain()
         finally:
             os.close(fd)
         w.end()

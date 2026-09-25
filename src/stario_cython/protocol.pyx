@@ -76,6 +76,7 @@ from stario_cython.exchange cimport (
     RequestExchange,
     RequestHandle,
     _host_without_port_n,
+    wake_waiters,
     acquire_exchange,
     canonical_path,
     decode_path_full,
@@ -202,6 +203,10 @@ cdef enum:
     # RFC 7541 / nghttp2 default. Advertising 0 is a HPACK-bomb hedge some
     # intermediaries reject; 4KiB is the spec default.
     H2_HEADER_TABLE_SIZE = 4096
+    # w.drain() on HTTP/2 waits while a stream has more unsent DATA than
+    # this, and wakes once nghttp2 has sent it down to the low mark.
+    H2_DRAIN_HIGH = 256 * 1024
+    H2_DRAIN_LOW = 64 * 1024
 
 cdef bytes H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 cdef object _settings_lock = Lock()
@@ -217,6 +222,16 @@ cdef object _span_path(const char* url, Py_ssize_t n):
     if out is None:
         out = PyUnicode_DecodeLatin1(url, end, NULL)
     return out
+
+
+cdef Py_ssize_t _h2_unsent(RequestExchange ex) noexcept:
+    """DATA bytes a stream has queued but nghttp2 has not sent yet."""
+    cdef object pending = ex._h2_pending
+    if PyBytes_Check(pending):
+        return PyBytes_GET_SIZE(pending) - ex._h2_pending_off
+    if PyByteArray_Check(pending):
+        return PyByteArray_GET_SIZE(pending) - ex._h2_pending_off
+    return 0
 
 
 cdef inline bint _as_buf(object data, const char** ptr, Py_ssize_t* n) noexcept:
@@ -654,6 +669,7 @@ cdef class CHttpProtocol(Connection):
     cdef bint h2_goaway_sent
     cdef bint h1_headers_too_large
     cdef int deferred_status
+    cdef list _write_waiters
     cdef object deferred_body
     cdef bint deferred_head
 
@@ -691,6 +707,7 @@ cdef class CHttpProtocol(Connection):
         self.deferred_status = 0
         self.deferred_body = None
         self.deferred_head = False
+        self._write_waiters = []
         self._app_state = None
         self._in_buf = None
         self._in_view = None
@@ -800,7 +817,7 @@ cdef class CHttpProtocol(Connection):
                 self.loop, self.connections, self.timeout_sweep_interval
             )
 
-    cpdef object ensure_disconnect(self):
+    cdef object ensure_disconnect(self):
         if self.disconnect is None:
             self.disconnect = self.loop.create_future()
             if self.closed and not self.disconnect.done():
@@ -838,6 +855,7 @@ cdef class CHttpProtocol(Connection):
             self.active_exchange.c_abort()
         if self.disconnect is not None and not self.disconnect.done():
             self.disconnect.set_result(None)
+        wake_waiters(self._write_waiters)
         self.pause_reasons = 0
         self.body_pause_owner = None
         self.held_data = None
@@ -845,7 +863,7 @@ cdef class CHttpProtocol(Connection):
         self.pump_scheduled = False
         self.transport = None
 
-    cpdef void release_exchange(self, RequestExchange exchange):
+    cdef void release_exchange(self, RequestExchange exchange):
         """Detach, then keep one idle on this connection or recycle on this thread."""
         cdef int32_t stream_id
         if exchange._http2 and self.h2 != NULL:
@@ -1198,7 +1216,7 @@ cdef class CHttpProtocol(Connection):
             if transport is not None and not transport.is_closing():
                 transport.resume_reading()
 
-    cpdef void set_body_paused(self, RequestExchange exchange, bint paused):
+    cdef void set_body_paused(self, RequestExchange exchange, bint paused):
         if exchange._http2:
             # HTTP/2: hold this stream's WINDOW_UPDATE instead of pausing the
             # socket, so one slow body consumer cannot stall other streams.
@@ -1267,6 +1285,23 @@ cdef class CHttpProtocol(Connection):
 
     def resume_writing(self):
         self._set_pause_reason(PAUSE_WRITE, False)
+        wake_waiters(self._write_waiters)
+
+    cdef object drain_waiter(self, RequestExchange exchange):
+        """A future to await before writing more, or None to go ahead."""
+        cdef object fut
+        cdef object transport = self.transport
+        if self.closed or transport is None or transport.is_closing():
+            return None
+        if self.pause_reasons & PAUSE_WRITE:
+            fut = self.loop.create_future()
+            self._write_waiters.append(fut)
+            return fut
+        if exchange._http2 and _h2_unsent(exchange) > H2_DRAIN_HIGH:
+            fut = self.loop.create_future()
+            exchange._drain_waiters.append(fut)
+            return fut
+        return None
 
     cdef bint _header_too_large(self, size_t length) noexcept:
         self.head_bytes += <int>length
@@ -1822,7 +1857,7 @@ cdef class CHttpProtocol(Connection):
             exchange.cancel_before_start()
         self.pending_exchanges.clear()
 
-    cpdef void response_completed(self, RequestExchange exchange):
+    cdef void response_completed(self, RequestExchange exchange):
         """Advance the connection after the response is fully sent.
 
         Fired from ``respond()`` / ``end()`` / ``abort()`` via ``_done`` — not when
@@ -2633,6 +2668,8 @@ cdef class CHttpProtocol(Connection):
                 PyBytes_FromStringAndSize(src + off, <Py_ssize_t>length),
             ))
         ex._h2_pending_off = off + <Py_ssize_t>length
+        if ex._drain_waiters and n - ex._h2_pending_off <= H2_DRAIN_LOW:
+            wake_waiters(ex._drain_waiters)
         if ex._h2_pending_off >= n:
             ex._h2_pending = b""
             ex._h2_pending_off = 0
@@ -2716,7 +2753,7 @@ cdef class CHttpProtocol(Connection):
             filled += 1
         return filled
 
-    cpdef void h2_respond(
+    cdef void h2_respond(
         self,
         RequestExchange ex,
         object nva,
@@ -2787,7 +2824,7 @@ cdef class CHttpProtocol(Connection):
             if heap:
                 free(nvs)
 
-    cpdef void h2_write_headers(
+    cdef void h2_write_headers(
         self,
         RequestExchange ex,
         object nva,
@@ -2904,7 +2941,7 @@ cdef class CHttpProtocol(Connection):
             ex._h2_pending_off = 0
         pending.extend(data)
 
-    cpdef void h2_write_data(self, RequestExchange ex, object data, bint end):
+    cdef void h2_write_data(self, RequestExchange ex, object data, bint end):
         if self.h2 == NULL or ex is None or ex.in_pool:
             return
         if data:
@@ -2914,10 +2951,10 @@ cdef class CHttpProtocol(Connection):
         nghttp2_session_resume_data(self.h2, ex._h2_stream_id)
         self._h2_send()
 
-    cpdef void h2_end(self, RequestExchange ex):
+    cdef void h2_end(self, RequestExchange ex):
         self.h2_write_data(ex, None, True)
 
-    cpdef void h2_abort(self, RequestExchange ex):
+    cdef void h2_abort(self, RequestExchange ex):
         if self.h2 == NULL or ex is None:
             return
         nghttp2_submit_rst_stream(
