@@ -1,6 +1,7 @@
 #include "compression_buf.h"
 
 #include <brotli/encode.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -286,6 +287,9 @@ static int gzip_deflate(
     size_t* out_len
 ) {
     size_t used = 0;
+    size_t remaining = in_len;
+    size_t room;
+    uInt take;
     int rc;
 
     if (
@@ -297,18 +301,25 @@ static int gzip_deflate(
     }
     *out = NULL;
     *out_len = 0;
+    /* zlib counts in uInt: feed inputs over 4 GiB in slices. */
     gzip->strm.next_in = (Bytef*)in;
-    gzip->strm.avail_in = (uInt)in_len;
+    gzip->strm.avail_in = 0;
     for (;;) {
+        if (gzip->strm.avail_in == 0 && remaining > 0) {
+            take = remaining > UINT_MAX ? UINT_MAX : (uInt)remaining;
+            gzip->strm.avail_in = take;
+            remaining -= take;
+        }
         if (
             used == gzip->out_cap &&
             grow_buffer(&gzip->out, &gzip->out_cap, used) != 0
         ) {
             return -1;
         }
+        room = gzip->out_cap - used;
         gzip->strm.next_out = gzip->out + used;
-        gzip->strm.avail_out = (uInt)(gzip->out_cap - used);
-        rc = deflate(&gzip->strm, flush);
+        gzip->strm.avail_out = room > UINT_MAX ? UINT_MAX : (uInt)room;
+        rc = deflate(&gzip->strm, remaining > 0 ? Z_NO_FLUSH : flush);
         used = (size_t)(gzip->strm.next_out - gzip->out);
         if (rc == Z_STREAM_END) {
             gzip->finished = 1;
@@ -317,7 +328,10 @@ static int gzip_deflate(
         if (rc != Z_OK) {
             return -1;
         }
-        if (gzip->strm.avail_in == 0 && gzip->strm.avail_out > 0) {
+        if (
+            gzip->strm.avail_in == 0 && remaining == 0 &&
+            gzip->strm.avail_out > 0
+        ) {
             break;
         }
     }

@@ -247,6 +247,8 @@ cdef class RequestExchange:
     cdef Py_ssize_t _out_len
     cdef int _status_code
     cdef Py_ssize_t _declared_length
+    # HTTP/1.0 streaming: no chunked coding, the body ends when we close.
+    cdef bint _close_delimited
     cdef Py_ssize_t _bytes_written
     cdef bint _brotli_enabled
     cdef bint _gzip_enabled
@@ -425,6 +427,7 @@ cdef class RequestExchange:
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1
     cdef int _finish(self, const unsigned char** out, size_t* out_len) except -1
     cdef int _write_native_chunk(self, const unsigned char* data, size_t n) except -1
+    cdef int _block_raw(self, const char* ptr, size_t n, const unsigned char** out, size_t* out_len) except -1
     cdef int _ensure_brotli(self) except -1
     cdef int _ensure_gzip(self) except -1
     cdef void _free_compressors(self)

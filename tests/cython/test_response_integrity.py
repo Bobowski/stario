@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import zlib
 
 import pytest
 
@@ -213,7 +214,7 @@ async def test_wide_memoryview_body_is_rejected() -> None:
         writer.close()
     assert response.endswith(b"ok")
     assert len(errors) == 1
-    assert "itemsize" in errors[0]
+    assert "memoryview" in errors[0]
 
 
 @pytest.mark.asyncio
@@ -250,3 +251,108 @@ async def test_h2_no_rst_stream_after_client_reset() -> None:
                 frames.extend(parsed)
         writer.close()
     assert not h2.has_rst(frames, 1)
+
+
+async def _raw_exchange(port: int, request: bytes) -> bytes:
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(request)
+    async with asyncio.timeout(2):
+        data = await reader.read()
+    writer.close()
+    return data
+
+
+def _dechunk(body: bytes) -> bytes:
+    out = b""
+    while True:
+        size_line, body = body.split(b"\r\n", 1)
+        size = int(size_line, 16)
+        if size == 0:
+            return out
+        out += body[:size]
+        body = body[size + 2 :]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gzip", [False, True])
+async def test_http10_stream_is_close_delimited(gzip: bool) -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        w.headers.set("content-type", "text/plain")
+        w.write(b"alpha-" * 50)
+        w.write(memoryview(b"beta"))
+        w.end()
+
+    app.add(Route("GET /"), page)
+    extra = b"Accept-Encoding: gzip\r\n" if gzip else b""
+    async with running_server(app, compression=CompressionConfig(min_size=1)) as port:
+        raw = await _raw_exchange(
+            port,
+            b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n" + extra + b"\r\n",
+        )
+    head, body = raw.split(b"\r\n\r\n", 1)
+    lower = head.lower()
+    assert head.startswith(b"HTTP/1.1 200")
+    assert b"transfer-encoding" not in lower
+    assert b"connection: close" in lower
+    if gzip:
+        assert b"content-encoding: gzip" in lower
+        body = zlib.decompress(body, 16 + zlib.MAX_WBITS)
+    assert body == b"alpha-" * 50 + b"beta"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gzip", [False, True])
+async def test_chunked_write_accepts_memoryview_parts(gzip: bool) -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        w.headers.set("content-type", "text/plain")
+        w.write([b"ab", memoryview(b"cd"), bytearray(b"ef")])
+        w.write(memoryview(b"gh"))
+        w.end()
+
+    app.add(Route("GET /"), page)
+    extra = b"Accept-Encoding: gzip\r\n" if gzip else b""
+    async with running_server(app, compression=CompressionConfig(min_size=1)) as port:
+        raw = await _raw_exchange(
+            port,
+            b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n" + extra + b"\r\n",
+        )
+    head, body = raw.split(b"\r\n\r\n", 1)
+    assert b"transfer-encoding: chunked" in head.lower()
+    body = _dechunk(body)
+    if gzip:
+        body = zlib.decompress(body, 16 + zlib.MAX_WBITS)
+    assert body == b"abcdefgh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "view",
+    [
+        memoryview(b"abcdef").cast("B", (2, 3)),
+        memoryview(b"abcdef")[::2],
+    ],
+    ids=["2d", "strided"],
+)
+async def test_non_flat_memoryview_body_is_rejected(view: memoryview) -> None:
+    app = App()
+    errors: list[str] = []
+
+    async def page(_c, w) -> None:
+        try:
+            w.write(view)
+        except TypeError as exc:
+            errors.append(str(exc))
+        responses.text(w, "ok")
+
+    app.add(Route("GET /"), page)
+    async with running_server(app) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        response = await read_response(reader)
+        writer.close()
+    assert response.endswith(b"ok")
+    assert len(errors) == 1

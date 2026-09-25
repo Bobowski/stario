@@ -30,6 +30,7 @@ from cpython.bytes cimport (
     PyBytes_GET_SIZE,
 )
 from cpython.list cimport PyList_GET_SIZE
+from cpython.buffer cimport PyBUF_SIMPLE, PyBuffer_Release, PyObject_GetBuffer
 from cpython.exc cimport PyErr_Clear
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
 from cpython.ref cimport Py_REFCNT
@@ -193,10 +194,15 @@ cdef inline bint _is_bytes_like(object obj) except -1:
     if isinstance(obj, (bytes, bytearray)):
         return True
     if isinstance(obj, memoryview):
-        # Lengths are counted with len(): only byte views count bytes.
-        if (<memoryview>obj).itemsize != 1:
+        # Lengths are counted with len() and written as one flat buffer.
+        if (
+            (<memoryview>obj).itemsize != 1
+            or (<memoryview>obj).ndim != 1
+            or not (<memoryview>obj).c_contiguous
+        ):
             raise TypeError(
-                "memoryview body parts must have itemsize 1; use .cast('B')"
+                "memoryview body parts must be flat, contiguous bytes; "
+                "use bytes(view) or view.cast('B')"
             )
         return True
     return False
@@ -2180,6 +2186,7 @@ cdef class RequestExchange:
         self._declared_length = -1
         self._bytes_written = 0
         self._completed = False
+        self._close_delimited = False
         self._out_len = 0
         self.headers.c_clear()
 
@@ -2260,8 +2267,15 @@ cdef class RequestExchange:
     cdef int _buf_bytes(self, object data) except -1:
         cdef Py_ssize_t n = len(data)
         cdef const char* p
+        cdef Py_buffer view
         if n == 0:
             return 0
+        if isinstance(data, memoryview):
+            PyObject_GetBuffer(data, &view, PyBUF_SIMPLE)
+            try:
+                return self._buf_add(<const char*>view.buf, view.len)
+            finally:
+                PyBuffer_Release(&view)
         p = data
         return self._buf_add(p, n)
 
@@ -2312,10 +2326,10 @@ cdef class RequestExchange:
         raise TypeError(BODY_TYPE_ERROR)
 
     cdef int _buf_uint(self, size_t n, int base) except -1:
-        cdef char tmp[16]
+        cdef char tmp[24]
         cdef int i
         if base == 16:
-            i = sprintf(tmp, "%x", <unsigned int>n)
+            i = sprintf(tmp, "%zx", n)
         else:
             i = sprintf(tmp, "%zu", n)
         return self._buf_add(tmp, i)
@@ -2474,8 +2488,24 @@ cdef class RequestExchange:
         return 0
 
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1:
-        cdef const char* ptr = data
-        cdef size_t n = <size_t>len(data)
+        cdef Py_buffer view
+        if isinstance(data, memoryview):
+            PyObject_GetBuffer(data, &view, PyBUF_SIMPLE)
+            try:
+                return self._block_raw(
+                    <const char*>view.buf, <size_t>view.len, out, out_len
+                )
+            finally:
+                PyBuffer_Release(&view)
+        return self._block_raw(data, <size_t>len(data), out, out_len)
+
+    cdef int _block_raw(
+        self,
+        const char* ptr,
+        size_t n,
+        const unsigned char** out,
+        size_t* out_len,
+    ) except -1:
         if self._brotli != NULL:
             if stario_brotli_block_borrowed(
                 self._brotli, <const unsigned char*>ptr, n, out, out_len
@@ -2511,6 +2541,10 @@ cdef class RequestExchange:
         self, const unsigned char* data, size_t n
     ) except -1:
         if n == 0:
+            return 0
+        if self._close_delimited:
+            self._buf_add(<const char*>data, <Py_ssize_t>n)
+            self._flush()
             return 0
         self._buf_uint(n, 16)
         self._buf_bytes(CRLF)
@@ -3463,7 +3497,13 @@ cdef class RequestExchange:
                     help_text="Set Content-Length to a non-negative integer before write_headers().",
                 ) from exc
         elif not self._http2:
-            headers.c_set(b"transfer-encoding", b"chunked")
+            if self._version == "1.0":
+                # RFC 9112 7: HTTP/1.0 has no chunked coding.
+                headers.c_remove(b"transfer-encoding")
+                headers.c_set(b"connection", b"close")
+                self._close_delimited = True
+            else:
+                headers.c_set(b"transfer-encoding", b"chunked")
             if headers.c_get(b"content-encoding") is None:
                 encoding = None
                 if self._may_compress(
@@ -3567,6 +3607,10 @@ cdef class RequestExchange:
                 self._block(data, &native_out, &native_len)
                 self._write_native_chunk(native_out, native_len)
             return self
+        if self._close_delimited:
+            self._buf_body(data)
+            self._flush()
+            return self
         self._buf_uint(<size_t>n, 16)
         self._buf_bytes(CRLF)
         self._buf_body(data)
@@ -3621,7 +3665,8 @@ cdef class RequestExchange:
                 self._finish(&native_out, &native_len)
                 self._write_native_chunk(native_out, native_len)
                 self._free_compressors()
-            self._buf_bytes(CHUNK_END)
+            if not self._close_delimited:
+                self._buf_bytes(CHUNK_END)
             self._flush()
         self._completed = True
         self._done()
