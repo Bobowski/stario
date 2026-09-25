@@ -7,6 +7,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from io import StringIO
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -232,9 +233,10 @@ class TestSpanId:
 
         from stario.telemetry import spans
 
+        std: Any = stdlib_uuid
         saved = (
-            stdlib_uuid._last_timestamp_v7,
-            stdlib_uuid._last_counter_v7,
+            std._last_timestamp_v7,
+            std._last_counter_v7,
             spans._last_timestamp_v7,
             spans._last_counter_v7,
         )
@@ -251,22 +253,20 @@ class TestSpanId:
         monkeypatch.setattr(os, "urandom", fake_urandom)
 
         try:
-            stdlib_uuid._last_timestamp_v7 = None
-            stdlib_uuid._last_counter_v7 = 0
+            std._last_timestamp_v7 = None
+            std._last_counter_v7 = 0
             spans._last_timestamp_v7 = None
             spans._last_counter_v7 = 0
-            std = [stdlib_uuid.uuid7() for _ in range(3)]
-            stdlib_uuid._last_timestamp_v7 = None
-            stdlib_uuid._last_counter_v7 = 0
+            theirs = [std.uuid7() for _ in range(3)]
+            std._last_timestamp_v7 = None
+            std._last_counter_v7 = 0
             spans._last_timestamp_v7 = None
             spans._last_counter_v7 = 0
             index["n"] = 0
             ours = [spans._span_id() for _ in range(3)]
-            assert ours == std
+            assert ours == theirs
         finally:
-            (
-                stdlib_uuid._last_timestamp_v7,
-                stdlib_uuid._last_counter_v7,
-                spans._last_timestamp_v7,
-                spans._last_counter_v7,
-            ) = saved
+            std._last_timestamp_v7 = saved[0]
+            std._last_counter_v7 = saved[1]
+            spans._last_timestamp_v7 = saved[2]
+            spans._last_counter_v7 = saved[3]
