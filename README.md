@@ -207,6 +207,7 @@ No bundled ORM, admin UI, or plugin discovery system. Databases, auth, and broke
 ## Releases
 
 Version history and upgrade notes live in [`CHANGELOG.md`](CHANGELOG.md).
+A tag `v*` on `main` builds the sdist and wheel and uploads them to PyPI.
 
 ## Contributing
 
