@@ -247,8 +247,8 @@ class TestClientBasics:
     @pytest.mark.parametrize(
         ("client_timeout", "request_timeout"),
         [
-            (0.05, None),
-            (None, 0.05),
+            (0.01, None),
+            (None, 0.01),
         ],
     )
     async def test_request_timeout_default_applies(
@@ -307,8 +307,6 @@ class TestClientBasics:
             evs = [e async for e in r.iter_events()]
         assert evs == [{"event": "ping", "data": "hello"}]
 
-
-class TestTestClient:
     async def test_client_exit_signals_context_disconnect(self):
         app = App()
         done = asyncio.Event()

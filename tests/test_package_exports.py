@@ -5,6 +5,25 @@ import importlib
 import pytest
 
 
+def test_from_stario_import_app_and_serve() -> None:
+    """Fresh interpreter: package root must bind App and serve without a cycle."""
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from stario import App, serve\n"
+            "import stario\n"
+            "assert 'serve' in vars(stario)\n"
+            "assert stario.serve is serve\n"
+            "assert stario.App is App\n",
+        ],
+        check=True,
+    )
+
+
 def test_core_modules_import() -> None:
     import stario
     import stario.datastar
@@ -38,6 +57,7 @@ def test_core_modules_import() -> None:
                 "StaticAssets",
                 "UrlPath",
                 "Writer",
+                "serve",
             ],
         ),
         (
@@ -120,13 +140,9 @@ def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
         "stario.routing.trie",
         "stario.routing.pattern",
         "stario.http.protocol",
+        "stario.html",
     ],
 )
 def test_removed_shim_modules(removed_module: str) -> None:
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module(removed_module)
-
-
-def test_stario_html_module_removed() -> None:
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("stario.html")

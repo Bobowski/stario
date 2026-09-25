@@ -23,11 +23,11 @@ Full guides, API reference, and tutorials live at [stario.dev](https://stario.de
 
 ## Where Stario fits
 
-Stario is an asyncio-native HTTP stack: you write async handlers and register routes on an `App`, and the `stario` CLI runs a built-in HTTP server (TCP or a Unix domain socket). It is not an ASGI application you mount in Uvicorn or Hypercorn; wiring goes through the `bootstrap` hook, `Context`, and `Writer` instead.
+Stario is an asyncio-native HTTP stack: you write async handlers and register routes on an `App`, and you start the built-in HTTP server (TCP or a Unix domain socket) with `asyncio.run(stario.serve(bootstrap))` (or `uvloop.run(...)`) or the `stario` CLI. It is not an ASGI application you mount in Uvicorn or Hypercorn; wiring goes through the `bootstrap` hook, `Context`, and `Writer` instead.
 
 ## Requirements
 
-Python 3.14 or newer is required. The package tracks current Python and the standard library (including APIs the framework builds on) rather than supporting older runtimes.
+Python 3.12 or newer is required.
 
 **uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
 
@@ -139,6 +139,7 @@ async def home(c: Context, w: Writer) -> None:
 
 HOME = Route("GET", "/")
 
+
 async def bootstrap(app: App, span: Span):
     span.attr("app.name", "example")
     app.add(HOME, home)
@@ -148,6 +149,21 @@ async def bootstrap(app: App, span: Span):
 ```bash
 uv run stario watch main:bootstrap
 ```
+
+To start the same app from Python, await `serve` on a loop you start
+(and continue after shutdown):
+
+```python
+import asyncio
+from stario import serve
+
+if __name__ == "__main__":
+    asyncio.run(serve(bootstrap))
+```
+
+Use `uvloop.run(serve(bootstrap))` when you want uvloop. Pass listen
+settings as keywords: `serve(bootstrap, host="0.0.0.0", port=9000)`.
+`Server` takes a `ServerConfig` object.
 
 Install with `pip install stario` if you are not using uv. During startup, `bootstrap` runs until its single `yield`: register routes and attach attributes to `span` before `yield`; put teardown after `yield` when needed. Use `stario watch` in development so the process reloads when files change; use `stario serve` for a normal long-running server without reload. Server runtime policy (`STARIO_HOST`, `STARIO_PORT`, `STARIO_TRACER`, and related vars) is configured through environment variables — see `stario serve --help` (Stario does not load `.env` files; export vars in your shell or use your own dotenv tooling). See [Getting started](https://stario.dev/docs) for project layout. For containers, TLS, and production-oriented setup, see [Deployment, containers, and TLS](https://stario.dev/docs/how-tos/deployment-containers-and-tls).
 
@@ -192,7 +208,25 @@ No bundled ORM, admin UI, or plugin discovery system. Databases, auth, and broke
 
 ## Releases
 
-Version history and upgrade notes live in [`CHANGELOG.md`](CHANGELOG.md).
+The bump commit is the source of truth. The tag must name that version.
+There is no autotag, and the build does not rewrite the version.
+
+1. Keep notes under `## Unreleased` in [`CHANGELOG.md`](CHANGELOG.md).
+2. When those notes are the release, one commit:
+   - set `version` in `pyproject.toml` (for example `4.3.0`)
+   - move `## Unreleased` to `## 4.3.0 - YYYY-MM-DD` and leave an empty
+     `## Unreleased` above it
+3. Tag that commit and push:
+
+```bash
+git tag 4.3.0
+git push origin 4.3.0
+```
+
+A GitHub Release with the same tag is the same event. The workflow tests
+3.12–3.14, checks that the tag, `pyproject.toml`, and changelog agree,
+then uploads `stario-4.3.0` to PyPI. If the tag does not match the
+committed version, the job fails.
 
 ## Contributing
 

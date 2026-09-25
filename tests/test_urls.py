@@ -1,21 +1,9 @@
-"""Tests for UrlPath URL builders."""
+"""Tests for obsolete UrlPath compose. Href bind lives in test_route."""
 
 import pytest
 
-from stario import Route, UrlPath
+from stario import UrlPath
 from stario.exceptions import StarioError
-from stario.http.route import normalize_path
-
-
-class TestNormalizePath:
-    def test_canonical_path(self):
-        assert normalize_path("") == "/"
-        assert normalize_path("users") == "/users"
-        assert normalize_path("/users/") == "/users"
-        assert normalize_path("/") == "/"
-        assert normalize_path("//host/") == "/host"
-        assert UrlPath("/users/").href() == "/users"
-        assert UrlPath("/v1", host="API.Example.COM").href() == "//api.example.com/v1"
 
 
 class TestUrlPath:
@@ -34,119 +22,12 @@ class TestUrlPath:
         with pytest.raises(StarioError, match="host must not be empty"):
             UrlPath("/users", host="")
 
-    def test_href_appends_query_params(self):
-        search = UrlPath("/search")
-
-        assert search.href(query={"q": "stario urls", "page": 2}) == (
-            "/search?q=stario+urls&page=2"
-        )
-        assert search.href(query={"tag": ["python", "web"], "empty": None}) == (
-            "/search?tag=python&tag=web"
-        )
-
-    def test_href_appends_fragment(self):
-        docs = UrlPath("/docs")
-
-        assert docs.href(fragment="install guide") == "/docs#install%20guide"
-        assert docs.href(query={"q": "routes"}, fragment="section/one?tab=api") == (
-            "/docs?q=routes#section/one?tab=api"
-        )
-
-    def test_href_quotes_path_params(self):
-        path = UrlPath("/files/{name}")
-
-        assert path.href(name="a b.txt") == "/files/a%20b.txt"
-
-    def test_href_rejects_slash_in_path_wildcard(self):
-        path = UrlPath("/files/{name}")
-
-        with pytest.raises(StarioError, match="contains '/'"):
-            path.href(name="a/b.txt")
-
-    def test_preserves_slashes_for_catchall_params(self):
-        path = UrlPath("/files/{path...}")
-
-        assert path.href(path="docs/read me.txt") == "/files/docs/read%20me.txt"
-
-    def test_rejects_empty_segments_in_catchall_params(self):
-        path = UrlPath("/files/{path...}")
-
-        for value in ("/docs", "docs/", "docs//readme.txt"):
-            with pytest.raises(StarioError, match="empty path segment"):
-                path.href(path=value)
-
-    def test_builds_host_routes_with_params(self):
-        path = UrlPath("/users/{user_id}", host="{tenant}.example.com")
-
-        assert path.href(tenant="ACME", user_id="42") == "//acme.example.com/users/42"
-
-    def test_rejects_question_mark_in_host_parameter(self):
-        path = UrlPath("/dash", host="{tenant}.example.com")
-        with pytest.raises(StarioError, match="invalid character"):
-            path.href(tenant="evil?")
-
-    def test_rejects_dot_in_host_wildcard(self):
-        path = UrlPath("/users", host="{tenant}.example.com")
-
-        with pytest.raises(StarioError, match=r"contains '\.'"):
-            path.href(tenant="acme.eu")
-
-    def test_host_catchall_accepts_dotted_values(self):
-        path = UrlPath("/users", host="{tenant...}.example.com")
-
-        assert path.href(tenant="acme.eu") == "//acme.eu.example.com/users"
-
-    def test_href_without_kwargs_raises_for_templated_path(self):
+    def test_repr_and_host_case(self):
         path = UrlPath("/h/{house_id}")
+        hosted = UrlPath("/v1", host="API.Example.COM")
 
-        with pytest.raises(StarioError, match="parameter missing"):
-            path.href()
         assert repr(path) == "UrlPath('/h/{house_id}')"
-
-    def test_malformed_placeholder_raises(self):
-        with pytest.raises(StarioError, match="Invalid route parameter"):
-            UrlPath("/{broken")
-
-    @pytest.mark.parametrize("name", ["class", "for", "def", "return", "async"])
-    def test_rejects_python_keyword_param_names(self, name: str):
-        with pytest.raises(StarioError, match="Python keyword"):
-            UrlPath(f"/items/{{{name}}}")
-
-    def test_duplicate_placeholder_raises(self):
-        with pytest.raises(StarioError, match="Duplicate route parameter"):
-            Route("GET", "/teams/{id}/users/{id}")
-        with pytest.raises(StarioError, match="Duplicate route parameter"):
-            UrlPath("/teams/{id}/users/{id}")
-
-    def test_rejects_unknown_params(self):
-        path = UrlPath("/h/{house_id}")
-
-        with pytest.raises(StarioError, match="unknown parameter"):
-            path.href(house_id="abc", typo="oops")
-
-    def test_static_route_rejects_unknown_params(self):
-        home = UrlPath("/")
-
-        with pytest.raises(StarioError, match="unknown parameter"):
-            home.href(typo="oops")
-
-    def test_href_accepts_positional_params(self):
-        path = UrlPath("/h/{house_id}")
-
-        assert path.href("abc") == "/h/abc"
-        with pytest.raises(StarioError, match="must not be a mapping"):
-            path.href({"house_id": "abc"})
-
-    def test_href_positionals_follow_host_then_path(self):
-        path = UrlPath("/users/{user_id}", host="{tenant}.example.com")
-
-        assert path.href("acme", "42") == "//acme.example.com/users/42"
-        assert path.href("acme", user_id="42") == "//acme.example.com/users/42"
-
-    @pytest.mark.parametrize("name", ["query", "fragment"])
-    def test_rejects_reserved_href_param_names(self, name: str):
-        with pytest.raises(StarioError, match="reserved"):
-            UrlPath(f"/{{{name}}}")
+        assert hosted.href() == "//api.example.com/v1"
 
     def test_truediv_joins_paths(self):
         api = UrlPath("/api/v1")

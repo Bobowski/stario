@@ -13,15 +13,6 @@ assert "stario.telemetry.json" not in sys.modules
 assert "stario.telemetry.sqlite" not in sys.modules
 assert "stario.telemetry.tty" not in sys.modules
 assert stario.Span is not None
-"""
-    subprocess.run([sys.executable, "-c", code], check=True)
-
-
-def test_tty_tracer_module_available_without_rich() -> None:
-    code = """
-import sys
-import stario
-assert "rich" not in sys.modules
 from stario.telemetry.tty import TTYTracer
 assert "rich" not in sys.modules
 assert "stario.telemetry.tty" in sys.modules

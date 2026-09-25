@@ -3,7 +3,7 @@
 import bisect
 from types import TracebackType
 from typing import Any, Self, cast
-from uuid import UUID, uuid7
+from uuid import UUID
 
 from stario.telemetry.core import Attributes, Span, TelemetryStats
 from stario.telemetry.spans import RecordingSpan
@@ -86,21 +86,7 @@ class TestTracer:
     ) -> Span:
         if self._entry_depth <= 0:
             raise RuntimeError("TestTracer must be entered before creating spans.")
-        span_id = uuid7()
-        if parent is None:
-            trace_id = span_id
-            parent_id = None
-        else:
-            trace_id = parent.trace_id
-            parent_id = parent.id
-        span = RecordingSpan(
-            span_id,
-            self,
-            trace_id,
-            parent_id,
-            name,
-            attributes=dict(attributes) if attributes else None,
-        )
+        span = RecordingSpan.create(self, name, attributes, parent=parent)
         self._open.add(span.id)
         return span
 

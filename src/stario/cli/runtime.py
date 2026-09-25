@@ -10,7 +10,6 @@ Server runtime policy is read from `STARIO_*` environment variables
 import inspect
 import math
 import shlex
-import socket
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -18,11 +17,7 @@ from fnmatch import translate as glob_to_regex
 from pathlib import Path
 from typing import cast
 
-from stario.cli.env import (
-    server_config_from_env,
-    tracer_from_env,
-    unix_socket_from_env,
-)
+from stario.cli.env import server_config_from_env, tracer_from_env
 from stario.cli.errors import CliError
 from stario.cli.imports import load_symbol
 from stario.cli.term import echo, style
@@ -60,22 +55,9 @@ def load_bootstrap(spec: str) -> Bootstrap:
     return cast(Bootstrap, bootstrap)
 
 
-def _check_unix_socket_supported(unix_socket: str | None) -> None:
-    """`AF_UNIX` is Unix-only on most Python builds; Windows may lack it entirely."""
-    if unix_socket is None:
-        return
-    if not hasattr(socket, "AF_UNIX"):
-        raise CliError(
-            "Unix domain sockets are not available on this platform. "
-            "Unset STARIO_UNIX_SOCKET or use STARIO_HOST and STARIO_PORT."
-        )
-
-
 def serve_once(app_spec: str) -> None:
-    """CLI entry: load bootstrap, pick tracer, construct `Server`, block until shutdown."""
+    """CLI entry: load bootstrap, pick tracer, run `Server` until shutdown."""
     config = server_config_from_env()
-    _check_unix_socket_supported(config.unix_socket)
-
     bootstrap = load_bootstrap(app_spec)
     tracer = tracer_from_env()
     try:
@@ -111,8 +93,6 @@ def watch_app(
     """
     from watchfiles import run_process
     from watchfiles.filters import DefaultFilter
-
-    _check_unix_socket_supported(unix_socket_from_env())
 
     stripped = tuple(spec.strip() for spec in watch_specs)
     paths = tuple(dict.fromkeys(stripped)) or (".",)

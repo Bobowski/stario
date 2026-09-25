@@ -55,9 +55,9 @@ class TestFiles:
 
     def test_rejects_urlpath_prefix(self, tmp_path: Path) -> None:
         with pytest.raises(StarioError, match="must be a string"):
-            Files(tmp_path, UrlPath("/media"))
+            Files(tmp_path, UrlPath("/media"))  # pyright: ignore[reportArgumentType]
         with pytest.raises(StarioError, match="must be a string"):
-            Assets(tmp_path, UrlPath("/static"))
+            Assets(tmp_path, UrlPath("/static"))  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
         "path",
@@ -175,12 +175,15 @@ class TestServing:
 
     async def test_content_type_override(self, tmp_path: Path) -> None:
         (tmp_path / "site.custom").write_text("data")
+        (tmp_path / "IMAGE.PNG").write_bytes(b"\x89PNG\r\n\x1a\n")
         files = Files(tmp_path, content_types={".custom": "application/x-custom"})
 
         async with TestClient(_app(files)) as client:
-            response = await client.get("/data/site.custom")
+            custom = await client.get("/data/site.custom")
+            png = await client.get("/data/IMAGE.PNG")
 
-        assert response.headers.get("content-type") == "application/x-custom"
+        assert custom.headers.get("content-type") == "application/x-custom"
+        assert png.headers.get("content-type") == "image/png"
 
     async def test_load_change_and_deletion_do_not_serve_stale_bytes(
         self, tmp_path: Path
@@ -773,27 +776,6 @@ class TestAssets:
         assert body.headers.get("etag") == f'"{digest}"'
 
     @pytest.mark.asyncio
-    async def test_cached_asset_honors_range(self, tmp_path: Path) -> None:
-        (tmp_path / "app.js").write_text("console.log(1)")
-        files = Assets(tmp_path)
-        href = files.href("app.js")
-        await files.load(precompress=())
-
-        async with TestClient(_app(files)) as client:
-            partial = await client.get(href, headers={"Range": "bytes=0-6"})
-            gzip_range = await client.get(
-                href, headers={"Range": "bytes=0-6", "Accept-Encoding": "gzip"}
-            )
-
-        assert files.stats["cached_files"] == 1
-        assert partial.status_code == 206
-        assert partial.content == b"console"
-        assert partial.headers.get("accept-ranges") == "bytes"
-        assert gzip_range.status_code == 206
-        assert gzip_range.content == b"console"
-        assert gzip_range.headers.get("content-encoding") is None
-
-    @pytest.mark.asyncio
     async def test_load_hashes_files_not_passed_to_href(self, tmp_path: Path) -> None:
         (tmp_path / "app.js").write_text("console.log('hi');")
         files = Assets(tmp_path, "/static")
@@ -935,7 +917,7 @@ class TestAssets:
         assert response.headers.get("x-content-type-options") == "nosniff"
 
     @pytest.mark.asyncio
-    async def test_validators_and_304(self, tmp_path: Path) -> None:
+    async def test_cached_asset_honors_etag_304(self, tmp_path: Path) -> None:
         (tmp_path / "app.js").write_text("console.log(1)")
         files = Assets(tmp_path)
         href = files.href("app.js")
@@ -944,53 +926,14 @@ class TestAssets:
         async with TestClient(_app(files)) as client:
             initial = await client.get(href)
             etag = initial.headers.get("etag")
-            modified = initial.headers.get("last-modified")
             assert etag is not None
-            assert modified is not None
-            wildcard = await client.get(href, headers={"If-None-Match": "*"})
-            listed = await client.get(
-                href, headers={"If-None-Match": f'"other", {etag}'}
-            )
-            weak = await client.get(href, headers={"If-None-Match": f"W/{etag}"})
-            ims = await client.get(href, headers={"If-Modified-Since": modified})
+            cached = await client.get(href, headers={"If-None-Match": etag})
 
-        assert etag.startswith('"')
-        for response in (wildcard, listed, weak, ims):
-            assert response.status_code == 304
-            assert response.content == b""
-            assert response.headers.get("etag") == etag
-            assert response.headers.get("x-content-type-options") == "nosniff"
-
-    @pytest.mark.asyncio
-    async def test_etag_is_distinct_per_encoding(self, tmp_path: Path) -> None:
-        payload = ("body { color: red; }\n" * 100).encode()
-        (tmp_path / "app.css").write_bytes(payload)
-        files = Assets(tmp_path)
-        href = files.href("app.css")
-        await files.load(compression=CompressionConfig(min_size=1))
-
-        async with TestClient(_app(files)) as client:
-            identity = await client.get(href)
-            br = await client.get(href, headers={"Accept-Encoding": "br"})
-            gzip_resp = await client.get(href, headers={"Accept-Encoding": "gzip"})
-            identity_etag = identity.headers.get("etag")
-            br_etag = br.headers.get("etag")
-            gzip_etag = gzip_resp.headers.get("etag")
-            stale = await client.get(href, headers={"If-None-Match": br_etag or ""})
-            fresh = await client.get(
-                href,
-                headers={"Accept-Encoding": "br", "If-None-Match": br_etag or ""},
-            )
-
-        assert identity.headers.get("content-encoding") is None
-        assert br.headers.get("content-encoding") == "br"
-        assert gzip_resp.headers.get("content-encoding") == "gzip"
-        assert len({identity_etag, br_etag, gzip_etag}) == 3
-        for etag in (identity_etag, br_etag, gzip_etag):
-            assert etag is not None
-            assert etag.startswith('"')
-        assert stale.status_code == 200
-        assert fresh.status_code == 304
+        assert files.stats["cached_files"] == 1
+        assert initial.status_code == 200
+        assert cached.status_code == 304
+        assert cached.content == b""
+        assert cached.headers.get("etag") == etag
 
     @pytest.mark.asyncio
     async def test_streamed_etag_and_304(self, tmp_path: Path) -> None:

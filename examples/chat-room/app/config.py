@@ -5,6 +5,8 @@ Environment variables are the runtime source of truth; defaults here keep
 local development zero-setup. No scattered `os.environ` reads elsewhere.
 """
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 

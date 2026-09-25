@@ -7,7 +7,7 @@ this module re-exports them for env wiring.
 from collections.abc import Callable
 from pathlib import Path
 from ssl import SSLContext
-from typing import Literal
+from typing import Literal, TypedDict
 
 from stario._env import (
     env_bool,
@@ -267,6 +267,25 @@ class ServerConfig:
             )
         else:
             self.ssl = None
+
+
+class ServerOptions(TypedDict, total=False):
+    """Keyword fields for `stario.serve()`; same names as `ServerConfig`."""
+
+    host: str
+    port: int
+    unix_socket: str | None
+    unix_socket_mode: int
+    requests: RequestPolicy
+    compression: CompressionConfig
+    graceful_shutdown_timeout: float
+    backlog: int
+    reuse_addr: bool
+    event_loop: EventLoopKind
+    threads: int
+    ssl: SSLContext
+    ssl_certfile: str | Path | None
+    ssl_keyfile: str | Path | None
 
 
 def _event_loop_from_env() -> EventLoopKind:

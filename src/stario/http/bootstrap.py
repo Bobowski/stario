@@ -9,7 +9,7 @@ server failures never enter the generator.
 import inspect
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Literal, cast
 
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span
@@ -36,20 +36,19 @@ async def bootstrap_run(
     failures in the scoped body never enter bootstrap teardown via `.athrow()`.
     """
     result = bootstrap(app, span)
-    if inspect.isasyncgen(result):
-        gen = result
-    elif inspect.iscoroutine(result):
+    if inspect.iscoroutine(result):
         result.close()
         raise StarioError(
             "Bootstrap must yield exactly once",
             help_text="Define `async def bootstrap(app, span): ...; yield` (one yield).",
         )
-    else:
+    if not inspect.isasyncgen(result):
         raise StarioError(
             "Bootstrap must be an async generator",
             context={"type": type(result).__name__},
             help_text="Define `async def bootstrap(app, span): ...; yield` (one yield).",
         )
+    gen = cast(AsyncGenerator[None], result)
 
     try:
         await anext(gen)

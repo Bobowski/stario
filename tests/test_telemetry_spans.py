@@ -1,16 +1,20 @@
 """Tests for span primitives: `RecordingSpan`, `ProxySpan`, `NoOpSpan`."""
 
 import json
+import os
+import sys
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from io import StringIO
+from typing import Any
 from uuid import uuid4
 
 import pytest
 
 from stario.telemetry.json import JsonTracer
 from stario.telemetry.noop import NoOpTracer
-from stario.telemetry.spans import NoOpSpan, ProxySpan
+from stario.telemetry.spans import NoOpSpan, ProxySpan, RecordingSpan, _span_id
 
 
 def make_tracer() -> tuple[JsonTracer, StringIO]:
@@ -196,3 +200,73 @@ class TestProxySpan:
         assert second_payload["links"] == [
             {"name": "previous", "span_id": first_id and str(first_id)}
         ]
+
+
+class TestSpanId:
+    def test_is_uuid_version_7_rfc4122(self) -> None:
+        value = _span_id()
+        assert value.version == 7
+        assert (value.int >> 62) & 0b11 == 0b10
+
+    def test_is_unique(self) -> None:
+        seen = {_span_id() for _ in range(256)}
+        assert len(seen) == 256
+
+    def test_is_monotonic_in_the_same_millisecond(self) -> None:
+        values = [_span_id() for _ in range(32)]
+        assert values == sorted(values)
+
+    def test_create_assigns_root_and_child_ids(self) -> None:
+        with tracing() as (tracer, _output):
+            root = RecordingSpan.create(tracer, "root")
+            child = RecordingSpan.create(tracer, "child", parent=root)
+        assert root.id.version == 7
+        assert root.trace_id == root.id
+        assert root.parent_id is None
+        assert child.trace_id == root.trace_id
+        assert child.parent_id == root.id
+        assert child.id != root.id
+
+    @pytest.mark.skipif(sys.version_info < (3, 14), reason="stdlib uuid7 is 3.14+")
+    def test_matches_stdlib_uuid7(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import uuid as stdlib_uuid
+
+        from stario.telemetry import spans
+
+        std: Any = stdlib_uuid
+        saved = (
+            std._last_timestamp_v7,
+            std._last_counter_v7,
+            spans._last_timestamp_v7,
+            spans._last_counter_v7,
+        )
+        blobs = [bytes(range(10)), bytes(range(4)), bytes(range(4, 8))]
+        index = {"n": 0}
+
+        def fake_urandom(n: int) -> bytes:
+            blob = blobs[index["n"]]
+            index["n"] += 1
+            assert len(blob) == n
+            return blob
+
+        monkeypatch.setattr(time, "time_ns", lambda: 1_700_000_000_000_000_000)
+        monkeypatch.setattr(os, "urandom", fake_urandom)
+
+        try:
+            std._last_timestamp_v7 = None
+            std._last_counter_v7 = 0
+            spans._last_timestamp_v7 = None
+            spans._last_counter_v7 = 0
+            theirs = [std.uuid7() for _ in range(3)]
+            std._last_timestamp_v7 = None
+            std._last_counter_v7 = 0
+            spans._last_timestamp_v7 = None
+            spans._last_counter_v7 = 0
+            index["n"] = 0
+            ours = [spans._span_id() for _ in range(3)]
+            assert ours == theirs
+        finally:
+            std._last_timestamp_v7 = saved[0]
+            std._last_counter_v7 = saved[1]
+            spans._last_timestamp_v7 = saved[2]
+            spans._last_counter_v7 = saved[3]

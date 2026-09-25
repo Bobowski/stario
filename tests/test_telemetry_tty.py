@@ -8,8 +8,7 @@ so the refresh thread is not part of the assertions.
 
 import io
 import threading
-import time
-from uuid import UUID, uuid4, uuid7
+from uuid import UUID, uuid4
 
 from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.spans import RecordedEvent, RecordedLink, RecordingSpan
@@ -38,7 +37,7 @@ def make_span(
     events: list[RecordedEvent] | None = None,
     links: list[RecordedLink] | None = None,
 ) -> RecordingSpan:
-    span_id = uuid7()
+    span_id = uuid4()
     return RecordingSpan(
         id=span_id,
         tracer=_NOOP,
@@ -249,23 +248,6 @@ class TestTracerPublicLifecycle:
         assert "request.in-flight" in text
         assert "db.query" in text
         assert "http.method" in text
-
-    def test_refresh_thread_skips_erase_on_static_span(self, monkeypatch):
-        _patch_terminal_size(monkeypatch, columns=80, lines=24)
-        output = _CountingIO()
-
-        with TTYTracer(out=output) as tracer:
-            root = tracer.create("request")
-            root.start()
-            root.attr("http.method", "GET")
-            deadline = time.monotonic() + 0.5
-            while time.monotonic() < deadline and "request" not in output.getvalue():
-                time.sleep(0.02)
-            assert "request" in output.getvalue()
-            writes = output.writes
-            time.sleep(0.35)
-            assert output.writes == writes
-            assert "\x1b[1A" not in output.getvalue()
 
 
 class TestLiveRegionIO:

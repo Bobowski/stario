@@ -76,6 +76,12 @@ class TestHostRouting:
             assert span.ok
             assert not client.tracer.has_open_spans()
 
+    def test_trailing_slash_on_double_slash_is_not_protocol_relative(self):
+        _context, writer = run_with_app(lambda _app: None, "//aftra.io/")
+
+        assert writer.status == 308
+        assert writer.headers.get("location") == "/aftra.io"
+
 
 class TestAppErrorSurface:
     def test_unhandled_exception_writes_500(self, caplog: pytest.LogCaptureFixture):

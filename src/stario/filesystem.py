@@ -26,9 +26,10 @@ from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
 from os import stat_result
 from pathlib import Path
-from typing import Final, NamedTuple, TypeIs
+from typing import Final, NamedTuple
 
 import xxhash
+from typing_extensions import TypeIs
 
 import stario.responses as responses
 from stario.exceptions import StarioError, StarioRuntime
@@ -295,7 +296,7 @@ def _date_matches(value: bytes, modified: float) -> bool:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return int(modified) <= int(parsed.timestamp())
-    except UnicodeDecodeError, OverflowError, TypeError, ValueError:
+    except (UnicodeDecodeError, OverflowError, TypeError, ValueError):
         return False
 
 

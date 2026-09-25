@@ -141,7 +141,7 @@ async def _connect_with_retry(
         while True:
             try:
                 return await asyncio.open_unix_connection(path)
-            except ConnectionRefusedError, FileNotFoundError:
+            except (ConnectionRefusedError, FileNotFoundError):
                 await asyncio.sleep(0.005)
 
 

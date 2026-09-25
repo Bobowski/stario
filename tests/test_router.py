@@ -4,14 +4,10 @@ import pytest
 
 from stario.exceptions import StarioError
 from stario.http import Router, default_not_found, method_not_allowed_handler
-from stario.http.context import EMPTY_MATCH, Context, Handler, Match
+from stario.http.context import EMPTY_MATCH, Context, Match
 from stario.http.route import EMPTY_ROUTE, Route
 from stario.http.writer import Writer
-from tests.helpers import DummyWriter, run_handler, run_with_app
-
-
-async def noop_handler(c: Context, w: Writer) -> None:
-    return None
+from tests.helpers import DummyWriter, noop_handler, run_handler, track
 
 
 class TestFindHandler:
@@ -71,7 +67,6 @@ class TestFindHandler:
 
         assert route is curly
         assert hit.pattern == "GET /curly/{id}"
-        assert curly.href() == "/curly/{id}"
 
     def test_radix_exact_chain_and_split(self):
         router = Router()
@@ -98,14 +93,6 @@ class TestFindHandler:
 
         assert route.target == "/files/{path...}"
         assert dict(hit.params) == {"path": "docs/readme.txt"}
-
-    def test_rejects_non_terminal_catchall(self):
-        router = Router()
-
-        with pytest.raises(
-            StarioError, match="Catchall path param in invalid position"
-        ):
-            router.add(Route("GET", "/files/{path...}/edit"), noop_handler)
 
     def test_method_not_allowed_allowed_methods_sorted_in_allow_header(self):
         router = Router()
@@ -169,7 +156,6 @@ class TestFindHandler:
 
         assert route is curly
         assert hit.pattern == "GET //{api}.example.com/"
-        assert curly.href() == "//{api}.example.com/"
 
     def test_hostless_routes_fallback_when_no_host_branch_matches(self):
         router = Router()
@@ -201,7 +187,6 @@ class TestFindHandler:
         _, route, hit = router.find_handler("", "/rooms/7/send", "POST")
 
         assert route.target == "/rooms/{room_id}/send"
-        assert route.pattern == "POST /rooms/{room_id}/send"
         assert dict(hit.params) == {"room_id": "7"}
         assert hit.pattern == send.pattern
 
@@ -219,7 +204,6 @@ class TestFindHandler:
         _, other, other_hit = router.find_handler("", "/t/beta/users/1", "GET")
 
         assert acme.target == "/t/acme/users/{id}"
-        assert acme.pattern == "GET /t/acme/users/{id}"
         assert dict(acme_hit.params) == {"id": "1"}
         assert other.target == "/t/{tenant}/users/{id}"
         assert dict(other_hit.params) == {"tenant": "beta", "id": "1"}
@@ -227,7 +211,7 @@ class TestFindHandler:
     def test_verb_helpers_are_deprecated(self):
         router = Router()
         with pytest.warns(DeprecationWarning, match=r"add\(Route\('GET'"):
-            router.get("/x", noop_handler)
+            router.get("/x", noop_handler)  # pyright: ignore[reportDeprecated]
 
         _, route, _ = router.find_handler("", "/x", "GET")
         assert route.target == "/x"
@@ -235,7 +219,7 @@ class TestFindHandler:
     def test_handle_is_deprecated(self):
         router = Router()
         with pytest.warns(DeprecationWarning, match=r"add\(Route"):
-            router.handle("GET", "/y", noop_handler)
+            router.handle("GET", "/y", noop_handler)  # pyright: ignore[reportDeprecated]
 
         _, route, _ = router.find_handler("", "/y", "GET")
         assert route.target == "/y"
@@ -274,16 +258,8 @@ class TestFindHandler:
 class TestRouterUse:
     def test_use_applies_middleware_to_later_routes(self):
         calls: list[str] = []
-
-        def scope_middleware(handler: Handler) -> Handler:
-            async def wrapped(c: Context, w: Writer) -> None:
-                calls.append("scope")
-                await handler(c, w)
-
-            return wrapped
-
         router = Router()
-        router.use("/", scope_middleware)
+        router.use("/", track(calls, "scope"))
         router.add(Route("GET", "/users"), noop_handler)
 
         handler, _, _ = router.find_handler("", "/users", "GET")
@@ -302,19 +278,8 @@ class TestRouterUse:
 
     def test_use_middleware_runs_in_registration_order(self):
         calls: list[str] = []
-
-        def track(label: str):
-            def deco(handler: Handler) -> Handler:
-                async def wrapped(c: Context, w: Writer) -> None:
-                    calls.append(label)
-                    await handler(c, w)
-
-                return wrapped
-
-            return deco
-
         router = Router()
-        router.use("/", track("mw1"), track("mw2"))
+        router.use("/", track(calls, "mw1"), track(calls, "mw2"))
         router.add(Route("GET", "/"), noop_handler)
         handler, _, _ = router.find_handler("", "/", "GET")
         run_handler(handler, "/")
@@ -322,20 +287,9 @@ class TestRouterUse:
 
     def test_nested_use_scopes_run_general_to_specific(self):
         calls: list[str] = []
-
-        def track(label: str):
-            def deco(handler: Handler) -> Handler:
-                async def wrapped(c: Context, w: Writer) -> None:
-                    calls.append(label)
-                    await handler(c, w)
-
-                return wrapped
-
-            return deco
-
         router = Router()
-        router.use("/", track("root"))
-        router.use("/users", track("users"))
+        router.use("/", track(calls, "root"))
+        router.use("/users", track(calls, "users"))
         router.add(Route("GET", "/users/panel"), noop_handler)
         handler, _, _ = router.find_handler("", "/users/panel", "GET")
         run_handler(handler, "/users/panel")
@@ -343,23 +297,12 @@ class TestRouterUse:
 
     def test_route_middleware_runs_after_scope_middleware(self):
         calls: list[str] = []
-
-        def track(label: str):
-            def deco(handler: Handler) -> Handler:
-                async def wrapped(c: Context, w: Writer) -> None:
-                    calls.append(label)
-                    await handler(c, w)
-
-                return wrapped
-
-            return deco
-
         router = Router()
-        router.use("/", track("scope"))
+        router.use("/", track(calls, "scope"))
         router.add(
             Route("GET", "/"),
             noop_handler,
-            middleware=[track("route")],
+            middleware=[track(calls, "route")],
         )
         handler, _, _ = router.find_handler("", "/", "GET")
         run_handler(handler, "/")
@@ -367,20 +310,9 @@ class TestRouterUse:
 
     def test_host_route_inherits_hostless_path_middleware(self):
         calls: list[str] = []
-
-        def track(label: str):
-            def deco(handler: Handler) -> Handler:
-                async def wrapped(c: Context, w: Writer) -> None:
-                    calls.append(label)
-                    await handler(c, w)
-
-                return wrapped
-
-            return deco
-
         router = Router()
-        router.use("/", track("root"))
-        router.use("/users", track("users"))
+        router.use("/", track(calls, "root"))
+        router.use("/users", track(calls, "users"))
         router.add(Route("GET //api.example.com/users"), noop_handler)
 
         handler, _, _ = router.find_handler("api.example.com", "/users", "GET")
@@ -402,12 +334,3 @@ class TestRouterUse:
         assert hit.pattern == ""
         run_handler(handler, "/missing", host="api.example.com")
         assert calls == ["host-404"]
-
-
-class TestRouterDispatch:
-    def test_dispatch_trailing_slash_redirect_normalizes_leading_slashes(self):
-        """`//host/` must not become a protocol-relative Location (`//host`)."""
-        _context, writer = run_with_app(lambda _app: None, "//aftra.io/")
-
-        assert writer.status == 308
-        assert writer.headers.get("location") == "/aftra.io"

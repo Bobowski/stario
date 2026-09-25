@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import zlib
 from collections.abc import Iterable
-from compression import zstd
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import brotli  # pyright: ignore[reportMissingTypeStubs]
+import zstandard as zstd
 
 from stario._env import env_int, env_optional_int
 from stario.exceptions import StarioError
@@ -28,11 +28,9 @@ def brotli_decompress(data: bytes) -> bytes:
 
 # `CompressionConfig.select` honors `Accept-Encoding` q-values, then prefers
 # br -> zstd -> gzip when the client weights supported encodings equally.
-# zstd uses the 3.14 `compression.zstd` API; brotli/gzip cover older clients.
 
-_ZSTD_WINDOW_LOG_MIN, _ZSTD_WINDOW_LOG_MAX = (
-    zstd.CompressionParameter.window_log.bounds()
-)
+_ZSTD_WINDOW_LOG_MIN = zstd.WINDOWLOG_MIN
+_ZSTD_WINDOW_LOG_MAX = zstd.WINDOWLOG_MAX
 _BROTLI_WINDOW_LOG_MIN = 10
 _BROTLI_WINDOW_LOG_MAX = 24
 _GZIP_WINDOW_BITS_MIN = 9
@@ -140,7 +138,11 @@ def content_type_is_compressible(content_type: bytes) -> bool:
     return not media_type.startswith(_NONCOMPRESSIBLE_CONTENT_TYPE_PREFIXES)
 
 
-_ZSTD_FLUSH_BLOCK = 1  # zstd block flush for incremental chunked HTTP
+def _zstd_compressor(level: int, window: int | None) -> zstd.ZstdCompressor:
+    if window is None:
+        return zstd.ZstdCompressor(level=level)
+    params = zstd.ZstdCompressionParameters(compression_level=level, window_log=window)
+    return zstd.ZstdCompressor(compression_params=params)
 
 
 class Compressor:
@@ -177,38 +179,24 @@ class Compressor:
 
 
 class _Zstd(Compressor):
-    """Zstandard - Python 3.14 stdlib. Fastest with best ratio."""
+    """Zstandard (`zstandard` package)."""
 
     encoding = b"zstd"
 
     def frame(self, data: bytes) -> bytes:
-        if self._window is not None:
-            return zstd.compress(
-                data,
-                options={
-                    zstd.CompressionParameter.compression_level: self._level,
-                    zstd.CompressionParameter.window_log: self._window,
-                },
-            )
-        return zstd.compress(data, level=self._level)
+        return _zstd_compressor(self._level, self._window).compress(data)
 
     def block(self, data: bytes) -> bytes:
         if self._stream is None:
-            if self._window is not None:
-                self._stream = zstd.ZstdCompressor(
-                    options={
-                        zstd.CompressionParameter.compression_level: self._level,
-                        zstd.CompressionParameter.window_log: self._window,
-                    },
-                )
-            else:
-                self._stream = zstd.ZstdCompressor(level=self._level)
-        return self._stream.compress(data, mode=_ZSTD_FLUSH_BLOCK)
+            self._stream = _zstd_compressor(self._level, self._window).compressobj()
+        return self._stream.compress(data) + self._stream.flush(
+            zstd.COMPRESSOBJ_FLUSH_BLOCK
+        )
 
     def finish(self) -> bytes:
         if self._stream is None:
             return b""
-        return self._stream.flush()
+        return self._stream.flush(zstd.COMPRESSOBJ_FLUSH_FINISH)
 
 
 class _Brotli(Compressor):

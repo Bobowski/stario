@@ -18,7 +18,8 @@ pick `at.get` / `at.post` / … at the call site.
 from collections.abc import Mapping
 from typing import Any, Literal
 from urllib.parse import urlencode
-from warnings import deprecated
+
+from typing_extensions import deprecated
 
 from stario.exceptions import StarioError
 from stario.http.route import Route

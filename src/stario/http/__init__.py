@@ -6,14 +6,20 @@ matched handler as a task.
 
 **Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
 
-**Process** — import submodules directly for embedding:
+**Process** — `await serve(bootstrap, …)` on a running loop, or
+`asyncio.run(stario.serve(bootstrap))` / `uvloop.run(...)`.
+Lower-level embedding imports the submodules:
 
 ```python
+import asyncio
+from stario import serve
 from stario.http.bootstrap import bootstrap_run
 from stario.http.compression import CompressionConfig
 from stario.http.config import RequestPolicy, ServerConfig, server_config_from_env
 from stario.http.redirect import normalized_location
 from stario.http.server import Server
+
+asyncio.run(serve(bootstrap, port=9000))
 ```
 
 Filesystem serving lives in `stario.filesystem` (`Files`).

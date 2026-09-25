@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal
-from warnings import deprecated
 
 import xxhash
+from typing_extensions import deprecated
 
 import stario.responses as responses
 from stario.exceptions import StarioError
@@ -357,6 +357,10 @@ class AssetManifest:
             ) from exc
         return append_query_fragment(href, query=query, fragment=fragment)
 
+    @property
+    def route(self) -> Route:
+        return self._route
+
 
 @dataclass(slots=True)
 class CachedFile:
@@ -450,7 +454,7 @@ class StaticAssets:
                 ),
             )
         self.manifest = manifest
-        self._route = manifest._route
+        self._route = manifest.route
         if cache_max_size <= 0:
             raise StarioError(
                 "StaticAssets numeric limits must be positive",

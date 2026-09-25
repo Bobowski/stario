@@ -10,7 +10,7 @@ from typing import Any, cast
 from urllib.parse import urlencode
 
 from stario.http.app import App
-from stario.http.context import Context
+from stario.http.context import Context, Handler
 from stario.http.headers import Headers
 from stario.http.writer import Writer
 from stario.telemetry.noop import NoOpTracer
@@ -18,6 +18,21 @@ from stario.testing.harness import TestContext, TestRequest, TestWriter
 from stario.testing.tracer import TestTracer
 
 type AppSetup = Callable[[App], None]
+
+
+async def noop_handler(_c: Context, _w: Writer) -> None:
+    return None
+
+
+def track(calls: list[str], label: str):
+    def deco(handler: Handler) -> Handler:
+        async def wrapped(c: Context, w: Writer) -> None:
+            calls.append(label)
+            await handler(c, w)
+
+        return wrapped
+
+    return deco
 
 
 def app_for_loop(_loop: asyncio.AbstractEventLoop) -> App:
