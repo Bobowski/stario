@@ -214,3 +214,39 @@ async def test_wide_memoryview_body_is_rejected() -> None:
     assert response.endswith(b"ok")
     assert len(errors) == 1
     assert "itemsize" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_h2_no_rst_stream_after_client_reset() -> None:
+    app = App()
+    started = asyncio.Event()
+    aborted = asyncio.Event()
+
+    async def page(_c, w) -> None:
+        started.set()
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            w.abort()
+            aborted.set()
+            raise
+
+    app.add(Route("GET /"), page)
+    async with running_server(app) as port:
+        reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
+        writer.write(_h2_get(1, "/"))
+        async with asyncio.timeout(2):
+            await started.wait()
+        writer.write(h2.pack_frame(h2.TYPE_RST_STREAM, 0, 1, (8).to_bytes(4, "big")))
+        async with asyncio.timeout(2):
+            await aborted.wait()
+        ping = 0x6
+        writer.write(h2.pack_frame(ping, 0, 0, b"barrier!"))
+        frames: list[h2.H2Frame] = []
+        async with asyncio.timeout(2):
+            while not any(f.type == ping and f.flags & h2.FLAG_ACK for f in frames):
+                buf += await reader.read(65536)
+                parsed, buf = h2.parse_frames(buf)
+                frames.extend(parsed)
+        writer.close()
+    assert not h2.has_rst(frames, 1)

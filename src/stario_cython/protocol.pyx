@@ -2995,6 +2995,8 @@ cdef class CHttpProtocol(Connection):
     cdef void h2_abort(self, RequestExchange ex):
         if self.h2 == NULL or ex is None:
             return
+        if self.h2_streams.get(ex._h2_stream_id) is not ex:
+            return
         nghttp2_submit_rst_stream(
             self.h2, NGHTTP2_FLAG_NONE, ex._h2_stream_id, NGHTTP2_INTERNAL_ERROR
         )
