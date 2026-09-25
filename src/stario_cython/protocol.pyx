@@ -1452,6 +1452,10 @@ cdef class CHttpProtocol(Connection):
         if (flags & F_TRANSFER_ENCODING) and not (flags & F_CHUNKED):
             self._protocol_error(400, "Invalid HTTP request")
             return
+        # RFC 9112 6.1: Transfer-Encoding in HTTP/1.0 is faulty framing;
+        # answer, then close.
+        if (flags & F_TRANSFER_ENCODING) and http_minor == 0:
+            self.request_keep_alive = False
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
             # after oversize headers would be a read-DoS if we stayed open.
@@ -1937,7 +1941,10 @@ cdef class CHttpProtocol(Connection):
             transport.close()
             return
         self._set_pause_reason(PAUSE_PIPELINE, False)
-        self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
+        # Headers of the next request may already be trickling in: their
+        # deadline keeps running, or slow headers never time out.
+        if self.timeout_kind != TIMEOUT_HEADER:
+            self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
     cdef void _finish_protocol_span(
         self,

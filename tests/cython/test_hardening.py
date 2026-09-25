@@ -1017,6 +1017,62 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http10_transfer_encoding_closes_after_response() -> None:
+    app = App()
+
+    async def handler(c, w) -> None:
+        responses.text(w, (await c.req.body()).decode())
+
+    app.post("/", handler)
+    proto, app, transport = _attach(app=app)
+    try:
+        proto.data_received(
+            b"POST / HTTP/1.0\r\nConnection: keep-alive\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"
+        )
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        assert transport.is_closing()
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_pipelined_trickled_headers_time_out_after_response() -> None:
+    """An earlier response finishing must not swap the header deadline for idle."""
+    app = App()
+    release = asyncio.Event()
+
+    async def handler(_c, w) -> None:
+        await release.wait()
+        responses.text(w, "ok")
+
+    app.get("/", handler)
+    proto, app, transport = _attach(
+        app=app, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
+    )
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\n")
+        await asyncio.sleep(_TIMEOUT / 3)
+        release.set()
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+        for _ in range(8):
+            if transport.is_closing():
+                break
+            proto.data_received(b"X")
+            await asyncio.sleep(_TRICKLE_PAUSE)
+        assert transport.is_closing()
+    finally:
+        release.set()
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
 async def test_stalled_chunked_body_aborts_without_hanging() -> None:
     """Chunked / large bodies dispatch at headers-complete. A stalled
     ``body()`` wait must abort via the shared connection sweeper, not hang.
