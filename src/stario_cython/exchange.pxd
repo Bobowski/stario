@@ -102,7 +102,7 @@ cdef class RequestHandle
 cdef class Request:
     cdef public object method
     cdef public object path
-    cdef public object headers
+    cdef readonly RequestHeaders headers
     cdef public object protocol_version
     cdef public bint keep_alive
     cdef object _query_bytes
@@ -112,7 +112,7 @@ cdef class Request:
     cdef Py_ssize_t _p_len
     cdef Py_ssize_t _q_off
     cdef Py_ssize_t _q_len
-    cdef public object _body
+    cdef object _body
     cdef object _query
     cdef object _cookies
     cdef object _host
@@ -127,7 +127,7 @@ cdef Request make_request(
     object path,
     object protocol_version,
     bint keep_alive,
-    object headers,
+    RequestHeaders headers,
     object body,
 )
 
@@ -474,6 +474,7 @@ cdef class RequestHeaders:
     cdef Py_ssize_t _cookie_index(self) noexcept
     cdef Py_ssize_t _auth_index(self) noexcept
     cdef void _take_ownership(self) noexcept
+    cdef int _own_pairs(self, list pairs) except -1
     cdef object c_get(self, object name)
     cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept
     cdef object c_value_str(self, Py_ssize_t index)

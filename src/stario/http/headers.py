@@ -1,5 +1,9 @@
-"""Header pair list. The implementation is ``stario_cython.exchange.Headers``."""
+"""Header types. The implementations live in ``stario_cython.exchange``.
 
-from stario_cython.exchange import Headers, encode_header_value
+``Headers`` is the mutable response header list (``w.headers``).
+``RequestHeaders`` is the read-only view handlers get as ``c.req.headers``.
+"""
 
-__all__ = ["Headers", "encode_header_value"]
+from stario_cython.exchange import Headers, RequestHeaders, encode_header_value
+
+__all__ = ["Headers", "RequestHeaders", "encode_header_value"]

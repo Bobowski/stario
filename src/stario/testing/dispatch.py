@@ -8,11 +8,12 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsp
 
 from stario.http.app import App
 from stario.http.headers import Headers
+from stario.http.request import Request
 from stario.http.wire import decode_path
 from stario.telemetry.core import Span
 from stario.testing.cookies import serialize_cookie_header
 from stario.testing.encode import encode_request_body, expand_pairs
-from stario.testing.harness import TestContext, TestRequest, TestWriter
+from stario.testing.harness import TestContext, TestWriter
 from stario.testing.models import ClientRequest
 from stario.testing.tracer import TestTracer
 from stario.testing.types import (
@@ -53,7 +54,7 @@ def wire_dispatch(
     except ValueError:
         # App.__call__ answers 400 from raw_path, like the HTTP protocol.
         path = ppath
-    request = TestRequest(
+    request = Request(
         method=pm,
         path=path,
         raw_path=raw_path,

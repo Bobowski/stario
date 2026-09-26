@@ -41,7 +41,7 @@ from stario.http.compression import (
     negotiate_content_encoding,
 )
 from stario.http.context import Context
-from stario.http.headers import Headers, encode_header_value
+from stario.http.headers import RequestHeaders, encode_header_value
 from stario.http.route import Route, append_query_fragment, public_prefix
 from stario.http.writer import Writer
 
@@ -265,7 +265,9 @@ def _last_modified(modified: float) -> bytes:
     ).encode("ascii")
 
 
-def _range_header(request: Headers, identity_etag: bytes, modified: float) -> bytes:
+def _range_header(
+    request: RequestHeaders, identity_etag: bytes, modified: float
+) -> bytes:
     range_header = request.unsafe_get(b"range", b"")
     if (if_range := request.unsafe_get(b"if-range")) is None:
         return range_header
@@ -277,7 +279,7 @@ def _range_header(request: Headers, identity_etag: bytes, modified: float) -> by
     return range_header if _date_matches(stripped, modified) else b""
 
 
-def _fresh(request: Headers, etag: bytes, modified: float) -> bool:
+def _fresh(request: RequestHeaders, etag: bytes, modified: float) -> bool:
     if_none_match = request.unsafe_get(b"if-none-match")
     if if_none_match is None:
         since = request.unsafe_get(b"if-modified-since")

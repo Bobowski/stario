@@ -1,117 +1,27 @@
-"""In-process request/response doubles for TestClient.
+"""In-process response doubles for TestClient.
 
-These are not the production Writer / Request / Context. They only need to
-accept a handler call and collect a status, headers, and body.
+Requests are the production ``Request``; the writer and context are doubles
+that only need to accept a handler call and collect a status, headers, and body.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
-from urllib.parse import quote
 
-from stario.exceptions import RequestBodyError
 from stario.http.context import (
     EMPTY_MATCH,
     Match,
     _Alive,  # pyright: ignore[reportPrivateUsage]
 )
 from stario.http.headers import Headers
-from stario.http.host import host_without_port
-from stario.http.query import ParsedQuery
-from stario.http.request import ParsedCookies
 from stario.telemetry.core import Span
 from stario.testing.transport import GrowingSink
 
 if TYPE_CHECKING:
     from stario.http.app import App
     from stario.http.request import Request
-
-
-class TestRequest:
-    """Simple request the test client passes into ``app(c, w)``."""
-
-    __test__ = False
-
-    __slots__ = (
-        "_body",
-        "_consumed_stream",
-        "_cookies",
-        "_host",
-        "_query",
-        "headers",
-        "keep_alive",
-        "method",
-        "path",
-        "protocol_version",
-        "query_bytes",
-        "raw_path",
-    )
-
-    def __init__(
-        self,
-        *,
-        method: str = "GET",
-        path: str = "/",
-        raw_path: bytes | None = None,
-        query_bytes: bytes = b"",
-        headers: Headers | None = None,
-        body: bytes = b"",
-        protocol_version: str = "1.1",
-        keep_alive: bool = True,
-    ) -> None:
-        self.method = method
-        self.path = path
-        self.raw_path = (
-            raw_path
-            if raw_path is not None
-            else quote(path or "/", safe="/!$&'()*+,;=:@~").encode("ascii")
-        )
-        self.query_bytes = query_bytes if query_bytes else b""
-        self.headers = headers if headers is not None else Headers()
-        self.protocol_version = protocol_version
-        self.keep_alive = keep_alive
-        self._body = body
-        self._query: ParsedQuery | None = None
-        self._cookies: ParsedCookies | None = None
-        self._host: str | None = None
-        self._consumed_stream = False
-
-    @property
-    def host(self) -> str:
-        if self._host is None:
-            self._host = host_without_port(self.headers.get("host") or "")
-        return self._host
-
-    @property
-    def query(self) -> ParsedQuery:
-        if self._query is None:
-            self._query = ParsedQuery(self.query_bytes)
-        return self._query
-
-    @property
-    def cookies(self) -> ParsedCookies:
-        if self._cookies is None:
-            self._cookies = ParsedCookies(self.headers.getlist("cookie"))
-        return self._cookies
-
-    async def body(self, max_size: int | None = None) -> bytes:
-        if max_size is not None and max_size < 0:
-            raise ValueError("max_size must be non-negative.")
-        if self._consumed_stream:
-            raise RuntimeError("Request body was already streamed.")
-        if max_size is not None and len(self._body) > max_size:
-            raise RequestBodyError(413, "Request body too large")
-        return self._body
-
-    async def stream(self, max_chunk: int | None = None) -> AsyncIterator[bytes]:
-        if self._consumed_stream:
-            raise RuntimeError("Request body is already streaming.")
-        self._consumed_stream = True
-        if self._body:
-            yield self._body
 
 
 class TestWriter:

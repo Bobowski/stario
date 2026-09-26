@@ -4,12 +4,8 @@
 ``stario_cython.exchange``. Host parsing lives in ``stario.http.host``.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Protocol
-
 from stario.http.host import host_without_port
-from stario_cython.exchange import ParsedCookies
+from stario_cython.exchange import ParsedCookies, Request
 
 # =============================================================================
 # Security limits (used by ServerConfig / RequestPolicy)
@@ -17,46 +13,6 @@ from stario_cython.exchange import ParsedCookies
 DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
 DEFAULT_MAX_HEADER_BYTES = 64 * 1024  # 64 KiB
 DEFAULT_BODY_TIMEOUT = 30.0  # seconds
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-
-    from stario.http.headers import Headers
-    from stario.http.query import ParsedQuery
-
-    # Structural, so the Cython request and ``stario.testing.TestRequest``
-    # both satisfy it.
-    class Request(Protocol):
-        method: str
-        path: str
-        """Fully percent-decoded path (``%2F`` becomes ``/``)."""
-        headers: Headers
-        protocol_version: str
-        keep_alive: bool
-
-        @property
-        def raw_path(self) -> bytes:
-            """Path exactly as sent: percent-encoded, no query. Routing uses this."""
-            ...
-
-        @property
-        def query_bytes(self) -> bytes: ...
-
-        @property
-        def host(self) -> str: ...
-
-        @property
-        def query(self) -> ParsedQuery: ...
-
-        @property
-        def cookies(self) -> ParsedCookies: ...
-
-        async def body(self, max_size: int | None = None) -> bytes: ...
-
-        def stream(self, max_chunk: int | None = None) -> AsyncIterator[bytes]: ...
-
-else:
-    from stario_cython.exchange import Request
 
 __all__ = [
     "DEFAULT_BODY_TIMEOUT",

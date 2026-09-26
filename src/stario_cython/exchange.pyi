@@ -40,6 +40,36 @@ class Headers:
 
 def encode_header_value(value: str) -> bytes: ...
 
+class RequestHeaders:
+    """Read-only request headers (``c.req.headers``)."""
+
+    def __init__(
+        self,
+        headers: Headers
+        | Mapping[str, str | list[str]]
+        | Mapping[bytes, bytes | list[bytes]]
+        | None = None,
+    ) -> None: ...
+    @overload
+    def get(self, name: str) -> str | None: ...
+    @overload
+    def get(self, name: str, default: str) -> str: ...
+    @overload
+    def get(self, name: str, default: str | None) -> str | None: ...
+    def getlist(self, name: str) -> list[str]: ...
+    def items(self) -> list[tuple[str, str]]: ...
+    @overload
+    def unsafe_get(self, name: bytes) -> bytes | None: ...
+    @overload
+    def unsafe_get(self, name: bytes, default: bytes) -> bytes: ...
+    @overload
+    def unsafe_get(self, name: bytes, default: bytes | None) -> bytes | None: ...
+    def unsafe_getlist(self, name: bytes) -> list[bytes]: ...
+    def unsafe_items(self) -> list[tuple[bytes, bytes]]: ...
+    def __contains__(self, name: object) -> bool: ...
+    def __bool__(self) -> bool: ...
+    def __len__(self) -> int: ...
+
 class ParsedQuery:
     def __init__(self, raw: bytes = b"") -> None: ...
     @overload
@@ -76,7 +106,8 @@ class Request:
     method: str
     path: str
     """Fully percent-decoded path (``%2F`` becomes ``/``)."""
-    headers: Headers
+    @property
+    def headers(self) -> RequestHeaders: ...
     protocol_version: str
     keep_alive: bool
     def __init__(
@@ -87,7 +118,11 @@ class Request:
         query_bytes: bytes = b"",
         protocol_version: str = "1.1",
         keep_alive: bool = True,
-        headers: Headers | Mapping[str, str] | None = None,
+        headers: RequestHeaders
+        | Headers
+        | Mapping[str, str | list[str]]
+        | Mapping[bytes, bytes | list[bytes]]
+        | None = None,
         body: bytes | None = None,
         raw_path: bytes | None = None,
     ) -> None: ...

@@ -1930,7 +1930,11 @@ cdef class Request:
     ):
         self.method = method
         self.path = path
-        self.headers = headers
+        self.headers = (
+            <RequestHeaders>headers
+            if isinstance(headers, RequestHeaders)
+            else RequestHeaders(headers)
+        )
         self.protocol_version = protocol_version
         self.keep_alive = keep_alive
         self._query_bytes = query_bytes
@@ -1962,55 +1966,22 @@ cdef class Request:
             self._body = _BODY_GONE
 
     cdef void prefetch_host(self) noexcept:
-        cdef RequestHeaders view
-        cdef Headers hdrs
+        cdef RequestHeaders view = self.headers
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef const char* arena
-        cdef object host_wire
-        cdef object host_str
-        cdef const char* p
-        cdef Py_ssize_t n = 0
         if self._host is not None:
             return
-        if isinstance(self.headers, RequestHeaders):
-            view = <RequestHeaders>self.headers
-            index = view._host_index()
-            arena = view._arena()
-            if index < 0 or arena == NULL:
-                self._host = ""
-                return
-            header = &view._headers()[index]
-            self._host = _host_without_port_n(
-                arena + header.value_offset,
-                <Py_ssize_t>header.value_length,
-            )
-            return
-        if isinstance(self.headers, Headers):
-            hdrs = <Headers>self.headers
-            host_wire = hdrs.c_get(b"host")
-            if host_wire is None:
-                self._host = ""
-                return
-            self._host = _host_without_port_n(
-                PyBytes_AS_STRING(host_wire),
-                PyBytes_GET_SIZE(host_wire),
-            )
-            return
-        host_str = ""
-        if self.headers is not None:
-            host_str = self.headers.get("host") or ""
-        if host_str is None:
+        index = view._host_index()
+        arena = view._arena()
+        if index < 0 or arena == NULL:
             self._host = ""
             return
-        if not isinstance(host_str, str):
-            host_str = str(host_str)
-        p = PyUnicode_AsUTF8AndSize(host_str, &n)
-        if p == NULL:
-            PyErr_Clear()
-            self._host = ""
-            return
-        self._host = _host_without_port_n(p, n)
+        header = &view._headers()[index]
+        self._host = _host_without_port_n(
+            arena + header.value_offset,
+            <Py_ssize_t>header.value_length,
+        )
 
     cdef object _materialize_query(self):
         cdef const char* arena
@@ -2074,10 +2045,7 @@ cdef class Request:
         cdef ParsedCookies parsed
         if self._cookies is None:
             parsed = ParsedCookies.__new__(ParsedCookies)
-            if isinstance(self.headers, RequestHeaders):
-                parsed.bind_request_headers(<RequestHeaders>self.headers)
-            else:
-                parsed.__init__(self.headers.getlist("cookie"))
+            parsed.bind_request_headers(self.headers)
             self._cookies = parsed
         return self._cookies
 
@@ -2113,7 +2081,7 @@ cdef Request make_request(
     object path,
     object protocol_version,
     bint keep_alive,
-    object headers,
+    RequestHeaders headers,
     object body,
 ):
     """Hot-path constructor. ``__new__`` skips Python ``__init__``.
@@ -4179,6 +4147,70 @@ cdef class RequestHeaders:
         self._own_host = -1
         self._own_cookie = -1
         self._own_auth = -1
+
+    def __init__(self, headers=None):
+        """Standalone headers for requests built outside the server (tests).
+
+        ``headers`` is a ``Headers`` or a mapping of names to a value or a
+        list of values (``str`` or ``bytes``). Names are lowercased.
+        """
+        cdef list pairs
+        cdef object name
+        cdef object value
+        cdef object item
+        if headers is None:
+            return
+        if isinstance(headers, Headers):
+            pairs = (<Headers>headers).unsafe_items()
+        else:
+            pairs = []
+            for name, value in headers.items():
+                name = _trusted_bytes(name).lower()
+                if type(value) is list:
+                    for item in value:
+                        pairs.append((name, _trusted_bytes(item)))
+                else:
+                    pairs.append((name, _trusted_bytes(value)))
+        self._own_pairs(pairs)
+
+    cdef int _own_pairs(self, list pairs) except -1:
+        cdef Py_ssize_t count = len(pairs)
+        cdef Py_ssize_t size = 0
+        cdef Py_ssize_t offset = 0
+        cdef Py_ssize_t index
+        cdef bytes name
+        cdef bytes value
+        cdef RawHeader* header
+        if count == 0:
+            return 0
+        for name, value in pairs:
+            size += PyBytes_GET_SIZE(name) + PyBytes_GET_SIZE(value)
+        if size > <Py_ssize_t>0xFFFFFFFF:
+            raise ValueError("RequestHeaders are limited to 4 GiB")
+        self._own_arena = <char*>malloc(<size_t>(size if size > 0 else 1))
+        self._own_headers = <RawHeader*>malloc(<size_t>count * sizeof(RawHeader))
+        if self._own_arena == NULL or self._own_headers == NULL:
+            raise MemoryError()
+        for index in range(count):
+            name, value = pairs[index]
+            header = &self._own_headers[index]
+            header.name_offset = <uint32_t>offset
+            header.name_length = <uint32_t>PyBytes_GET_SIZE(name)
+            memcpy(self._own_arena + offset, PyBytes_AS_STRING(name), header.name_length)
+            offset += header.name_length
+            header.value_offset = <uint32_t>offset
+            header.value_length = <uint32_t>PyBytes_GET_SIZE(value)
+            memcpy(self._own_arena + offset, PyBytes_AS_STRING(value), header.value_length)
+            offset += header.value_length
+            if self._own_host < 0 and name == b"host":
+                self._own_host = index
+            elif self._own_cookie < 0 and name == b"cookie":
+                self._own_cookie = index
+            elif self._own_auth < 0 and name == b"authorization":
+                self._own_auth = index
+        self._own_arena_len = size
+        self._own_count = count
+        return 0
 
     def __dealloc__(self):
         if self._own_arena != NULL:
