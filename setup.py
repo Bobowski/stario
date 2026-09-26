@@ -1,12 +1,14 @@
 """Build the Cython HTTP runtime (``stario_cython``).
 
-Native libraries come from pkg-config: nghttp2 (1.61+, or a distro build with
-the CVE-2024-28182 backport such as Ubuntu 24.04's 1.59) and Brotli. Gzip links
-system zlib. llhttp is vendored.
+Native libraries come from pkg-config: nghttp2 1.66+ (MadeYouReset,
+CVE-2025-8671) and Brotli. Gzip links system zlib. llhttp is vendored.
+A distro nghttp2 older than 1.66 that carries the security backports can be
+used with ``STARIO_ALLOW_OLD_NGHTTP2=1``.
 
 Development build: ``uv pip install -e .`` or ``python setup.py build_ext --inplace``.
 """
 
+import os
 import platform
 import shlex
 import subprocess
@@ -16,6 +18,7 @@ from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
 _NATIVE_PACKAGES = ("libnghttp2", "libbrotlienc", "libbrotlicommon")
+_MIN_NGHTTP2 = (1, 66)
 
 
 def _pkg_config(option: str) -> list[str]:
@@ -37,10 +40,32 @@ def _pkg_config(option: str) -> list[str]:
     return shlex.split(result.stdout)
 
 
+def _require_nghttp2_version() -> None:
+    if os.environ.get("STARIO_ALLOW_OLD_NGHTTP2") == "1":
+        return
+    raw = subprocess.run(
+        ["pkg-config", "--modversion", "libnghttp2"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    version = tuple(int(part) for part in raw.split(".")[:2] if part.isdigit())
+    if version < _MIN_NGHTTP2:
+        wanted = ".".join(map(str, _MIN_NGHTTP2))
+        raise RuntimeError(
+            f"stario needs nghttp2 {wanted}+ (found {raw}): older releases lack "
+            "the MadeYouReset (CVE-2025-8671) fix. Install a newer libnghttp2, "
+            "build one with scripts/build-native-deps.sh, or set "
+            "STARIO_ALLOW_OLD_NGHTTP2=1 if your distro backports the fix."
+        )
+
+
 class native_build_ext(build_ext):
     """Resolve pkg-config flags at compile time so sdist/metadata need no libs."""
 
     def build_extensions(self) -> None:
+        _pkg_config("--exists")
+        _require_nghttp2_version()
         include_dirs = [f[2:] for f in _pkg_config("--cflags-only-I") if f.startswith("-I")]
         library_dirs = [f[2:] for f in _pkg_config("--libs-only-L") if f.startswith("-L")]
         libraries = [f[2:] for f in _pkg_config("--libs-only-l") if f.startswith("-l")]
