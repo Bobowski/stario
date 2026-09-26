@@ -13,14 +13,21 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - **Stario is a compiled package.** PyPI ships wheels for Linux (x86_64,
   aarch64; glibc) and macOS (arm64) on CPython 3.12–3.14 and 3.14t, with
   nghttp2 and Brotli bundled. Other platforms build from the sdist and need
-  a C compiler, `pkg-config`, and the nghttp2 (1.61+) and Brotli development
-  packages. Windows and musl are not supported.
+  a C compiler, `pkg-config`, and the nghttp2 (1.66+) and Brotli development
+  packages. Windows and musl are not supported. An older distro nghttp2 that
+  carries the security backports builds with `STARIO_ALLOW_OLD_NGHTTP2=1`.
 - `stario_cython.request` is gone; import `Request` from `stario.http.request`
   (typing) or `stario_cython.exchange`.
-- `Headers`, `ParsedQuery`, and `ParsedCookies` are typed as the concrete
-  Cython classes (`stario_cython/*.pyi`), so `Headers()` / `ParsedQuery(b"")`
-  type-check. `Request` stays a structural `Protocol` that `TestRequest`
-  satisfies.
+- `Headers`, `ParsedQuery`, `ParsedCookies`, and `Request` are typed as the
+  concrete Cython classes (`stario_cython/*.pyi`), so `Headers()` /
+  `ParsedQuery(b"")` / `Request(...)` type-check.
+- **`c.req.headers` is a read-only `RequestHeaders`**, and is typed that way
+  (it was typed as `Headers`, so `set()` / `add()` type-checked and then
+  raised). `Request(headers=...)` accepts `Headers` or a mapping and stores a
+  `RequestHeaders`; build one directly with `RequestHeaders(...)`
+  (`stario.http.headers`). `req.headers` can no longer be reassigned.
+- `stario.testing.harness.TestRequest` is gone: `TestClient` and test helpers
+  build the production `Request`.
 - `App.on_error` and exception-type mapping are gone. Uncaught handler
   exceptions are logged. If the handler sent nothing, the framework writes
   **500**; a response already on the wire is not rewritten. Handlers must
@@ -87,6 +94,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   makes the server read a whole file into memory. TestClient's writer and
   the `Writer` protocol have it too.
 
+- `RequestPolicy.write_timeout` / `STARIO_REQUESTS_WRITE_TIMEOUT` (default
+  30s): a connection whose output stays stuck that long is aborted (see
+  Fixed).
 - `STARIO_THREADS` — opt-in worker count (`1` default). `N>1` runs N
   event-loop threads, each a full `create_server` on the same TCP port
   via `SO_REUSEPORT` (thread 0 also owns signals and shutdown). The
@@ -108,6 +118,25 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 - HEAD requests with `Accept-Encoding` no longer get a compressed body
   after the headers (which desynced keep-alive).
+- HEAD responses carry the same fields as GET (RFC 9110 §9.3.2): a
+  streaming handler no longer answers HEAD with `content-length: 0`, and a
+  compressible `respond()` gets GET's `Content-Encoding` and `Vary`. HEAD
+  omits Content-Length when GET's is only known by producing the body.
+- A client that stops reading no longer keeps its connection and buffered
+  responses forever. Timeouts used a graceful close that waits for the
+  write buffer to drain, and pipelined requests kept being answered into
+  it. Output stuck for `write_timeout` now aborts the connection, and
+  pipelined requests wait while writes are paused.
+- HTTP/2 idle and header timeouts send GOAWAY (last processed stream)
+  before closing. A server-side failure on one stream (dispatch error,
+  rejected response headers) resets that stream instead of closing the
+  connection.
+- `Headers({...})` encodes `str` keys and values and raises `TypeError` for
+  other types; it read the `str` object's memory as bytes before.
+- The TLS handshake times out after `header_timeout` instead of asyncio's
+  60s.
+- `set_cookie` rejects an invalid `samesite` (it could inject cookie
+  attributes) and emits through the validating header API.
 - `write()` past a declared `Content-Length` raises `StarioRuntime` before
   sending anything; previously the extra bytes went out and corrupted the
   next response on the connection.
