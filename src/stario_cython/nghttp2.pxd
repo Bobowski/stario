@@ -15,6 +15,8 @@ cdef extern from "nghttp2/nghttp2.h":
         NGHTTP2_SETTINGS
         NGHTTP2_WINDOW_UPDATE
         NGHTTP2_GOAWAY
+        NGHTTP2_PING
+        NGHTTP2_FLAG_ACK
         NGHTTP2_RST_STREAM
         NGHTTP2_NO_ERROR
         NGHTTP2_PROTOCOL_ERROR
@@ -118,6 +120,11 @@ cdef extern from "nghttp2/nghttp2.h":
         const nghttp2_frame* frame,
         void* user_data,
     )
+    ctypedef int (*nghttp2_on_frame_send_callback)(
+        nghttp2_session* session,
+        const nghttp2_frame* frame,
+        void* user_data,
+    )
     ctypedef int (*nghttp2_on_data_chunk_recv_callback)(
         nghttp2_session* session,
         uint8_t flags,
@@ -154,6 +161,10 @@ cdef extern from "nghttp2/nghttp2.h":
     void nghttp2_session_callbacks_set_on_frame_recv_callback(
         nghttp2_session_callbacks* cbs,
         nghttp2_on_frame_recv_callback on_frame_recv_callback,
+    )
+    void nghttp2_session_callbacks_set_on_frame_send_callback(
+        nghttp2_session_callbacks* cbs,
+        nghttp2_on_frame_send_callback on_frame_send_callback,
     )
     void nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
         nghttp2_session_callbacks* cbs,
@@ -264,7 +275,14 @@ cdef extern from "nghttp2/nghttp2.h":
     )
     int nghttp2_session_want_read(nghttp2_session* session)
     int nghttp2_session_want_write(nghttp2_session* session)
+    int nghttp2_session_get_stream_remote_close(
+        nghttp2_session* session, int32_t stream_id
+    )
     int32_t nghttp2_session_get_last_proc_stream_id(nghttp2_session* session)
+    int nghttp2_submit_shutdown_notice(nghttp2_session* session)
+    int nghttp2_submit_ping(
+        nghttp2_session* session, uint8_t flags, const uint8_t* opaque_data
+    )
     int nghttp2_submit_goaway(
         nghttp2_session* session,
         uint8_t flags,

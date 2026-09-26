@@ -6,24 +6,17 @@ on:
   push:
     tags:
       - "[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
 
 jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
-  pypi:
-    needs: test
+  version:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/stario
-    permissions:
-      id-token: write
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
       - name: Tag matches the committed version
         run: |
           tag="${GITHUB_REF_NAME}"
@@ -38,16 +31,64 @@ jobs:
             echo "Commit the version bump and changelog, then tag that commit."
             exit 1
           fi
-          if ! grep -q "^## ${version} " CHANGELOG.md; then
-            echo "CHANGELOG.md has no '## ${version}' heading."
-            echo "Move Unreleased notes into that section in the bump commit."
+          if ! grep -qE "^## ${version//./\\.} - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## ${version} - YYYY-MM-DD' heading."
+            echo "Date the release section in the bump commit."
             exit 1
           fi
-          echo "version=${version}" >> "$GITHUB_ENV"
-      - run: uv build
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pypa/cibuildwheel@v4.2.0
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  pypi:
+    needs: [test, version, sdist, wheels]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/stario
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Check dist names
         run: |
+          version="${GITHUB_REF_NAME#v}"
           ls dist
           test -f "dist/stario-${version}.tar.gz"
-          test -f "dist/stario-${version}-py3-none-any.whl"
+          ls dist/stario-${version}-cp314-cp314-manylinux*_x86_64.whl
+          ls dist/stario-${version}-cp314-cp314-manylinux*_aarch64.whl
+          ls dist/stario-${version}-cp314-cp314-macosx_*_arm64.whl
       - uses: pypa/gh-action-pypi-publish@release/v1

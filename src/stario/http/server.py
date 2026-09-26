@@ -23,12 +23,12 @@ from email.utils import format_datetime
 from types import FrameType
 from typing import Any, Unpack
 
-from stario_cython.protocol import HttpProtocol
-
 from stario._env import env_bool
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
 from stario.telemetry.spans import ProxySpan
+from stario_cython.protocol import HttpProtocol
+from stario_cython.timeouts import DATE_TICK_SWEEP_ATTR
 
 from .app import App
 from .bootstrap import (
@@ -76,7 +76,9 @@ def _make_http_protocol(
         keep_alive_timeout=requests.keep_alive_timeout,
         body_timeout=requests.body_timeout,
         max_pipelined_requests=requests.max_pipelined_requests,
+        write_timeout=requests.write_timeout,
     )
+
 
 type SignalHandler = Callable[[int, FrameType | None], object]
 type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
@@ -86,9 +88,6 @@ type LoopRun[T] = Callable[[Coroutine[Any, Any, T]], T]
 # Upper bound on the force-close loop after the graceful wait (see _drain_listener).
 _FORCE_CLOSE_CAP = 1.0
 
-# Keep in sync with ``stario_cython.protocol``: Cython skips its own sweeper
-# task when the Date tick already walks connections once a second.
-_DATE_TICK_SWEEPS_TIMEOUTS = "_stario_date_tick_sweeps_timeouts"
 
 # Yield to the event loop this many times while waiting for connection_made to register.
 _ACCEPT_REGISTER_YIELDS = 10
@@ -300,7 +299,7 @@ class _LoopWorker:
 
     def _run(self) -> None:
         try:
-            self.loop_run(self.server._run_reuseport_worker(self))
+            self.loop_run(self.server.run_reuseport_worker(self))
         except BaseException as exc:
             self.error = exc
             with suppress(Exception):
@@ -503,15 +502,20 @@ class Server:
                 self.config.requests,
             )
 
-        ssl_ctx = self.config.ssl
+        tls: dict[str, Any] = {}
+        if self.config.ssl is not None:
+            # A TLS handshake is part of sending the request head; asyncio's
+            # default would let a silent client hold the socket for 60s.
+            tls = {
+                "ssl": self.config.ssl,
+                "ssl_handshake_timeout": self.config.requests.header_timeout,
+            }
         if listen_sock is not None:
             if listen_sock.family == socket.AF_UNIX:
                 return await loop.create_unix_server(
-                    protocol_factory, sock=listen_sock, ssl=ssl_ctx
+                    protocol_factory, sock=listen_sock, **tls
                 )
-            return await loop.create_server(
-                protocol_factory, sock=listen_sock, ssl=ssl_ctx
-            )
+            return await loop.create_server(protocol_factory, sock=listen_sock, **tls)
         return await loop.create_server(
             protocol_factory,
             self.config.host,
@@ -519,7 +523,7 @@ class Server:
             backlog=self.config.backlog,
             reuse_address=self.config.reuse_addr,
             reuse_port=reuse_port,
-            ssl=ssl_ctx,
+            **tls,
         )
 
     async def _drain_listener(
@@ -911,7 +915,7 @@ class Server:
             box[0] = b"date: %s\r\n" % format_datetime(now, usegmt=True).encode("ascii")
 
         loop = asyncio.get_running_loop()
-        setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, True)
+        setattr(loop, DATE_TICK_SWEEP_ATTR, True)
 
         async def tick() -> None:
             while True:
@@ -924,12 +928,12 @@ class Server:
         try:
             yield
         finally:
-            setattr(loop, _DATE_TICK_SWEEPS_TIMEOUTS, False)
+            setattr(loop, DATE_TICK_SWEEP_ATTR, False)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
 
-    async def _run_reuseport_worker(self, worker: _LoopWorker) -> None:
+    async def run_reuseport_worker(self, worker: _LoopWorker) -> None:
         """Extra thread: bind SO_REUSEPORT, serve until shutdown, then drain."""
         loop = asyncio.get_running_loop()
         kind = require_configured_loop(
@@ -942,7 +946,6 @@ class Server:
         worker.app.attach_loop(loop)
         unix = self.config.unix_socket is not None
         sock = self._bind_reuseport(leader=False) if unix else None
-        listener: asyncio.Server | None = None
         try:
             async with self._date_tick(worker.date_box, worker.connections):
                 listener = await self._create_listener(
@@ -958,10 +961,7 @@ class Server:
                 try:
                     await worker.app.shutdown
                 finally:
-                    if listener is not None:
-                        await self._drain_listener(
-                            listener, worker.app, worker.connections
-                        )
+                    await self._drain_listener(listener, worker.app, worker.connections)
         finally:
             if sock is not None:
                 sock.close()
@@ -980,11 +980,12 @@ class Server:
         ]
         if self._owns_loop:
             require_configured_loop(self.config.event_loop, where="Server.run")
-        unix = self.config.unix_socket is not None
+        unix_socket = self.config.unix_socket
+        unix = unix_socket is not None
         sock = self._bind_reuseport(leader=True) if unix else None
         unix_file_id: tuple[int, int] | None = None
-        if unix:
-            bound = os.stat(self.config.unix_socket)
+        if unix_socket is not None:
+            bound = os.stat(unix_socket)
             unix_file_id = (bound.st_dev, bound.st_ino)
         connections: set[Connection] = set()
         join_timeout = (
@@ -1069,6 +1070,7 @@ class Server:
             "server.timeout.request_header": self.config.requests.header_timeout,
             "server.timeout.request_body": self.config.requests.body_timeout,
             "server.timeout.keep_alive": self.config.requests.keep_alive_timeout,
+            "server.timeout.response_write": self.config.requests.write_timeout,
             "server.event_loop": loop_implementation(),
             "server.threads": self._thread_count,
             "server.threads_requested": self.config.threads,

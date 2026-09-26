@@ -1,10 +1,10 @@
 [project]
 name = "stario"
-version = "4.3.0"
+version = "5.0.0"
 description = "Craft realtime hypermedia apps that are a joy to write and ship."
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "vendor/llhttp/LICENSE-MIT"]
 authors = [
     { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
 ]
@@ -14,7 +14,9 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Cython",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -44,14 +46,43 @@ uvloop = ["uvloop>=0.21.0,<1"]
 stario = "stario.cli.main:main"
 
 [build-system]
-requires = ["uv_build>=0.8.6,<0.9.0"]
-build-backend = "uv_build"
+requires = ["setuptools>=77", "Cython>=3.1,<4"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["stario", "stario.*", "stario_cython"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed", "*.pyi"]
+
+[tool.setuptools.exclude-package-data]
+stario_cython = ["*.c", "*.pxd", "*.pxi", "*.pyx"]
+
+# Wheels bundle nghttp2 and Brotli built by scripts/build-native-deps.sh
+# (manylinux ships an nghttp2 that predates the CONTINUATION flood fix).
+[tool.cibuildwheel]
+build = ["cp312-*", "cp313-*", "cp314-*", "cp314t-*"]
+skip = ["*-musllinux_*"]
+test-groups = ["test"]
+test-sources = ["tests", "benchmarks/server", "pyproject.toml"]
+test-command = "pytest -q -p no:cacheprovider"
+
+[tool.cibuildwheel.linux]
+before-all = "bash scripts/build-native-deps.sh /usr/local"
+
+[tool.cibuildwheel.macos]
+before-all = "bash scripts/build-native-deps.sh /tmp/stario-deps"
+environment = { PKG_CONFIG_PATH = "/tmp/stario-deps/lib/pkgconfig", DYLD_LIBRARY_PATH = "/tmp/stario-deps/lib" }
 
 [dependency-groups]
-dev = [
-    "pyright>=1.1.403",
+test = [
     "pytest>=8.4.1",
     "pytest-asyncio>=1.3.0",
+]
+dev = [
+    { include-group = "test" },
+    "pyright>=1.1.403",
     "ruff>=0.12.8",
 ]
 
@@ -100,7 +131,7 @@ allowed-confusables = ["×"]
 # First-party roots aligned with pyright `include`. Multi-file examples use an
 # `app` package (see examples/chat-room); add other top-level example package
 # names here when a new layout needs it.
-known-first-party = ["stario", "tests", "app"]
+known-first-party = ["stario", "stario_cython", "tests", "app"]
 
 [tool.ruff.format]
 quote-style = "double"

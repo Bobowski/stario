@@ -8,10 +8,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from stario_cython.protocol import HttpProtocol
-
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
+from stario_cython.protocol import HttpProtocol
 
 DATE = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
@@ -68,6 +67,7 @@ def make_protocol(
     keep_alive_timeout: float = 5.0,
     body_timeout: float = 30.0,
     max_pipelined_requests: int = 8,
+    write_timeout: float = 30.0,
 ) -> HttpProtocol:
     if connections is None:
         connections = set()
@@ -84,6 +84,7 @@ def make_protocol(
         keep_alive_timeout=keep_alive_timeout,
         body_timeout=body_timeout,
         max_pipelined_requests=max_pipelined_requests,
+        write_timeout=write_timeout,
     )
 
 
@@ -99,6 +100,8 @@ async def running_server(
     keep_alive_timeout: float = 5.0,
     body_timeout: float = 30.0,
     max_pipelined_requests: int = 8,
+    write_timeout: float = 30.0,
+    tracer=None,
 ) -> AsyncIterator[int]:
     loop = asyncio.get_running_loop()
     connections: set[HttpProtocol] = set()
@@ -115,6 +118,8 @@ async def running_server(
             keep_alive_timeout=keep_alive_timeout,
             body_timeout=body_timeout,
             max_pipelined_requests=max_pipelined_requests,
+            write_timeout=write_timeout,
+            tracer=tracer,
         ),
         "127.0.0.1",
         free_port(),

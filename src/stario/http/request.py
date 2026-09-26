@@ -1,14 +1,11 @@
-"""Request protocol and body-size / timeout defaults.
+"""Request type and body-size / timeout defaults.
 
-Runtime ``Request`` and ``ParsedCookies`` are Cython types from
+``Request`` and ``ParsedCookies`` are Cython types from
 ``stario_cython.exchange``. Host parsing lives in ``stario.http.host``.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Protocol
-
 from stario.http.host import host_without_port
+from stario_cython.exchange import ParsedCookies, Request
 
 # =============================================================================
 # Security limits (used by ServerConfig / RequestPolicy)
@@ -16,49 +13,6 @@ from stario.http.host import host_without_port
 DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
 DEFAULT_MAX_HEADER_BYTES = 64 * 1024  # 64 KiB
 DEFAULT_BODY_TIMEOUT = 30.0  # seconds
-
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
-
-    from stario.http.headers import Headers
-    from stario.http.query import ParsedQuery
-
-    class ParsedCookies(Protocol, Mapping[str, str]):
-        def get(self, key: str, default: str | None = None) -> str | None: ...
-        def as_dict(self) -> dict[str, str]: ...
-        def items(self) -> list[tuple[str, str]]: ...
-        def keys(self) -> list[str]: ...
-        def values(self) -> list[str]: ...
-
-    class Request(Protocol):
-        method: str
-        path: str
-        """Fully percent-decoded path (``%2F`` becomes ``/``)."""
-        raw_path: bytes
-        """Path exactly as sent: percent-encoded, no query. Routing uses this."""
-        headers: Headers
-        protocol_version: str
-        keep_alive: bool
-
-        @property
-        def query_bytes(self) -> bytes: ...
-
-        @property
-        def host(self) -> str: ...
-
-        @property
-        def query(self) -> ParsedQuery: ...
-
-        @property
-        def cookies(self) -> ParsedCookies: ...
-
-        async def body(self, max_size: int | None = None) -> bytes: ...
-
-        def stream(self, max_chunk: int | None = None) -> AsyncIterator[bytes]: ...
-
-else:
-    from stario_cython.exchange import ParsedCookies, Request
 
 __all__ = [
     "DEFAULT_BODY_TIMEOUT",

@@ -386,22 +386,34 @@ def encode_header_value(str value):
     return _encode_value(value)
 
 
+cdef inline bytes _trusted_bytes(object value):
+    if type(value) is bytes:
+        return <bytes>value
+    if type(value) is str:
+        return (<str>value).encode("latin-1")
+    raise TypeError(
+        f"Headers() keys and values must be str or bytes, not {type(value).__name__}"
+    )
+
+
 @cython.final
 cdef class Headers:
     def __init__(self, raw_header_data=None):
         cdef object key
         cdef object value
         cdef object item
+        cdef bytes name
         self._names = []
         self._values = []
         self._n = 0
         if raw_header_data:
             for key, value in raw_header_data.items():
+                name = _trusted_bytes(key)
                 if type(value) is list:
                     for item in value:
-                        self.c_add(key, item)
+                        self.c_add(name, _trusted_bytes(item))
                 else:
-                    self.c_set(key, value)
+                    self.c_set(name, _trusted_bytes(value))
 
     cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept:
         cdef char buf[NAME_STACK]
@@ -657,13 +669,13 @@ cdef class Headers:
     def add(self, str name, str value):
         self.c_add(_encode_name(name), _encode_value(value))
 
-    def unsafe_add(self, name, value):
+    def unsafe_add(self, bytes name not None, bytes value not None):
         self.c_add(name, value)
 
     def set(self, str name, str value):
         self.c_set(_encode_name(name), _encode_value(value))
 
-    def unsafe_set(self, name, value):
+    def unsafe_set(self, bytes name not None, bytes value not None):
         self.c_set(name, value)
 
     def setdefault(self, str name, str value):
@@ -682,7 +694,7 @@ cdef class Headers:
             return default
         return wire.decode("latin-1")
 
-    def unsafe_get(self, name, default=None):
+    def unsafe_get(self, bytes name not None, default=None):
         cdef object value = self.c_get(name)
         if value is None:
             return default
@@ -694,8 +706,8 @@ cdef class Headers:
             for value in self.unsafe_getlist(_encode_name(name))
         ]
 
-    def unsafe_getlist(self, name):
-        cdef bytes key = <bytes>name
+    def unsafe_getlist(self, bytes name not None):
+        cdef bytes key = name
         cdef char buf[NAME_STACK]
         cdef const char* src = PyBytes_AS_STRING(key)
         cdef Py_ssize_t n = PyBytes_GET_SIZE(key)
@@ -712,7 +724,7 @@ cdef class Headers:
     def remove(self, str name):
         self.c_remove(_encode_name(name))
 
-    def unsafe_remove(self, name):
+    def unsafe_remove(self, bytes name not None):
         self.c_remove(name)
 
     def items(self):
@@ -730,13 +742,6 @@ cdef class Headers:
                 _bare_bytes(self._values[i], 2),
             ))
         return result
-
-    def unsafe_append_wire_lines(self, list parts):
-        """Append pre-baked ``name: `` / ``value\\r\\n`` pairs for the writer."""
-        cdef Py_ssize_t i
-        for i in range(self._n):
-            parts.append(self._names[i])
-            parts.append(self._values[i])
 
     def __contains__(self, name):
         cdef char buf[NAME_STACK]

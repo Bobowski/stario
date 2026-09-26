@@ -4,7 +4,7 @@ Failure types:
 - `StarioError` — invalid framework or API usage: wrong arguments, invalid
   configuration, or calls that are wrong regardless of object state. Uncaught
   on the request path: logged and the writer is aborted. Examples: bad
-  `UrlPath` params, duplicate route registration, invalid bootstrap shape,
+  `Route` params, duplicate route registration, invalid bootstrap shape,
   unfilled `@baked` slots, invalid `Content-Length`.
 
 - `StarioRuntime` — valid API call at the wrong lifecycle phase of a

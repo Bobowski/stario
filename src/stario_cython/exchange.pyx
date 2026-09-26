@@ -26,12 +26,12 @@ from cpython.bytearray cimport (
 )
 from cpython.bytes cimport (
     PyBytes_AS_STRING,
-    PyBytes_Check,
     PyBytes_FromStringAndSize,
     PyBytes_GET_SIZE,
 )
-from cpython.list cimport PyList_GET_ITEM, PyList_GET_SIZE
-from cpython.exc cimport PyErr_Clear, PyErr_Occurred
+from cpython.list cimport PyList_GET_SIZE
+from cpython.buffer cimport PyBUF_SIMPLE, PyBuffer_Release, PyObject_GetBuffer
+from cpython.exc cimport PyErr_Clear
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
 from cpython.ref cimport Py_REFCNT
 from cpython.unicode cimport (
@@ -56,7 +56,6 @@ from stario.http.compression import (
 )
 from stario.http.context import EMPTY_MATCH, _Alive
 from stario.http.invoke import on_handler_done
-from stario.http.wire import decode_path
 
 from stario_cython.compression_buf cimport (
     StarioBrotli,
@@ -125,15 +124,14 @@ cdef class Connection:
     cdef void h2_abort(self, RequestExchange ex):
         raise NotImplementedError("h2_abort")
 
+    cdef void h2_handler_finished(self, RequestExchange ex):
+        pass
+
 cdef int LOW_WATER = 128 * 1024
 cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
 cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
 cdef int STREAM_CHUNK_CL = 256 * 1024
-# Same bound as protocol SMALL_BODY_COMPLETE_DISPATCH: a declared oversize
-# body this small can be discarded on keep-alive; larger or unknown lengths
-# close the HTTP/1 connection (unbounded read-DoS).
-cdef int SMALL_BODY_DRAIN = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 # Same-OS-thread spare only. Keep-alive reuse is the connection idle slot.
@@ -191,8 +189,22 @@ cdef inline list _thread_pool():
     return pool
 
 
-cdef inline bint _is_bytes_like(object obj) noexcept:
-    return isinstance(obj, (bytes, bytearray, memoryview))
+cdef inline bint _is_bytes_like(object obj) except -1:
+    if isinstance(obj, (bytes, bytearray)):
+        return True
+    if isinstance(obj, memoryview):
+        # Lengths are counted with len() and written as one flat buffer.
+        if (
+            (<memoryview>obj).itemsize != 1
+            or (<memoryview>obj).ndim != 1
+            or not (<memoryview>obj).c_contiguous
+        ):
+            raise TypeError(
+                "memoryview body parts must be flat, contiguous bytes; "
+                "use bytes(view) or view.cast('B')"
+            )
+        return True
+    return False
 
 
 cdef inline void _require_bytes_like(object part):
@@ -358,6 +370,21 @@ cdef inline int _require_final_status(int status) except -1:
     if status < 200 or status > 599:
         return _raise_bad_status(status)
     return 0
+
+
+cdef Py_ssize_t _parse_declared_length(object raw) except -1:
+    cdef object parsed
+    try:
+        parsed = int(raw)
+        if parsed < 0:
+            raise ValueError()
+        return parsed
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise StarioError(
+            "Invalid Content-Length header",
+            context={"content-length": raw},
+            help_text="Set Content-Length to a non-negative integer before write_headers().",
+        ) from exc
 
 
 cdef list _build_status_lines():
@@ -681,6 +708,16 @@ def canonical_request_path(raw):
     if flags & PATH_REDIRECT:
         return 308, canonical_path(PyBytes_AS_STRING(data), PyBytes_GET_SIZE(data))
     return 200, None
+
+
+def host_without_port(str host):
+    """Lowercased Host value without a numeric port; IPv6 literals keep brackets.
+
+    One trailing dot is dropped: ``example.com.`` names ``example.com``.
+    """
+    cdef Py_ssize_t n = 0
+    cdef const char* p = PyUnicode_AsUTF8AndSize(host, &n)
+    return _host_without_port_n(p, n)
 
 
 def decode_request_path(raw):
@@ -1786,7 +1823,10 @@ cdef object _ascii_lower_latin1(const char* s, Py_ssize_t n):
 
 
 cdef object _host_without_port_n(const char* s, Py_ssize_t n):
-    """Match ``stario.http.host.host_without_port`` on a wire Host value."""
+    """Lowercased Host without a numeric port; IPv6 literals keep brackets.
+
+    One trailing dot is dropped: ``example.com.`` names ``example.com``.
+    """
     cdef object host = _host_without_port_raw(s, n)
     cdef Py_ssize_t m = len(host)
     # ``example.com.`` (fully qualified) is the same host as ``example.com``.
@@ -1890,7 +1930,11 @@ cdef class Request:
     ):
         self.method = method
         self.path = path
-        self.headers = headers
+        self.headers = (
+            <RequestHeaders>headers
+            if isinstance(headers, RequestHeaders)
+            else RequestHeaders(headers)
+        )
         self.protocol_version = protocol_version
         self.keep_alive = keep_alive
         self._query_bytes = query_bytes
@@ -1922,55 +1966,22 @@ cdef class Request:
             self._body = _BODY_GONE
 
     cdef void prefetch_host(self) noexcept:
-        cdef RequestHeaders view
-        cdef Headers hdrs
+        cdef RequestHeaders view = self.headers
         cdef RawHeader* header
         cdef Py_ssize_t index
         cdef const char* arena
-        cdef object host_wire
-        cdef object host_str
-        cdef const char* p
-        cdef Py_ssize_t n = 0
         if self._host is not None:
             return
-        if isinstance(self.headers, RequestHeaders):
-            view = <RequestHeaders>self.headers
-            index = view._host_index()
-            arena = view._arena()
-            if index < 0 or arena == NULL:
-                self._host = ""
-                return
-            header = &view._headers()[index]
-            self._host = _host_without_port_n(
-                arena + header.value_offset,
-                <Py_ssize_t>header.value_length,
-            )
-            return
-        if isinstance(self.headers, Headers):
-            hdrs = <Headers>self.headers
-            host_wire = hdrs.c_get(b"host")
-            if host_wire is None:
-                self._host = ""
-                return
-            self._host = _host_without_port_n(
-                PyBytes_AS_STRING(host_wire),
-                PyBytes_GET_SIZE(host_wire),
-            )
-            return
-        host_str = ""
-        if self.headers is not None:
-            host_str = self.headers.get("host") or ""
-        if host_str is None:
+        index = view._host_index()
+        arena = view._arena()
+        if index < 0 or arena == NULL:
             self._host = ""
             return
-        if not isinstance(host_str, str):
-            host_str = str(host_str)
-        p = PyUnicode_AsUTF8AndSize(host_str, &n)
-        if p == NULL:
-            PyErr_Clear()
-            self._host = ""
-            return
-        self._host = _host_without_port_n(p, n)
+        header = &view._headers()[index]
+        self._host = _host_without_port_n(
+            arena + header.value_offset,
+            <Py_ssize_t>header.value_length,
+        )
 
     cdef object _materialize_query(self):
         cdef const char* arena
@@ -2034,10 +2045,7 @@ cdef class Request:
         cdef ParsedCookies parsed
         if self._cookies is None:
             parsed = ParsedCookies.__new__(ParsedCookies)
-            if isinstance(self.headers, RequestHeaders):
-                parsed.bind_request_headers(<RequestHeaders>self.headers)
-            else:
-                parsed.__init__(self.headers.getlist("cookie"))
+            parsed.bind_request_headers(self.headers)
             self._cookies = parsed
         return self._cookies
 
@@ -2073,7 +2081,7 @@ cdef Request make_request(
     object path,
     object protocol_version,
     bint keep_alive,
-    object headers,
+    RequestHeaders headers,
     object body,
 ):
     """Hot-path constructor. ``__new__`` skips Python ``__init__``.
@@ -2173,6 +2181,8 @@ cdef class RequestExchange:
         self._declared_length = -1
         self._bytes_written = 0
         self._completed = False
+        self._close_delimited = False
+        self._skip_body = False
         self._out_len = 0
         self.headers.c_clear()
 
@@ -2253,8 +2263,15 @@ cdef class RequestExchange:
     cdef int _buf_bytes(self, object data) except -1:
         cdef Py_ssize_t n = len(data)
         cdef const char* p
+        cdef Py_buffer view
         if n == 0:
             return 0
+        if isinstance(data, memoryview):
+            PyObject_GetBuffer(data, &view, PyBUF_SIMPLE)
+            try:
+                return self._buf_add(<const char*>view.buf, view.len)
+            finally:
+                PyBuffer_Release(&view)
         p = data
         return self._buf_add(p, n)
 
@@ -2305,10 +2322,10 @@ cdef class RequestExchange:
         raise TypeError(BODY_TYPE_ERROR)
 
     cdef int _buf_uint(self, size_t n, int base) except -1:
-        cdef char tmp[16]
+        cdef char tmp[24]
         cdef int i
         if base == 16:
-            i = sprintf(tmp, "%x", <unsigned int>n)
+            i = sprintf(tmp, "%zx", n)
         else:
             i = sprintf(tmp, "%zu", n)
         return self._buf_add(tmp, i)
@@ -2354,20 +2371,26 @@ cdef class RequestExchange:
             nbytes = 0
         elif existing_ce is None and self._may_compress(body, content_type, False, nbytes):
             encoding = _encoding_wire(self._req_encoding)
-            flat = self._body_as_bytes(body)
             try:
-                self._frame(flat, encoding, &native_out, &native_len)
-                nbytes = <Py_ssize_t>native_len
-                if existing_cl is not None:
-                    h.c_require_respond_length(existing_cl, _dec(native_len))
-                payload = PyBytes_FromStringAndSize(<char*>native_out, <Py_ssize_t>native_len)
                 nva = [
                     (b":status", _dec(<size_t>status)),
                     (b"date", self._h2_date_value()),
                     (b"content-type", content_type),
-                    (b"content-length", _dec(native_len)),
-                    (b"content-encoding", encoding),
                 ]
+                if self._head_request:
+                    # RFC 9110 9.3.2: HEAD may omit the compressed length.
+                    payload = b""
+                else:
+                    flat = self._body_as_bytes(body)
+                    self._frame(flat, encoding, &native_out, &native_len)
+                    if existing_cl is not None:
+                        h.c_require_respond_length(existing_cl, _dec(native_len))
+                    payload = PyBytes_FromStringAndSize(
+                        <char*>native_out, <Py_ssize_t>native_len
+                    )
+                    nva.append((b"content-length", _dec(native_len)))
+                nbytes = <Py_ssize_t>native_len
+                nva.append((b"content-encoding", encoding))
                 if not h.c_vary_contains(b"accept-encoding"):
                     nva.append((b"vary", b"accept-encoding"))
                 self._status_code = status
@@ -2467,8 +2490,24 @@ cdef class RequestExchange:
         return 0
 
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1:
-        cdef const char* ptr = data
-        cdef size_t n = <size_t>len(data)
+        cdef Py_buffer view
+        if isinstance(data, memoryview):
+            PyObject_GetBuffer(data, &view, PyBUF_SIMPLE)
+            try:
+                return self._block_raw(
+                    <const char*>view.buf, <size_t>view.len, out, out_len
+                )
+            finally:
+                PyBuffer_Release(&view)
+        return self._block_raw(data, <size_t>len(data), out, out_len)
+
+    cdef int _block_raw(
+        self,
+        const char* ptr,
+        size_t n,
+        const unsigned char** out,
+        size_t* out_len,
+    ) except -1:
         if self._brotli != NULL:
             if stario_brotli_block_borrowed(
                 self._brotli, <const unsigned char*>ptr, n, out, out_len
@@ -2504,6 +2543,10 @@ cdef class RequestExchange:
         self, const unsigned char* data, size_t n
     ) except -1:
         if n == 0:
+            return 0
+        if self._close_delimited:
+            self._buf_add(<const char*>data, <Py_ssize_t>n)
+            self._flush()
             return 0
         self._buf_uint(n, 16)
         self._buf_bytes(CRLF)
@@ -2870,6 +2913,7 @@ cdef class RequestExchange:
         self._h2_awaiting_headers = False
         self._h2_header_deadline = 0.0
         self._h2_outbound = False
+        self._h2_end_sent = False
         self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
@@ -2885,6 +2929,7 @@ cdef class RequestExchange:
         self._h2_awaiting_headers = True
         self._h2_header_deadline = 0.0
         self._h2_outbound = False
+        self._h2_end_sent = False
         self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
@@ -3101,6 +3146,9 @@ cdef class RequestExchange:
     def on_handler_done(self, task):
         """Log/abort on failure, then recycle after the handler task."""
         cdef RequestHandle handle = self._handle
+        if task is not self._handler_task:
+            # A callback from a request this exchange no longer serves.
+            return
         if handle is not None:
             on_handler_done(handle, handle, task)
             # Drop our reference before recycle counts who still holds ``c``.
@@ -3115,6 +3163,8 @@ cdef class RequestExchange:
             self._clear_body_storage()
             self._cancel_stall_timer()
             self._connection.set_body_paused(self, False)
+            if self._http2:
+                self._connection.h2_handler_finished(self)
         self._maybe_recycle()
 
     cdef void cancel_before_start(self):
@@ -3140,10 +3190,12 @@ cdef class RequestExchange:
         if self.in_pool:
             return
         self.in_pool = True
+        self._generation += 1
         wake_waiters(self._drain_waiters)
         self._detach_views()
         self._clear_request_binding()
         self._cached = None
+        self._wake()
         self._data_ready = None
         self._h2_pending = b""
         self._h2_pending_off = 0
@@ -3311,15 +3363,16 @@ cdef class RequestExchange:
                 if self._may_compress(body, content_type, False, nbytes):
                     encoding = _encoding_wire(self._req_encoding)
                 if encoding is not None:
-                    flat = self._body_as_bytes(body)
                     try:
-                        self._frame(flat, encoding, &native_out, &native_len)
+                        if not self._head_request:
+                            flat = self._body_as_bytes(body)
+                            self._frame(flat, encoding, &native_out, &native_len)
+                            if existing_cl is not None:
+                                h.c_require_respond_length(
+                                    existing_cl, _dec(native_len)
+                                )
                         self._declared_length = <Py_ssize_t>native_len
                         self._bytes_written = 0
-                        if existing_cl is not None:
-                            h.c_require_respond_length(
-                                existing_cl, _dec(native_len)
-                            )
                         self._buf_bytes(_status_line(status))
                         self._buf_bytes(self._date_box[0])
                         if self._out_buf is None:
@@ -3338,11 +3391,16 @@ cdef class RequestExchange:
                             self._buf_bytes(CRLF)
                         self._buf_bytes(CT_PREFIX)
                         self._buf_bytes(content_type)
-                        self._buf_bytes(CRLF)
-                        self._buf_bytes(CL_HEADER)
-                        self._buf_uint(native_len, 10)
-                        self._buf_bytes(CRLF2)
-                        self._buf_add(<const char*>native_out, <Py_ssize_t>native_len)
+                        if self._head_request:
+                            # RFC 9110 9.3.2: the compressed length is only
+                            # known by compressing; HEAD may omit it.
+                            self._buf_bytes(CRLF2)
+                        else:
+                            self._buf_bytes(CRLF)
+                            self._buf_bytes(CL_HEADER)
+                            self._buf_uint(native_len, 10)
+                            self._buf_bytes(CRLF2)
+                            self._buf_add(<const char*>native_out, <Py_ssize_t>native_len)
                         self._flush()
                     finally:
                         self._free_compressors()
@@ -3393,11 +3451,27 @@ cdef class RequestExchange:
             self._transport.close()
         self._done()
 
+    cdef int _stream_encoding(self, Headers headers, bint allocate) except -1:
+        cdef object encoding
+        if headers.c_get(b"content-encoding") is not None:
+            return 0
+        if not self._may_compress(None, headers.c_get(b"content-type"), True, -1):
+            return 0
+        encoding = _encoding_wire(self._req_encoding)
+        if encoding is None:
+            return 0
+        if allocate:
+            if encoding == b"br":
+                self._ensure_brotli()
+            else:
+                self._ensure_gzip()
+        headers.c_set(b"content-encoding", encoding)
+        headers.c_merge_vary(b"accept-encoding")
+        return 0
+
     cpdef object write_headers(self, int status_code, bint body=True):
         cdef Headers headers = self.headers
         cdef object raw_length
-        cdef object parsed_length
-        cdef object encoding
         cdef list nva
         if self._transport.is_closing():
             return self
@@ -3410,63 +3484,36 @@ cdef class RequestExchange:
                 ),
             )
         _require_final_status(status_code)
-        if not body:
-            self._head_request = True
+        self._skip_body = self._head_request or not body
+        self._bytes_written = 0
+        raw_length = headers.c_get(b"content-length")
         if not _may_have_body(status_code):
             headers.c_remove(b"transfer-encoding")
             headers.c_remove(b"content-length")
             self._declared_length = 0
-            self._bytes_written = 0
+        elif raw_length is not None:
+            headers.c_remove(b"transfer-encoding")
+            self._declared_length = _parse_declared_length(raw_length)
         elif self._head_request:
+            # RFC 9110 9.3.2: a HEAD response may omit Content-Length, which
+            # GET only learns while streaming. Everything else matches GET.
             headers.c_remove(b"transfer-encoding")
-            if headers.c_get(b"content-length") is not None:
-                raw_length = headers.c_get(b"content-length")
-                try:
-                    parsed_length = int(raw_length)
-                    if parsed_length < 0:
-                        raise ValueError()
-                    self._declared_length = parsed_length
-                    self._bytes_written = 0
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise StarioError(
-                        "Invalid Content-Length header",
-                        context={"content-length": raw_length},
-                        help_text="Set Content-Length to a non-negative integer before write_headers().",
-                    ) from exc
-            else:
-                self._declared_length = 0
-                self._bytes_written = 0
-                headers.c_set(b"content-length", b"0")
-        elif headers.c_get(b"content-length") is not None:
+            self._declared_length = 0
+            if not self._http2:
+                self._stream_encoding(headers, False)
+        elif self._skip_body:
             headers.c_remove(b"transfer-encoding")
-            raw_length = headers.c_get(b"content-length")
-            try:
-                parsed_length = int(raw_length)
-                if parsed_length < 0:
-                    raise ValueError()
-                self._declared_length = parsed_length
-                self._bytes_written = 0
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise StarioError(
-                    "Invalid Content-Length header",
-                    context={"content-length": raw_length},
-                    help_text="Set Content-Length to a non-negative integer before write_headers().",
-                ) from exc
+            headers.c_set(b"content-length", b"0")
+            self._declared_length = 0
         elif not self._http2:
-            headers.c_set(b"transfer-encoding", b"chunked")
-            if headers.c_get(b"content-encoding") is None:
-                encoding = None
-                if self._may_compress(
-                    None, headers.c_get(b"content-type"), True, -1
-                ):
-                    encoding = _encoding_wire(self._req_encoding)
-                if encoding is not None:
-                    if encoding == b"br":
-                        self._ensure_brotli()
-                    else:
-                        self._ensure_gzip()
-                    headers.c_set(b"content-encoding", encoding)
-                    headers.c_merge_vary(b"accept-encoding")
+            if self._version == "1.0":
+                # RFC 9112 7: HTTP/1.0 has no chunked coding.
+                headers.c_remove(b"transfer-encoding")
+                headers.c_set(b"connection", b"close")
+                self._close_delimited = True
+            else:
+                headers.c_set(b"transfer-encoding", b"chunked")
+            self._stream_encoding(headers, True)
         self._expect_continue = False
         if self._http2:
             nva = [
@@ -3507,6 +3554,7 @@ cdef class RequestExchange:
             )
         if not data:
             return self
+        n = self._body_nbytes(data)
         if self._status_code < 0:
             self.write_headers(200)
         if self._status_code >= 0 and not _may_have_body(self._status_code):
@@ -3516,11 +3564,18 @@ cdef class RequestExchange:
                     "204/304 and 1xx responses must not include a message body."
                 ),
             )
-        if self._head_request:
+        if self._skip_body or n == 0:
             return self
-        n = self._body_nbytes(data)
-        if n == 0:
-            return self
+        if self._declared_length >= 0 and self._bytes_written + n > self._declared_length:
+            raise StarioRuntime(
+                "Response body exceeds Content-Length: writing "
+                f"{n} bytes after {self._bytes_written}, Content-Length is "
+                f"{self._declared_length}",
+                help_text=(
+                    "When Content-Length is set, write exactly that many bytes. "
+                    "Nothing past it is sent."
+                ),
+            )
         if self._http2:
             self._bytes_written += n
             if isinstance(data, (list, tuple)):
@@ -3549,6 +3604,10 @@ cdef class RequestExchange:
                 self._block(data, &native_out, &native_len)
                 self._write_native_chunk(native_out, native_len)
             return self
+        if self._close_delimited:
+            self._buf_body(data)
+            self._flush()
+            return self
         self._buf_uint(<size_t>n, 16)
         self._buf_bytes(CRLF)
         self._buf_body(data)
@@ -3576,10 +3635,12 @@ cdef class RequestExchange:
                 self.write_headers(204)
         if data:
             self.write(data)
-        if self._head_request:
+        if self._skip_body:
+            # Completed first: END_STREAM can close the stream synchronously,
+            # and an incomplete close reads as a client abort.
+            self._completed = True
             if self._http2:
                 self._connection.h2_end(self)
-            self._completed = True
             self._done()
             return
         if self._declared_length >= 0 and self._bytes_written != self._declared_length:
@@ -3592,8 +3653,8 @@ cdef class RequestExchange:
                 ),
             )
         if self._http2:
-            self._connection.h2_end(self)
             self._completed = True
+            self._connection.h2_end(self)
             self._done()
             return
         if self._declared_length < 0:
@@ -3601,7 +3662,8 @@ cdef class RequestExchange:
                 self._finish(&native_out, &native_len)
                 self._write_native_chunk(native_out, native_len)
                 self._free_compressors()
-            self._buf_bytes(CHUNK_END)
+            if not self._close_delimited:
+                self._buf_bytes(CHUNK_END)
             self._flush()
         self._completed = True
         self._done()
@@ -3664,7 +3726,7 @@ cdef class RequestExchange:
                     self._consumed_as == CONSUMED_BODY
                     or (
                         self._consumed_as == CONSUMED_NONE
-                        and self._expected_size <= SMALL_BODY_DRAIN
+                        and self._expected_size <= SMALL_BODY
                     )
                 )
             ):
@@ -3830,7 +3892,7 @@ cdef class RequestExchange:
                 self._http2
                 or (
                     self._expected_size >= 0
-                    and self._expected_size <= SMALL_BODY_DRAIN
+                    and self._expected_size <= SMALL_BODY
                 )
             ):
                 self._total_read = new_total
@@ -3932,6 +3994,8 @@ cdef class RequestExchange:
         self._maybe_recycle()
 
     async def _wait_for_body_data(self):
+        cdef unsigned long generation = self._generation
+        cdef object ready
         if self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
             self._raise_abort()
@@ -3941,14 +4005,18 @@ cdef class RequestExchange:
             self._raise_abort()
         if self._data_ready is None:
             self._data_ready = asyncio.Event()
+        ready = self._data_ready
         self._waiting = True
         self._reset_stall_timer()
         try:
-            await self._data_ready.wait()
+            await ready.wait()
         finally:
-            self._waiting = False
-            self._cancel_stall_timer()
-        self._data_ready.clear()
+            if generation == self._generation:
+                self._waiting = False
+                self._cancel_stall_timer()
+        if generation != self._generation:
+            raise StarioRuntime(BODY_GONE_ERROR)
+        ready.clear()
         if self._abort_reason != ABORT_NONE:
             self._clear_body_storage()
             self._raise_abort()
@@ -3956,6 +4024,7 @@ cdef class RequestExchange:
     async def stream(self, max_chunk=None):
         cdef object out
         cdef Py_ssize_t chunk_size
+        cdef unsigned long generation = self._generation
         if self._discard_body:
             raise StarioRuntime(
                 "Request body is no longer available after its handler finished."
@@ -4003,6 +4072,8 @@ cdef class RequestExchange:
                 if self._body_used < LOW_WATER:
                     self._connection.set_body_paused(self, False)
                 yield out
+                if generation != self._generation:
+                    raise StarioRuntime(BODY_GONE_ERROR)
             if self._body_complete:
                 return
             # About to wait for bytes: reading must be on, or nothing arrives.
@@ -4076,6 +4147,70 @@ cdef class RequestHeaders:
         self._own_host = -1
         self._own_cookie = -1
         self._own_auth = -1
+
+    def __init__(self, headers=None):
+        """Standalone headers for requests built outside the server (tests).
+
+        ``headers`` is a ``Headers`` or a mapping of names to a value or a
+        list of values (``str`` or ``bytes``). Names are lowercased.
+        """
+        cdef list pairs
+        cdef object name
+        cdef object value
+        cdef object item
+        if headers is None:
+            return
+        if isinstance(headers, Headers):
+            pairs = (<Headers>headers).unsafe_items()
+        else:
+            pairs = []
+            for name, value in headers.items():
+                name = _trusted_bytes(name).lower()
+                if type(value) is list:
+                    for item in value:
+                        pairs.append((name, _trusted_bytes(item)))
+                else:
+                    pairs.append((name, _trusted_bytes(value)))
+        self._own_pairs(pairs)
+
+    cdef int _own_pairs(self, list pairs) except -1:
+        cdef Py_ssize_t count = len(pairs)
+        cdef Py_ssize_t size = 0
+        cdef Py_ssize_t offset = 0
+        cdef Py_ssize_t index
+        cdef bytes name
+        cdef bytes value
+        cdef RawHeader* header
+        if count == 0:
+            return 0
+        for name, value in pairs:
+            size += PyBytes_GET_SIZE(name) + PyBytes_GET_SIZE(value)
+        if size > <Py_ssize_t>0xFFFFFFFF:
+            raise ValueError("RequestHeaders are limited to 4 GiB")
+        self._own_arena = <char*>malloc(<size_t>(size if size > 0 else 1))
+        self._own_headers = <RawHeader*>malloc(<size_t>count * sizeof(RawHeader))
+        if self._own_arena == NULL or self._own_headers == NULL:
+            raise MemoryError()
+        for index in range(count):
+            name, value = pairs[index]
+            header = &self._own_headers[index]
+            header.name_offset = <uint32_t>offset
+            header.name_length = <uint32_t>PyBytes_GET_SIZE(name)
+            memcpy(self._own_arena + offset, PyBytes_AS_STRING(name), header.name_length)
+            offset += header.name_length
+            header.value_offset = <uint32_t>offset
+            header.value_length = <uint32_t>PyBytes_GET_SIZE(value)
+            memcpy(self._own_arena + offset, PyBytes_AS_STRING(value), header.value_length)
+            offset += header.value_length
+            if self._own_host < 0 and name == b"host":
+                self._own_host = index
+            elif self._own_cookie < 0 and name == b"cookie":
+                self._own_cookie = index
+            elif self._own_auth < 0 and name == b"authorization":
+                self._own_auth = index
+        self._own_arena_len = size
+        self._own_count = count
+        return 0
 
     def __dealloc__(self):
         if self._own_arena != NULL:

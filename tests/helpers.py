@@ -12,9 +12,10 @@ from urllib.parse import urlencode
 from stario.http.app import App
 from stario.http.context import Context, Handler
 from stario.http.headers import Headers
+from stario.http.request import Request
 from stario.http.writer import Writer
 from stario.telemetry.noop import NoOpTracer
-from stario.testing.harness import TestContext, TestRequest, TestWriter
+from stario.testing.harness import TestContext, TestWriter
 from stario.testing.tracer import TestTracer
 
 type AppSetup = Callable[[App], None]
@@ -111,7 +112,7 @@ def make_request(
     body: bytes = b"",
     query: dict[str, object] | None = None,
     query_bytes: bytes | None = None,
-) -> TestRequest:
+) -> Request:
     hdrs = Headers()
     if headers:
         for name, value in headers.items():
@@ -122,7 +123,7 @@ def make_request(
     if query_bytes is None:
         query_bytes = urlencode(query or {}, doseq=True).encode("ascii")
 
-    return TestRequest(
+    return Request(
         method=method,
         path=path,
         query_bytes=query_bytes,

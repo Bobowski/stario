@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from stario_cython.serve import run, serve
+
+# The extensions import stario at module init and stario imports them back;
+# loading stario first keeps `import stario_cython.exchange` order-independent.
+import stario  # noqa: F401  # pyright: ignore[reportUnusedImport]
 
 __all__ = ["run", "serve"]
 

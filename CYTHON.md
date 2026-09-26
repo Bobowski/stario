@@ -8,18 +8,22 @@ lab assumptions: [Current snapshot (2026-09-21)](#current-snapshot-2026-09-21).
 Multi-threaded free-threaded runtime (`STARIO_THREADS`, `SO_REUSEPORT`):
 [`docs/free-threading.md`](docs/free-threading.md).
 
-Linux builds need `pkg-config`, the Brotli development package, and
-`libnghttp2-dev`. Gzip links system zlib (`-lz`). The native protocol
-offers `br` and `gzip` only; Python response helpers still negotiate zstd
-for non-native writers.
+Building needs `pkg-config`, nghttp2 1.66+ (older distro builds that carry
+the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), and Brotli
+development packages (`libnghttp2-dev libbrotli-dev` on Debian/Ubuntu,
+`brew install pkg-config nghttp2 brotli` on macOS). Gzip links system zlib
+(`-lz`). Published wheels bundle nghttp2 and Brotli
+(`scripts/build-native-deps.sh`). The native protocol offers `br` and `gzip`
+only; Python response helpers still negotiate zstd for non-native writers.
 
 ```bash
-uv venv --python 3.14
-uv pip install --python .venv/bin/python -e ".[uvloop]" cython setuptools wheel pytest pytest-asyncio
-.venv/bin/python setup.py
-PYTHONPATH=src:. .venv/bin/python -m stario.cli serve examples.cython.hello:bootstrap
-# or: PYTHONPATH=src:. .venv/bin/python -m stario_cython examples.cython.hello:bootstrap
+uv sync --all-extras          # editable install; compiles the extensions
+uv run stario serve examples.cython.hello:bootstrap
+# or: uv run python -m stario_cython examples.cython.hello:bootstrap
 ```
+
+After editing a `.pyx` / `.pxd` / `.pxi`, rebuild in place with
+`uv run python setup.py build_ext --inplace`.
 
 Direct TLS: `STARIO_SSL_CERTFILE` / `STARIO_SSL_KEYFILE` (or
 `ServerConfig(ssl=…)`). ALPN advertises `h2` then `http/1.1`.
@@ -34,14 +38,11 @@ uses 100 streams per connection. TLS ALPN selects `h2` or `http/1.1`;
 a self-signed cert serves both. See
 [`benchmarks/server/pico-h2-20260831.md`](benchmarks/server/pico-h2-20260831.md).
 
-`PYTHONPATH=src` is required so `stario_cython` resolves after the inplace
-build.
-
 ## Current snapshot (2026-09-21)
 
 `cython-core` after 4.2 (`Route` / `c.match` / `Assets` / `stario.json`)
 and the request hotpath (fresh `Request`, lazy query, Router `_lookup`).
-Python httptools stays on `main`. Production HTTP here is Cython:
+The Python httptools protocol is gone in 5.0. Production HTTP is Cython:
 `stario serve` and `python -m stario_cython` are the same protocol.
 
 Official wrk suite, one worker, `10s` × 5 measured + 1 warmup, 4 vCPU
@@ -155,7 +156,8 @@ Granian (LRU always hot). This capture is the honest one.
 
 ### Missing / not doing (on purpose)
 
-App and Router stay Python. Do not revive:
+`App` and `Router` stay Python; `find_handler` runs on the `CRouter` trie
+compiled from them. Do not revive:
 
 - a dual Cython App/Router
 - a contiguous serializer
@@ -163,8 +165,8 @@ App and Router stay Python. Do not revive:
 - static / pre-serialized handlers
 - pooled / reset `Request` objects
 
-Python httptools lives on `main`. Native zstd is not offered (Python
-response helpers still negotiate it for non-native writers). picohttpparser
+Native zstd is not offered (precompressed `Files` / `Assets` variants
+still serve it). picohttpparser
 is not the H1 parser: parser-only it is ~2.5–3.3× llhttp, but end-to-end
 GET was even and a tiny JSON POST was slower.
 
@@ -295,5 +297,5 @@ wrk: sweep ≈ callbacks on plaintext; timeouts-off ~+5% plaintext (keep
 timeouts); 10ms sweep −7% on 2MB stream; 50ms and 1s Date tick are a wash
 (129.3k / 130.8k / 128.0k). Callbacks were deleted.
 
-App/Router stay Python. Do not revive dual Cython App/Router, a contiguous
+`App` / `Router` stay Python (compiled to `CRouter`). Do not revive dual Cython App/Router, a contiguous
 serializer, pooled `asyncio.Event`, or static/pre-serialized handlers.

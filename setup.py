@@ -1,21 +1,30 @@
+"""Build the Cython HTTP runtime (``stario_cython``).
+
+Native libraries come from pkg-config: nghttp2 1.66+ (MadeYouReset,
+CVE-2025-8671) and Brotli. Gzip links system zlib. llhttp is vendored.
+A distro nghttp2 older than 1.66 that carries the security backports can be
+used with ``STARIO_ALLOW_OLD_NGHTTP2=1``.
+
+Development build: ``uv pip install -e .`` or ``python setup.py build_ext --inplace``.
+"""
+
+import os
 import platform
 import shlex
 import subprocess
 
 from Cython.Build import cythonize
-from setuptools import Extension
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
-from setuptools.dist import Distribution
 
-opts = dict(language_level=3)
-
-_CODEC_PACKAGES = ("libbrotlienc", "libbrotlicommon")
+_NATIVE_PACKAGES = ("libnghttp2", "libbrotlienc", "libbrotlicommon")
+_MIN_NGHTTP2 = (1, 66)
 
 
-def _pkg_config(packages, option):
+def _pkg_config(option: str) -> list[str]:
     try:
         result = subprocess.run(
-            ["pkg-config", option, *packages],
+            ["pkg-config", option, *_NATIVE_PACKAGES],
             check=True,
             capture_output=True,
             text=True,
@@ -23,44 +32,66 @@ def _pkg_config(packages, option):
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise RuntimeError(
-            "Native codec development libraries are required. "
-            "Install pkg-config and brotli. Gzip uses system zlib (-lz). "
+            "Building stario needs pkg-config plus the nghttp2 and Brotli "
+            "development packages (Debian/Ubuntu: libnghttp2-dev libbrotli-dev; "
+            "macOS: brew install pkg-config nghttp2 brotli). "
             f"pkg-config detail: {detail.strip()}"
         ) from exc
     return shlex.split(result.stdout)
 
 
-codec_include_dirs = [
-    flag[2:] for flag in _pkg_config(_CODEC_PACKAGES, "--cflags-only-I") if flag.startswith("-I")
-]
-codec_library_dirs = [
-    flag[2:] for flag in _pkg_config(_CODEC_PACKAGES, "--libs-only-L") if flag.startswith("-L")
-]
-codec_libraries = [
-    flag[2:] for flag in _pkg_config(_CODEC_PACKAGES, "--libs-only-l") if flag.startswith("-l")
-]
-if "z" not in codec_libraries:
-    codec_libraries.append("z")
-codec_compile_args = _pkg_config(_CODEC_PACKAGES, "--cflags-only-other")
-codec_link_args = _pkg_config(_CODEC_PACKAGES, "--libs-only-other")
-_llhttp_sse = (
-    ["-msse4.2"]
-    if platform.machine().lower() in {"x86_64", "amd64"}
-    else []
-)
+def _require_nghttp2_version() -> None:
+    if os.environ.get("STARIO_ALLOW_OLD_NGHTTP2") == "1":
+        return
+    raw = subprocess.run(
+        ["pkg-config", "--modversion", "libnghttp2"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    version = tuple(int(part) for part in raw.split(".")[:2] if part.isdigit())
+    if version < _MIN_NGHTTP2:
+        wanted = ".".join(map(str, _MIN_NGHTTP2))
+        raise RuntimeError(
+            f"stario needs nghttp2 {wanted}+ (found {raw}): older releases lack "
+            "the MadeYouReset (CVE-2025-8671) fix. Install a newer libnghttp2, "
+            "build one with scripts/build-native-deps.sh, or set "
+            "STARIO_ALLOW_OLD_NGHTTP2=1 if your distro backports the fix."
+        )
+
+
+class native_build_ext(build_ext):
+    """Resolve pkg-config flags at compile time so sdist/metadata need no libs."""
+
+    def build_extensions(self) -> None:
+        _pkg_config("--exists")
+        _require_nghttp2_version()
+        include_dirs = [f[2:] for f in _pkg_config("--cflags-only-I") if f.startswith("-I")]
+        library_dirs = [f[2:] for f in _pkg_config("--libs-only-L") if f.startswith("-L")]
+        libraries = [f[2:] for f in _pkg_config("--libs-only-l") if f.startswith("-l")]
+        if "z" not in libraries:
+            libraries.append("z")
+        compile_args = _pkg_config("--cflags-only-other")
+        link_args = _pkg_config("--libs-only-other")
+        for ext in self.extensions:
+            ext.include_dirs.extend(include_dirs)
+            ext.library_dirs.extend(library_dirs)
+            ext.libraries.extend(libraries)
+            ext.extra_compile_args.extend(compile_args)
+            ext.extra_link_args.extend(link_args)
+        super().build_extensions()
+
+
+base_args = ["-O3", "-fno-strict-aliasing"]
+llhttp_sse = ["-msse4.2"] if platform.machine().lower() in {"x86_64", "amd64"} else []
+include_dirs = ["vendor", "vendor/llhttp/include", "src"]
 
 extensions = [
     Extension(
         "stario_cython.exchange",
-        sources=[
-            "src/stario_cython/exchange.pyx",
-            "vendor/compression_buf.c",
-        ],
-        include_dirs=["vendor", "src", *codec_include_dirs],
-        library_dirs=codec_library_dirs,
-        libraries=codec_libraries,
-        extra_compile_args=["-O3", "-fno-strict-aliasing", *codec_compile_args],
-        extra_link_args=codec_link_args,
+        sources=["src/stario_cython/exchange.pyx", "vendor/compression_buf.c"],
+        include_dirs=list(include_dirs),
+        extra_compile_args=list(base_args),
     ),
     Extension(
         "stario_cython.protocol",
@@ -71,22 +102,12 @@ extensions = [
             "vendor/llhttp/src/api.c",
             "vendor/llhttp/src/stario_alloc.c",
         ],
-        include_dirs=["vendor/llhttp/include", "vendor", "src"],
-        libraries=["nghttp2"],
-        extra_compile_args=["-O3", "-fno-strict-aliasing", *_llhttp_sse],
+        include_dirs=list(include_dirs),
+        extra_compile_args=[*base_args, *llhttp_sse],
     ),
 ]
 
-# Do not call setup(): this tree's pyproject.toml belongs to the stario
-# uv_build package, and current setuptools rejects its license classifier.
-dist = Distribution(
-    {
-        "ext_modules": cythonize(extensions, **opts),
-        "package_dir": {"": "src"},
-        "packages": ["stario_cython"],
-    }
+setup(
+    ext_modules=cythonize(extensions, compiler_directives={"language_level": 3}),
+    cmdclass={"build_ext": native_build_ext},
 )
-command = build_ext(dist)
-command.inplace = True
-command.ensure_finalized()
-command.run()

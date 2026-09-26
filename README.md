@@ -27,7 +27,7 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 ## Requirements
 
-Python 3.12 or newer is required.
+Python 3.12 or newer is required, on Linux (glibc) or macOS. The HTTP server is compiled: PyPI ships wheels for Linux x86_64/aarch64 and macOS arm64 with nghttp2 and Brotli bundled. Elsewhere `pip` builds from source and needs a C compiler, `pkg-config`, and the nghttp2 (1.66+) and Brotli development packages. Windows is not supported.
 
 **uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
 
@@ -188,7 +188,7 @@ async def bootstrap(app: App, span: Span):
 ```
 
 `Assets` hashes names and 307s the logical path. Both send strong ETags
-and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
+and `X-Content-Type-Options: nosniff`.
 
 ## What you get
 
@@ -197,8 +197,7 @@ and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
 - Files: `Assets` and `Files` expose a directory at a URL prefix.
   `attach(app)` registers GET/HEAD and loads the tree. `Assets`
   hashes names and 307s the logical path. Both use strong ETags and 304.
-  Import from `stario` or `stario.filesystem`. `stario.staticassets` is
-  obsolete.
+  Import from `stario` or `stario.filesystem`.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.
 - Observable runs: spans for startup and requests are part of how you structure apps, not an afterthought.
 

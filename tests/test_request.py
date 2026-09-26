@@ -1,12 +1,11 @@
-"""Tests for the request view used by handlers (Cython Request / TestRequest)."""
+"""Tests for the request view used by handlers (Cython Request)."""
 
 import pytest
 
 from stario.exceptions import RequestBodyError
-from stario.http.headers import Headers
+from stario.http.headers import Headers, RequestHeaders
 from stario.http.host import host_without_port
-from stario.http.request import Request
-from stario.testing.harness import TestRequest
+from stario_cython.exchange import Request
 from tests.helpers import make_request as _make_request
 
 
@@ -36,7 +35,7 @@ class TestRequestCookies:
         hdrs = Headers()
         hdrs.add("Cookie", "a=1")
         hdrs.add("Cookie", "b=2")
-        req = TestRequest(method="GET", path="/", headers=hdrs)
+        req = Request(method="GET", path="/", headers=hdrs)
         assert req.cookies == {"a": "1", "b": "2"}
         assert req.cookies.get("a") == "1"
         assert "b" in req.cookies
@@ -94,26 +93,29 @@ class TestRequestHost:
         req = _make_request(headers={"Host": "  Example.COM:8080  "})
         assert req.host == "example.com"
 
-    def test_cython_request_host_matches_python(self):
-        cases = (
-            "",
-            "  ",
-            "Example.COM:8080",
-            "  Example.COM:8080  ",
-            "[::1]:8000",
-            "[::1]",
-            "localhost",
-            "example.com:",
-            "[::1]foo",
-            "Example.COM:80a",
-            "EXAMPLE.COM",
-        )
-        for raw in cases:
+    def test_request_host_normalization(self):
+        cases = {
+            "": "",
+            "  ": "",
+            "Example.COM:8080": "example.com",
+            "  Example.COM:8080  ": "example.com",
+            "[::1]:8000": "[::1]",
+            "[::1]": "[::1]",
+            "localhost": "localhost",
+            "example.com:": "example.com:",
+            "[::1]foo": "[::1]foo",
+            "Example.COM:80a": "example.com:80a",
+            "EXAMPLE.COM": "example.com",
+            "example.com.:443": "example.com",
+            "example.com..": "example.com..",
+        }
+        for raw, expected in cases.items():
             hdrs = Headers()
             if raw:
                 hdrs.set("Host", raw)
             req = Request(method="GET", path="/", headers=hdrs, body=b"")
-            assert req.host == host_without_port(raw), raw
+            assert req.host == expected, raw
+            assert host_without_port(raw) == expected, raw
 
     def test_host_is_lowercased_before_routing(self):
         req = _make_request(headers={"Host": "API.Example.COM"})
@@ -133,7 +135,7 @@ class TestRequestBody:
         assert body1 == body2 == b"data"
 
     async def test_body_max_size_is_per_call_limit(self):
-        req = TestRequest(method="POST", path="/", body=b"hello")
+        req = Request(method="POST", path="/", body=b"hello")
 
         with pytest.raises(RequestBodyError) as excinfo:
             await req.body(max_size=4)
@@ -142,13 +144,30 @@ class TestRequestBody:
         assert await req.body(max_size=5) == b"hello"
 
     async def test_body_none_returns_empty(self):
-        req = TestRequest(method="GET", path="/", body=b"")
+        req = Request(method="GET", path="/", body=b"")
         assert await req.body() == b""
 
-    async def test_stream_then_stream_raises(self):
-        req = TestRequest(method="POST", path="/", body=b"chunk")
-        stream = req.stream()
-        assert await stream.__anext__() == b"chunk"
-        with pytest.raises(RuntimeError, match="already streaming"):
-            async for _ in req.stream():
-                pass
+    async def test_stream_yields_a_bytes_body_once(self):
+        req = Request(method="POST", path="/", body=b"chunk")
+        assert [chunk async for chunk in req.stream()] == [b"chunk"]
+
+
+class TestRequestHeaders:
+    def test_constructed_request_gets_read_only_request_headers(self):
+        req = Request(headers={"Host": "Example.com", "X-Many": ["a", "b"]})
+        assert type(req.headers) is RequestHeaders
+        assert req.headers.get("host") == "Example.com"
+        assert req.headers.getlist("x-many") == ["a", "b"]
+        assert req.host == "example.com"
+        with pytest.raises(Exception, match="read-only"):
+            req.headers.set("x", "y")  # pyright: ignore[reportAttributeAccessIssue]
+        with pytest.raises(AttributeError):
+            req.headers = RequestHeaders()  # type: ignore[misc]
+
+    def test_request_headers_copy_response_headers(self):
+        hdrs = Headers()
+        hdrs.add("Cookie", "a=1")
+        view = RequestHeaders(hdrs)
+        hdrs.add("Cookie", "b=2")
+        assert view.getlist("cookie") == ["a=1"]
+        assert Request(headers=view).headers is view

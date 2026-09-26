@@ -22,6 +22,11 @@ cdef enum:
     ABORT_TOO_LARGE = 1
     ABORT_DISCONNECTED = 2
     ABORT_TIMEOUT = 3
+    # Bodies up to this size dispatch once complete (body() is already
+    # bytes), and an oversize declared body this small is drained on
+    # keep-alive instead of closing the connection. 256 KiB sits above
+    # API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
+    SMALL_BODY = 256 * 1024
 
 # ``scan_request_path`` result bits (a negative result means 400).
 cdef enum:
@@ -97,7 +102,7 @@ cdef class RequestHandle
 cdef class Request:
     cdef public object method
     cdef public object path
-    cdef public object headers
+    cdef readonly RequestHeaders headers
     cdef public object protocol_version
     cdef public bint keep_alive
     cdef object _query_bytes
@@ -107,7 +112,7 @@ cdef class Request:
     cdef Py_ssize_t _p_len
     cdef Py_ssize_t _q_off
     cdef Py_ssize_t _q_len
-    cdef public object _body
+    cdef object _body
     cdef object _query
     cdef object _cookies
     cdef object _host
@@ -122,12 +127,12 @@ cdef Request make_request(
     object path,
     object protocol_version,
     bint keep_alive,
-    object headers,
+    RequestHeaders headers,
     object body,
 )
 
 cdef class Connection:
-    """Typed protocol surface used by RequestExchange (cpdef = virtual)."""
+    """Typed protocol surface used by RequestExchange (cdef methods dispatch virtually)."""
     cdef public int timeout_cleanup
     cdef void release_exchange(self, RequestExchange exchange)
     cdef void response_completed(self, RequestExchange exchange)
@@ -155,6 +160,7 @@ cdef class Connection:
     cdef void h2_write_data(self, RequestExchange ex, object data, bint end)
     cdef void h2_end(self, RequestExchange ex)
     cdef void h2_abort(self, RequestExchange ex)
+    cdef void h2_handler_finished(self, RequestExchange ex)
 
 cdef class AppState:
     cdef public bint host_routing
@@ -247,6 +253,8 @@ cdef class RequestExchange:
     cdef Py_ssize_t _out_len
     cdef int _status_code
     cdef Py_ssize_t _declared_length
+    # HTTP/1.0 streaming: no chunked coding, the body ends when we close.
+    cdef bint _close_delimited
     cdef Py_ssize_t _bytes_written
     cdef bint _brotli_enabled
     cdef bint _gzip_enabled
@@ -288,6 +296,8 @@ cdef class RequestExchange:
 
     cdef object _cached
     cdef object _data_ready
+    # Bumped on detach: body readers from an earlier request stop reading.
+    cdef unsigned long _generation
     cdef double _stall_deadline
     cdef uint64_t _stall_touch
     cdef uint64_t _stall_seen
@@ -317,6 +327,8 @@ cdef class RequestExchange:
     cdef bint _h2_awaiting_headers
     cdef double _h2_header_deadline
     cdef bint _h2_outbound
+    # END_STREAM for the response has left nghttp2.
+    cdef bint _h2_end_sent
     # Body consumer is behind: hold this stream's WINDOW_UPDATE (HTTP/2).
     cdef bint _h2_flow_paused
     # ``w.drain()`` waiters for this stream's unsent DATA (HTTP/2).
@@ -324,7 +336,10 @@ cdef class RequestExchange:
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef object _handler_task
+    # The request method was HEAD.
     cdef bint _head_request
+    # No body bytes follow the response headers (HEAD, or write_headers(body=False)).
+    cdef bint _skip_body
     cdef bint _expect_continue
     cdef bint _waiting
     cdef bint _discard_body
@@ -357,6 +372,7 @@ cdef class RequestExchange:
     cdef object decode_request_path(self)
     cdef object host_from_arena(self)
     cpdef void respond(self, object body, object content_type, int status=*)
+    cdef int _stream_encoding(self, Headers headers, bint allocate) except -1
     cpdef object write_headers(self, int status_code, bint body=*)
     cpdef object write(self, object data)
     cpdef void end(self, object data=*)
@@ -425,6 +441,7 @@ cdef class RequestExchange:
     cdef int _block(self, object data, const unsigned char** out, size_t* out_len) except -1
     cdef int _finish(self, const unsigned char** out, size_t* out_len) except -1
     cdef int _write_native_chunk(self, const unsigned char* data, size_t n) except -1
+    cdef int _block_raw(self, const char* ptr, size_t n, const unsigned char** out, size_t* out_len) except -1
     cdef int _ensure_brotli(self) except -1
     cdef int _ensure_gzip(self) except -1
     cdef void _free_compressors(self)
@@ -457,6 +474,7 @@ cdef class RequestHeaders:
     cdef Py_ssize_t _cookie_index(self) noexcept
     cdef Py_ssize_t _auth_index(self) noexcept
     cdef void _take_ownership(self) noexcept
+    cdef int _own_pairs(self, list pairs) except -1
     cdef object c_get(self, object name)
     cdef Py_ssize_t c_find_n(self, const char* query, Py_ssize_t query_length) noexcept
     cdef object c_value_str(self, Py_ssize_t index)

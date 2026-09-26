@@ -11,6 +11,7 @@ TYPE_DATA = 0x0
 TYPE_HEADERS = 0x1
 TYPE_RST_STREAM = 0x3
 TYPE_SETTINGS = 0x4
+TYPE_PING = 0x6
 TYPE_GOAWAY = 0x7
 TYPE_WINDOW_UPDATE = 0x8
 TYPE_CONTINUATION = 0x9
@@ -263,3 +264,34 @@ async def read_stream(
                 break
             buf += chunk
     return collected, buf
+
+
+async def read_until_closed(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    buf: bytes,
+    *,
+    ack_pings: bool = True,
+    timeout: float = 3.0,
+) -> list[H2Frame]:
+    """Read frames until the server closes, ACKing PINGs like a real client."""
+    frames: list[H2Frame] = []
+    async with asyncio.timeout(timeout):
+        while True:
+            parsed, buf = parse_frames(buf)
+            for frame in parsed:
+                if ack_pings and frame.type == TYPE_PING and not frame.flags & FLAG_ACK:
+                    writer.write(pack_frame(TYPE_PING, FLAG_ACK, 0, frame.payload))
+            frames.extend(parsed)
+            chunk = await reader.read(65536)
+            if not chunk:
+                return frames
+            buf += chunk
+
+
+def goaway_last_stream_ids(frames: list[H2Frame]) -> list[int]:
+    return [
+        int.from_bytes(frame.payload[:4], "big") & 0x7FFFFFFF
+        for frame in frames
+        if frame.type == TYPE_GOAWAY
+    ]

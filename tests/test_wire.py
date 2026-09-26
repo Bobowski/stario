@@ -1,9 +1,9 @@
 """Tests for wire-level path/method decoding and request-path canonicalization."""
 
 import pytest
-from stario_cython.exchange import canonical_request_path
 
 from stario.http.wire import decode_method, decode_path
+from stario_cython.exchange import canonical_request_path
 
 
 class TestDecodeMethod:

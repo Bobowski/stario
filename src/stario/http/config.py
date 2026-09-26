@@ -34,6 +34,7 @@ DEFAULT_BACKLOG = 2048
 DEFAULT_UNIX_SOCKET_MODE = 0o660
 DEFAULT_HEADER_TIMEOUT = 5.0
 DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
+DEFAULT_WRITE_TIMEOUT = 30.0
 DEFAULT_REUSE_ADDR = True
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
 DEFAULT_EVENT_LOOP = "asyncio"
@@ -52,6 +53,7 @@ class RequestPolicy:
         "max_body_bytes",
         "max_header_bytes",
         "max_pipelined_requests",
+        "write_timeout",
     )
 
     def __init__(
@@ -63,6 +65,7 @@ class RequestPolicy:
         body_timeout: float = DEFAULT_BODY_TIMEOUT,
         keep_alive_timeout: float = DEFAULT_KEEP_ALIVE_TIMEOUT,
         max_pipelined_requests: int = DEFAULT_MAX_PIPELINED_REQUESTS,
+        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
     ) -> None:
         if max_header_bytes < 256:
             raise StarioError(
@@ -88,6 +91,7 @@ class RequestPolicy:
             ("header_timeout", header_timeout),
             ("body_timeout", body_timeout),
             ("keep_alive_timeout", keep_alive_timeout),
+            ("write_timeout", write_timeout),
         ):
             if value <= 0:
                 raise StarioError(
@@ -106,6 +110,7 @@ class RequestPolicy:
         self.body_timeout = body_timeout
         self.keep_alive_timeout = keep_alive_timeout
         self.max_pipelined_requests = max_pipelined_requests
+        self.write_timeout = write_timeout
 
 
 def _config_from_env[T](build: Callable[[], T]) -> T:
@@ -116,7 +121,7 @@ def _config_from_env[T](build: Callable[[], T]) -> T:
 
 
 def request_policy_from_env() -> RequestPolicy:
-    """Read `STARIO_REQUESTS_*` size caps, read timeouts, and keep-alive idle timeout."""
+    """Read `STARIO_REQUESTS_*` size caps, read/write timeouts, and keep-alive idle timeout."""
     return _config_from_env(
         lambda: RequestPolicy(
             max_header_bytes=env_int(
@@ -136,6 +141,9 @@ def request_policy_from_env() -> RequestPolicy:
             ),
             max_pipelined_requests=env_int(
                 "STARIO_REQUESTS_MAX_PIPELINED_REQUESTS", DEFAULT_MAX_PIPELINED_REQUESTS
+            ),
+            write_timeout=env_float(
+                "STARIO_REQUESTS_WRITE_TIMEOUT", DEFAULT_WRITE_TIMEOUT
             ),
         )
     )

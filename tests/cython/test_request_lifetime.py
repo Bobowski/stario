@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from stario_cython.exchange import _retained_detach_count
 
 import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioRuntime
+from stario_cython.exchange import _retained_detach_count
 from tests.cython.http import read_response, running_server
 
 
@@ -367,3 +367,49 @@ async def test_h2_streams_never_take_the_retained_copy_path() -> None:
     assert h2.stream_data(frames + more, 1) == b"sync"
     assert h2.stream_data(frames + more, 3) == b"/async"
     assert _retained_detach_count() == before
+
+
+@pytest.mark.asyncio
+async def test_body_stream_outliving_its_request_cannot_read_the_next_body() -> None:
+    app = App()
+    stale: list[object] = []
+    second: list[bytes] = []
+    resume = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def drain_later(chunks) -> None:
+        await resume.wait()
+        try:
+            async for chunk in chunks:
+                stale.append(chunk)
+        except StarioRuntime as exc:
+            stale.append(type(exc))
+        finished.set()
+
+    async def upload(c, w) -> None:
+        if not second and not stale:
+            chunks = c.req.stream(max_chunk=1).__aiter__()
+            stale.append(await chunks.__anext__())
+            asyncio.get_running_loop().create_task(drain_later(chunks))
+        else:
+            second.append(await c.req.body())
+        responses.text(w, "ok")
+
+    app.add(Route("POST /"), upload)
+    chunked = b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+    async with running_server(app) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(chunked + b"2\r\nab\r\n")
+        await asyncio.sleep(0.05)
+        writer.write(b"0\r\n\r\n")
+        await read_response(reader)
+        writer.write(chunked + b"6\r\nSECRET\r\n")
+        await asyncio.sleep(0.05)
+        resume.set()
+        async with asyncio.timeout(2):
+            await finished.wait()
+        writer.write(b"0\r\n\r\n")
+        await read_response(reader)
+        writer.close()
+    assert stale == [b"a", StarioRuntime]
+    assert second == [b"SECRET"]

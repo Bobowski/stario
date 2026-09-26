@@ -283,8 +283,10 @@ class TestClient:
                 )
                 try:
                     await wait
-                except TimeoutError:
-                    raise TimeoutError("TestClient stream timed out waiting for headers.")
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        "TestClient stream timed out waiting for headers."
+                    ) from exc
 
             status_code = writer.status_code if writer.status_code is not None else 500
             response_headers = writer.headers

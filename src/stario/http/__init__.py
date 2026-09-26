@@ -4,7 +4,8 @@
 `Router` and tracks tasks. The protocol runs `find_handler` then the
 matched handler as a task.
 
-**Message** — `Request`, `Writer`, `Headers`, `ParsedQuery` for one HTTP exchange.
+**Message** — `Request` (read-only `RequestHeaders`), `Writer`, `Headers`,
+`ParsedQuery` for one HTTP exchange.
 
 **Process** — `await serve(bootstrap, …)` on a running loop, or
 `asyncio.run(stario.serve(bootstrap))` / `uvloop.run(...)`.
@@ -29,7 +30,7 @@ For tests, import `aload_app` from `stario.testing`.
 from stario.http.app import App
 from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
-from stario.http.headers import Headers
+from stario.http.headers import Headers, RequestHeaders
 from stario.http.middleware import (
     catch_errors,
     catch_request_body_errors,
@@ -38,7 +39,7 @@ from stario.http.middleware import (
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
 from stario.http.request import ParsedCookies, Request
-from stario.http.route import Route, UrlPath
+from stario.http.route import Route
 from stario.http.writer import Writer
 
 __all__ = [
@@ -51,9 +52,9 @@ __all__ = [
     "ParsedCookies",
     "ParsedQuery",
     "Request",
+    "RequestHeaders",
     "Route",
     "Router",
-    "UrlPath",
     "Writer",
     "catch_errors",
     "catch_request_body_errors",
