@@ -502,15 +502,20 @@ class Server:
                 self.config.requests,
             )
 
-        ssl_ctx = self.config.ssl
+        tls: dict[str, Any] = {}
+        if self.config.ssl is not None:
+            # A TLS handshake is part of sending the request head; asyncio's
+            # default would let a silent client hold the socket for 60s.
+            tls = {
+                "ssl": self.config.ssl,
+                "ssl_handshake_timeout": self.config.requests.header_timeout,
+            }
         if listen_sock is not None:
             if listen_sock.family == socket.AF_UNIX:
                 return await loop.create_unix_server(
-                    protocol_factory, sock=listen_sock, ssl=ssl_ctx
+                    protocol_factory, sock=listen_sock, **tls
                 )
-            return await loop.create_server(
-                protocol_factory, sock=listen_sock, ssl=ssl_ctx
-            )
+            return await loop.create_server(protocol_factory, sock=listen_sock, **tls)
         return await loop.create_server(
             protocol_factory,
             self.config.host,
@@ -518,7 +523,7 @@ class Server:
             backlog=self.config.backlog,
             reuse_address=self.config.reuse_addr,
             reuse_port=reuse_port,
-            ssl=ssl_ctx,
+            **tls,
         )
 
     async def _drain_listener(
