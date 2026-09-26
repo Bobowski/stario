@@ -22,6 +22,11 @@ cdef enum:
     ABORT_TOO_LARGE = 1
     ABORT_DISCONNECTED = 2
     ABORT_TIMEOUT = 3
+    # Bodies up to this size dispatch once complete (body() is already
+    # bytes), and an oversize declared body this small is drained on
+    # keep-alive instead of closing the connection. 256 KiB sits above
+    # API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
+    SMALL_BODY = 256 * 1024
 
 # ``scan_request_path`` result bits (a negative result means 400).
 cdef enum:

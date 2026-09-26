@@ -132,10 +132,6 @@ cdef int HIGH_WATER = 512 * 1024
 cdef int BODY_HIGH_WATER = 64 * 1024
 cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
 cdef int STREAM_CHUNK_CL = 256 * 1024
-# Same bound as protocol SMALL_BODY_COMPLETE_DISPATCH: a declared oversize
-# body this small can be discarded on keep-alive; larger or unknown lengths
-# close the HTTP/1 connection (unbounded read-DoS).
-cdef int SMALL_BODY_DRAIN = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
 # Same-OS-thread spare only. Keep-alive reuse is the connection idle slot.
@@ -3762,7 +3758,7 @@ cdef class RequestExchange:
                     self._consumed_as == CONSUMED_BODY
                     or (
                         self._consumed_as == CONSUMED_NONE
-                        and self._expected_size <= SMALL_BODY_DRAIN
+                        and self._expected_size <= SMALL_BODY
                     )
                 )
             ):
@@ -3928,7 +3924,7 @@ cdef class RequestExchange:
                 self._http2
                 or (
                     self._expected_size >= 0
-                    and self._expected_size <= SMALL_BODY_DRAIN
+                    and self._expected_size <= SMALL_BODY
                 )
             ):
                 self._total_read = new_total

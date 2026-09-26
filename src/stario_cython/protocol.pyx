@@ -63,6 +63,7 @@ from stario.telemetry.noop import NoOpTracer
 
 from stario_cython.exchange cimport (
     ABORT_TOO_LARGE,
+    SMALL_BODY,
     PATH_BAD,
     PATH_HAS_PCT,
     PATH_OPTIONS_STAR,
@@ -182,10 +183,6 @@ from stario_cython.timeouts import (
 )
 
 cdef enum:
-    # 256 KiB sits above API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
-    # body() is then already bytes when the handler starts. File uploads
-    # (MiB) still dispatch at headers-complete so stream() can start early.
-    SMALL_BODY_COMPLETE_DISPATCH = 256 * 1024
     PARSE_NONE = 0
     PARSE_H1 = 1
     PARSE_H2 = 2
@@ -1553,7 +1550,7 @@ cdef class CHttpProtocol(Connection):
             # Keep-alive only when the declared body is small enough to drain.
             # A huge or chunked upload after 413 would be a read-DoS.
             if (
-                content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                content_length <= <uint64_t>SMALL_BODY
                 and self.request_keep_alive
             ):
                 self.h1_headers_too_large = True
@@ -1588,7 +1585,7 @@ cdef class CHttpProtocol(Connection):
                 if (
                     not exchange._req_expect_continue
                     and (flags & F_CONTENT_LENGTH)
-                    and content_length <= <uint64_t>SMALL_BODY_COMPLETE_DISPATCH
+                    and content_length <= <uint64_t>SMALL_BODY
                 ):
                     return
             else:
@@ -2606,7 +2603,7 @@ cdef class CHttpProtocol(Connection):
         if (
             not ex._h2_dispatched
             and not self.rejected
-            and ex._total_read > SMALL_BODY_COMPLETE_DISPATCH
+            and ex._total_read > SMALL_BODY
         ):
             self._h2_dispatch_stream(ex)
 
@@ -2648,7 +2645,7 @@ cdef class CHttpProtocol(Connection):
                 if (
                     not expect
                     and content_length > 0
-                    and content_length <= SMALL_BODY_COMPLETE_DISPATCH
+                    and content_length <= SMALL_BODY
                     and not end_stream
                 ):
                     return
