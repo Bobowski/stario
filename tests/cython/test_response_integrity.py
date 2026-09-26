@@ -24,29 +24,67 @@ def _h2_get(stream_id: int, path: str, *, method: str = "GET", extra=None) -> by
     )
 
 
+def _header_map(head: bytes) -> dict[bytes, bytes]:
+    lines = head.split(b"\r\n")[1:]
+    return {
+        name.strip().lower(): value.strip()
+        for name, _, value in (line.partition(b":") for line in lines if line)
+        if name.strip().lower() != b"date"
+    }
+
+
+async def _page_respond_text(_c, w) -> None:
+    responses.text(w, "x" * 4096)
+
+
+async def _page_respond_image(_c, w) -> None:
+    w.respond(b"x" * 4096, b"image/png")
+
+
+async def _page_stream_text(_c, w) -> None:
+    w.headers.set("content-type", "text/plain")
+    w.write_headers(200)
+    w.write(b"x" * 4096)
+    w.end()
+
+
+async def _page_stream_image(_c, w) -> None:
+    w.headers.set("content-type", "image/png")
+    w.write_headers(200)
+    w.write(b"x" * 4096)
+    w.end()
+
+
 @pytest.mark.asyncio
-async def test_head_with_accept_encoding_sends_no_body() -> None:
+@pytest.mark.parametrize(
+    "page",
+    [_page_respond_text, _page_respond_image, _page_stream_text, _page_stream_image],
+)
+async def test_head_headers_match_get(page) -> None:
+    # RFC 9110 9.3.2: same fields as GET; Content-Length may be omitted
+    # but must not differ, and no body follows.
     app = App()
-
-    async def page(_c, w) -> None:
-        responses.text(w, "x" * 4096)
-
     app.add(Route("GET /"), page)
     app.add(Route("HEAD /"), page)
+    request = b" / HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n"
     async with running_server(app, compression=CompressionConfig(min_size=1)) as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(
-            b"HEAD / HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n"
-            b"GET / HTTP/1.1\r\nHost: t\r\n\r\n"
-        )
-        async with asyncio.timeout(2):
-            head = await reader.readuntil(b"\r\n\r\n")
-        second = await read_response(reader)
+        writer.write(b"GET" + request)
+        get = _header_map(await reader.readuntil(b"\r\n\r\n"))
         writer.close()
-    assert head.startswith(b"HTTP/1.1 200")
-    assert b"content-encoding" not in head.lower()
-    assert second.startswith(b"HTTP/1.1 200")
-    assert second.endswith(b"x" * 4096)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"HEAD" + request + b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        async with asyncio.timeout(2):
+            head = _header_map(await reader.readuntil(b"\r\n\r\n"))
+            follow = await reader.readuntil(b"\r\n\r\n")
+        writer.close()
+    assert follow.startswith(b"HTTP/1.1 200")
+    if b"content-length" in head:
+        assert head[b"content-length"] == get[b"content-length"]
+    framing = {b"content-length", b"transfer-encoding"}
+    assert {k: v for k, v in head.items() if k not in framing} == {
+        k: v for k, v in get.items() if k not in framing
+    }
 
 
 @pytest.mark.asyncio

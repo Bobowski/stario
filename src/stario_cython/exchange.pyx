@@ -376,6 +376,21 @@ cdef inline int _require_final_status(int status) except -1:
     return 0
 
 
+cdef Py_ssize_t _parse_declared_length(object raw) except -1:
+    cdef object parsed
+    try:
+        parsed = int(raw)
+        if parsed < 0:
+            raise ValueError()
+        return parsed
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise StarioError(
+            "Invalid Content-Length header",
+            context={"content-length": raw},
+            help_text="Set Content-Length to a non-negative integer before write_headers().",
+        ) from exc
+
+
 cdef list _build_status_lines():
     cdef list lines = [None] * 600
     cdef int status
@@ -2203,6 +2218,7 @@ cdef class RequestExchange:
         self._bytes_written = 0
         self._completed = False
         self._close_delimited = False
+        self._skip_body = False
         self._out_len = 0
         self.headers.c_clear()
 
@@ -2391,20 +2407,26 @@ cdef class RequestExchange:
             nbytes = 0
         elif existing_ce is None and self._may_compress(body, content_type, False, nbytes):
             encoding = _encoding_wire(self._req_encoding)
-            flat = self._body_as_bytes(body)
             try:
-                self._frame(flat, encoding, &native_out, &native_len)
-                nbytes = <Py_ssize_t>native_len
-                if existing_cl is not None:
-                    h.c_require_respond_length(existing_cl, _dec(native_len))
-                payload = PyBytes_FromStringAndSize(<char*>native_out, <Py_ssize_t>native_len)
                 nva = [
                     (b":status", _dec(<size_t>status)),
                     (b"date", self._h2_date_value()),
                     (b"content-type", content_type),
-                    (b"content-length", _dec(native_len)),
-                    (b"content-encoding", encoding),
                 ]
+                if self._head_request:
+                    # RFC 9110 9.3.2: HEAD may omit the compressed length.
+                    payload = b""
+                else:
+                    flat = self._body_as_bytes(body)
+                    self._frame(flat, encoding, &native_out, &native_len)
+                    if existing_cl is not None:
+                        h.c_require_respond_length(existing_cl, _dec(native_len))
+                    payload = PyBytes_FromStringAndSize(
+                        <char*>native_out, <Py_ssize_t>native_len
+                    )
+                    nva.append((b"content-length", _dec(native_len)))
+                nbytes = <Py_ssize_t>native_len
+                nva.append((b"content-encoding", encoding))
                 if not h.c_vary_contains(b"accept-encoding"):
                     nva.append((b"vary", b"accept-encoding"))
                 self._status_code = status
@@ -2471,7 +2493,7 @@ cdef class RequestExchange:
         bint streaming,
         Py_ssize_t nbytes,
     ):
-        if self._req_encoding == ENCODING_NONE or self._head_request:
+        if self._req_encoding == ENCODING_NONE:
             return False
         if not streaming:
             if data is None or nbytes < self._compress_min_size:
@@ -3377,15 +3399,16 @@ cdef class RequestExchange:
                 if self._may_compress(body, content_type, False, nbytes):
                     encoding = _encoding_wire(self._req_encoding)
                 if encoding is not None:
-                    flat = self._body_as_bytes(body)
                     try:
-                        self._frame(flat, encoding, &native_out, &native_len)
+                        if not self._head_request:
+                            flat = self._body_as_bytes(body)
+                            self._frame(flat, encoding, &native_out, &native_len)
+                            if existing_cl is not None:
+                                h.c_require_respond_length(
+                                    existing_cl, _dec(native_len)
+                                )
                         self._declared_length = <Py_ssize_t>native_len
                         self._bytes_written = 0
-                        if existing_cl is not None:
-                            h.c_require_respond_length(
-                                existing_cl, _dec(native_len)
-                            )
                         self._buf_bytes(_status_line(status))
                         self._buf_bytes(self._date_box[0])
                         if self._out_buf is None:
@@ -3404,11 +3427,16 @@ cdef class RequestExchange:
                             self._buf_bytes(CRLF)
                         self._buf_bytes(CT_PREFIX)
                         self._buf_bytes(content_type)
-                        self._buf_bytes(CRLF)
-                        self._buf_bytes(CL_HEADER)
-                        self._buf_uint(native_len, 10)
-                        self._buf_bytes(CRLF2)
-                        self._buf_add(<const char*>native_out, <Py_ssize_t>native_len)
+                        if self._head_request:
+                            # RFC 9110 9.3.2: the compressed length is only
+                            # known by compressing; HEAD may omit it.
+                            self._buf_bytes(CRLF2)
+                        else:
+                            self._buf_bytes(CRLF)
+                            self._buf_bytes(CL_HEADER)
+                            self._buf_uint(native_len, 10)
+                            self._buf_bytes(CRLF2)
+                            self._buf_add(<const char*>native_out, <Py_ssize_t>native_len)
                         self._flush()
                     finally:
                         self._free_compressors()
@@ -3459,11 +3487,27 @@ cdef class RequestExchange:
             self._transport.close()
         self._done()
 
+    cdef int _stream_encoding(self, Headers headers, bint allocate) except -1:
+        cdef object encoding
+        if headers.c_get(b"content-encoding") is not None:
+            return 0
+        if not self._may_compress(None, headers.c_get(b"content-type"), True, -1):
+            return 0
+        encoding = _encoding_wire(self._req_encoding)
+        if encoding is None:
+            return 0
+        if allocate:
+            if encoding == b"br":
+                self._ensure_brotli()
+            else:
+                self._ensure_gzip()
+        headers.c_set(b"content-encoding", encoding)
+        headers.c_merge_vary(b"accept-encoding")
+        return 0
+
     cpdef object write_headers(self, int status_code, bint body=True):
         cdef Headers headers = self.headers
         cdef object raw_length
-        cdef object parsed_length
-        cdef object encoding
         cdef list nva
         if self._transport.is_closing():
             return self
@@ -3476,48 +3520,27 @@ cdef class RequestExchange:
                 ),
             )
         _require_final_status(status_code)
-        if not body:
-            self._head_request = True
+        self._skip_body = self._head_request or not body
+        self._bytes_written = 0
+        raw_length = headers.c_get(b"content-length")
         if not _may_have_body(status_code):
             headers.c_remove(b"transfer-encoding")
             headers.c_remove(b"content-length")
             self._declared_length = 0
-            self._bytes_written = 0
+        elif raw_length is not None:
+            headers.c_remove(b"transfer-encoding")
+            self._declared_length = _parse_declared_length(raw_length)
         elif self._head_request:
+            # RFC 9110 9.3.2: a HEAD response may omit Content-Length, which
+            # GET only learns while streaming. Everything else matches GET.
             headers.c_remove(b"transfer-encoding")
-            if headers.c_get(b"content-length") is not None:
-                raw_length = headers.c_get(b"content-length")
-                try:
-                    parsed_length = int(raw_length)
-                    if parsed_length < 0:
-                        raise ValueError()
-                    self._declared_length = parsed_length
-                    self._bytes_written = 0
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise StarioError(
-                        "Invalid Content-Length header",
-                        context={"content-length": raw_length},
-                        help_text="Set Content-Length to a non-negative integer before write_headers().",
-                    ) from exc
-            else:
-                self._declared_length = 0
-                self._bytes_written = 0
-                headers.c_set(b"content-length", b"0")
-        elif headers.c_get(b"content-length") is not None:
+            self._declared_length = 0
+            if not self._http2:
+                self._stream_encoding(headers, False)
+        elif self._skip_body:
             headers.c_remove(b"transfer-encoding")
-            raw_length = headers.c_get(b"content-length")
-            try:
-                parsed_length = int(raw_length)
-                if parsed_length < 0:
-                    raise ValueError()
-                self._declared_length = parsed_length
-                self._bytes_written = 0
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise StarioError(
-                    "Invalid Content-Length header",
-                    context={"content-length": raw_length},
-                    help_text="Set Content-Length to a non-negative integer before write_headers().",
-                ) from exc
+            headers.c_set(b"content-length", b"0")
+            self._declared_length = 0
         elif not self._http2:
             if self._version == "1.0":
                 # RFC 9112 7: HTTP/1.0 has no chunked coding.
@@ -3526,19 +3549,7 @@ cdef class RequestExchange:
                 self._close_delimited = True
             else:
                 headers.c_set(b"transfer-encoding", b"chunked")
-            if headers.c_get(b"content-encoding") is None:
-                encoding = None
-                if self._may_compress(
-                    None, headers.c_get(b"content-type"), True, -1
-                ):
-                    encoding = _encoding_wire(self._req_encoding)
-                if encoding is not None:
-                    if encoding == b"br":
-                        self._ensure_brotli()
-                    else:
-                        self._ensure_gzip()
-                    headers.c_set(b"content-encoding", encoding)
-                    headers.c_merge_vary(b"accept-encoding")
+            self._stream_encoding(headers, True)
         self._expect_continue = False
         if self._http2:
             nva = [
@@ -3589,7 +3600,7 @@ cdef class RequestExchange:
                     "204/304 and 1xx responses must not include a message body."
                 ),
             )
-        if self._head_request or n == 0:
+        if self._skip_body or n == 0:
             return self
         if self._declared_length >= 0 and self._bytes_written + n > self._declared_length:
             raise StarioRuntime(
@@ -3660,7 +3671,7 @@ cdef class RequestExchange:
                 self.write_headers(204)
         if data:
             self.write(data)
-        if self._head_request:
+        if self._skip_body:
             # Completed first: END_STREAM can close the stream synchronously,
             # and an incomplete close reads as a client abort.
             self._completed = True

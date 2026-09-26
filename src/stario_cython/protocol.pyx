@@ -3049,7 +3049,7 @@ cdef class CHttpProtocol(Connection):
                 return
             ex._h2_headers_sent = True
             ex._h2_outbound = True
-            if ex._head_request:
+            if ex._skip_body:
                 ex._h2_body_done = True
                 rv = nghttp2_submit_response(
                     self.h2, ex._h2_stream_id, nvs, <size_t>nvlen, NULL

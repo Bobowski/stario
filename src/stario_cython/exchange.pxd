@@ -331,7 +331,10 @@ cdef class RequestExchange:
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef object _handler_task
+    # The request method was HEAD.
     cdef bint _head_request
+    # No body bytes follow the response headers (HEAD, or write_headers(body=False)).
+    cdef bint _skip_body
     cdef bint _expect_continue
     cdef bint _waiting
     cdef bint _discard_body
@@ -364,6 +367,7 @@ cdef class RequestExchange:
     cdef object decode_request_path(self)
     cdef object host_from_arena(self)
     cpdef void respond(self, object body, object content_type, int status=*)
+    cdef int _stream_encoding(self, Headers headers, bint allocate) except -1
     cpdef object write_headers(self, int status_code, bint body=*)
     cpdef object write(self, object data)
     cpdef void end(self, object data=*)
