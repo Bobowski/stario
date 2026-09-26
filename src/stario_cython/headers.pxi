@@ -386,22 +386,34 @@ def encode_header_value(str value):
     return _encode_value(value)
 
 
+cdef inline bytes _trusted_bytes(object value):
+    if type(value) is bytes:
+        return <bytes>value
+    if type(value) is str:
+        return (<str>value).encode("latin-1")
+    raise TypeError(
+        f"Headers() keys and values must be str or bytes, not {type(value).__name__}"
+    )
+
+
 @cython.final
 cdef class Headers:
     def __init__(self, raw_header_data=None):
         cdef object key
         cdef object value
         cdef object item
+        cdef bytes name
         self._names = []
         self._values = []
         self._n = 0
         if raw_header_data:
             for key, value in raw_header_data.items():
+                name = _trusted_bytes(key)
                 if type(value) is list:
                     for item in value:
-                        self.c_add(key, item)
+                        self.c_add(name, _trusted_bytes(item))
                 else:
-                    self.c_set(key, value)
+                    self.c_set(name, _trusted_bytes(value))
 
     cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept:
         cdef char buf[NAME_STACK]

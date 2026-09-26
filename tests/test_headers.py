@@ -137,6 +137,18 @@ class TestHeaderMutators:
         h = Headers({b"host": b"example.com"})
         assert h.unsafe_get(b"host") == b"example.com"
 
+    def test_constructor_accepts_str_mappings(self):
+        h = Headers({"X-Name": "value", "X-Many": ["a", "b"]})
+        assert h.items() == [("x-name", "value"), ("x-many", "a"), ("x-many", "b")]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [{b"x": 12345}, {12: b"v"}, {b"x": [b"a", None]}, {b"x": bytearray(b"v")}],
+    )
+    def test_constructor_rejects_non_text_keys_and_values(self, raw):
+        with pytest.raises(TypeError):
+            Headers(raw)
+
     def test_remove_missing_is_noop(self):
         h = Headers()
         h.remove("X-Missing")
