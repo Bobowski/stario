@@ -114,3 +114,13 @@ def test_set_cookie_rejects_comma_in_domain() -> None:
     w = make_writer()
     with pytest.raises(StarioError, match="Invalid cookie domain"):
         cookies.set_cookie(w, "sid", "v", domain="example.com, evil.test")
+
+
+@pytest.mark.parametrize(
+    "samesite", ["lax; Domain=evil.example", "none\r\nX: y", "loose"]
+)
+def test_invalid_samesite_is_rejected(samesite: str) -> None:
+    w = make_writer()
+    with pytest.raises(StarioError, match="samesite"):
+        cookies.set_cookie(w, "sid", "v", samesite=samesite)  # type: ignore[arg-type]
+    assert not w.headers.unsafe_getlist(b"set-cookie")

@@ -13,6 +13,8 @@ from typing import Literal
 from stario.exceptions import StarioError
 from stario.http.writer import Writer
 
+_SAMESITE = frozenset(("lax", "strict", "none"))
+
 
 def morsels_from_lines(
     header_values: Iterable[str],
@@ -77,6 +79,12 @@ def set_cookie(
             context={"domain": domain},
             help_text="Cookie Domain must not contain ';' or ','.",
         )
+    if samesite is not None and samesite.lower() not in _SAMESITE:
+        raise StarioError(
+            "Invalid cookie samesite",
+            context={"samesite": samesite},
+            help_text="SameSite must be 'lax', 'strict', 'none', or None.",
+        )
     if isinstance(expires, str) and (";" in expires or "," in expires):
         raise StarioError(
             "Invalid cookie expires",
@@ -107,13 +115,10 @@ def set_cookie(
             cookie[name]["httponly"] = True
         if samesite:
             cookie[name]["samesite"] = samesite
-        if secure or samesite == "none":
+        if secure or (samesite is not None and samesite.lower() == "none"):
             cookie[name]["secure"] = True
-        w.headers.unsafe_add(
-            b"set-cookie",
-            cookie.output(header="").strip().encode("latin-1"),
-        )
-    except http.cookies.CookieError as exc:
+        w.headers.add("set-cookie", cookie.output(header="").strip())
+    except (http.cookies.CookieError, ValueError) as exc:
         raise StarioError(
             "Invalid cookie name, value, or attribute",
             context={"name": name},
