@@ -8,8 +8,8 @@ lab assumptions: [Current snapshot (2026-09-21)](#current-snapshot-2026-09-21).
 Multi-threaded free-threaded runtime (`STARIO_THREADS`, `SO_REUSEPORT`):
 [`docs/free-threading.md`](docs/free-threading.md).
 
-Building needs `pkg-config`, nghttp2 (1.61+, or a distro build with the
-CVE-2024-28182 backport such as Ubuntu 24.04's 1.59), and Brotli
+Building needs `pkg-config`, nghttp2 1.66+ (older distro builds that carry
+the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), and Brotli
 development packages (`libnghttp2-dev libbrotli-dev` on Debian/Ubuntu,
 `brew install pkg-config nghttp2 brotli` on macOS). Gzip links system zlib
 (`-lz`). Published wheels bundle nghttp2 and Brotli
