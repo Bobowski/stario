@@ -76,6 +76,7 @@ def _make_http_protocol(
         keep_alive_timeout=requests.keep_alive_timeout,
         body_timeout=requests.body_timeout,
         max_pipelined_requests=requests.max_pipelined_requests,
+        write_timeout=requests.write_timeout,
     )
 
 
@@ -1064,6 +1065,7 @@ class Server:
             "server.timeout.request_header": self.config.requests.header_timeout,
             "server.timeout.request_body": self.config.requests.body_timeout,
             "server.timeout.keep_alive": self.config.requests.keep_alive_timeout,
+            "server.timeout.response_write": self.config.requests.write_timeout,
             "server.event_loop": loop_implementation(),
             "server.threads": self._thread_count,
             "server.threads_requested": self.config.threads,

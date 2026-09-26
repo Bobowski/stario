@@ -52,6 +52,7 @@ from stario.http.config import (
     DEFAULT_HEADER_TIMEOUT,
     DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_MAX_PIPELINED_REQUESTS,
+    DEFAULT_WRITE_TIMEOUT,
 )
 from stario.http.invoke import finish_request_span, on_handler_done
 from stario.http.request import (
@@ -684,6 +685,10 @@ cdef class CHttpProtocol(Connection):
     cdef double header_timeout
     cdef double keep_alive_timeout
     cdef double body_timeout
+    cdef double write_timeout
+    # 0.0 = arm on the next sweep while output is stuck.
+    cdef double write_stall_deadline
+    cdef Py_ssize_t write_stall_size
     cdef double timeout_sweep_interval
     cdef int timeout_kind
     cdef double timeout_deadline
@@ -791,6 +796,7 @@ cdef class CHttpProtocol(Connection):
         keep_alive_timeout=DEFAULT_KEEP_ALIVE_TIMEOUT,
         body_timeout=DEFAULT_BODY_TIMEOUT,
         max_pipelined_requests=DEFAULT_MAX_PIPELINED_REQUESTS,
+        write_timeout=DEFAULT_WRITE_TIMEOUT,
         timeout_cleanup=None,
         timeout_sweep_interval=None,
     ):
@@ -816,6 +822,9 @@ cdef class CHttpProtocol(Connection):
         self.header_timeout = header_timeout
         self.keep_alive_timeout = keep_alive_timeout
         self.body_timeout = body_timeout
+        self.write_timeout = write_timeout
+        self.write_stall_deadline = 0.0
+        self.write_stall_size = 0
         if timeout_cleanup is None:
             self.timeout_cleanup = parse_timeout_mode()
         elif isinstance(timeout_cleanup, str):
@@ -1077,9 +1086,8 @@ cdef class CHttpProtocol(Connection):
         cdef RequestExchange reading
         cdef RequestExchange active
         cdef RequestExchange exchange
-        cdef object transport
         cdef double seconds
-        if self.rejected:
+        if self._check_write_stall(now) or self.rejected:
             return
         if self.timeout_kind != TIMEOUT_NONE:
             if self.timeout_deadline <= 0.0:
@@ -1095,9 +1103,7 @@ cdef class CHttpProtocol(Connection):
             elif now >= self.timeout_deadline:
                 self.timeout_kind = TIMEOUT_NONE
                 self.timeout_deadline = 0.0
-                transport = self.transport
-                if transport is not None and not transport.is_closing():
-                    transport.close()
+                self._close_on_timeout()
                 return
         reading = self.reading_exchange
         active = self.active_exchange
@@ -1111,6 +1117,47 @@ cdef class CHttpProtocol(Connection):
                 self._check_h2_header_timeout(exchange, now)
                 if not exchange.in_pool:
                     self._check_body_stall(exchange, now)
+
+    cdef bint _check_write_stall(self, double now):
+        """Abort a connection whose peer stopped reading its output.
+
+        Output counts as stuck while the transport paused writing, or while
+        a closing transport still holds unsent bytes. Any shrink of the
+        buffer re-arms the deadline, so slow readers are not cut off.
+        """
+        cdef object transport = self.transport
+        cdef object buffer_size
+        cdef Py_ssize_t size
+        if transport is None or self.write_timeout <= 0.0:
+            return False
+        if not (self.pause_reasons & PAUSE_WRITE) and not transport.is_closing():
+            self.write_stall_deadline = 0.0
+            return False
+        buffer_size = getattr(transport, "get_write_buffer_size", None)
+        size = buffer_size() if buffer_size is not None else 0
+        if size <= 0:
+            self.write_stall_deadline = 0.0
+            return False
+        if self.write_stall_deadline <= 0.0 or size < self.write_stall_size:
+            self.write_stall_deadline = now + self.write_timeout
+            self.write_stall_size = size
+            return False
+        self.write_stall_size = size
+        if now < self.write_stall_deadline:
+            return False
+        self.write_stall_deadline = 0.0
+        transport.abort()
+        return True
+
+    cdef void _close_on_timeout(self):
+        cdef object transport = self.transport
+        if transport is None or transport.is_closing():
+            return
+        if self.parse_mode == PARSE_H2 and self.h2 != NULL:
+            # RFC 9113 6.8: tell the client which streams were processed.
+            self._h2_final_goaway()
+            self._h2_send()
+        transport.close()
 
     cdef void _check_h2_header_timeout(self, RequestExchange ex, double now) noexcept:
         """Reset a stream that has not dispatched within the header timeout."""
@@ -1370,7 +1417,14 @@ cdef class CHttpProtocol(Connection):
 
     def resume_writing(self):
         self._set_pause_reason(PAUSE_WRITE, False)
+        self.write_stall_deadline = 0.0
         wake_waiters(self._write_waiters)
+        if (
+            self.active_exchange is None
+            and self.pending_exchanges
+            and not self._closing()
+        ):
+            self._start_next_pending()
 
     cdef object drain_waiter(self, RequestExchange exchange):
         """A future to await before writing more, or None to go ahead."""
@@ -1764,9 +1818,11 @@ cdef class CHttpProtocol(Connection):
         if exchange._http2:
             self._start_exchange(exchange, True)
             return
-        if self.active_exchange is None:
+        if self.active_exchange is None and not (self.pause_reasons & PAUSE_WRITE):
             self._start_exchange(exchange, True)
         else:
+            # Queued behind the in-flight response, or behind output the
+            # client has not read yet (resume_writing starts it).
             if len(self.pending_exchanges) >= self.max_pipelined_requests:
                 self._protocol_error(429, "Too many pipelined requests")
                 return
@@ -1960,6 +2016,12 @@ cdef class CHttpProtocol(Connection):
             exchange.cancel_before_start()
         self.pending_exchanges.clear()
 
+    cdef void _start_next_pending(self):
+        cdef RequestExchange next_exchange = self.pending_exchanges.popleft()
+        self._start_exchange(next_exchange, False)
+        if not self.pending_exchanges:
+            self._set_pause_reason(PAUSE_PIPELINE, False)
+
     cdef void response_completed(self, RequestExchange exchange):
         """Advance the connection after the response is fully sent.
 
@@ -1970,7 +2032,6 @@ cdef class CHttpProtocol(Connection):
         """
         cdef object transport = self.transport
         cdef object conn
-        cdef RequestExchange next_exchange
         cdef bint keep
         if exchange._http2:
             # Keep the stream mapped until on_stream_close so the DATA
@@ -2000,10 +2061,10 @@ cdef class CHttpProtocol(Connection):
             self._drop_pending()
             return
         if self.pending_exchanges:
-            next_exchange = self.pending_exchanges.popleft()
-            self._start_exchange(next_exchange, False)
-            if not self.pending_exchanges:
-                self._set_pause_reason(PAUSE_PIPELINE, False)
+            # A peer that is not reading gets no more responses queued;
+            # resume_writing() starts the next one.
+            if not (self.pause_reasons & PAUSE_WRITE):
+                self._start_next_pending()
             return
         if self.deferred_status:
             # Every request before the failed one is answered: its error

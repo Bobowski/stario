@@ -23,6 +23,7 @@ class HttpProtocol(asyncio.Protocol):
         keep_alive_timeout: float = ...,
         body_timeout: float = ...,
         max_pipelined_requests: int = ...,
+        write_timeout: float = ...,
         timeout_cleanup: str | int | None = None,
         timeout_sweep_interval: float | None = None,
     ) -> None: ...

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
 import stario.responses as responses
 from stario import App, Route
+from stario.telemetry.noop import NoOpTracer
 from tests.cython import h2wire as h2
 from tests.cython.http import (
     RecordingTransport,
@@ -247,3 +249,146 @@ async def test_h2_connection_window_caps_bodies_nobody_reads() -> None:
     # 4 MiB connection window plus what streams read before they paused;
     # without the cap every stream fills its own 1 MiB window (~8.5 MiB).
     assert sent < 6 * 1024 * 1024
+
+
+_BIG = 32 * 1024 * 1024
+
+
+async def _open_non_reader(port: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.setblocking(False)
+    await asyncio.get_running_loop().sock_connect(sock, ("127.0.0.1", port))
+    return sock
+
+
+async def _drain_socket(sock: socket.socket, timeout: float) -> int:
+    loop = asyncio.get_running_loop()
+    total = 0
+    try:
+        async with asyncio.timeout(timeout):
+            while chunk := await loop.sock_recv(sock, 1 << 20):
+                total += len(chunk)
+    except ConnectionResetError:
+        pass
+    return total
+
+
+@pytest.mark.asyncio
+async def test_client_that_stops_reading_is_aborted_after_write_timeout() -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        w.respond(b"x" * _BIG, b"application/octet-stream")
+
+    app.add(Route("GET /"), page)
+    async with running_server(
+        app, write_timeout=_TIMEOUT, keep_alive_timeout=_TIMEOUT
+    ) as port:
+        sock = await _open_non_reader(port)
+        try:
+            await asyncio.get_running_loop().sock_sendall(
+                sock, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+            )
+            await asyncio.sleep(3.0)
+            received = await _drain_socket(sock, 5.0)
+        finally:
+            sock.close()
+    assert received < _BIG
+
+
+@pytest.mark.asyncio
+async def test_pipelined_requests_wait_while_the_client_is_not_reading() -> None:
+    app = App()
+    started = 0
+
+    async def page(_c, w) -> None:
+        nonlocal started
+        started += 1
+        w.respond(b"x" * _BIG, b"application/octet-stream")
+
+    app.add(Route("GET /"), page)
+    async with running_server(app) as port:
+        sock = await _open_non_reader(port)
+        try:
+            await asyncio.get_running_loop().sock_sendall(
+                sock, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n" * 3
+            )
+            await asyncio.sleep(0.5)
+            assert started == 1
+        finally:
+            sock.close()
+
+
+@pytest.mark.asyncio
+async def test_h2_idle_timeout_sends_goaway_before_closing() -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        responses.text(w, "ok")
+
+    app.add(Route("GET /"), page)
+    async with running_server(app, keep_alive_timeout=_TIMEOUT) as port:
+        reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
+        writer.write(
+            h2.pack_frame(
+                h2.TYPE_HEADERS,
+                h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+                1,
+                h2.encode_request(),
+            )
+        )
+        _frames, buf = await h2.read_stream(reader, buf, 1)
+        try:
+            frames = await h2.read_until_closed(reader, writer, buf)
+        finally:
+            writer.close()
+    assert h2.goaway_last_stream_ids(frames) == [1]
+
+
+class _TracerFailingOnSecondRequest:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create(self, name: str):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("tracer is broken")
+        return NoOpTracer().create(name)
+
+
+@pytest.mark.asyncio
+async def test_h2_dispatch_failure_resets_only_its_stream(caplog) -> None:
+    app = App()
+    release = asyncio.Event()
+
+    async def slow(_c, w) -> None:
+        await release.wait()
+        responses.text(w, "slow")
+
+    app.add(Route("GET /slow"), slow)
+    app.add(Route("GET /fast"), slow)
+    async with running_server(app, tracer=_TracerFailingOnSecondRequest()) as port:
+        reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
+        with caplog.at_level("ERROR", logger="stario.http"):
+            writer.write(
+                h2.pack_frame(
+                    h2.TYPE_HEADERS,
+                    h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+                    1,
+                    h2.encode_request(path="/slow"),
+                )
+                + h2.pack_frame(
+                    h2.TYPE_HEADERS,
+                    h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+                    3,
+                    h2.encode_request(path="/fast"),
+                )
+            )
+            frames, buf = await h2.read_stream(reader, buf, 3)
+            release.set()
+            more, buf = await h2.read_stream(reader, buf, 1)
+        writer.close()
+    assert h2.rst_code(frames, 3) == 2
+    assert h2.stream_data(frames + more, 1) == b"slow"
+    assert not h2.has_goaway(frames + more)

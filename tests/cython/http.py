@@ -67,6 +67,7 @@ def make_protocol(
     keep_alive_timeout: float = 5.0,
     body_timeout: float = 30.0,
     max_pipelined_requests: int = 8,
+    write_timeout: float = 30.0,
 ) -> HttpProtocol:
     if connections is None:
         connections = set()
@@ -83,6 +84,7 @@ def make_protocol(
         keep_alive_timeout=keep_alive_timeout,
         body_timeout=body_timeout,
         max_pipelined_requests=max_pipelined_requests,
+        write_timeout=write_timeout,
     )
 
 
@@ -98,6 +100,8 @@ async def running_server(
     keep_alive_timeout: float = 5.0,
     body_timeout: float = 30.0,
     max_pipelined_requests: int = 8,
+    write_timeout: float = 30.0,
+    tracer=None,
 ) -> AsyncIterator[int]:
     loop = asyncio.get_running_loop()
     connections: set[HttpProtocol] = set()
@@ -114,6 +118,8 @@ async def running_server(
             keep_alive_timeout=keep_alive_timeout,
             body_timeout=body_timeout,
             max_pipelined_requests=max_pipelined_requests,
+            write_timeout=write_timeout,
+            tracer=tracer,
         ),
         "127.0.0.1",
         free_port(),
