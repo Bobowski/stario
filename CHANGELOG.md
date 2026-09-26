@@ -28,6 +28,15 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   (`stario.http.headers`). `req.headers` can no longer be reassigned.
 - `stario.testing.harness.TestRequest` is gone: `TestClient` and test helpers
   build the production `Request`.
+- Removed the APIs deprecated in 4.2.0:
+  - `UrlPath` / `as_target`. Pass `/path` or `//host/path` strings, or use
+    `Route`. `app.use` / `not_found` / `method_not_allowed` take `str` only.
+  - `app.get` / `app.post` / `app.handle` / … and `Route.get` /
+    `Route.query` / …. Use `app.add(Route("GET /"), handler)`.
+  - `at.fetch`. Name the verb at the call site: `at.get(route.href())`,
+    `at.post(route.href())`.
+  - `stario.staticassets` (`AssetManifest`, `StaticAssets`). Use `Assets` /
+    `Files` and `await attach(app)`.
 - `App.on_error` and exception-type mapping are gone. Uncaught handler
   exceptions are logged. If the handler sent nothing, the framework writes
   **500**; a response already on the wire is not rewritten. Handlers must
