@@ -274,22 +274,6 @@ class TestFindHandler:
         assert other.target == "/t/{tenant}/users/{id}"
         assert dict(other_hit.params) == {"tenant": "beta", "id": "1"}
 
-    def test_verb_helpers_are_deprecated(self):
-        router = Router()
-        with pytest.warns(DeprecationWarning, match=r"add\(Route\('GET'"):
-            router.get("/x", noop_handler)  # pyright: ignore[reportDeprecated]
-
-        _, route, _ = router.find_handler("", "/x", "GET")
-        assert route.target == "/x"
-
-    def test_handle_is_deprecated(self):
-        router = Router()
-        with pytest.warns(DeprecationWarning, match=r"add\(Route"):
-            router.handle("GET", "/y", noop_handler)  # pyright: ignore[reportDeprecated]
-
-        _, route, _ = router.find_handler("", "/y", "GET")
-        assert route.target == "/y"
-
     def test_query_registers_rfc_query_method(self):
         router = Router()
         router.add(Route("QUERY", "/feed"), noop_handler)

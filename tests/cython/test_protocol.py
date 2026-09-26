@@ -3,10 +3,9 @@ import asyncio
 import pytest
 
 import stario.responses as responses
-from stario import App
+from stario import App, Route
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
-from stario.http.route import UrlPath
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
 from stario_cython.protocol import HttpProtocol
@@ -34,7 +33,7 @@ async def test_trailing_slash_redirects_without_create_task() -> None:
     async def search(_c, w):
         responses.text(w, "hit")
 
-    app.get("/search", search)
+    app.add(Route("GET /search"), search)
     connections: set[HttpProtocol] = set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
@@ -131,7 +130,7 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
 
         return respond
 
-    app.get("/hello", hello)
+    app.add(Route("GET /hello"), hello)
     app.not_found("/", custom_404)
     app.method_not_allowed("/", custom_405)
     connections: set[HttpProtocol] = set()
@@ -182,7 +181,7 @@ async def test_handler_exception_writes_500() -> None:
     async def boom(_c, _w):
         raise RuntimeError("boom")
 
-    app.get("/boom", boom)
+    app.add(Route("GET /boom"), boom)
     connections: set[HttpProtocol] = set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
@@ -229,8 +228,8 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         body = await c.req.body()
         w.respond(body, b"text/plain; charset=utf-8", 200)
 
-    app.get("/plaintext", plaintext)
-    app.post("/echo", echo)
+    app.add(Route("GET /plaintext"), plaintext)
+    app.add(Route("POST /echo"), echo)
 
     connections: set[HttpProtocol] = set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
@@ -282,7 +281,7 @@ async def test_small_content_length_body_is_complete_when_handler_runs() -> None
         assert payload == b"x" * 1024
         w.respond(payload, b"text/plain; charset=utf-8")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -325,7 +324,7 @@ async def test_fragmented_headers_materialize_correctly() -> None:
         assert c.req.headers.getlist("x-test") == ["one", "two"]
         responses.text(w, "ok")
 
-    app.get("/", inspect)
+    app.add(Route("GET /"), inspect)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -379,7 +378,7 @@ async def test_request_headers_scan_arena_without_copy() -> None:
         seen.append(headers.items())
         responses.text(w, "ok")
 
-    app.get("/", inspect)
+    app.add(Route("GET /"), inspect)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -428,7 +427,7 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
         seen_local.append(headers.get("x-local"))
         responses.text(w, "ok")
 
-    app.get("/", inspect)
+    app.add(Route("GET /"), inspect)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -470,7 +469,7 @@ async def test_stream_large_and_chunked_upload() -> None:
             total += len(chunk)
         w.respond(str(total).encode("ascii"), b"text/plain; charset=utf-8", 200)
 
-    app.post("/upload", upload)
+    app.add(Route("POST /upload"), upload)
 
     connections: set[HttpProtocol] = set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
@@ -537,8 +536,8 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
         seen.append(c._exchange_id)
         responses.text(w, c.req.path)
 
-    app.post("/ignore", ignore)
-    app.get("/next", next_request)
+    app.add(Route("POST /ignore"), ignore)
+    app.add(Route("GET /next"), next_request)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -592,8 +591,8 @@ async def test_abandoned_stream_discards_remainder_and_advances_pipeline() -> No
     async def next_request(_c, w):
         responses.text(w, "next")
 
-    app.post("/partial", partial)
-    app.get("/next", next_request)
+    app.add(Route("POST /partial"), partial)
+    app.add(Route("GET /next"), next_request)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -642,7 +641,7 @@ async def test_small_expect_continue_is_sent_before_body() -> None:
         started.set()
         w.respond(await c.req.body(), b"text/plain")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -695,7 +694,7 @@ async def test_disconnect_future_is_lazy() -> None:
         assert not fut.done()
         responses.text(w, "ok")
 
-    app.get("/watch", watch)
+    app.add(Route("GET /watch"), watch)
     connections: set[HttpProtocol] = set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
@@ -746,8 +745,8 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
         events.append(("second-start", c.req.path))
         responses.text(w, "second")
 
-    app.get("/first", first)
-    app.get("/second", second)
+    app.add(Route("GET /first"), first)
+    app.add(Route("GET /second"), second)
     connections: set[HttpProtocol] = set()
     date_box = [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"]
 
@@ -804,8 +803,8 @@ async def test_handler_after_respond_stays_on_app_tasks_and_next_request_starts(
         second_started.set()
         responses.text(w, "second")
 
-    app.get("/first", first)
-    app.get("/second", second)
+    app.add(Route("GET /first"), first)
+    app.add(Route("GET /second"), second)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -861,7 +860,7 @@ async def test_large_single_read_pipeline_is_bounded() -> None:
             await release.wait()
         w.respond(str(index).encode("ascii"), b"text/plain")
 
-    app.get("/", endpoint)
+    app.add(Route("GET /"), endpoint)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -918,7 +917,7 @@ async def test_pipelined_streaming_bodies_are_request_owned() -> None:
             total += len(chunk)
         w.respond(str(total).encode("ascii"), b"text/plain; charset=utf-8")
 
-    app.post("/upload", upload)
+    app.add(Route("POST /upload"), upload)
     connections: set[HttpProtocol] = set()
     date_box = [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"]
     server = await loop.create_server(
@@ -969,7 +968,7 @@ async def test_exchange_pool_reuses_across_connections() -> None:
         exchanges.append(c._exchange_id)
         responses.text(w, "ok")
 
-    app.get("/", endpoint)
+    app.add(Route("GET /"), endpoint)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1015,7 +1014,7 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
         body = await c.req.body()
         w.respond(body, b"text/plain")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1061,7 +1060,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
         body = await c.req.body()
         w.respond(body, b"text/plain")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1112,7 +1111,7 @@ async def test_content_length_body_survives_many_64k_segments() -> None:
         body = await c.req.body()
         w.respond(body, b"application/octet-stream")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1158,7 +1157,7 @@ async def test_content_length_body_in_same_packet_as_headers() -> None:
     async def echo(c, w):
         w.respond(await c.req.body(), b"application/octet-stream")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1214,8 +1213,8 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
         second_started.set()
         w.respond(b"two", b"text/plain")
 
-    app.get("/first", first)
-    app.get("/second", second)
+    app.add(Route("GET /first"), first)
+    app.add(Route("GET /second"), second)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1268,7 +1267,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
             raise
         w.respond(b"ok", b"text/plain")
 
-    app.post("/upload", upload)
+    app.add(Route("POST /upload"), upload)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1318,7 +1317,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
             sizes.append(len(chunk))
         w.respond(str(sum(sizes)).encode("ascii"), b"text/plain")
 
-    app.post("/upload", upload)
+    app.add(Route("POST /upload"), upload)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1367,7 +1366,7 @@ async def test_medium_content_length_body_is_complete_when_handler_runs() -> Non
         assert payload == b"y" * (200 * 1024)
         w.respond(payload, b"text/plain; charset=utf-8")
 
-    app.post("/echo", echo)
+    app.add(Route("POST /echo"), echo)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1414,7 +1413,7 @@ async def test_stream_default_chunk_follows_content_length() -> None:
             sizes.append(len(chunk))
         w.respond(str(sum(sizes)).encode("ascii"), b"text/plain")
 
-    app.post("/upload", upload)
+    app.add(Route("POST /upload"), upload)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1466,7 +1465,7 @@ async def test_request_headers_are_read_only() -> None:
         errors.append("raised")
         responses.text(w, "ok")
 
-    app.get("/", inspect)
+    app.add(Route("GET /"), inspect)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1518,7 +1517,7 @@ async def test_lazy_cookies_and_query_from_arena() -> None:
         seen["ok"] = True
         responses.text(w, "ok")
 
-    app.get("/search", inspect)
+    app.add(Route("GET /search"), inspect)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1564,7 +1563,7 @@ async def test_cookies_do_not_leak_across_keepalive() -> None:
         seen.append(dict(c.req.cookies))
         responses.text(w, "ok")
 
-    app.get("/", inspect)
+    app.add(Route("GET /"), inspect)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -1608,7 +1607,7 @@ async def test_host_routing_normalizes_host_header() -> None:
     async def hello(c, w):
         responses.text(w, f"host:{c.req.host}")
 
-    app.get(UrlPath("/", host="example.com"), hello)
+    app.add(Route("GET //example.com/"), hello)
     connections: set[HttpProtocol] = set()
     server = await loop.create_server(
         lambda: HttpProtocol(

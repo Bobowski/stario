@@ -591,36 +591,17 @@ class TestDatastarActions:
         action = at.set_all("null", include=["draft"], exclude="tmp.*")
         assert action == "@setAll(null, {'include':'draft','exclude':'tmp.*'})"
 
-    def test_fetch_uses_route_method_and_href(self):
-        subscribe = Route("GET /rooms/7/subscribe")
-        send = Route("POST /rooms/7/send")
-        remove = Route("DELETE /rooms/7")
+    def test_actions_take_route_href(self):
+        subscribe = Route("GET /rooms/{room_id}/subscribe")
+        send = Route("POST /rooms/{room_id}/send")
 
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(subscribe, retry="always") == (
-                "@get('/rooms/7/subscribe', {retry: 'always'})"
-            )
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(send) == "@post('/rooms/7/send')"
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(remove) == "@delete('/rooms/7')"
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert (
-                at.fetch(send, query={"src": "btn"}, fragment="latest")
-                == "@post('/rooms/7/send?src=btn#latest')"
-            )
-
-    def test_fetch_rejects_unknown_methods(self):
-        with (
-            pytest.warns(DeprecationWarning, match="at.get"),
-            pytest.raises(StarioError, match="no Datastar action"),
-        ):
-            at.fetch(Route("HEAD", "/page"))
-        with (
-            pytest.warns(DeprecationWarning, match="at.get"),
-            pytest.raises(StarioError, match="no Datastar action"),
-        ):
-            at.fetch(Route("QUERY", "/feed"))
+        assert at.get(subscribe.href("7"), retry="always") == (
+            "@get('/rooms/7/subscribe', {retry: 'always'})"
+        )
+        assert (
+            at.post(send.href("7", query={"src": "btn"}, fragment="latest"))
+            == "@post('/rooms/7/send?src=btn#latest')"
+        )
 
 
 class TestDatastarScriptTag:

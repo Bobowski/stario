@@ -9,7 +9,7 @@ import random
 import pytest
 
 import stario.responses as responses
-from stario import App, Relay
+from stario import App, Relay, Route
 from stario.datastar import SSE
 from stario.testing.tracer import TestTracer
 from stario_cython.exchange import Request
@@ -65,7 +65,7 @@ async def test_chunked_writes_stay_stable_if_transport_holds_buffers() -> None:
         w.write(b"charlie")
         w.end()
 
-    app.get("/", stream)
+    app.add(Route("GET /"), stream)
     proto = make_protocol(loop, app)
     transport = HoldingTransport(proto)
     proto.connection_made(transport)
@@ -128,7 +128,7 @@ async def test_write_then_raise_logs_and_keeps_response(
         raise RuntimeError("after write")
 
     app = App()
-    app.get("/x", handler)
+    app.add(Route("GET /x"), handler)
     proto, app, transport = _attach(app)
     try:
         with caplog.at_level(logging.ERROR, logger="stario.http"):
@@ -192,7 +192,7 @@ async def test_split_headers_then_body() -> None:
         bodies.append(await c.req.body())
         responses.text(w, "ok")
 
-    app.post("/", echo)
+    app.add(Route("POST /"), echo)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n")
@@ -230,7 +230,7 @@ async def test_header_total_over_limit_returns_431() -> None:
         hits += 1
         responses.text(w, "should not run")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app, max_header_bytes=limit)
     try:
         pad = b"x" * (limit + 32)
@@ -256,7 +256,7 @@ async def test_keep_alive_431_does_not_keep_header_timer() -> None:
     async def handler(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
         app=app, max_header_bytes=512, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
     )
@@ -287,8 +287,8 @@ async def test_body_over_limit_returns_413() -> None:
         hits += 1
         responses.text(w, "ok")
 
-    app.post("/", read_body)
-    app.get("/", hello)
+    app.add(Route("POST /"), read_body)
+    app.add(Route("GET /"), hello)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
     try:
         proto.data_received(
@@ -317,7 +317,7 @@ async def test_declared_body_over_limit_fails_before_handler_runs() -> None:
         hits += 1
         responses.text(w, "ok")
 
-    app.post("/", ignore_body)
+    app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
     try:
         proto.data_received(
@@ -344,7 +344,7 @@ async def test_huge_declared_body_over_limit_closes() -> None:
         hits += 1
         responses.text(w, "ok")
 
-    app.post("/", ignore_body)
+    app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
     try:
         proto.data_received(
@@ -367,7 +367,7 @@ async def test_keep_alive_413_does_not_keep_header_timer() -> None:
     async def ignore_body(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.post("/", ignore_body)
+    app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(
         app=app, max_body_bytes=20, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
     )
@@ -392,7 +392,7 @@ async def test_keep_alive_413_idle_times_out() -> None:
     async def ignore_body(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.post("/", ignore_body)
+    app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(
         app=app, max_body_bytes=20, header_timeout=5.0, keep_alive_timeout=_TIMEOUT
     )
@@ -421,7 +421,7 @@ async def test_keep_alive_413_deferred_body_then_second_get() -> None:
         hits += 1
         responses.text(w, "ok")
 
-    app.get("/", hello)
+    app.add(Route("GET /"), hello)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
     try:
         proto.data_received(
@@ -485,7 +485,7 @@ async def test_percent_encoded_path_reaches_handler() -> None:
         seen.append(c.req.path)
         responses.text(w, "ok")
 
-    app.get("/hello world", handler)
+    app.add(Route("GET /hello world"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET /hello%20world HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -508,7 +508,7 @@ async def test_percent_encoded_letter_matches_static_route() -> None:
         seen.append(c.req.path)
         responses.text(w, "plain")
 
-    app.get("/plaintext", plaintext)
+    app.add(Route("GET /plaintext"), plaintext)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET /%70laintext HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -536,7 +536,7 @@ async def test_req_identity_stable_within_handler() -> None:
         assert first.method == "GET"
         responses.text(w, "ok")
 
-    app.get("/stable", handler)
+    app.add(Route("GET /stable"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET /stable HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -562,8 +562,8 @@ async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
         seen.append("nested")
         responses.text(w, "nested")
 
-    app.get("/files/{name}", wildcard)
-    app.get("/files/a/b", nested)
+    app.add(Route("GET /files/{name}"), wildcard)
+    app.add(Route("GET /files/a/b"), nested)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET /files/a%2Fb HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -608,7 +608,7 @@ async def test_chunked_request_body_reaches_handler() -> None:
         bodies.append(await c.req.body())
         responses.text(w, "ok")
 
-    app.post("/", echo)
+    app.add(Route("POST /"), echo)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(
@@ -637,7 +637,7 @@ async def test_expect_100_continue_sends_interim_response() -> None:
         body = await c.req.body()
         responses.text(w, body.decode())
 
-    app.post("/", echo)
+    app.add(Route("POST /"), echo)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(
@@ -668,7 +668,7 @@ async def test_connection_close_header_closes_socket_after_response() -> None:
     async def handler(_c, w) -> None:
         responses.text(w, "bye")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
@@ -692,7 +692,7 @@ async def test_keep_alive_uses_a_new_request_object() -> None:
         ids.append(id(c.req))
         responses.text(w, "ok")
 
-    app.get("/", echo)
+    app.add(Route("GET /"), echo)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -722,8 +722,8 @@ async def test_keep_alive_serves_second_request_on_same_connection() -> None:
         hits.append("b")
         responses.text(w, "b")
 
-    app.get("/a", a)
-    app.get("/b", b)
+    app.add(Route("GET /a"), a)
+    app.add(Route("GET /b"), b)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -757,8 +757,8 @@ async def test_pipelined_requests_are_served_in_order() -> None:
         order.append("fast")
         responses.text(w, "fast")
 
-    app.get("/slow", slow)
-    app.get("/fast", fast)
+    app.add(Route("GET /slow"), slow)
+    app.add(Route("GET /fast"), fast)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(
@@ -791,7 +791,7 @@ async def test_connection_lost_signals_disconnect_without_cancelling_handler() -
             await hang.wait()
         finished.set()
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -820,7 +820,7 @@ async def test_connection_lost_lets_sse_handler_run_post_alive_cleanup() -> None
         cleanup_events.append("disconnected")
         c.span.event("disconnected", {})
 
-    app.get("/subscribe", subscribe)
+    app.add(Route("GET /subscribe"), subscribe)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET /subscribe HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -839,7 +839,7 @@ async def test_close_if_idle_closes_keep_alive_socket() -> None:
     async def handler(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -864,7 +864,7 @@ async def test_close_if_idle_skips_in_flight_handler() -> None:
         started.set()
         await hang.wait()
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -931,7 +931,7 @@ async def test_stalled_deferred_small_body_times_out() -> None:
         await c.req.body()
         responses.text(w, "ok")
 
-    app.post("/", handler)
+    app.add(Route("POST /"), handler)
     proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
     try:
         proto.data_received(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\n")
@@ -951,7 +951,7 @@ async def test_complete_request_does_not_keep_header_timer() -> None:
     async def handler(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
         app=app, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
     )
@@ -974,7 +974,7 @@ async def test_idle_keep_alive_times_out() -> None:
     async def handler(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
         app=app, header_timeout=5.0, keep_alive_timeout=_TIMEOUT
     )
@@ -1002,7 +1002,7 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
         await hang.wait()
         responses.text(w, "ok")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -1023,7 +1023,7 @@ async def test_http10_transfer_encoding_closes_after_response() -> None:
     async def handler(c, w) -> None:
         responses.text(w, (await c.req.body()).decode())
 
-    app.post("/", handler)
+    app.add(Route("POST /"), handler)
     proto, app, transport = _attach(app=app)
     try:
         proto.data_received(
@@ -1049,7 +1049,7 @@ async def test_pipelined_trickled_headers_time_out_after_response() -> None:
         await release.wait()
         responses.text(w, "ok")
 
-    app.get("/", handler)
+    app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
         app=app, header_timeout=_TIMEOUT, keep_alive_timeout=5.0
     )
@@ -1083,7 +1083,7 @@ async def test_stalled_chunked_body_aborts_without_hanging() -> None:
         await c.req.body()
         responses.text(w, "ok")
 
-    app.post("/", handler)
+    app.add(Route("POST /"), handler)
     proto, app, transport = _attach(app=app, body_timeout=_TIMEOUT, header_timeout=5.0)
     try:
         proto.data_received(
@@ -1158,7 +1158,7 @@ async def test_pipeline_cap_rejects_ninth_queued_request() -> None:
             await release.wait()
         responses.text(w, str(index))
 
-    app.get("/", endpoint)
+    app.add(Route("GET /"), endpoint)
     proto, app, transport = _attach(app=app, max_pipelined_requests=8)
     try:
         chunks = [
@@ -1241,8 +1241,8 @@ async def test_head_response_omits_body_and_keeps_pipeline_in_sync() -> None:
     async def hello(_c, w) -> None:
         responses.text(w, "hello")
 
-    app.get("/", hello)
-    app.head("/", hello)
+    app.add(Route("GET /"), hello)
+    app.add(Route("HEAD /"), hello)
     proto, app, transport = _attach(app)
     try:
         proto.data_received(
@@ -1274,7 +1274,7 @@ async def test_close_error_does_not_splice_status_into_started_response() -> Non
         started.set_result(None)
         await asyncio.Event().wait()
 
-    app.get("/", hang)
+    app.add(Route("GET /"), hang)
     proto, app, transport = _attach(app)
     try:
         proto.data_received(
@@ -1310,7 +1310,7 @@ async def test_unread_body_trickle_does_not_reset_idle_timeout() -> None:
     async def ignore_body(_c, w) -> None:
         responses.text(w, "ok")
 
-    app.post("/", ignore_body)
+    app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(
         app=app, header_timeout=5.0, keep_alive_timeout=_TIMEOUT
     )
@@ -1394,7 +1394,7 @@ async def test_respond_before_body_does_not_emit_100_continue() -> None:
         responses.text(w, "early")
         await c.req.body()
 
-    app.post("/", early)
+    app.add(Route("POST /"), early)
     proto, app, transport = _attach(app)
     try:
         proto.data_received(
@@ -1477,7 +1477,7 @@ async def test_mixed_case_transfer_encoding_is_rejected_by_respond() -> None:
         w.headers.unsafe_set(b"Transfer-Encoding", b"chunked")
         responses.text(w, "ok")
 
-    app.get("/", bad)
+    app.add(Route("GET /"), bad)
     proto, app, transport = _attach(app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -1499,7 +1499,7 @@ async def test_respond_rejects_crlf_in_content_type() -> None:
     async def bad(_c, w) -> None:
         w.respond(b"x", b"text/plain\r\nX-Injected: 1")
 
-    app.get("/", bad)
+    app.add(Route("GET /"), bad)
     proto, app, transport = _attach(app)
     try:
         proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")

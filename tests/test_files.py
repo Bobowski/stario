@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from stario import App, Assets, Files, UrlPath
+from stario import App, Assets, Files
 from stario.exceptions import StarioError
 from stario.http.compression import CompressionConfig
 from stario.testing import TestClient
@@ -52,12 +52,6 @@ class TestFiles:
             files.href("file.txt", query={"download": 1}, fragment="top")
             == "/media/file.txt?download=1#top"
         )
-
-    def test_rejects_urlpath_prefix(self, tmp_path: Path) -> None:
-        with pytest.raises(StarioError, match="must be a string"):
-            Files(tmp_path, UrlPath("/media"))  # pyright: ignore[reportArgumentType]
-        with pytest.raises(StarioError, match="must be a string"):
-            Assets(tmp_path, UrlPath("/static"))  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
         "path",

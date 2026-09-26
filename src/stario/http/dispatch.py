@@ -7,12 +7,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 
-from typing_extensions import deprecated
-
 import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context, Handler, Match, Middleware
-from stario.http.route import EMPTY_ROUTE, Route, UrlPath, as_target
+from stario.http.route import EMPTY_ROUTE, Route
 from stario.http.segment import Segment
 from stario.http.writer import Writer
 from stario_cython.exchange import compile_router
@@ -264,8 +262,8 @@ class Router:
             current = _descend_or_create(current, segment)
         return current
 
-    def _policy_node(self, pattern: UrlPath | str) -> Node:
-        route = Route(as_target(pattern))
+    def _policy_node(self, pattern: str) -> Node:
+        route = Route(pattern)
         if any(segment.kind == "catchall" for segment in route.host_segments):
             raise StarioError(
                 "Catchall host policy is not supported",
@@ -279,7 +277,7 @@ class Router:
         tree = self._tree_for(route)
         return self._descend(tree, route)
 
-    def use(self, pattern: UrlPath | str, *middleware: Middleware) -> None:
+    def use(self, pattern: str, *middleware: Middleware) -> None:
         current = self._policy_node(pattern)
         if not middleware:
             return
@@ -291,14 +289,14 @@ class Router:
         current.middleware = current.middleware + tuple(middleware)
         self._invalidate_lookup()
 
-    def not_found(self, pattern: UrlPath | str, handler: Handler) -> None:
+    def not_found(self, pattern: str, handler: Handler) -> None:
         require_async_handler(handler, what="Not-found handler")
         self._policy_node(pattern).not_found_handler = handler
         self._invalidate_lookup()
 
     def method_not_allowed(
         self,
-        pattern: UrlPath | str,
+        pattern: str,
         handler: MethodNotAllowedHandler,
     ) -> None:
         def checked(allowed: frozenset[str]) -> Handler:
@@ -354,108 +352,6 @@ class Router:
         else:
             current.endpoints[method] = endpoint
         self._invalidate_lookup()
-
-    @deprecated("Use add(Route(method, path), handler).")
-    def handle(
-        self,
-        method: str,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        """Deprecated. Register with `add(Route(method, path), handler)`."""
-        _add_path(self, method, path, handler, middleware)
-
-    @deprecated("Use add(Route('GET', path), handler).")
-    def get(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "GET", path, handler, middleware)
-
-    @deprecated("Use add(Route('QUERY', path), handler).")
-    def query(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "QUERY", path, handler, middleware)
-
-    @deprecated("Use add(Route('POST', path), handler).")
-    def post(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "POST", path, handler, middleware)
-
-    @deprecated("Use add(Route('PUT', path), handler).")
-    def put(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "PUT", path, handler, middleware)
-
-    @deprecated("Use add(Route('DELETE', path), handler).")
-    def delete(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "DELETE", path, handler, middleware)
-
-    @deprecated("Use add(Route('PATCH', path), handler).")
-    def patch(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "PATCH", path, handler, middleware)
-
-    @deprecated("Use add(Route('HEAD', path), handler).")
-    def head(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "HEAD", path, handler, middleware)
-
-    @deprecated("Use add(Route('OPTIONS', path), handler).")
-    def options(
-        self,
-        path: UrlPath | str,
-        handler: Handler,
-        *,
-        middleware: Sequence[Middleware] = (),
-    ) -> None:
-        _add_path(self, "OPTIONS", path, handler, middleware)
-
-
-def _add_path(
-    router: Router,
-    method: str,
-    path: UrlPath | str,
-    handler: Handler,
-    middleware: Sequence[Middleware],
-) -> None:
-    router.add(Route(method, as_target(path)), handler, middleware=middleware)
 
 
 __all__ = [

@@ -3,6 +3,7 @@
 import logging
 
 import stario.responses as responses
+from stario import Route
 from stario.exceptions import RequestBodyError
 from stario.http.context import Context
 from stario.http.middleware import (
@@ -27,7 +28,7 @@ class TestCatchErrors:
 
         def setup(app) -> None:
             app.use("/", catch_errors(AppError, respond=respond))
-            app.get("/x", handler)
+            app.add(Route("GET /x"), handler)
 
         _context, writer = run_with_app(setup, "/x")
 
@@ -48,7 +49,7 @@ class TestCatchErrors:
 
         def setup(app) -> None:
             app.use("/", catch_errors(AppError, respond=respond))
-            app.get("/x", handler)
+            app.add(Route("GET /x"), handler)
 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             _context, writer = run_with_app(setup, "/x")
@@ -64,7 +65,7 @@ class TestCatchErrors:
 
         def setup(app) -> None:
             app.use("/", catch_request_body_errors())
-            app.post("/upload", handler)
+            app.add(Route("POST /upload"), handler)
 
         _context, writer = run_with_app(setup, "/upload", method="POST")
 
@@ -79,7 +80,7 @@ class TestCatchErrors:
             app.use(
                 "/", catch_errors(RequestBodyError, respond=respond_request_body_error)
             )
-            app.post("/upload", handler)
+            app.add(Route("POST /upload"), handler)
 
         _context, writer = run_with_app(setup, "/upload", method="POST")
 

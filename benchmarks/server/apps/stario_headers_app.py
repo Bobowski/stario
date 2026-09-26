@@ -4,7 +4,7 @@ These routes keep the response constant and validate every lookup so the wrk
 comparison measures request-header representation rather than silent misses.
 """
 
-from stario import App, Span
+from stario import App, Route, Span
 
 BODY = b"ok"
 CONTENT_TYPE = b"text/plain"
@@ -54,9 +54,9 @@ async def response_headers(_c, w):
 
 
 async def bootstrap(app: App, _span: Span) -> None:
-    app.get("/headers/none", no_reads)
-    app.get("/headers/one", one_read)
-    app.get("/headers/three", three_reads)
-    app.get("/headers/cookies", cookie_list)
-    app.get("/headers/response", response_headers)
+    app.add(Route("GET /headers/none"), no_reads)
+    app.add(Route("GET /headers/one"), one_read)
+    app.add(Route("GET /headers/three"), three_reads)
+    app.add(Route("GET /headers/cookies"), cookie_list)
+    app.add(Route("GET /headers/response"), response_headers)
     yield

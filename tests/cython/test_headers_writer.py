@@ -5,7 +5,7 @@ import brotli
 import pytest
 
 import stario.cookies as cookies
-from stario import App
+from stario import App, Route
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.http.headers import Headers as PublicHeaders
@@ -94,7 +94,7 @@ async def test_exchange_respond_native_compression_round_trip(
     async def compressed(_c, w):
         w.respond(body, b"text/plain; charset=utf-8")
 
-    app.get("/", compressed)
+    app.add(Route("GET /"), compressed)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -140,7 +140,7 @@ async def test_one_shot_compression_writes_generated_headers_without_dict_roundt
         state["content-length"] = w.headers.get("content-length")
         state["vary"] = w.headers.get("vary")
 
-    app.get("/", compressed)
+    app.add(Route("GET /"), compressed)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -200,7 +200,7 @@ async def test_native_compression_qvalue_negotiation(
     async def compressed(_c, w):
         w.respond(body, b"text/plain")
 
-    app.get("/", compressed)
+    app.add(Route("GET /"), compressed)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -240,7 +240,7 @@ async def test_compression_disabled_still_serves_with_accept_encoding() -> None:
     async def hello(_c, w):
         w.respond(body, b"text/plain")
 
-    app.get("/", hello)
+    app.add(Route("GET /"), hello)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -288,7 +288,7 @@ async def test_native_content_type_compression_check(
     async def respond(_c, w):
         w.respond(b"x" * 1024, content_type)
 
-    app.get("/", respond)
+    app.add(Route("GET /"), respond)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -332,7 +332,7 @@ async def test_exchange_sse_gzip_flushes_each_write() -> None:
         w.write(b"data: 1\n\n")
         w.end()
 
-    app.get("/stream", stream)
+    app.add(Route("GET /stream"), stream)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -386,7 +386,7 @@ async def test_exchange_sse_brotli_flushes_each_write() -> None:
         w.write(b"data: 1\n\n")
         w.end()
 
-    app.get("/stream", stream)
+    app.add(Route("GET /stream"), stream)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -438,7 +438,7 @@ async def test_exchange_respond_plaintext_uses_date_box() -> None:
         state["status"] = w.status_code
         state["completed"] = w.completed
 
-    app.get("/", plaintext)
+    app.add(Route("GET /"), plaintext)
     async with running_server(app, date=b"date: boxed\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -470,7 +470,7 @@ async def test_exchange_rejects_negative_content_length() -> None:
             caught.set_result(exc)
             w.abort()
 
-    app.get("/", invalid)
+    app.add(Route("GET /"), invalid)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -492,7 +492,7 @@ async def test_respond_accepts_list_of_bytes_parts() -> None:
     async def multi(_c, w):
         w.respond([b"hel", b"lo", b", ", b"parts"], b"text/plain; charset=utf-8")
 
-    app.get("/", multi)
+    app.add(Route("GET /"), multi)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -515,7 +515,7 @@ async def test_respond_accepts_tuple_of_bytes_parts() -> None:
     async def multi(_c, w):
         w.respond((b"tup", b"le"), b"text/plain; charset=utf-8")
 
-    app.get("/", multi)
+    app.add(Route("GET /"), multi)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -542,7 +542,7 @@ async def test_write_known_length_accepts_list_of_bytes_parts() -> None:
         w.write([b"hello", b" ", b"world"])
         w.end()
 
-    app.get("/", multi)
+    app.add(Route("GET /"), multi)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -567,7 +567,7 @@ async def test_write_chunked_accepts_list_of_bytes_parts() -> None:
         w.write([b"aaa", b"bbb", b"ccc"])
         w.end()
 
-    app.get("/", multi)
+    app.add(Route("GET /"), multi)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -596,7 +596,7 @@ async def test_respond_list_parts_native_compression_round_trip() -> None:
     async def compressed(_c, w):
         w.respond(parts, b"text/plain; charset=utf-8")
 
-    app.get("/", compressed)
+    app.add(Route("GET /"), compressed)
     async with running_server(
         app,
         date=b"date: now\r\n",
@@ -638,7 +638,7 @@ async def test_respond_rejects_non_bytes_parts() -> None:
             caught.set_result(exc)
             w.respond(b"err", b"text/plain", 500)
 
-    app.get("/", bad)
+    app.add(Route("GET /"), bad)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -663,7 +663,7 @@ async def test_respond_writes_extra_headers_before_derived_type_and_length() -> 
         w.headers.add("Set-Cookie", "b=2")
         w.respond(b"hello", b"text/plain; charset=utf-8")
 
-    app.get("/", extra)
+    app.add(Route("GET /"), extra)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -702,7 +702,7 @@ async def test_respond_reads_input_headers_and_writes_cookies() -> None:
         cookies.set_cookie(w, "theme", "dark")
         w.respond(b"hello", b"text/plain; charset=utf-8")
 
-    app.get("/", echo)
+    app.add(Route("GET /"), echo)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -743,7 +743,7 @@ async def test_respond_accepts_matching_owned_headers() -> None:
         w.headers.set("content-length", "2")
         w.respond(b"ok", b"text/plain; charset=utf-8")
 
-    app.get("/", matching)
+    app.add(Route("GET /"), matching)
     async with running_server(app, date=b"date: now\r\n") as port:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
@@ -799,7 +799,7 @@ async def test_respond_errors_when_owned_headers_conflict(
             caught.set_result(exc)
             w.abort()
 
-    app.get("/", bad)
+    app.add(Route("GET /"), bad)
     async with running_server(app, date=b"date: now\r\n") as port:
         _reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:

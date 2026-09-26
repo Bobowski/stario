@@ -31,7 +31,6 @@ def test_core_modules_import() -> None:
     import stario.http
     import stario.json
     import stario.markup
-    import stario.staticassets
 
     assert isinstance(stario.__version__, str)
     assert stario.__version__
@@ -48,14 +47,11 @@ def test_core_modules_import() -> None:
             "stario",
             [
                 "App",
-                "AssetManifest",
                 "Assets",
                 "Context",
                 "Files",
                 "Match",
                 "Route",
-                "StaticAssets",
-                "UrlPath",
                 "Writer",
                 "serve",
             ],
@@ -63,10 +59,6 @@ def test_core_modules_import() -> None:
         (
             "stario.filesystem",
             ["Assets", "Files"],
-        ),
-        (
-            "stario.staticassets",
-            ["AssetManifest", "StaticAssets", "fingerprint"],
         ),
         (
             "stario.http",
@@ -108,22 +100,31 @@ def test_filesystem_all_is_exact() -> None:
     assert stario.Files is stario.filesystem.Files
 
 
-def test_obsolete_staticassets_still_exported() -> None:
-    import stario
-    import stario.staticassets
+@pytest.mark.parametrize(
+    ("module_name", "name"),
+    [
+        ("stario", "AssetManifest"),
+        ("stario", "StaticAssets"),
+        ("stario", "UrlPath"),
+        ("stario.http", "UrlPath"),
+        ("stario.http.route", "UrlPath"),
+        ("stario.http.route", "as_target"),
+    ],
+)
+def test_removed_names(module_name: str, name: str) -> None:
+    module = importlib.import_module(module_name)
+    assert not hasattr(module, name)
 
-    assert stario.StaticAssets is stario.staticassets.StaticAssets
-    assert stario.AssetManifest is stario.staticassets.AssetManifest
 
+def test_removed_verb_helpers() -> None:
+    from stario.datastar import at
+    from stario.http import Route, Router
 
-def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
-    from stario.staticassets import AssetManifest, StaticAssets
-
-    (tmp_path / "app.js").write_text("ok")
-    with pytest.warns(DeprecationWarning, match="obsolete and will be removed"):
-        manifest = AssetManifest(tmp_path)
-    with pytest.warns(DeprecationWarning, match="obsolete and will be removed"):
-        StaticAssets(manifest)
+    for verb in ("get", "query", "post", "put", "delete", "patch", "head", "options"):
+        assert not hasattr(Route, verb)
+        assert not hasattr(Router, verb)
+    assert not hasattr(Router, "handle")
+    assert not hasattr(at, "fetch")
 
 
 @pytest.mark.parametrize(
@@ -137,6 +138,7 @@ def test_obsolete_staticassets_warn_on_construct(tmp_path) -> None:
         "stario.http.router",
         "stario.http.staticassets",
         "stario.routing",
+        "stario.staticassets",
         "stario.routing.trie",
         "stario.routing.pattern",
         "stario.http.protocol",

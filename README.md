@@ -188,7 +188,7 @@ async def bootstrap(app: App, span: Span):
 ```
 
 `Assets` hashes names and 307s the logical path. Both send strong ETags
-and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
+and `X-Content-Type-Options: nosniff`.
 
 ## What you get
 
@@ -197,8 +197,7 @@ and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
 - Files: `Assets` and `Files` expose a directory at a URL prefix.
   `attach(app)` registers GET/HEAD and loads the tree. `Assets`
   hashes names and 307s the logical path. Both use strong ETags and 304.
-  Import from `stario` or `stario.filesystem`. `stario.staticassets` is
-  obsolete.
+  Import from `stario` or `stario.filesystem`.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.
 - Observable runs: spans for startup and requests are part of how you structure apps, not an afterthought.
 
