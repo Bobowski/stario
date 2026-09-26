@@ -7,11 +7,14 @@ Listen:
   STARIO_HOST=127.0.0.1
   STARIO_PORT=8000
   STARIO_LOOP=asyncio|uvloop
+  STARIO_THREADS=1            (N>1: N SO_REUSEPORT servers; 3.14t; else 1)
   STARIO_UNIX_SOCKET=          (empty = TCP)
   STARIO_UNIX_SOCKET_MODE=660  (octal; after bind on unix socket)
   STARIO_BACKLOG=2048
   STARIO_REUSE_ADDR=1          (TCP only; set 0 to disable SO_REUSEADDR)
   STARIO_GRACEFUL_SHUTDOWN_TIMEOUT=5
+  STARIO_SSL_CERTFILE=         (PEM cert; enables direct TLS + ALPN h2,http/1.1)
+  STARIO_SSL_KEYFILE=          (PEM key; defaults to the cert file if omitted)
 
 Telemetry (STARIO_TRACER plus json/sqlite backend tuning):
   STARIO_TRACER=auto|tty|json|noop|sqlite|module|module:callable
@@ -32,6 +35,7 @@ Request limits:
   STARIO_REQUESTS_BODY_TIMEOUT=30
   STARIO_REQUESTS_KEEP_ALIVE_TIMEOUT=5
   STARIO_REQUESTS_MAX_PIPELINED_REQUESTS=8
+  STARIO_REQUESTS_WRITE_TIMEOUT=30
 
 Compression:
   STARIO_COMPRESS_MIN_SIZE=512

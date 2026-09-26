@@ -27,6 +27,7 @@ For a multi-file layout, clone examples/chat-room from the stario repo
 """
 
 import random
+import threading
 import uuid
 from pathlib import Path
 
@@ -113,6 +114,7 @@ class Game:
         self.colors = palette
         self.board: dict[int, str] = {}  # cell index → paint color
         self.user_colors: dict[str, str] = {}  # only tabs with an open /subscribe
+        self._lock = threading.Lock()
 
         total = grid_size * grid_size
         # Partial fill so first paint looks lived-in, not an empty grid.
@@ -125,22 +127,33 @@ class Game:
 
     def join(self, user_id: str) -> None:
         # Stable color per id — reconnecting the same tab keeps the same swatch.
-        if user_id not in self.user_colors:
-            self.user_colors[user_id] = random.Random(user_id).choice(self.colors)
+        with self._lock:
+            if user_id not in self.user_colors:
+                self.user_colors[user_id] = random.Random(user_id).choice(self.colors)
 
     def leave(self, user_id: str) -> None:
         # SSE closed — drop from roster so other tabs stop counting this player.
-        self.user_colors.pop(user_id, None)
+        with self._lock:
+            self.user_colors.pop(user_id, None)
 
     def paint_cell(self, user_id: str, cell_id: int) -> str:
         """Toggle cell with this player's color. Returns painted or cleared."""
-        color = self.user_colors[user_id]
-        # Same color again erases — quick undo without a separate erase action.
-        if self.board.get(cell_id) == color:
-            self.board.pop(cell_id, None)
-            return "cleared"
-        self.board[cell_id] = color
-        return "painted"
+        with self._lock:
+            color = self.user_colors[user_id]
+            # Same color again erases — quick undo without a separate erase action.
+            if self.board.get(cell_id) == color:
+                self.board.pop(cell_id, None)
+                return "cleared"
+            self.board[cell_id] = color
+            return "painted"
+
+    def snapshot_board(self) -> dict[int, str]:
+        with self._lock:
+            return dict(self.board)
+
+    def snapshot_users(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self.user_colors)
 
 
 # =============================================================================
@@ -184,7 +197,8 @@ def cell_view(cell_id: int, color: str | None) -> HtmlElement:
 
 def board_view(game: Game) -> HtmlElement:
     size = game.grid_size
-    complete = len(game.board) == game.total_cells
+    board = game.snapshot_board()
+    complete = len(board) == game.total_cells
 
     return h.Div(
         {"id": "board"},
@@ -201,7 +215,7 @@ def board_view(game: Game) -> HtmlElement:
             h.Div(
                 {"class": "row"},
                 [
-                    cell_view(row * size + col, game.board.get(row * size + col))
+                    cell_view(row * size + col, board.get(row * size + col))
                     for col in range(size)
                 ],
             )
@@ -212,7 +226,9 @@ def board_view(game: Game) -> HtmlElement:
 
 def info_view(user_id: str, game: Game) -> HtmlElement:
     # Before /subscribe runs, this tab isn't in user_colors yet — show a neutral swatch.
-    my_color = game.user_colors.get(user_id, "#ccc")
+    users = game.snapshot_users()
+    my_color = users.get(user_id, "#ccc")
+    colors = list(users.values())
     return h.Div(
         {"id": "info", "class": "info-panel"},
         h.Div(
@@ -227,7 +243,7 @@ def info_view(user_id: str, game: Game) -> HtmlElement:
                             styles({"background-color": color}),
                         )
                     )
-                    for color in game.user_colors.values()
+                    for color in colors
                 ]
                 or [h.Li({"class": "empty"}, "...")],
             ),

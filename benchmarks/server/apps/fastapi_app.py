@@ -1,44 +1,75 @@
 # pyright: reportMissingImports=false
 
 import ujson
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, Response
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request, Response
+from starlette.routing import Route
 
-HELLO = "Hello, World!"
-JSON_MEDIA_TYPE = "application/json"
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
-class UserInput(BaseModel):
-    name: str = Field(min_length=1)
-    age: int = Field(ge=0, le=150)
+def text_response(line: str | bytes) -> Response:
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    return Response(body, media_type=TEXT_CONTENT_TYPE_STR)
 
 
-def json_response(value: object, status_code: int = 200) -> Response:
-    return Response(
-        ujson.dumps(value).encode("utf-8"),
-        status_code=status_code,
-        media_type=JSON_MEDIA_TYPE,
+async def plaintext(_request: Request) -> Response:
+    return text_response(PLAINTEXT_BODY)
+
+
+async def read_request(request: Request) -> Response:
+    return text_response(
+        request_line(
+            request.path_params["user_id"],
+            query_value(request.query_params.get("q")),
+            as_str(request.headers.get(REQUEST_HEADER)),
+        )
     )
 
 
-@app.get("/plaintext")
-async def plaintext() -> PlainTextResponse:
-    return PlainTextResponse(HELLO)
+async def post_json(request: Request) -> Response:
+    raw = await request.body()
+    await yield_once()
+    return text_response(json_echo_line(ujson.loads(raw) if raw else {}))
 
 
-@app.get("/json")
-async def json_endpoint() -> Response:
-    return json_response({"message": HELLO})
+async def ingest_buffer(request: Request) -> Response:
+    body = await request.body()
+    await yield_once()
+    return text_response(bytes_line(len(body)))
 
 
-@app.get("/user/{user_id}")
-async def get_user(user_id: str) -> Response:
-    return json_response({"id": user_id, "name": f"User {user_id}"})
+async def ingest_stream(request: Request) -> Response:
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+    await yield_once()
+    return text_response(bytes_line(total))
 
 
-@app.post("/validate")
-async def validate(body: UserInput) -> Response:
-    return json_response({"name": body.name, "age": body.age, "valid": True})
+async def upload(request: Request) -> Response:
+    body = await request.body()
+    await yield_once()
+    return text_response(bytes_line(len(body)))
+
+
+app.router.routes = [
+    Route("/plaintext", plaintext, methods=["GET"]),
+    Route("/user/{user_id}", read_request, methods=["GET"]),
+    Route("/echo", post_json, methods=["POST"]),
+    Route("/ingest/64k", ingest_buffer, methods=["POST"]),
+    Route("/ingest/2m", ingest_buffer, methods=["POST"]),
+    Route("/ingest/stream/2m", ingest_stream, methods=["POST"]),
+    Route("/upload", upload, methods=["POST"]),
+]

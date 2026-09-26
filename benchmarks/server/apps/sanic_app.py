@@ -2,46 +2,81 @@
 
 import argparse
 
-from sanic import Sanic, json, text
+import ujson
+from sanic import Sanic, raw
+from sanic.views import stream
 
-HELLO = "Hello, World!"
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
 app = Sanic("stario_benchmark_sanic")
 app.config.ACCESS_LOG = False
-app.config.RESPONSE_TIMEOUT = 60
-app.config.REQUEST_TIMEOUT = 60
+app.config.MOTD = False
+app.config.RESPONSE_TIMEOUT = 120
+app.config.REQUEST_TIMEOUT = 120
+app.config.REQUEST_MAX_SIZE = 4 * 1024 * 1024
+
+
+def text_response(line: str | bytes):
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    return raw(body, content_type=TEXT_CONTENT_TYPE_STR)
 
 
 @app.get("/plaintext")
 async def plaintext(request):
-    return text(HELLO)
-
-
-@app.get("/json")
-async def json_endpoint(request):
-    return json({"message": HELLO})
+    return text_response(PLAINTEXT_BODY)
 
 
 @app.get("/user/<user_id>")
-async def get_user(request, user_id: str):
-    return json({"id": user_id, "name": f"User {user_id}"})
-
-
-@app.post("/validate")
-async def validate(request):
-    body = request.json or {}
-    name = body.get("name")
-    age = body.get("age")
-
-    if not isinstance(name, str) or not name:
-        return json({"error": "name must be a non-empty string"}, status=400)
-    if not isinstance(age, int) or age < 0 or age > 150:
-        return json(
-            {"error": "age must be an integer between 0 and 150"},
-            status=400,
+async def read_request(request, user_id: str):
+    return text_response(
+        request_line(
+            user_id,
+            query_value(request.args.get("q")),
+            as_str(request.headers.get(REQUEST_HEADER)),
         )
+    )
 
-    return json({"name": name, "age": age, "valid": True})
+
+@app.post("/echo")
+async def post_json(request):
+    raw_body = request.body
+    await yield_once()
+    return text_response(json_echo_line(ujson.loads(raw_body) if raw_body else {}))
+
+
+@app.post("/ingest/64k", name="ingest_64k")
+@app.post("/ingest/2m", name="ingest_2m")
+async def ingest_buffer(request):
+    body = request.body
+    await yield_once()
+    return text_response(bytes_line(len(body)))
+
+
+@app.post("/ingest/stream/2m", name="ingest_stream_2m")
+@stream
+async def ingest_stream(request):
+    total = 0
+    async for chunk in request.stream:
+        total += len(chunk)
+    await yield_once()
+    return text_response(bytes_line(total))
+
+
+@app.post("/upload")
+async def upload(request):
+    body = request.body
+    await yield_once()
+    return text_response(bytes_line(len(body)))
 
 
 if __name__ == "__main__":
@@ -55,4 +90,5 @@ if __name__ == "__main__":
         single_process=True,
         access_log=False,
         debug=False,
+        motd=False,
     )

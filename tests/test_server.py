@@ -43,6 +43,48 @@ class TestContextCreateTask:
         await asyncio.sleep(0)
         assert not context.app.tasks
 
+    async def test_eager_task_completes_without_registration(self) -> None:
+        context = make_context(loop=asyncio.get_running_loop())
+        started = False
+
+        async def worker() -> int:
+            nonlocal started
+            started = True
+            return 42
+
+        task = context.app.create_task(worker(), eager_start=True)
+
+        assert started
+        assert task.done()
+        assert task.result() == 42
+        assert task not in context.app.tasks
+
+    async def test_task_construction_bypasses_loop_task_factory(self) -> None:
+        loop = asyncio.get_running_loop()
+        context = make_context(loop=loop)
+        calls = 0
+        previous = loop.get_task_factory()
+
+        def factory(loop, coro, **kwargs):
+            nonlocal calls
+            calls += 1
+            return asyncio.Task(coro, loop=loop, **kwargs)
+
+        async def worker() -> int:
+            await asyncio.sleep(0)
+            return 42
+
+        loop.set_task_factory(factory)
+        try:
+            task = context.app.create_task(worker(), name="direct-task")
+        finally:
+            loop.set_task_factory(previous)
+
+        assert calls == 0
+        assert task.get_loop() is loop
+        assert task.get_name() == "direct-task"
+        assert await task == 42
+
 
 class TestServerConstructorValidation:
     def test_header_limit_below_minimum_raises(self) -> None:
@@ -129,7 +171,7 @@ class TestServerRunLifecycle:
             async def hello(c, w):
                 responses.text(w, "hello")
 
-            app.add(Route("GET", "/"), hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -163,6 +205,8 @@ class TestServerRunLifecycle:
         names = [s["name"] for s in spans]
         assert "server.startup" in names
         assert "GET /" in names
+        request_span = next(s for s in spans if s["name"] == "GET /")
+        assert request_span["attributes"]["request.method"] == "GET"
         shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
         assert shutdown_span["attributes"]["server.shutdown.trigger"] == "expected_stop"
         assert shutdown_span["status"] == "ok"
@@ -252,7 +296,7 @@ class TestServerRunLifecycle:
             async def hello(c, w):
                 responses.text(w, "hello")
 
-            app.add(Route("GET", "/"), hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -300,7 +344,7 @@ class TestServerRunLifecycle:
                 handler_started.set()
                 await asyncio.Event().wait()
 
-            app.add(Route("GET", "/"), slow)
+            app.add(Route("GET /"), slow)
             yield
 
         server = Server(
@@ -346,7 +390,7 @@ class TestServerRunLifecycle:
             async def hello(c, w):
                 responses.text(w, "hello")
 
-            app.add(Route("GET", "/"), hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(

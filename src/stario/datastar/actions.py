@@ -19,10 +19,7 @@ from collections.abc import Mapping
 from typing import Any, Literal
 from urllib.parse import urlencode
 
-from typing_extensions import deprecated
-
 from stario.exceptions import StarioError
-from stario.http.route import Route
 
 from .format import FilterValue, filter_js, js_object, string_literal
 
@@ -340,56 +337,6 @@ class DatastarActions:
             "delete",
             url,
             queries,
-            content_type=content_type,
-            include=include,
-            exclude=exclude,
-            selector=selector,
-            headers=headers,
-            open_when_hidden=open_when_hidden,
-            payload=payload,
-            retry=retry,
-            retry_interval_ms=retry_interval_ms,
-            retry_scaler=retry_scaler,
-            retry_max_wait_ms=retry_max_wait_ms,
-            retry_max_count=retry_max_count,
-            request_cancellation=request_cancellation,
-        )
-
-    @deprecated("Use at.get(route.href()) or at.post(route.href()).")
-    def fetch(
-        self,
-        route: Route,
-        *,
-        query: Mapping[str, object] | None = None,
-        fragment: str | None = None,
-        content_type: ContentType | str | None = None,
-        include: FilterValue | None = None,
-        exclude: FilterValue | None = None,
-        selector: str | None = None,
-        headers: dict[str, str] | None = None,
-        open_when_hidden: bool | None = None,
-        payload: dict[str, Any] | None = None,
-        retry: Retry | str | None = None,
-        retry_interval_ms: int | None = None,
-        retry_scaler: float | None = None,
-        retry_max_wait_ms: int | None = None,
-        retry_max_count: int | None = None,
-        request_cancellation: RequestCancellation | str | None = None,
-    ) -> str:
-        """Build `@get` / `@post` / `@put` / `@patch` / `@delete` from a `Route`.
-
-        Deprecated. Name the verb at the call site:
-        `at.get(route.href())` or `at.post(route.href())`.
-        """
-        if route.method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-            raise StarioError(
-                "at.fetch() has no Datastar action for this method",
-                context={"method": route.method, "path": route.path},
-                help_text="at.fetch() emits @get, @post, @put, @patch, or @delete.",
-            )
-        return self._fetch(
-            route.method.lower(),
-            route.href(query=query, fragment=fragment),
             content_type=content_type,
             include=include,
             exclude=exclude,

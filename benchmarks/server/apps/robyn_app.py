@@ -1,53 +1,111 @@
 # pyright: reportMissingImports=false
 
-import argparse
+import os
 
 import ujson
-from robyn import Robyn
+from robyn import Config, Robyn
+from robyn.robyn import Headers, Response
 
-HELLO = "Hello, World!"
-JSON_HEADERS = {"Content-Type": "application/json"}
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
+
+config = Config()
+app = Robyn(__file__, config=config)
 
 
-def error_json(value):
-    return (value, JSON_HEADERS, 400)
+def _body_bytes(request) -> bytes:
+    body = request.body
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    return body or b""
 
 
-app = Robyn(__file__)
+def _query_map(request) -> object:
+    return getattr(request, "query_params", None) or getattr(request, "queries", {})
 
 
-@app.get("/plaintext", const=True)
-def plaintext():
-    return HELLO
+def _header(request, name: str) -> str:
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return ""
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return ""
+    for key in (name, name.title(), name.upper()):
+        try:
+            value = getter(key)
+        except TypeError:
+            value = getter(key, None)
+        if value:
+            return as_str(value)
+    return ""
 
 
-@app.get("/json", const=True)
-def json_endpoint():
-    return {"message": HELLO}
+def text_response(line: str | bytes) -> Response:
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    return Response(
+        status_code=200,
+        headers=Headers({"Content-Type": TEXT_CONTENT_TYPE_STR}),
+        description=body,
+    )
+
+
+@app.get("/plaintext")
+async def plaintext():
+    return text_response(PLAINTEXT_BODY)
 
 
 @app.get("/user/:user_id")
-def get_user(user_id: str):
-    return {"id": user_id, "name": f"User {user_id}"}
+async def read_request(request):
+    params = _query_map(request)
+    getter = getattr(params, "get", None)
+    q = query_value(getter("q", "") if getter else None)
+    return request_line(
+        request.path_params["user_id"],
+        q,
+        _header(request, REQUEST_HEADER),
+    )
 
 
-@app.post("/validate")
-def validate(request):
-    body = ujson.loads(request.body)
-    name = body.get("name")
-    age = body.get("age")
+@app.post("/echo")
+async def post_json(request):
+    raw = _body_bytes(request)
+    await yield_once()
+    return json_echo_line(ujson.loads(raw) if raw else {})
 
-    if not isinstance(name, str) or not name:
-        return error_json({"error": "name must be a non-empty string"})
-    if not isinstance(age, int) or age < 0 or age > 150:
-        return error_json({"error": "age must be an integer between 0 and 150"})
 
-    return {"name": name, "age": age, "valid": True}
+@app.post("/ingest/64k")
+@app.post("/ingest/2m")
+async def ingest_buffer(request):
+    body = _body_bytes(request)
+    await yield_once()
+    return bytes_line(len(body))
+
+
+@app.post("/ingest/stream/2m")
+async def ingest_stream(request):
+    body = _body_bytes(request)
+    await yield_once()
+    return bytes_line(len(body))
+
+
+@app.post("/upload")
+async def upload(request):
+    body = _body_bytes(request)
+    await yield_once()
+    return bytes_line(len(body))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=3000)
-    args, _ = parser.parse_known_args()
-    app.start(host=args.host, port=args.port, _check_port=False)
+    host = os.environ.get("BENCH_HOST", "127.0.0.1")
+    port = int(os.environ.get("BENCH_PORT", "8080"))
+    app.start(host=host, port=port, _check_port=False)
