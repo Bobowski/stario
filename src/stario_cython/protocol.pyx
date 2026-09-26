@@ -167,6 +167,7 @@ from stario_cython.nghttp2 cimport (
     nghttp2_session_get_stream_remote_close,
     nghttp2_session_want_write,
     nghttp2_settings_entry,
+    nghttp2_strerror,
     nghttp2_submit_goaway,
     nghttp2_submit_headers,
     nghttp2_submit_ping,
@@ -2433,7 +2434,7 @@ cdef class CHttpProtocol(Connection):
             ex._h2_dispatched = True
         except Exception:
             _log.exception("Failed to dispatch request")
-            self._protocol_error(400, "Invalid HTTP request")
+            self._h2_fail_stream(ex._h2_stream_id)
 
     cdef void _h2_begin_stream(self, int32_t stream_id):
         cdef RequestExchange ex
@@ -2656,7 +2657,7 @@ cdef class CHttpProtocol(Connection):
                 self._h2_dispatch_stream(ex)
         except Exception:
             _log.exception("Failed to dispatch request")
-            self._protocol_error(400, "Invalid HTTP request")
+            self._h2_fail_stream(stream_id)
 
     cdef void _h2_end_stream(self, int32_t stream_id):
         cdef RequestExchange ex = self._h2_stream_ex(stream_id)
@@ -2753,6 +2754,11 @@ cdef class CHttpProtocol(Connection):
 
     cdef void h2_handler_finished(self, RequestExchange ex):
         self._h2_reset_if_half_open(ex)
+        self._h2_send()
+
+    cdef void _h2_fail_stream(self, int32_t stream_id) noexcept:
+        """Reset one stream after a server-side failure; others keep going."""
+        self._h2_reject_stream(stream_id, NGHTTP2_INTERNAL_ERROR)
         self._h2_send()
 
     cdef void _h2_reject_stream(self, int32_t stream_id, uint32_t error_code) noexcept:
@@ -2956,7 +2962,7 @@ cdef class CHttpProtocol(Connection):
         else:
             nvs = <nghttp2_nv*>malloc(sizeof(nghttp2_nv) * <size_t>cap)
             if nvs == NULL:
-                self._protocol_error(500, "Internal Server Error")
+                self._h2_fail_stream(ex._h2_stream_id)
                 return
             heap = 1
         try:
@@ -2991,7 +2997,11 @@ cdef class CHttpProtocol(Connection):
                 )
             if rv != 0:
                 ex._h2_outbound = False
-                self._protocol_error(400, "Invalid HTTP request")
+                _log.error(
+                    "nghttp2 rejected response headers: %s",
+                    nghttp2_strerror(rv).decode(),
+                )
+                self._h2_fail_stream(ex._h2_stream_id)
                 return
             self._h2_send()
         finally:
@@ -3027,7 +3037,7 @@ cdef class CHttpProtocol(Connection):
         else:
             nvs = <nghttp2_nv*>malloc(sizeof(nghttp2_nv) * <size_t>cap)
             if nvs == NULL:
-                self._protocol_error(500, "Internal Server Error")
+                self._h2_fail_stream(ex._h2_stream_id)
                 return
             heap = 1
         try:
@@ -3059,7 +3069,11 @@ cdef class CHttpProtocol(Connection):
                 )
             if rv != 0:
                 ex._h2_outbound = False
-                self._protocol_error(400, "Invalid HTTP request")
+                _log.error(
+                    "nghttp2 rejected response headers: %s",
+                    nghttp2_strerror(rv).decode(),
+                )
+                self._h2_fail_stream(ex._h2_stream_id)
                 return
             self._h2_send()
         finally:
