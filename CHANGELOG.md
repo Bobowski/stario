@@ -125,6 +125,14 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Fixed
 
+- HTTP/1 keep-alive is stored only on the request exchange. A 413/431
+  that still needs the value after the exchange recycles snapshots it
+  first, so recycle cannot flip a `Connection: close` request back to
+  keep-alive.
+- Recycle uniqueness uses the 3.14 unique-ref API (else `Py_REFCNT`)
+  and a thread-local retained-copy counter, so free-threaded workers do
+  not race a process-global increment.
+
 - HEAD requests with `Accept-Encoding` no longer get a compressed body
   after the headers (which desynced keep-alive).
 - HEAD responses carry the same fields as GET (RFC 9110 §9.3.2): a

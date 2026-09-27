@@ -132,7 +132,7 @@ cdef Request make_request(
 )
 
 cdef class Connection:
-    """Typed protocol surface used by RequestExchange (cdef methods dispatch virtually)."""
+    """Connection (asyncio.Protocol) surface. Per-request flags live on RequestExchange."""
     cdef public int timeout_cleanup
     cdef void release_exchange(self, RequestExchange exchange)
     cdef void response_completed(self, RequestExchange exchange)
@@ -215,12 +215,13 @@ cdef class CRouter:
 cpdef CRouter compile_router(object router)
 
 cdef class RequestExchange:
+    # Connection-owned writer targets (bound in reset(), live across keep-alive).
     cdef object _transport
-    # transport.is_closing / .writelines, bound once per connection.
     cdef object _t_is_closing
     cdef object _t_writelines
     cdef list _date_box
     cdef object _compression
+    # Request-scoped flags reused by dispatch, body, and the writer.
     cdef int _req_encoding
     cdef bint _req_expect_continue
     cdef bint _req_connection_close
@@ -279,6 +280,9 @@ cdef class RequestExchange:
     cdef object _path
     cdef object _version
     cdef object _target_host
+    # HTTP/1 keep-alive for this request. Set at headers-complete. Recycle
+    # resets it — snapshot before handler_finished() if the connection still
+    # needs the value (413/431 drain).
     cdef bint _keep_alive
     cdef int _path_flags
     # Protocol-level answer (keep-alive 413/431) sent in order at dispatch.
@@ -301,7 +305,6 @@ cdef class RequestExchange:
     cdef double _stall_deadline
     cdef uint64_t _stall_touch
     cdef uint64_t _stall_seen
-    cdef int _buffered
     cdef int _total_read
     cdef int _max_size
     cdef Py_ssize_t _read_max_size

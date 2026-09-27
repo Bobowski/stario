@@ -1,10 +1,18 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
 """One request's lifecycle: headers, arena-backed request, body, and response.
 
-``Headers`` lives here (one extension). ``RequestExchange`` is pooled for its
-native buffers (arena, compressors, output). ``Request`` is not pooled: it is
-built only if the handler reads ``c.req``. Query and cookies stay unset until
-the handler reads them.
+Ownership (three objects, no overlap of duties):
+
+* ``Connection`` / ``HttpProtocol`` — the asyncio connection: socket, parser
+  session, pause/resume, pipeline queue, timeouts. One per TCP/TLS socket.
+* ``RequestExchange`` — one HTTP request/response on that connection. Holds
+  keep-alive, Accept-Encoding, Expect, HEAD, body, writer, and H2 stream
+  state. Pooled (connection idle slot, then this thread's spare list).
+* ``RequestHandle`` — the ``c`` / ``w`` given to one handler call. Thin
+  facade; finished once the exchange recycles.
+
+``Request`` is not pooled: it is built only if the handler reads ``c.req``.
+Query and cookies stay unset until the handler reads them.
 """
 
 cimport cython
@@ -33,7 +41,6 @@ from cpython.list cimport PyList_GET_SIZE
 from cpython.buffer cimport PyBUF_SIMPLE, PyBuffer_Release, PyObject_GetBuffer
 from cpython.exc cimport PyErr_Clear
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
-from cpython.ref cimport Py_REFCNT
 from cpython.unicode cimport (
     PyUnicode_AsUTF8AndSize,
     PyUnicode_DecodeASCII,
@@ -73,7 +80,7 @@ include "headers.pxi"
 include "router.pxi"
 
 cdef class Connection:
-    """Default stubs. The HTTP protocol overrides every cpdef entry."""
+    """Connection vtable. ``CHttpProtocol`` overrides every entry."""
 
     def __cinit__(self):
         self.timeout_cleanup = 0
@@ -170,13 +177,42 @@ cdef object STARTED_ERROR = (
 
 cdef object _POOL_LOCAL = threading.local()
 cdef object _UNBOUND = object()
-# Recycles that found a per-request object still referenced (tests pin this
-# to zero for plain requests so the refcount baselines cannot drift).
-cdef Py_ssize_t _RETAINED_DETACHES = 0
+
+cdef extern from *:
+    """
+    #include <Python.h>
+    #if defined(_MSC_VER)
+    #define STARIO_TLS __declspec(thread)
+    #else
+    #define STARIO_TLS _Thread_local
+    #endif
+    /* Per-OS-thread: recycle uniqueness and the test counter never share a
+       process-global increment (3.14t). */
+    static STARIO_TLS Py_ssize_t stario_retained_detaches = 0;
+
+    static void stario_note_retained(void) {
+        stario_retained_detaches += 1;
+    }
+
+    static Py_ssize_t stario_retained_count(void) {
+        return stario_retained_detaches;
+    }
+
+    static int stario_is_unique(PyObject* obj) {
+    #if PY_VERSION_HEX >= 0x030e00a0
+        return PyUnstable_Object_IsUniquelyReferenced(obj);
+    #else
+        return Py_REFCNT(obj) == 1;
+    #endif
+    }
+    """
+    void stario_note_retained() noexcept
+    Py_ssize_t stario_retained_count() noexcept
+    bint stario_is_unique(object obj) noexcept
 
 
 def _retained_detach_count():
-    return _RETAINED_DETACHES
+    return stario_retained_count()
 
 
 cdef inline list _thread_pool():
@@ -2891,30 +2927,37 @@ cdef class RequestExchange:
         self.match = EMPTY_MATCH
         self._clear_request_binding()
         self._clear_request_headers()
-        # No response state may survive into the next request.
+        # No response / upload leftover may survive into the next request.
         self._completed = False
         self._status_code = -1
+        self._skip_body = False
+        self._close_delimited = False
+        self._expect_continue = False
+        self._discard_body = False
         self.handler_done = False
         self.handler_started = False
-        self._http2 = False
-        self._h2_stream_id = 0
-        self._h2_pending = b""
-        self._h2_pending_off = 0
-        self._h2_body_done = False
-        self._h2_method = None
-        self._h2_got_method = False
-        self._h2_got_path = False
-        self._h2_got_authority = False
-        self._h2_dispatched = False
-        self._h2_headers_done = False
-        self._h2_headers_sent = False
-        self._h2_headers_too_large = False
-        self._h2_head_bytes = 0
-        self._h2_awaiting_headers = False
-        self._h2_header_deadline = 0.0
-        self._h2_outbound = False
-        self._h2_end_sent = False
-        self._h2_flow_paused = False
+        # A connection is H1 or H2 for life. Skip the H2 block on H1 reuse.
+        # An H2 exchange recycled onto this thread still has _http2 set.
+        if self._http2:
+            self._http2 = False
+            self._h2_stream_id = 0
+            self._h2_pending = b""
+            self._h2_pending_off = 0
+            self._h2_body_done = False
+            self._h2_method = None
+            self._h2_got_method = False
+            self._h2_got_path = False
+            self._h2_got_authority = False
+            self._h2_dispatched = False
+            self._h2_headers_done = False
+            self._h2_headers_sent = False
+            self._h2_headers_too_large = False
+            self._h2_head_bytes = 0
+            self._h2_awaiting_headers = False
+            self._h2_header_deadline = 0.0
+            self._h2_outbound = False
+            self._h2_end_sent = False
+            self._h2_flow_paused = False
         self._handler_task = None
         self._head_request = False
 
@@ -2988,6 +3031,8 @@ cdef class RequestExchange:
         self._path = None
         self._version = None
         self._target_host = None
+        # Default until headers-complete. Recycle must not be treated as
+        # "this request stays open" — callers snapshot first.
         self._keep_alive = True
         self._path_flags = 0
         self._protocol_status = 0
@@ -3104,11 +3149,10 @@ cdef class RequestExchange:
         cdef Request request
         cdef RequestHeaders view
         cdef Headers headers
-        global _RETAINED_DETACHES
         self._handle = None
         if handle is not None:
-            if Py_REFCNT(handle) > 1:
-                _RETAINED_DETACHES += 1
+            if not stario_is_unique(handle):
+                stario_note_retained()
                 handle._req = self.ensure_request()
                 handle._final_status = self._status_code
                 handle._ex = None
@@ -3122,26 +3166,29 @@ cdef class RequestExchange:
         request = self._req
         self._req = None
         if request is not None:
-            if Py_REFCNT(request) > 1:
-                _RETAINED_DETACHES += 1
+            if not stario_is_unique(request):
+                stario_note_retained()
                 request.detach_body(self)
             request = None
         view = self._req_view
         self._req_view = None
         if view is not None:
-            if Py_REFCNT(view) > 1:
-                _RETAINED_DETACHES += 1
+            if not stario_is_unique(view):
+                stario_note_retained()
                 view._take_ownership()
             else:
                 view._ex = None
                 self._spare_view = view
             view = None
         headers = self.headers
-        # The field and this local are ours; any more means a task kept
-        # ``w.headers``. Give the next response its own list.
-        if Py_REFCNT(headers) > 2:
-            _RETAINED_DETACHES += 1
+        # Drop the field so uniqueness is "only this local". A task that kept
+        # ``w.headers`` still holds a ref; give the next response its own list.
+        self.headers = None
+        if headers is not None and not stario_is_unique(headers):
+            stario_note_retained()
             self.headers = Headers()
+        else:
+            self.headers = headers
 
     def on_handler_done(self, task):
         """Log/abort on failure, then recycle after the handler task."""
@@ -3706,7 +3753,6 @@ cdef class RequestExchange:
         self._body_buf = None
         self._body_used = 0
         self._body_cap = 0
-        self._buffered = 0
 
     cdef int _body_reserve(self, Py_ssize_t need) noexcept:
         cdef object buf
@@ -3786,7 +3832,6 @@ cdef class RequestExchange:
         if take < self._body_used:
             memmove(src, src + take, <size_t>(self._body_used - take))
         self._body_used -= take
-        self._buffered = self._body_used
         return out
 
     cdef void _raise_abort(self):
@@ -3850,7 +3895,7 @@ cdef class RequestExchange:
         if self._http2:
             self._connection.h2_write_headers(self, [(b":status", b"100")], True, True, True, True)
             return
-        self._transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        self._transport.write(_status_line(100) + CRLF)
 
     cdef void _maybe_pause(self):
         if self._consumed_as == CONSUMED_STREAM:
@@ -3926,7 +3971,6 @@ cdef class RequestExchange:
                 length,
             )
         self._body_used = used
-        self._buffered = used
         self._total_read = new_total
         if self._consumed_as == CONSUMED_STREAM:
             self._wake()

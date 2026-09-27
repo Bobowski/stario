@@ -105,13 +105,33 @@ Granian (LRU always hot). This capture is the honest one.
   async uploads (`await asyncio.sleep(0)`) from small JSON through 2MB
   buffer / stream / multipart. Both Stario runner targets are Cython.
 
+### Class ownership
+
+Three objects, no overlapping duties:
+
+| Object | Owns | Lifetime |
+| --- | --- | --- |
+| `HttpProtocol` (`Connection`) | Socket, llhttp/nghttp2 session, pause/resume, pipeline queue, timeouts, one idle exchange | One TCP/TLS connection |
+| `RequestExchange` | Keep-alive, Accept-Encoding, Expect, HEAD, arena, body, writer, H2 stream | One request; pooled on the connection then this thread |
+| `RequestHandle` | Handler `c` / `w` (one object) | One dispatch; finished when the exchange recycles |
+
+Keep-alive is set on the exchange at HTTP/1 headers-complete. Recycle
+resets it (`_clear_request_binding`), so a 413/431 drain that still needs
+the value snapshots it *before* `handler_finished()`. Encoding, Expect, and
+HEAD stay on the exchange for the whole request; the protocol does not keep
+a second copy.
+
+Recycle uniqueness uses `PyUnstable_Object_IsUniquelyReferenced` on 3.14+
+(else `Py_REFCNT == 1`) and a thread-local retained-copy counter. Do not
+put a process-global increment on that path.
+
 ### Request lifetime and paths
 
 - **Handle per dispatch.** The exchange (arena, buffers, compressors) is
   pooled; `c` / `w` is a small `RequestHandle` created per dispatch (one
   object for both). When the exchange recycles, the handle is finished:
   writes raise, `end()`/`abort()` no-op, reads still describe its request.
-  Recycle checks reference counts: if user code still holds the handle,
+  Recycle checks uniqueness: if user code still holds the handle,
   `c.req`, or its header view, those take a private copy of the arena; if
   not, the handle and view are reused for the next request (no one can tell).
   `tests/cython/test_request_lifetime.py` pins that plain HTTP/1, pipelined,

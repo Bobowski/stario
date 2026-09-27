@@ -2,7 +2,11 @@
 # cython: auto_pickle=False
 """asyncio Protocol: llhttp for HTTP/1, nghttp2 for HTTP/2.
 
-``HttpProtocol`` owns parser callbacks, pause/resume, and request dispatch.
+``HttpProtocol`` (the ``Connection``) owns the socket, parser session,
+pause/resume, pipeline queue, and timeouts. Per-request flags — keep-alive,
+Accept-Encoding, Expect, HEAD — live on ``RequestExchange``. The handler
+sees ``RequestHandle`` (``c`` / ``w``), not the pooled exchange.
+
 H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). URL bytes
 and header fragments go into the current exchange arena. Dispatch walks
 the compiled trie from those bytes (ASCII paths never become a ``str``).
@@ -695,7 +699,6 @@ cdef class CHttpProtocol(Connection):
     cdef bint header_timeout_reset
     cdef bint rejected
     cdef bint request_dispatched
-    cdef bint request_keep_alive
     cdef int pause_reasons
     cdef object body_pause_owner
     cdef object held_data
@@ -840,7 +843,6 @@ cdef class CHttpProtocol(Connection):
         )
         self.rejected = False
         self.request_dispatched = False
-        self.request_keep_alive = True
         self.timeout_kind = TIMEOUT_NONE
         self.timeout_deadline = 0.0
         self.header_timeout_reset = False
@@ -1496,7 +1498,6 @@ cdef class CHttpProtocol(Connection):
             return
         self.head_bytes = 40
         self.request_dispatched = False
-        self.request_keep_alive = True
         self.header_timeout_reset = True
         self.h1_headers_too_large = False
         self.h1_in_trailers = False
@@ -1557,7 +1558,9 @@ cdef class CHttpProtocol(Connection):
             (flags & F_CHUNKED) != 0
             or ((flags & F_CONTENT_LENGTH) != 0 and content_length > 0)
         )
-        self.request_keep_alive = (
+        # Keep-alive is an exchange flag. Recycle resets it, so callers that
+        # still need the value after handler_finished() must snapshot first.
+        exchange._keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
             or (
                 http_major == 1
@@ -1580,7 +1583,7 @@ cdef class CHttpProtocol(Connection):
         # RFC 9112 6.1: Transfer-Encoding in HTTP/1.0 is faulty framing;
         # answer, then close.
         if (flags & F_TRANSFER_ENCODING) and http_minor == 0:
-            self.request_keep_alive = False
+            exchange._keep_alive = False
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
             # after oversize headers would be a read-DoS if we stayed open.
@@ -1590,7 +1593,7 @@ cdef class CHttpProtocol(Connection):
                 431,
                 "Request header fields too large",
                 has_body
-                or not self.request_keep_alive
+                or not exchange._keep_alive
                 or llhttp_should_keep_alive(self.parser) == 0,
                 -1,
             )
@@ -1606,7 +1609,7 @@ cdef class CHttpProtocol(Connection):
             # A huge or chunked upload after 413 would be a read-DoS.
             if (
                 content_length <= <uint64_t>SMALL_BODY
-                and self.request_keep_alive
+                and exchange._keep_alive
             ):
                 self.h1_headers_too_large = True
                 self._protocol_error(
@@ -1660,10 +1663,14 @@ cdef class CHttpProtocol(Connection):
     cdef void _on_message_complete(self) noexcept:
         cdef RequestExchange exchange
         cdef object transport
+        cdef bint keep_alive
         if self.rejected:
             return
         exchange = self.reading_exchange
         if self.h1_headers_too_large:
+            # Snapshot before handler_finished() recycles the exchange and
+            # _clear_request_binding() resets _keep_alive to True.
+            keep_alive = exchange is not None and exchange._keep_alive
             if exchange is not None:
                 if exchange._body_active and not exchange._body_complete:
                     if exchange.c_complete() != 0:
@@ -1678,7 +1685,7 @@ cdef class CHttpProtocol(Connection):
             self.h1_headers_too_large = False
             if self.timeout_kind == TIMEOUT_HEADER:
                 self._cancel_timeout()
-            if not self.request_keep_alive:
+            if not keep_alive:
                 transport = self.transport
                 if transport is not None and not transport.is_closing():
                     transport.close()
@@ -1737,7 +1744,7 @@ cdef class CHttpProtocol(Connection):
                 <int>llhttp_get_http_major(self.parser),
                 <int>llhttp_get_http_minor(self.parser),
             )
-            exchange._keep_alive = self.request_keep_alive
+            # H1 keep-alive was set at headers-complete on this exchange.
         exchange._method = method
         exchange._version = version
         exchange._path = None

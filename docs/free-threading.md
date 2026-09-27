@@ -269,14 +269,14 @@ Cython 3.1: `# cython: freethreading_compatible=True` (or
 `-X freethreading_compatible=True`) only **declares** safety. It does
 not add locks.
 
-| Site | Why it is unsafe today |
+| Site | Status |
 | --- | --- |
-| `exchange.pyx` exchange spare | Done. One idle `RequestExchange` stays on the connection (keep-alive). Overflow goes to a small `threading.local()` list (`POOL_MAX=16`) via `release_exchange` → `detach` / `recycle`. Same-OS-thread only — 3.14t never shares an exchange across loops. No process-global list. |
-| `vendor/compression_buf.c` `brotli_pool[]` / `gzip_pool[]` | Plain C arrays + `pool_count`. No mutex. Classic use-after-free / double-free. |
-| `protocol.pyx` URL cache `_UC_KEY[]` … `_UC_PATH` | Open-addressed C table, `malloc`/`free`, no lock. Parser threads will corrupt it. |
-| `_bind_settings()` / `_SETTINGS` | First two `HttpProtocol`s on two threads can both see `NULL` and both allocate. Init once under a `PyMutex` / `threading.Lock`, then treat as immutable. |
-| `HttpProtocol.connections` | Python `set` add/discard from many threads **plus** `tuple(connections)` in the Date-tick sweeper. Compound iterate-and-mutate. Make this **per loop**. |
-| `date_box` | One `list` of one `bytes`, written every second, read on every response. Per-loop box is cheaper than synchronizing. |
+| `exchange.pyx` exchange spare | Done. One idle `RequestExchange` stays on the connection (keep-alive). Overflow goes to a small `threading.local()` list (`POOL_MAX=16`) via `release_exchange` → `detach` / `recycle`. Same-OS-thread only — 3.14t never shares an exchange across loops. No process-global list. Recycle uniqueness and `_retained_detach_count` are `_Thread_local`. |
+| `vendor/compression_buf.c` `brotli_pool[]` / `gzip_pool[]` | Done. `_Thread_local` arrays (`STARIO_CODEC_POOL_MAX=32`). No process-global free-list. |
+| `protocol.pyx` URL cache `_UC_*` | Gone. The compiled `CRouter` trie is the lookup path; no C URL table. |
+| `_bind_settings()` / `_SETTINGS` | Done. Init once under `threading.Lock`, then immutable. |
+| `HttpProtocol.connections` | Per-loop set (Date-tick sweeper walks that loop's set only). |
+| `date_box` | Per-loop box. |
 | `llhttp` / `nghttp2` session | Per-`HttpProtocol` — OK **if** the protocol never runs on two threads. Affinity is the invariant. |
 | Brotli/gzip state on `RequestExchange` | Per-exchange — OK with affinity. Do not share an encoder. |
 
@@ -284,9 +284,9 @@ not add locks.
 recycle path, matches affinity) or a `PyMutex` around the global pool.
 Thread-local is the one that will not show up in plaintext profiles.
 
-Do **not** set `freethreading_compatible` until those are done and we
-have a threaded smoke test (accept on two loops, recycle exchanges,
-compress, hit the URL cache).
+The Cython modules already set `freethreading_compatible=True`. Keep it
+only while those pools stay per-thread (or locked at init). `tests/test_threads.py`
+and the cython lifetime tests cover recycle + two-loop accept.
 
 Native protocol already talks to libbrotli directly (`compression_buf.c`).
 The Python `brotli` package is still imported from
@@ -384,10 +384,9 @@ real sockets, recycle the thread-local exchange spare, hit compression.
 
 ### Races (correctness / memory)
 
-- Exchange pool reuse → two requests, one `RequestExchange`.
-- Compression C pool → two encoders, one `StarioBrotli*`.
-- URL cache → use-after-free of `malloc`’d keys.
-- `connections` iterate vs add/discard.
+- Exchange pool reuse → two requests, one `RequestExchange` (mitigated: connection idle + thread-local spare; never share across loops).
+- Compression C pool → two encoders, one `StarioBrotli*` (mitigated: `_Thread_local` pools).
+- `connections` iterate vs add/discard (mitigated: per-loop set).
 - TTY live view vs `RecordingSpan.attributes.update`.
 - `Game.board` / `user_colors` without a lock.
 - `app.shutdown` Future touched from the wrong loop.
