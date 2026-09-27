@@ -4,7 +4,9 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 5.0.0 - Unreleased
+## Unreleased
+
+## 5.0.0 - 2026-09-27
 
 ### Breaking changes
 
@@ -228,6 +230,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   methods share one byte table. Compressibility uses the Python helper.
 - `stario.http.host.host_without_port` re-exports the Cython Host parser
   so request routing and the helper agree.
+- A stalled body upload raises `RequestBodyError` 408 as
+  `Request timeout: body upload too slow.`
 
 ## 4.3.0 - 2026-09-25
 

@@ -212,19 +212,19 @@ There is no autotag, and the build does not rewrite the version.
 
 1. Keep notes under `## Unreleased` in [`CHANGELOG.md`](CHANGELOG.md).
 2. When those notes are the release, one commit:
-   - set `version` in `pyproject.toml` (for example `4.3.0`)
-   - move `## Unreleased` to `## 4.3.0 - YYYY-MM-DD` and leave an empty
+   - set `version` in `pyproject.toml` (for example `5.0.0`)
+   - move `## Unreleased` to `## 5.0.0 - YYYY-MM-DD` and leave an empty
      `## Unreleased` above it
 3. Tag that commit and push:
 
 ```bash
-git tag 4.3.0
-git push origin 4.3.0
+git tag 5.0.0
+git push origin 5.0.0
 ```
 
 A GitHub Release with the same tag is the same event. The workflow tests
 3.12–3.14, checks that the tag, `pyproject.toml`, and changelog agree,
-then uploads `stario-4.3.0` to PyPI. If the tag does not match the
+then uploads `stario-5.0.0` to PyPI. If the tag does not match the
 committed version, the job fails.
 
 ## Contributing
