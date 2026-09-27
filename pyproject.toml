@@ -25,11 +25,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "brotli>=1.1.0,<2",
     "typing_extensions>=4.13.0,<5",
     "watchfiles>=1.1.0,<2",
     "xxhash>=3.5.0,<4",
-    "zstandard>=0.25.0,<1",
 ]
 
 [project.urls]

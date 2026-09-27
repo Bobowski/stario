@@ -288,14 +288,11 @@ The Cython modules already set `freethreading_compatible=True`. Keep it
 only while those pools stay per-thread (or locked at init). `tests/test_threads.py`
 and the cython lifetime tests cover recycle + two-loop accept.
 
-Native protocol already talks to libbrotli directly (`compression_buf.c`).
-The Python `brotli` package is still imported from
-`stario.http.compression`. **google/brotli 1.1.0 re-enables the GIL** on
-import. That alone can make `STARIO_THREADS=4` a no-op. Options: drop
-the Python brotli import on the native path, wait for a `cp314t` wheel
-that sets `Py_MOD_GIL_NOT_USED`, or refuse to start. Same check for
-`xxhash` (Assets hashing at bootstrap — less hot — but it still runs at
-import). `watchfiles` is the parent of `stario watch` only.
+Native protocol talks to libbrotli / libzstd directly (`compression_buf.c`).
+Python `CompressionConfig` and `Files` / `Assets` use the same libs through
+`stario_cython.codecs` — no Python `brotli` / `zstandard` import, so those
+packages cannot re-enable the GIL. `xxhash` (Assets hashing at bootstrap)
+still can. `watchfiles` is the parent of `stario watch` only.
 
 ### 2. Server / App — will not boot correctly on N loops
 

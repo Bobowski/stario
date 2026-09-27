@@ -13,7 +13,8 @@ the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), Brotli, and zstd
 development packages (`libnghttp2-dev libbrotli-dev libzstd-dev` on
 Debian/Ubuntu, `brew install pkg-config nghttp2 brotli zstd` on macOS).
 Gzip links system zlib (`-lz`). Published wheels bundle nghttp2, Brotli,
-and zstd (`scripts/build-native-deps.sh`).
+and zstd (`scripts/build-native-deps.sh`). Python `CompressionConfig` /
+`Files` use the same libs through `stario_cython.codecs`.
 
 ```bash
 uv sync --all-extras          # editable install; compiles the extensions

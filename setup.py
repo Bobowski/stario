@@ -17,7 +17,13 @@ from Cython.Build import cythonize
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
-_NATIVE_PACKAGES = ("libnghttp2", "libbrotlienc", "libbrotlicommon", "libzstd")
+_NATIVE_PACKAGES = (
+    "libnghttp2",
+    "libbrotlienc",
+    "libbrotlidec",
+    "libbrotlicommon",
+    "libzstd",
+)
 _MIN_NGHTTP2 = (1, 66)
 
 
@@ -88,6 +94,12 @@ llhttp_sse = ["-msse4.2"] if platform.machine().lower() in {"x86_64", "amd64"} e
 include_dirs = ["vendor", "vendor/llhttp/include", "src"]
 
 extensions = [
+    Extension(
+        "stario_cython.codecs",
+        sources=["src/stario_cython/codecs.pyx", "vendor/compression_buf.c"],
+        include_dirs=list(include_dirs),
+        extra_compile_args=list(base_args),
+    ),
     Extension(
         "stario_cython.exchange",
         sources=["src/stario_cython/exchange.pyx", "vendor/compression_buf.c"],

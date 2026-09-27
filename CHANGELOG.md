@@ -98,6 +98,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - Native `zstd` on the Cython writer (`libzstd`), negotiated
   `br` → `zstd` → `gzip` like Python `CompressionConfig`. Wheels bundle
   libzstd; source builds need `libzstd-dev` (or `brew install zstd`).
+  `Files` / `Assets`, TestClient, and `CompressionConfig` use the same
+  libbrotli / libzstd via `stario_cython.codecs`. The Python `brotli`
+  and `zstandard` packages are no longer dependencies.
 - `await w.drain()` — write-side backpressure for streaming handlers.
   `write()` never blocks; `drain()` waits while the transport has paused
   writing or an HTTP/2 stream has more than 256 KiB of unsent DATA, and

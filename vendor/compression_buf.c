@@ -1,5 +1,6 @@
 #include "compression_buf.h"
 
+#include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <limits.h>
 #include <stdint.h>
@@ -600,4 +601,329 @@ void stario_zstd_release(StarioZstd* zstd) {
     } else {
         stario_zstd_free(zstd);
     }
+}
+
+struct StarioBrotliDecoder {
+    BrotliDecoderState* state;
+    unsigned char* out;
+    size_t out_cap;
+    int finished;
+};
+
+struct StarioZstdDecoder {
+    ZSTD_DCtx* dctx;
+    unsigned char* out;
+    size_t out_cap;
+    int finished;
+};
+
+static STARIO_TLS unsigned char* brotli_dec_scratch = NULL;
+static STARIO_TLS size_t brotli_dec_scratch_cap = 0;
+static STARIO_TLS unsigned char* zstd_dec_scratch = NULL;
+static STARIO_TLS size_t zstd_dec_scratch_cap = 0;
+
+static int brotli_decode_into(
+    BrotliDecoderState* state,
+    unsigned char** buf,
+    size_t* cap,
+    const unsigned char* in,
+    size_t in_len,
+    size_t* used,
+    int* finished
+) {
+    size_t available_in = in_len;
+    const unsigned char* next_in = in;
+    BrotliDecoderResult rc;
+
+    *used = 0;
+    for (;;) {
+        size_t available_out;
+        unsigned char* next_out;
+        if (
+            *used == *cap &&
+            grow_buffer(buf, cap, *used) != 0
+        ) {
+            return -1;
+        }
+        available_out = *cap - *used;
+        next_out = *buf + *used;
+        rc = BrotliDecoderDecompressStream(
+            state,
+            &available_in,
+            &next_in,
+            &available_out,
+            &next_out,
+            NULL
+        );
+        *used = (size_t)(next_out - *buf);
+        if (rc == BROTLI_DECODER_RESULT_SUCCESS) {
+            *finished = 1;
+            return 0;
+        }
+        if (rc == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
+            return 0;
+        }
+        if (rc == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            if (grow_buffer(buf, cap, *used) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+}
+
+static int zstd_decode_into(
+    ZSTD_DCtx* dctx,
+    unsigned char** buf,
+    size_t* cap,
+    const unsigned char* in,
+    size_t in_len,
+    size_t* used,
+    int* finished
+) {
+    ZSTD_inBuffer input;
+    ZSTD_outBuffer output;
+    size_t remaining;
+
+    input.src = in;
+    input.size = in_len;
+    input.pos = 0;
+    *used = 0;
+    for (;;) {
+        if (
+            *used == *cap &&
+            grow_buffer(buf, cap, *used) != 0
+        ) {
+            return -1;
+        }
+        output.dst = *buf;
+        output.size = *cap;
+        output.pos = *used;
+        remaining = ZSTD_decompressStream(dctx, &output, &input);
+        if (ZSTD_isError(remaining)) {
+            return -1;
+        }
+        *used = output.pos;
+        if (remaining == 0) {
+            *finished = 1;
+            return 0;
+        }
+        if (input.pos == input.size && output.pos < output.size) {
+            return 0;
+        }
+        if (output.pos == output.size && grow_buffer(buf, cap, *used) != 0) {
+            return -1;
+        }
+    }
+}
+
+int stario_brotli_decompress_borrowed(
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    BrotliDecoderState* state;
+    size_t used = 0;
+    int finished = 0;
+
+    if (out == NULL || out_len == NULL || (in == NULL && in_len != 0)) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+    state = BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (state == NULL) {
+        return -1;
+    }
+    if (
+        brotli_decode_into(
+            state,
+            &brotli_dec_scratch,
+            &brotli_dec_scratch_cap,
+            in,
+            in_len,
+            &used,
+            &finished
+        ) != 0 ||
+        !finished
+    ) {
+        BrotliDecoderDestroyInstance(state);
+        return -1;
+    }
+    BrotliDecoderDestroyInstance(state);
+    *out = brotli_dec_scratch;
+    *out_len = used;
+    return 0;
+}
+
+int stario_zstd_decompress_borrowed(
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    ZSTD_DCtx* dctx;
+    size_t used = 0;
+    int finished = 0;
+
+    if (out == NULL || out_len == NULL || (in == NULL && in_len != 0)) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+    dctx = ZSTD_createDCtx();
+    if (dctx == NULL) {
+        return -1;
+    }
+    if (
+        zstd_decode_into(
+            dctx,
+            &zstd_dec_scratch,
+            &zstd_dec_scratch_cap,
+            in,
+            in_len,
+            &used,
+            &finished
+        ) != 0 ||
+        !finished
+    ) {
+        ZSTD_freeDCtx(dctx);
+        return -1;
+    }
+    ZSTD_freeDCtx(dctx);
+    *out = zstd_dec_scratch;
+    *out_len = used;
+    return 0;
+}
+
+StarioBrotliDecoder* stario_brotli_decoder_new(void) {
+    StarioBrotliDecoder* decoder = (StarioBrotliDecoder*)calloc(
+        1, sizeof(StarioBrotliDecoder)
+    );
+    if (decoder == NULL) {
+        return NULL;
+    }
+    decoder->state = BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (decoder->state == NULL) {
+        free(decoder);
+        return NULL;
+    }
+    return decoder;
+}
+
+int stario_brotli_decoder_push_borrowed(
+    StarioBrotliDecoder* decoder,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    size_t used = 0;
+
+    if (
+        decoder == NULL || decoder->state == NULL ||
+        out == NULL || out_len == NULL ||
+        (in == NULL && in_len != 0)
+    ) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+    if (
+        brotli_decode_into(
+            decoder->state,
+            &decoder->out,
+            &decoder->out_cap,
+            in,
+            in_len,
+            &used,
+            &decoder->finished
+        ) != 0
+    ) {
+        return -1;
+    }
+    *out = decoder->out;
+    *out_len = used;
+    return 0;
+}
+
+int stario_brotli_decoder_finished(const StarioBrotliDecoder* decoder) {
+    return decoder != NULL && decoder->finished;
+}
+
+void stario_brotli_decoder_free(StarioBrotliDecoder* decoder) {
+    if (decoder == NULL) {
+        return;
+    }
+    if (decoder->state != NULL) {
+        BrotliDecoderDestroyInstance(decoder->state);
+    }
+    free(decoder->out);
+    free(decoder);
+}
+
+StarioZstdDecoder* stario_zstd_decoder_new(void) {
+    StarioZstdDecoder* decoder = (StarioZstdDecoder*)calloc(
+        1, sizeof(StarioZstdDecoder)
+    );
+    if (decoder == NULL) {
+        return NULL;
+    }
+    decoder->dctx = ZSTD_createDCtx();
+    if (decoder->dctx == NULL) {
+        free(decoder);
+        return NULL;
+    }
+    return decoder;
+}
+
+int stario_zstd_decoder_push_borrowed(
+    StarioZstdDecoder* decoder,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    size_t used = 0;
+
+    if (
+        decoder == NULL || decoder->dctx == NULL ||
+        out == NULL || out_len == NULL ||
+        (in == NULL && in_len != 0)
+    ) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+    if (
+        zstd_decode_into(
+            decoder->dctx,
+            &decoder->out,
+            &decoder->out_cap,
+            in,
+            in_len,
+            &used,
+            &decoder->finished
+        ) != 0
+    ) {
+        return -1;
+    }
+    *out = decoder->out;
+    *out_len = used;
+    return 0;
+}
+
+int stario_zstd_decoder_finished(const StarioZstdDecoder* decoder) {
+    return decoder != NULL && decoder->finished;
+}
+
+void stario_zstd_decoder_free(StarioZstdDecoder* decoder) {
+    if (decoder == NULL) {
+        return;
+    }
+    ZSTD_freeDCtx(decoder->dctx);
+    free(decoder->out);
+    free(decoder);
 }

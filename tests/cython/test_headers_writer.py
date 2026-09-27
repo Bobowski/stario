@@ -1,15 +1,18 @@
 import asyncio
 import gzip
 
-import brotli
 import pytest
-import zstandard as zstd
 
 import stario.cookies as cookies
 from stario import App, Route
 from stario.exceptions import StarioError, StarioRuntime
-from stario.http.compression import CompressionConfig
+from stario.http.compression import (
+    CompressionConfig,
+    brotli_decompress,
+    zstd_decompress,
+)
 from stario.http.headers import Headers as PublicHeaders
+from stario_cython.codecs import BrotliDecoder, ZstdDecoder
 from stario_cython.exchange import Headers
 from tests.cython.http import read_chunk, read_response, running_server
 
@@ -123,9 +126,9 @@ async def test_exchange_respond_native_compression_round_trip(
             header, compressed_body = payload.split(b"\r\n\r\n", 1)
             assert b"content-encoding: " + encoding + b"\r\n" in header + b"\r\n"
             if encoding == b"br":
-                decoded = brotli.decompress(compressed_body)
+                decoded = brotli_decompress(compressed_body)
             elif encoding == b"zstd":
-                decoded = zstd.decompress(compressed_body)
+                decoded = zstd_decompress(compressed_body)
             else:
                 decoded = gzip.decompress(compressed_body)
             assert decoded == body
@@ -429,13 +432,13 @@ async def test_exchange_sse_brotli_flushes_each_write() -> None:
             await first_written.wait()
             first_chunk = await read_chunk(reader)
             assert first_chunk
-            decoder = brotli.Decompressor()
-            decoded = [decoder.process(first_chunk)]
+            decoder = BrotliDecoder()
+            decoded = [decoder.decompress(first_chunk)]
             assert decoded == [b"data: 0\n\n"]
 
             release_second.set()
             while chunk := await read_chunk(reader):
-                decoded.append(decoder.process(chunk))
+                decoded.append(decoder.decompress(chunk))
             assert b"".join(decoded) == b"data: 0\n\ndata: 1\n\n"
             assert decoder.is_finished()
         finally:
@@ -484,7 +487,7 @@ async def test_exchange_sse_zstd_flushes_each_write() -> None:
             await first_written.wait()
             first_chunk = await read_chunk(reader)
             assert first_chunk
-            decoder = zstd.ZstdDecompressor().decompressobj()
+            decoder = ZstdDecoder()
             decoded = [decoder.decompress(first_chunk)]
             assert decoded == [b"data: 0\n\n"]
 
@@ -690,7 +693,7 @@ async def test_respond_list_parts_native_compression_round_trip() -> None:
             payload = await read_response(reader)
             header, compressed_body = payload.split(b"\r\n\r\n", 1)
             assert b"content-encoding: br\r\n" in header + b"\r\n"
-            assert brotli.decompress(compressed_body) == b"".join(parts)
+            assert brotli_decompress(compressed_body) == b"".join(parts)
         finally:
             writer.close()
             await writer.wait_closed()

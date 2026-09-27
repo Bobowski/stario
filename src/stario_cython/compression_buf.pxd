@@ -60,3 +60,44 @@ cdef extern from "compression_buf.h":
         size_t* out_len,
     )
     void stario_zstd_release(StarioZstd* zstd)
+
+    int stario_brotli_decompress_borrowed(
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
+    int stario_zstd_decompress_borrowed(
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
+
+    ctypedef struct StarioBrotliDecoder:
+        pass
+
+    StarioBrotliDecoder* stario_brotli_decoder_new()
+    int stario_brotli_decoder_push_borrowed(
+        StarioBrotliDecoder* decoder,
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
+    int stario_brotli_decoder_finished(const StarioBrotliDecoder* decoder)
+    void stario_brotli_decoder_free(StarioBrotliDecoder* decoder)
+
+    ctypedef struct StarioZstdDecoder:
+        pass
+
+    StarioZstdDecoder* stario_zstd_decoder_new()
+    int stario_zstd_decoder_push_borrowed(
+        StarioZstdDecoder* decoder,
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
+    int stario_zstd_decoder_finished(const StarioZstdDecoder* decoder)
+    void stario_zstd_decoder_free(StarioZstdDecoder* decoder)
