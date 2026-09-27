@@ -1,11 +1,9 @@
-"""Timeout cleanup for the Cython HTTP protocol.
+"""Timeout sweep mode for the Cython protocol.
 
-Header, idle, and body-stall timeouts share **one** mechanism: compare
-deadlines stored on the connection to ``loop.time()`` computed once per
-wake.
-
-``HttpProtocol`` reads these helpers in ``__init__`` (env is the default
-source). Pass ``timeout_cleanup="off"`` to skip cleanup without env.
+Header, idle, and body-stall deadlines share one compare against
+``loop.time()`` per wake. ``HttpProtocol`` reads these helpers in
+``__init__`` (env is the default). Pass ``timeout_cleanup="off"`` to skip
+cleanup without env.
 
 Under ``stario.http.server.Server`` the wake is the Date-header tick
 (once a second). Protocols constructed without Server start a fallback
@@ -13,7 +11,7 @@ sweeper at ``sweep_interval()``.
 
 ``STARIO_CYTHON_TIMEOUTS``: ``sweep`` (default) or ``off`` / ``0``.
 ``STARIO_CYTHON_TIMEOUT_SWEEP`` overrides the fallback period (default
-``1``). Tests set ``0.05`` so slowloris cases finish quickly.
+``1``). Tests set ``0.05`` so stall cases finish quickly.
 """
 
 from __future__ import annotations

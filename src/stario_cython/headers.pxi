@@ -330,8 +330,8 @@ cdef object _encode_value_bytes(object value):
 
 
 # Common content-types. Identity hits skip the CR/LF scan; equal-but-not-
-# identical bytes reuse the interned copy. [0] is last caller object, [1]
-# is the intern table — a list so the inline helper can mutate it.
+# identical bytes reuse the interned copy. [0] is the last caller object,
+# [1] is the intern table (a list so the inline helper can mutate it).
 cdef object CT_TEXT_PLAIN = b"text/plain"
 cdef object CT_TEXT_PLAIN_UTF8 = b"text/plain; charset=utf-8"
 cdef object CT_JSON = b"application/json"

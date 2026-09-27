@@ -7,11 +7,10 @@ literals compare against decoded segments; params are fully decoded
 (``%2F`` -> ``/``). Paths without ``%`` are walked straight from the arena
 bytes, so static GET never allocates.
 
-No radix ``rest`` compression (insert order cannot change the tree), no
-exact-map sidecar, no backtracking: at each segment an exact child wins,
-then ``{param}``, then ``{path...}``. Static hits return the 3-tuple stored at
-compile time (same Match identity). Param hits allocate one Match + one
-params dict. 404/405 tuples are interned on the node.
+At each segment an exact child wins, then ``{param}``, then ``{path...}``.
+Static hits return the 3-tuple stored at compile time (same Match identity).
+Param hits allocate one Match + one params dict. 404/405 tuples are interned
+on the node.
 """
 
 import sys

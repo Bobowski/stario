@@ -1,8 +1,6 @@
-"""Cython-backed HTTP server entry.
+"""Dev entry: uvloop + ``NoOpTracer``. Production is ``stario serve``.
 
 Lifecycle (signals, drain, Date tick) is ``stario.http.server.Server``.
-This module only injects uvloop + ``NoOpTracer`` for
-``python -m stario_cython``. Production CLI is ``stario serve``.
 """
 
 from __future__ import annotations

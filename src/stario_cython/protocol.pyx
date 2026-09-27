@@ -1,29 +1,13 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
 # cython: auto_pickle=False
-"""asyncio Protocol: llhttp for HTTP/1, nghttp2 for HTTP/2.
+"""asyncio protocol: HTTP/1 (llhttp) and HTTP/2 (nghttp2).
 
-``HttpProtocol`` (the ``Connection``) owns the socket, parser session,
-pause/resume, pipeline queue, and timeouts. Per-request flags — keep-alive,
-Accept-Encoding, Expect, HEAD — live on ``RequestExchange``. The handler
-sees ``RequestHandle`` (``c`` / ``w``), not the pooled exchange.
+``HttpProtocol`` owns the socket, parser session, pause/resume, pipeline
+queue, and timeouts. Per-request flags live on ``RequestExchange``. The
+handler sees ``RequestHandle`` (``c`` / ``w``), not the pooled exchange.
 
-H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). URL bytes
-and header fragments go into the current exchange arena. Dispatch walks
-the compiled trie from those bytes (ASCII paths never become a ``str``).
-``Request`` is built only if the handler reads ``c.req``. Query, cookies,
-and host stay lazy on that object.
-
-Lifecycle split (keep-alive GET):
-Cython / C — ``get_buffer`` (reusable bytearray), llhttp/nghttp2, header
-arena, trie walk, ``asyncio.Task`` construction, ``respond()`` writelines
-(compression / content-type), timeouts, recycle.
-Python — ``async def`` handler, ``on_handler_done`` on failure, ``app.tasks``
-when the handler actually suspends. Writes re-enter C via ``respond()``.
-
-Header, idle, and body-stall timeouts share one cleanup path. Under Server
-that path is the Date-header tick (once a second): one ``loop.time()``, then
-compare stored deadlines. Tests and raw ``create_server`` use a fallback
-sweeper at the same period. See ``stario_cython.timeouts``.
+H1 vs H2 is chosen once (TLS ALPN or the cleartext H2 preface). Timeouts:
+``stario_cython.timeouts``.
 """
 
 import asyncio
@@ -201,12 +185,12 @@ cdef enum:
     H2_STREAM_UPDATE_THRESH = 256 * 1024
     H2_CONN_UPDATE_THRESH = 512 * 1024
     H2_MAX_CONCURRENT = 256
-    # Rapid-reset: nghttp2 defaults 1000 burst / 33 per second. An app
-    # server is not a CDN — keep the refill, shrink the bucket.
+    # Rapid-reset: nghttp2 defaults 1000 burst / 33 per second.
+    # Keep the refill, shrink the bucket.
     H2_RST_BURST = 100
     H2_RST_RATE = 33
-    # RFC 7541 / nghttp2 default. Advertising 0 is a HPACK-bomb hedge some
-    # intermediaries reject; 4KiB is the spec default.
+    # RFC 7541 / nghttp2 default. Advertising 0 is rejected by some
+    # intermediaries; 4KiB is the spec default.
     H2_HEADER_TABLE_SIZE = 4096
     # w.drain() on HTTP/2 waits while a stream has more unsent DATA than
     # this, and wakes once nghttp2 has sent it down to the low mark.
@@ -667,6 +651,8 @@ def _stop_timeout_sweeper(loop, connections):
 
 
 cdef class CHttpProtocol(Connection):
+    """asyncio connection: socket, parser, pipeline queue, and timeouts."""
+
     cdef llhttp_t* parser
     cdef public object loop
     cdef object app
@@ -1058,7 +1044,7 @@ cdef class CHttpProtocol(Connection):
         """Store a header or idle deadline on the connection.
 
         The sweeper compares ``timeout_deadline`` to one ``loop.time()``
-        per wake. wrk keep-alive is a double store, not ``call_later``.
+        per wake. Keep-alive is a double store, not ``call_later``.
         """
         if self.timeout_cleanup == CLEANUP_OFF:
             return
@@ -1066,7 +1052,7 @@ cdef class CHttpProtocol(Connection):
             return
         self.timeout_kind = kind
         # Sweeper fills now+seconds on the next Date tick. Avoid loop.time()
-        # on the keep-alive hot path (every wrk GET).
+        # on every keep-alive request.
         self.timeout_deadline = 0.0
 
     cdef void _cancel_timeout(self):
@@ -1184,8 +1170,8 @@ cdef class CHttpProtocol(Connection):
         Unfinished headers (or a keep-alive 413 drain) get HEADER. A pump
         that left the HTTP/1 connection empty with no timer — protocol
         413/431 never goes through ``response_completed`` — gets IDLE.
-        Full wrk requests dispatch inside the pump, so HEADER is a no-op
-        on that hot path.
+        Full keep-alive requests dispatch inside the pump, so HEADER is a
+        no-op on that path.
         """
         if self.header_timeout_reset:
             self.header_timeout_reset = False
@@ -1488,7 +1474,7 @@ cdef class CHttpProtocol(Connection):
     cdef void _on_message_begin(self) noexcept:
         if self.rejected:
             return
-        # Pool miss: constructing an exchange can raise. Keepalive reuse
+        # Pool miss: constructing an exchange can raise. Keep-alive reuse
         # in ``_take_exchange`` is noexcept.
         try:
             self.reading_exchange = self._take_exchange()
@@ -1558,8 +1544,7 @@ cdef class CHttpProtocol(Connection):
             (flags & F_CHUNKED) != 0
             or ((flags & F_CONTENT_LENGTH) != 0 and content_length > 0)
         )
-        # Keep-alive is an exchange flag. Recycle resets it, so callers that
-        # still need the value after handler_finished() must snapshot first.
+        # Recycle resets this; snapshot first if the connection still needs it.
         exchange._keep_alive = (
             llhttp_should_keep_alive(self.parser) != 0
             or (
@@ -1586,7 +1571,7 @@ cdef class CHttpProtocol(Connection):
             exchange._keep_alive = False
         if self.h1_headers_too_large:
             # Keep-alive only when there is no body to drain. A huge POST
-            # after oversize headers would be a read-DoS if we stayed open.
+            # after oversize headers would keep the socket reading forever.
             # Trust llhttp when it says this message cannot be keep-alive
             # (TE-without-chunked is already rejected above).
             self._protocol_error(
@@ -1606,7 +1591,7 @@ cdef class CHttpProtocol(Connection):
             return
         if flags & F_CONTENT_LENGTH and content_length > <uint64_t>self.max_body_bytes:
             # Keep-alive only when the declared body is small enough to drain.
-            # A huge or chunked upload after 413 would be a read-DoS.
+            # A huge or chunked upload after 413 would keep the socket reading.
             if (
                 content_length <= <uint64_t>SMALL_BODY
                 and exchange._keep_alive
@@ -1744,7 +1729,6 @@ cdef class CHttpProtocol(Connection):
                 <int>llhttp_get_http_major(self.parser),
                 <int>llhttp_get_http_minor(self.parser),
             )
-            # H1 keep-alive was set at headers-complete on this exchange.
         exchange._method = method
         exchange._version = version
         exchange._path = None
@@ -1977,14 +1961,14 @@ cdef class CHttpProtocol(Connection):
         if span is not None and self.noop_span is None and exchange.match.pattern:
             span.rename(exchange.match.pattern)
             span.attr("http.route", exchange._route.path)
-        # 4.3 contract: a real asyncio.Task at dispatch (headers-complete for
+        # A real asyncio.Task at dispatch (headers-complete for
         # large/chunked/expect-continue, else message-complete). respond()/end()
         # frees the connection via response_completed; the Task may outlive the
         # response. Incomplete work joins app.tasks so shutdown drain sees it.
         h = exchange.start_handle()
         kw = self._task_kw_eager if eager_start else self._task_kw_lazy
         task = PyObject_Call(_asyncio_Task, (exchange._handler(h, h),), kw)
-        # Recycle counts references to ``h`` to spot user code that kept it.
+        # Drop the local so recycle can tell whether the handler kept ``c``.
         h = None
         exchange._handler_task = task
         if _task_done(task):
@@ -2050,7 +2034,6 @@ cdef class CHttpProtocol(Connection):
         if self._closing():
             self._drop_pending()
             return
-        # User may have set Connection: close on the response Headers.
         conn = exchange.headers.c_get(b"connection")
         if conn is not None and (
             conn == b"close" or conn.lower() == b"close"
@@ -2165,7 +2148,7 @@ cdef class CHttpProtocol(Connection):
 
         if self.rejected:
             return
-        # Keep-alive: never write a second status for this request.
+        # A keep-alive 413/431 already dispatched; do not write a second status.
         if not close_conn and self.request_dispatched:
             return
 
@@ -3247,9 +3230,9 @@ cdef class CHttpProtocol(Connection):
         if want < 1:
             want = 1
         if self._in_buf is None or PyByteArray_GET_SIZE(self._in_buf) < want:
-            # Uninitialized: only pages the kernel actually writes become
-            # resident, so an idle keep-alive connection costs ~a page, not
-            # 64 KiB. We never read past ``nbytes``.
+            # Skip zero-fill: only pages the kernel writes become resident,
+            # so an idle keep-alive connection costs ~a page, not 64 KiB.
+            # We never read past ``nbytes``.
             self._in_buf = PyByteArray_FromStringAndSize(NULL, want)
             self._in_view = memoryview(self._in_buf)
         cap = PyByteArray_GET_SIZE(self._in_buf)

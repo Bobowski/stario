@@ -22,10 +22,9 @@ cdef enum:
     ABORT_TOO_LARGE = 1
     ABORT_DISCONNECTED = 2
     ABORT_TIMEOUT = 3
-    # Bodies up to this size dispatch once complete (body() is already
-    # bytes), and an oversize declared body this small is drained on
-    # keep-alive instead of closing the connection. 256 KiB sits above
-    # API/RPC p90 (~12 KiB) and around p99 (~200 KiB).
+    # Bodies this size dispatch once complete (body() is already bytes).
+    # An oversize declared body this small is drained on keep-alive
+    # instead of closing the connection.
     SMALL_BODY = 256 * 1024
 
 # ``scan_request_path`` result bits (a negative result means 400).
@@ -132,7 +131,7 @@ cdef Request make_request(
 )
 
 cdef class Connection:
-    """Connection (asyncio.Protocol) surface. Per-request flags live on RequestExchange."""
+    """``cdef`` hooks implemented by ``CHttpProtocol``. Per-request flags live on RequestExchange."""
     cdef public int timeout_cleanup
     cdef void release_exchange(self, RequestExchange exchange)
     cdef void response_completed(self, RequestExchange exchange)
@@ -280,9 +279,8 @@ cdef class RequestExchange:
     cdef object _path
     cdef object _version
     cdef object _target_host
-    # HTTP/1 keep-alive for this request. Set at headers-complete. Recycle
-    # resets it — snapshot before handler_finished() if the connection still
-    # needs the value (413/431 drain).
+    # HTTP/1 keep-alive for this request. Set at headers-complete.
+    # Recycle resets it; snapshot first if the connection still needs it.
     cdef bint _keep_alive
     cdef int _path_flags
     # Protocol-level answer (keep-alive 413/431) sent in order at dispatch.
@@ -339,7 +337,6 @@ cdef class RequestExchange:
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef object _handler_task
-    # The request method was HEAD.
     cdef bint _head_request
     # No body bytes follow the response headers (HEAD, or write_headers(body=False)).
     cdef bint _skip_body

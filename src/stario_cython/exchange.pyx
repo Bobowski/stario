@@ -1,18 +1,8 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
-"""One request's lifecycle: headers, arena-backed request, body, and response.
+"""Pooled request/response state, plus the ``c`` / ``w`` given to one handler.
 
-Ownership (three objects, no overlap of duties):
-
-* ``Connection`` / ``HttpProtocol`` — the asyncio connection: socket, parser
-  session, pause/resume, pipeline queue, timeouts. One per TCP/TLS socket.
-* ``RequestExchange`` — one HTTP request/response on that connection. Holds
-  keep-alive, Accept-Encoding, Expect, HEAD, body, writer, and H2 stream
-  state. Pooled (connection idle slot, then this thread's spare list).
-* ``RequestHandle`` — the ``c`` / ``w`` given to one handler call. Thin
-  facade; finished once the exchange recycles.
-
-``Request`` is not pooled: it is built only if the handler reads ``c.req``.
-Query and cookies stay unset until the handler reads them.
+Socket and parsing live in ``protocol``. ``Request`` is built only if the
+handler reads ``c.req``. Query and cookies stay lazy on that object.
 """
 
 cimport cython
@@ -141,8 +131,7 @@ cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
 cdef int STREAM_CHUNK_CL = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
-# Same-OS-thread spare only. Keep-alive reuse is the connection idle slot.
-# 16 covers close-then-accept and H2 stream turnover without hoarding.
+# Same-OS-thread spare. Keep-alive reuse is the connection idle slot.
 cdef int POOL_MAX = 16
 cdef int REQUEST_NAME_MAX = 256
 cdef int REQUEST_ARENA_RETAIN_MAX = 8 * 1024
@@ -186,8 +175,7 @@ cdef extern from *:
     #else
     #define STARIO_TLS _Thread_local
     #endif
-    /* Per-OS-thread: recycle uniqueness and the test counter never share a
-       process-global increment (3.14t). */
+    /* Recycle uniqueness and the test counter are per OS thread. */
     static STARIO_TLS Py_ssize_t stario_retained_detaches = 0;
 
     static void stario_note_retained(void) {
@@ -435,8 +423,7 @@ cdef list _build_status_lines():
     return lines
 
 
-# Every status line 100-599, built once (was an HTTPStatus lookup per
-# response for anything but the ten most common codes).
+# Status lines 100-599, built once.
 cdef list _STATUS_LINES = _build_status_lines()
 
 
@@ -1006,12 +993,10 @@ cdef bint _query_name_matches(
 cdef class ParsedQuery:
     """Query index. First read fills C name/value spans.
 
-    Plain ASCII names stay on the original bytes (arena or ``bytes``) with no
-    memcpy. Names that are ASCII ``+`` / ``%XX`` need a private copy so they
-    can decode in place (output never grows; leftover tail is ignored via the
-    stored length). ``get`` memcmps typical ASCII names like headers, then
-    decodes only that value. First ``name=`` wins. ``items`` / ``as_dict`` /
-    ``as_lists`` still decode everything.
+    Names that need no unquote stay on the original bytes. Names with ``+``
+    / ``%XX`` get a private copy so they can decode in place. ``get``
+    memcmps typical ASCII names, then decodes only that value. First
+    ``name=`` wins. ``items`` / ``as_dict`` / ``as_lists`` decode everything.
     """
 
     cdef bytes _raw
@@ -2120,10 +2105,10 @@ cdef Request make_request(
     RequestHeaders headers,
     object body,
 ):
-    """Hot-path constructor. ``__new__`` skips Python ``__init__``.
+    """Build a Request without running ``__init__``.
 
     Query, cookies, and host stay unset. Handlers that never read them
-    (plaintext / JSON GET) never allocate those objects.
+    never allocate those objects.
     """
     cdef Request req = Request.__new__(Request)
     req.method = method
@@ -2137,6 +2122,8 @@ cdef Request make_request(
 
 @cython.final
 cdef class RequestExchange:
+    """Pooled per-request state: parse arena, body, writer, HTTP/2 stream."""
+
     def __cinit__(self):
         self._req_arena = NULL
         self._req_raw_headers = NULL
@@ -2927,7 +2914,7 @@ cdef class RequestExchange:
         self.match = EMPTY_MATCH
         self._clear_request_binding()
         self._clear_request_headers()
-        # No response / upload leftover may survive into the next request.
+        # No leftover from the last response or upload may survive.
         self._completed = False
         self._status_code = -1
         self._skip_body = False
@@ -3031,8 +3018,8 @@ cdef class RequestExchange:
         self._path = None
         self._version = None
         self._target_host = None
-        # Default until headers-complete. Recycle must not be treated as
-        # "this request stays open" — callers snapshot first.
+        # Default until headers-complete. Recycle is not "this request
+        # stays open" — callers that still need the value snapshot first.
         self._keep_alive = True
         self._path_flags = 0
         self._protocol_status = 0
@@ -3139,11 +3126,9 @@ cdef class RequestExchange:
     cdef void _detach_views(self):
         """Cut every per-request object loose from this exchange.
 
-        Runs before the exchange can serve another request. A reference count
-        above our own local means user code still holds the object (a task
-        kept ``c`` / ``w`` / ``c.req`` / ``req.headers``). Those keep working
-        from a private copy; everything else is simply dropped. Either way
-        nothing handed to a handler can observe the next request.
+        A leftover ``c`` / ``w`` / ``c.req`` / ``req.headers`` keeps working
+        from a private copy. Everything else is dropped. Nothing handed to a
+        handler can observe the next request.
         """
         cdef RequestHandle handle = self._handle
         cdef Request request
@@ -3157,8 +3142,7 @@ cdef class RequestExchange:
                 handle._final_status = self._status_code
                 handle._ex = None
             else:
-                # Only this local refers to it: nobody can tell it is reused.
-                # start_handle() rebinds every field.
+                # Only this local refers to it. start_handle() rebinds every field.
                 handle._ex = None
                 handle._state = None
                 self._spare_handle = handle
@@ -3181,7 +3165,7 @@ cdef class RequestExchange:
                 self._spare_view = view
             view = None
         headers = self.headers
-        # Drop the field so uniqueness is "only this local". A task that kept
+        # Drop the field so uniqueness is this local only. A task that kept
         # ``w.headers`` still holds a ref; give the next response its own list.
         self.headers = None
         if headers is not None and not stario_is_unique(headers):
@@ -3194,7 +3178,7 @@ cdef class RequestExchange:
         """Log/abort on failure, then recycle after the handler task."""
         cdef RequestHandle handle = self._handle
         if task is not self._handler_task:
-            # A callback from a request this exchange no longer serves.
+            # Done-callback from a request this exchange no longer serves.
             return
         if handle is not None:
             on_handler_done(handle, handle, task)
@@ -3288,7 +3272,7 @@ cdef class RequestExchange:
     cdef void _done(self):
         if self._body_active and self._consumed_as == CONSUMED_NONE:
             # Response is out; an unread body may buffer again (up to the cap)
-            # so the connection can move on, as before backpressure.
+            # so the connection can move on.
             self._connection.set_body_paused(self, False)
         self._connection.response_completed(self)
         self._maybe_recycle()
@@ -3339,8 +3323,7 @@ cdef class RequestExchange:
             self._h2_respond(body, content_type, status, nbytes)
             return
         # Empty headers + no compression: interned fragments via writev.
-        # No assemble-into-bytearray + copy-to-bytes (uvloop may hold the
-        # last write; interned status/date/CL pieces are stable).
+        # uvloop may hold the last write; interned status/date/CL pieces are stable.
         if h.c_empty() and (
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
@@ -3838,11 +3821,7 @@ cdef class RequestExchange:
         if self._abort_reason == ABORT_TOO_LARGE:
             raise RequestBodyError(413, "Request body too large")
         if self._abort_reason == ABORT_TIMEOUT:
-            raise RequestBodyError(
-                408,
-                "Request timeout: body upload too slow. "
-                "This may indicate a slowloris attack or very poor connection.",
-            )
+            raise RequestBodyError(408, "Request timeout: body upload too slow.")
         if self._abort_reason == ABORT_DISCONNECTED:
             raise ClientDisconnected()
 
@@ -3855,7 +3834,7 @@ cdef class RequestExchange:
         self._stall_seen = self._stall_touch
 
     cdef void _reset_stall_timer(self) noexcept:
-        """Arm/refresh slowloris stall timeout while a body consumer is waiting.
+        """Refresh the body-read deadline while ``body()`` or ``stream()`` is waiting.
 
         Sweep mode only bumps a generation counter. The connection sweeper
         stores ``now + timeout`` once per wake — body chunks do not call
@@ -3931,7 +3910,7 @@ cdef class RequestExchange:
         new_total = self._total_read + <Py_ssize_t>length
         # Discard leftover DATA on HTTP/2, or a bounded HTTP/1 body after a
         # keep-alive 413, without closing the socket. Unknown-length HTTP/1
-        # overflow after the handler finished still closes (read-DoS).
+        # overflow after the handler finished still closes.
         if self._discard_body:
             if (
                 self._http2
@@ -3980,8 +3959,8 @@ cdef class RequestExchange:
             return 0
         # body(): refresh stall on progress; wake on complete/abort, and also
         # when over the high-water mark so the waiter can unpause the transport.
-        # Without that, _pump_data keeps ingesting parser quantums and wrk's
-        # 32 connections dump full 2MB bodies without yielding.
+        # Without that, _pump_data keeps ingesting parser quantums and a
+        # slow consumer never yields.
         if self._waiting:
             self._reset_stall_timer()
         self._maybe_pause()
@@ -4120,7 +4099,7 @@ cdef class RequestExchange:
                     raise StarioRuntime(BODY_GONE_ERROR)
             if self._body_complete:
                 return
-            # About to wait for bytes: reading must be on, or nothing arrives.
+            # Reading must be on before we wait, or nothing arrives.
             self._connection.set_body_paused(self, False)
             await self._wait_for_body_data()
 
@@ -4175,11 +4154,11 @@ cdef class RequestExchange:
 @cython.final
 @cython.freelist(64)
 cdef class RequestHeaders:
-    """Read-only request headers for one request.
+    """Read-only request headers (``c.req.headers``).
 
     While the handler runs this reads the exchange arena in place. When the
     exchange is recycled and this view is still referenced, it copies the
-    arena and header table so it keeps answering for *its* request.
+    arena and header table so it keeps answering for this request.
     """
 
     def __cinit__(self):
@@ -4570,11 +4549,9 @@ cdef inline void _raise_finished() except *:
 cdef class RequestHandle:
     """``c`` and ``w`` for one handler call (one object implements both).
 
-    The pooled exchange behind it serves many requests; this handle belongs to
-    exactly one. After the handler returns and the exchange is recycled, the
-    handle is *finished*: writes raise, ``end()`` / ``abort()`` are no-ops
-    (as on any completed writer), and reads (``req``, ``match``, ``state``,
-    ``span``, ``status_code``) keep describing this request.
+    After the handler returns and the exchange is recycled, writes raise,
+    ``end()`` / ``abort()`` are no-ops, and reads (``req``, ``match``,
+    ``state``, ``span``, ``status_code``) keep describing this request.
     """
 
     def __cinit__(self):
@@ -4583,8 +4560,6 @@ cdef class RequestHandle:
         self._state = None
         self._req = None
         self._final_status = -1
-
-    # --- Context ---------------------------------------------------------
 
     @property
     def req(self):
@@ -4623,8 +4598,6 @@ cdef class RequestHandle:
 
     def alive(self, source=None):
         return _Alive(self, source)
-
-    # --- Writer ----------------------------------------------------------
 
     @property
     def headers(self):
@@ -4678,11 +4651,11 @@ cdef class RequestHandle:
     async def drain(self):
         """Wait until the client has taken enough of what was written.
 
-        Returns at once while the connection accepts data. After a large
-        ``write()`` on a slow client it waits for the transport (and, on
-        HTTP/2, this stream's flow-control window) to drain. Returns
-        immediately if the connection is gone or the request has finished;
-        check ``w.closing`` to stop producing.
+        ``write()`` never blocks, so a loop writing large chunks to a slow
+        client would buffer everything in memory. ``await w.drain()`` after
+        each chunk keeps that bounded. Returns immediately while the
+        connection keeps up, or once it is closed (check ``closing``).
+        On HTTP/2 this also waits for this stream's flow-control window.
         """
         cdef RequestExchange ex = self._ex
         cdef object waiter

@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any
 
-# Runtime base is asyncio.BufferedProtocol; data_received is implemented too,
+# Runtime base is asyncio.BufferedProtocol. data_received is implemented too,
 # so the class also satisfies asyncio.Protocol.
 class HttpProtocol(asyncio.Protocol):
     loop: asyncio.AbstractEventLoop
