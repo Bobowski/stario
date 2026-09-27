@@ -14,10 +14,11 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   protocol is gone. `stario serve` uses the compiled protocol.
 - **Stario is a compiled package.** PyPI ships wheels for Linux (x86_64,
   aarch64; glibc) and macOS (arm64) on CPython 3.12–3.14 and 3.14t, with
-  nghttp2 and Brotli bundled. Other platforms build from the sdist and need
-  a C compiler, `pkg-config`, and the nghttp2 (1.66+) and Brotli development
-  packages. Windows and musl are not supported. An older distro nghttp2 that
-  carries the security backports builds with `STARIO_ALLOW_OLD_NGHTTP2=1`.
+  nghttp2, Brotli, and zstd bundled. Other platforms build from the sdist and
+  need a C compiler, `pkg-config`, and the nghttp2 (1.66+), Brotli, and zstd
+  development packages. Windows and musl are not supported. An older distro
+  nghttp2 that carries the security backports builds with
+  `STARIO_ALLOW_OLD_NGHTTP2=1`.
 - `stario_cython.request` is gone; import `Request` from `stario.http.request`
   (typing) or `stario_cython.exchange`.
 - `Headers`, `ParsedQuery`, `ParsedCookies`, and `Request` are typed as the
@@ -85,9 +86,6 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 - **HTTP/2 graceful drain.** Shutdown sends GOAWAY with the last processed
   stream; in-flight streams finish, new ones are refused, and the connection
   closes when nghttp2 is done (also after a client GOAWAY).
-- Dynamic responses compress with `br` or `gzip` only. `zstd` is still
-  served for precompressed `Files` / `Assets` variants; the `zstd_*`
-  `CompressionConfig` fields apply only there.
 - Idle keep-alive connections hold ~8 KiB instead of ~69 KiB (the read
   buffer is no longer zero-filled).
 - Each header field counts 32 bytes toward `max_header_bytes` (RFC 7541
@@ -97,6 +95,9 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ### Added
 
+- Native `zstd` on the Cython writer (`libzstd`), negotiated
+  `br` → `zstd` → `gzip` like Python `CompressionConfig`. Wheels bundle
+  libzstd; source builds need `libzstd-dev` (or `brew install zstd`).
 - `await w.drain()` — write-side backpressure for streaming handlers.
   `write()` never blocks; `drain()` waits while the transport has paused
   writing or an HTTP/2 stream has more than 256 KiB of unsent DATA, and

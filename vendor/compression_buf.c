@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include <zstd.h>
 
 #ifndef STARIO_BROTLI_HTTP_WINDOW
 #define STARIO_BROTLI_HTTP_WINDOW 18
@@ -29,6 +30,15 @@ struct StarioGzip {
     int window_bits;
 };
 
+struct StarioZstd {
+    ZSTD_CCtx* cctx;
+    unsigned char* out;
+    size_t out_cap;
+    int finished;
+    int level;
+    int window_log;
+};
+
 #define STARIO_CODEC_POOL_MAX 32
 #define STARIO_RETAINED_OUTPUT_MAX (64 * 1024)
 
@@ -44,6 +54,8 @@ static STARIO_TLS StarioBrotli* brotli_pool[STARIO_CODEC_POOL_MAX];
 static STARIO_TLS size_t brotli_pool_count = 0;
 static STARIO_TLS StarioGzip* gzip_pool[STARIO_CODEC_POOL_MAX];
 static STARIO_TLS size_t gzip_pool_count = 0;
+static STARIO_TLS StarioZstd* zstd_pool[STARIO_CODEC_POOL_MAX];
+static STARIO_TLS size_t zstd_pool_count = 0;
 
 static void trim_output(unsigned char** out, size_t* cap) {
     if (*cap > STARIO_RETAINED_OUTPUT_MAX) {
@@ -417,5 +429,175 @@ void stario_gzip_release(StarioGzip* gzip) {
         gzip_pool[gzip_pool_count++] = gzip;
     } else {
         stario_gzip_free(gzip);
+    }
+}
+
+static int zstd_start(StarioZstd* zstd, int level, int window_log) {
+    if (zstd->cctx == NULL) {
+        zstd->cctx = ZSTD_createCCtx();
+        if (zstd->cctx == NULL) {
+            return -1;
+        }
+    } else if (ZSTD_isError(
+        ZSTD_CCtx_reset(zstd->cctx, ZSTD_reset_session_and_parameters)
+    )) {
+        return -1;
+    }
+    zstd->finished = 0;
+    if (ZSTD_isError(
+        ZSTD_CCtx_setParameter(zstd->cctx, ZSTD_c_compressionLevel, level)
+    )) {
+        return -1;
+    }
+    /* 0 keeps libzstd's default window for this level. */
+    if (
+        window_log > 0 &&
+        ZSTD_isError(
+            ZSTD_CCtx_setParameter(zstd->cctx, ZSTD_c_windowLog, window_log)
+        )
+    ) {
+        return -1;
+    }
+    zstd->level = level;
+    zstd->window_log = window_log;
+    return 0;
+}
+
+static int zstd_emit(
+    StarioZstd* zstd,
+    ZSTD_EndDirective end_op,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    ZSTD_inBuffer input;
+    ZSTD_outBuffer output;
+    size_t used = 0;
+    size_t remaining;
+    size_t previous_in;
+    size_t previous_used;
+
+    if (
+        zstd == NULL || zstd->cctx == NULL || zstd->finished ||
+        out == NULL || out_len == NULL ||
+        (in == NULL && in_len != 0)
+    ) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+
+    input.src = in;
+    input.size = in_len;
+    input.pos = 0;
+
+    for (;;) {
+        if (
+            used == zstd->out_cap &&
+            grow_buffer(&zstd->out, &zstd->out_cap, used) != 0
+        ) {
+            return -1;
+        }
+        output.dst = zstd->out;
+        output.size = zstd->out_cap;
+        output.pos = used;
+        previous_in = input.pos;
+        previous_used = used;
+        remaining = ZSTD_compressStream2(zstd->cctx, &output, &input, end_op);
+        if (ZSTD_isError(remaining)) {
+            return -1;
+        }
+        used = output.pos;
+        if (end_op == ZSTD_e_end) {
+            if (remaining == 0) {
+                zstd->finished = 1;
+                break;
+            }
+        } else if (input.pos == input.size && remaining == 0) {
+            break;
+        }
+        if (input.pos == previous_in && used == previous_used) {
+            return -1;
+        }
+    }
+    *out = zstd->out;
+    *out_len = used;
+    return 0;
+}
+
+StarioZstd* stario_zstd_new(int level, int window_log) {
+    StarioZstd* zstd = (StarioZstd*)calloc(1, sizeof(StarioZstd));
+    if (zstd == NULL || zstd_start(zstd, level, window_log) != 0) {
+        if (zstd != NULL) {
+            ZSTD_freeCCtx(zstd->cctx);
+        }
+        free(zstd);
+        return NULL;
+    }
+    return zstd;
+}
+
+StarioZstd* stario_zstd_acquire(int level, int window_log) {
+    StarioZstd* zstd;
+    size_t i;
+    for (i = 0; i < zstd_pool_count; i++) {
+        zstd = zstd_pool[i];
+        if (zstd->level == level && zstd->window_log == window_log) {
+            zstd_pool[i] = zstd_pool[--zstd_pool_count];
+            if (
+                zstd->cctx != NULL &&
+                !ZSTD_isError(
+                    ZSTD_CCtx_reset(zstd->cctx, ZSTD_reset_session_only)
+                )
+            ) {
+                zstd->finished = 0;
+                return zstd;
+            }
+            stario_zstd_free(zstd);
+            return NULL;
+        }
+    }
+    return stario_zstd_new(level, window_log);
+}
+
+int stario_zstd_block_borrowed(
+    StarioZstd* zstd,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    return zstd_emit(zstd, ZSTD_e_flush, in, in_len, out, out_len);
+}
+
+int stario_zstd_finish_borrowed(
+    StarioZstd* zstd,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    return zstd_emit(zstd, ZSTD_e_end, in, in_len, out, out_len);
+}
+
+void stario_zstd_free(StarioZstd* zstd) {
+    if (zstd == NULL) {
+        return;
+    }
+    ZSTD_freeCCtx(zstd->cctx);
+    free(zstd->out);
+    free(zstd);
+}
+
+void stario_zstd_release(StarioZstd* zstd) {
+    if (zstd == NULL) {
+        return;
+    }
+    trim_output(&zstd->out, &zstd->out_cap);
+    if (zstd_pool_count < STARIO_CODEC_POOL_MAX) {
+        zstd_pool[zstd_pool_count++] = zstd;
+    } else {
+        stario_zstd_free(zstd);
     }
 }

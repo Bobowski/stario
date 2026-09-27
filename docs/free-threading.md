@@ -272,13 +272,13 @@ not add locks.
 | Site | Status |
 | --- | --- |
 | `exchange.pyx` exchange spare | Done. One idle `RequestExchange` stays on the connection (keep-alive). Overflow goes to a small `threading.local()` list (`POOL_MAX=16`) via `release_exchange` → `detach` / `recycle`. Same-OS-thread only — 3.14t never shares an exchange across loops. No process-global list. Recycle uniqueness and `_retained_detach_count` are `_Thread_local`. |
-| `vendor/compression_buf.c` `brotli_pool[]` / `gzip_pool[]` | Done. `_Thread_local` arrays (`STARIO_CODEC_POOL_MAX=32`). No process-global free-list. |
+| `vendor/compression_buf.c` `brotli_pool[]` / `zstd_pool[]` / `gzip_pool[]` | Done. `_Thread_local` arrays (`STARIO_CODEC_POOL_MAX=32`). No process-global free-list. |
 | `protocol.pyx` URL cache `_UC_*` | Gone. The compiled `CRouter` trie is the lookup path; no C URL table. |
 | `_bind_settings()` / `_SETTINGS` | Done. Init once under `threading.Lock`, then immutable. |
 | `HttpProtocol.connections` | Per-loop set (Date-tick sweeper walks that loop's set only). |
 | `date_box` | Per-loop box. |
 | `llhttp` / `nghttp2` session | Per-`HttpProtocol` — OK **if** the protocol never runs on two threads. Affinity is the invariant. |
-| Brotli/gzip state on `RequestExchange` | Per-exchange — OK with affinity. Do not share an encoder. |
+| Brotli/zstd/gzip state on `RequestExchange` | Per-exchange — OK with affinity. Do not share an encoder. |
 
 **Fix shape for pools:** thread-local pools (best: no lock on the
 recycle path, matches affinity) or a `PyMutex` around the global pool.

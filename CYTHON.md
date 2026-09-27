@@ -9,12 +9,11 @@ Multi-threaded free-threaded runtime (`STARIO_THREADS`, `SO_REUSEPORT`):
 [`docs/free-threading.md`](docs/free-threading.md).
 
 Building needs `pkg-config`, nghttp2 1.66+ (older distro builds that carry
-the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), and Brotli
-development packages (`libnghttp2-dev libbrotli-dev` on Debian/Ubuntu,
-`brew install pkg-config nghttp2 brotli` on macOS). Gzip links system zlib
-(`-lz`). Published wheels bundle nghttp2 and Brotli
-(`scripts/build-native-deps.sh`). The native protocol offers `br` and `gzip`
-only; Python response helpers still negotiate zstd for non-native writers.
+the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), Brotli, and zstd
+development packages (`libnghttp2-dev libbrotli-dev libzstd-dev` on
+Debian/Ubuntu, `brew install pkg-config nghttp2 brotli zstd` on macOS).
+Gzip links system zlib (`-lz`). Published wheels bundle nghttp2, Brotli,
+and zstd (`scripts/build-native-deps.sh`).
 
 ```bash
 uv sync --all-extras          # editable install; compiles the extensions
@@ -99,8 +98,8 @@ Granian (LRU always hot). This capture is the honest one.
 - Timeouts share the Date-header tick (header 5s, idle 5s, body-stall 30s,
   pipeline cap 8). Hatch: `STARIO_CYTHON_TIMEOUTS=off`.
 - Optional uvloop (`STARIO_LOOP=uvloop`). TLS ALPN `h2` then `http/1.1`.
-  Native compress is **br** and **gzip** (system zlib). Official benches
-  turn compression off.
+  Native compress is **br**, **zstd**, and **gzip** (system zlib). Official
+  benches turn compression off.
 - Official suite shape: static GET, one interpolating request-fields GET,
   async uploads (`await asyncio.sleep(0)`) from small JSON through 2MB
   buffer / stream / multipart. Both Stario runner targets are Cython.
@@ -185,10 +184,8 @@ compiled from them. Do not revive:
 - static / pre-serialized handlers
 - pooled / reset `Request` objects
 
-Native zstd is not offered (precompressed `Files` / `Assets` variants
-still serve it). picohttpparser
-is not the H1 parser: parser-only it is ~2.5–3.3× llhttp, but end-to-end
-GET was even and a tiny JSON POST was slower.
+picohttpparser is not the H1 parser: parser-only it is ~2.5–3.3× llhttp,
+but end-to-end GET was even and a tiny JSON POST was slower.
 
 ### Not working / known holes
 

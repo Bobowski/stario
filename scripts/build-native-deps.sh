@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the native libraries stario links (nghttp2, Brotli) into PREFIX.
+# Build the native libraries stario links (nghttp2, Brotli, zstd) into PREFIX.
 # Used by cibuildwheel: manylinux ships an nghttp2 without
 # nghttp2_option_set_max_continuations, and Homebrew bottles target the
 # runner's macOS rather than MACOSX_DEPLOYMENT_TARGET.
@@ -8,6 +8,7 @@ set -euo pipefail
 PREFIX="${1:-/usr/local}"
 NGHTTP2_VERSION="1.70.0"
 BROTLI_VERSION="1.2.0"
+ZSTD_VERSION="1.5.7"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 
 SUDO=""
@@ -43,4 +44,18 @@ cmake -S "brotli-${BROTLI_VERSION}" -B brotli-build \
 cmake --build brotli-build -j"$JOBS" >/dev/null
 cmake --install brotli-build >/dev/null
 
-PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion libnghttp2 libbrotlienc
+curl -fsSL -o zstd.tar.gz \
+  "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz"
+tar xf zstd.tar.gz
+cmake -S "zstd-${ZSTD_VERSION}/build/cmake" -B zstd-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DZSTD_BUILD_PROGRAMS=OFF \
+  -DZSTD_BUILD_TESTS=OFF \
+  -DZSTD_BUILD_STATIC=OFF \
+  -DZSTD_BUILD_SHARED=ON >/dev/null
+cmake --build zstd-build -j"$JOBS" >/dev/null
+cmake --install zstd-build >/dev/null
+
+PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion libnghttp2 libbrotlienc libzstd

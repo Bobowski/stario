@@ -40,3 +40,23 @@ cdef extern from "compression_buf.h":
         size_t* out_len,
     )
     void stario_gzip_release(StarioGzip* gzip)
+
+    ctypedef struct StarioZstd:
+        pass
+
+    StarioZstd* stario_zstd_acquire(int level, int window_log)
+    int stario_zstd_block_borrowed(
+        StarioZstd* zstd,
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
+    int stario_zstd_finish_borrowed(
+        StarioZstd* zstd,
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
+    void stario_zstd_release(StarioZstd* zstd)

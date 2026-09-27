@@ -3,6 +3,7 @@ import gzip
 
 import brotli
 import pytest
+import zstandard as zstd
 
 import stario.cookies as cookies
 from stario import App, Route
@@ -73,6 +74,15 @@ def test_headers_unsafe_bytes():
             ),
         ),
         (
+            b"zstd",
+            CompressionConfig(
+                min_size=0,
+                brotli_level=-1,
+                zstd_level=3,
+                gzip_level=-1,
+            ),
+        ),
+        (
             b"gzip",
             CompressionConfig(
                 min_size=0,
@@ -114,6 +124,8 @@ async def test_exchange_respond_native_compression_round_trip(
             assert b"content-encoding: " + encoding + b"\r\n" in header + b"\r\n"
             if encoding == b"br":
                 decoded = brotli.decompress(compressed_body)
+            elif encoding == b"zstd":
+                decoded = zstd.decompress(compressed_body)
             else:
                 decoded = gzip.decompress(compressed_body)
             assert decoded == body
@@ -186,6 +198,10 @@ async def test_one_shot_compression_writes_generated_headers_without_dict_roundt
         (b"gzip;q=1, br;q=0.5", b"gzip"),
         (b"gzip;q=0.5, br;q=0.5", b"br"),
         (b"BR;Q=1", b"br"),
+        (b"gzip, zstd", b"zstd"),
+        (b"zstd;q=0.5, gzip;q=0.5", b"zstd"),
+        (b"zstd, br", b"br"),
+        (b"ZSTD;Q=1", b"zstd"),
         (b"*;q=0.8, identity;q=1", None),
     ],
 )
@@ -207,7 +223,7 @@ async def test_native_compression_qvalue_negotiation(
         compression=CompressionConfig(
             min_size=0,
             brotli_level=4,
-            zstd_level=-1,
+            zstd_level=3,
             gzip_level=6,
         ),
     ) as port:
@@ -422,6 +438,60 @@ async def test_exchange_sse_brotli_flushes_each_write() -> None:
                 decoded.append(decoder.process(chunk))
             assert b"".join(decoded) == b"data: 0\n\ndata: 1\n\n"
             assert decoder.is_finished()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_exchange_sse_zstd_flushes_each_write() -> None:
+    app = App()
+    first_written = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def stream(_c, w):
+        w.headers.set("content-type", "text/event-stream")
+        w.write_headers(200)
+        w.write(b"data: 0\n\n")
+        first_written.set()
+        await release_second.wait()
+        w.write(b"data: 1\n\n")
+        w.end()
+
+    app.add(Route("GET /stream"), stream)
+    async with running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(
+            brotli_level=-1,
+            zstd_level=3,
+            gzip_level=-1,
+        ),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET /stream HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: zstd\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            header = await reader.readuntil(b"\r\n\r\n")
+            assert b"content-encoding: zstd\r\n" in header
+            assert b"transfer-encoding: chunked\r\n" in header
+
+            await first_written.wait()
+            first_chunk = await read_chunk(reader)
+            assert first_chunk
+            decoder = zstd.ZstdDecompressor().decompressobj()
+            decoded = [decoder.decompress(first_chunk)]
+            assert decoded == [b"data: 0\n\n"]
+
+            release_second.set()
+            while chunk := await read_chunk(reader):
+                decoded.append(decoder.decompress(chunk))
+            assert b"".join(decoded) == b"data: 0\n\ndata: 1\n\n"
         finally:
             writer.close()
             await writer.wait_closed()

@@ -49,6 +49,7 @@ from stario.http.compression import (
     DEFAULT_BROTLI_LEVEL,
     DEFAULT_GZIP_LEVEL,
     DEFAULT_MIN_SIZE,
+    DEFAULT_ZSTD_LEVEL,
     content_type_is_compressible,
 )
 from stario.http.context import EMPTY_MATCH, _Alive
@@ -57,6 +58,7 @@ from stario.http.invoke import on_handler_done
 from stario_cython.compression_buf cimport (
     StarioBrotli,
     StarioGzip,
+    StarioZstd,
     stario_brotli_block_borrowed,
     stario_brotli_acquire,
     stario_brotli_finish_borrowed,
@@ -65,6 +67,10 @@ from stario_cython.compression_buf cimport (
     stario_gzip_acquire,
     stario_gzip_finish_borrowed,
     stario_gzip_release,
+    stario_zstd_block_borrowed,
+    stario_zstd_acquire,
+    stario_zstd_finish_borrowed,
+    stario_zstd_release,
 )
 include "headers.pxi"
 include "router.pxi"
@@ -147,7 +153,8 @@ cdef int CONSUMED_STREAM = 2
 
 cdef int ENCODING_NONE = 0
 cdef int ENCODING_BR = 1
-cdef int ENCODING_GZIP = 2
+cdef int ENCODING_ZSTD = 2
+cdef int ENCODING_GZIP = 3
 
 cdef bytes CT_PREFIX = b"content-type: "
 cdef bytes CE_PREFIX = b"content-encoding: "
@@ -372,6 +379,8 @@ cdef int _parse_qvalue(
 cdef inline object _encoding_wire(int enc) noexcept:
     if enc == ENCODING_BR:
         return b"br"
+    if enc == ENCODING_ZSTD:
+        return b"zstd"
     return b"gzip"
 
 
@@ -2133,6 +2142,7 @@ cdef class RequestExchange:
         self._req_cookie_index = -1
         self._req_authorization_index = -1
         self._brotli = NULL
+        self._zstd = NULL
         self._gzip = NULL
         self._out_buf = None
         self._out_len = 0
@@ -2180,6 +2190,7 @@ cdef class RequestExchange:
         self._stall_seen = 0
         self._compression = _UNBOUND
         self._brotli_enabled = False
+        self._zstd_enabled = False
         self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
         self.in_pool = False
@@ -2213,9 +2224,12 @@ cdef class RequestExchange:
         cdef object window
         self._brotli_level = DEFAULT_BROTLI_LEVEL
         self._brotli_window = 0
+        self._zstd_level = DEFAULT_ZSTD_LEVEL
+        self._zstd_window = 0
         self._gzip_level = DEFAULT_GZIP_LEVEL
         self._gzip_window = 15
         self._brotli_enabled = False
+        self._zstd_enabled = False
         self._gzip_enabled = False
         self._compress_min_size = DEFAULT_MIN_SIZE
         if compression is None:
@@ -2224,11 +2238,15 @@ cdef class RequestExchange:
         self._brotli_level = compression.brotli_level
         window = compression.brotli_window_log
         self._brotli_window = 0 if window is None else window
+        self._zstd_level = compression.zstd_level
+        window = compression.zstd_window_log
+        self._zstd_window = 0 if window is None else window
         self._gzip_level = compression.gzip_level
         window = compression.gzip_window_bits
         self._gzip_window = 15 if window is None else window
         self._compress_min_size = compression.min_size
         self._brotli_enabled = self._brotli_level >= 0
+        self._zstd_enabled = self._zstd_level >= 0
         self._gzip_enabled = self._gzip_level >= 0
 
     cdef inline int _ensure_brotli(self) except -1:
@@ -2240,6 +2258,17 @@ cdef class RequestExchange:
         )
         if self._brotli == NULL:
             raise StarioError("brotli stream init failed")
+        return 0
+
+    cdef inline int _ensure_zstd(self) except -1:
+        if self._zstd != NULL:
+            return 0
+        self._zstd = stario_zstd_acquire(
+            self._zstd_level,
+            self._zstd_window,
+        )
+        if self._zstd == NULL:
+            raise StarioError("zstd stream init failed")
         return 0
 
     cdef inline int _ensure_gzip(self) except -1:
@@ -2257,6 +2286,9 @@ cdef class RequestExchange:
         if self._brotli != NULL:
             stario_brotli_release(self._brotli)
             self._brotli = NULL
+        if self._zstd != NULL:
+            stario_zstd_release(self._zstd)
+            self._zstd = NULL
         if self._gzip != NULL:
             stario_gzip_release(self._gzip)
             self._gzip = NULL
@@ -2505,6 +2537,13 @@ cdef class RequestExchange:
             ) != 0:
                 raise StarioError("brotli compression failed")
             return 0
+        if encoding == b"zstd":
+            self._ensure_zstd()
+            if stario_zstd_finish_borrowed(
+                self._zstd, <const unsigned char*>ptr, n, out, out_len
+            ) != 0:
+                raise StarioError("zstd compression failed")
+            return 0
         self._ensure_gzip()
         if stario_gzip_finish_borrowed(
             self._gzip, <const unsigned char*>ptr, n, out, out_len
@@ -2536,6 +2575,11 @@ cdef class RequestExchange:
                 self._brotli, <const unsigned char*>ptr, n, out, out_len
             ) != 0:
                 raise StarioError("brotli stream failed")
+        elif self._zstd != NULL:
+            if stario_zstd_block_borrowed(
+                self._zstd, <const unsigned char*>ptr, n, out, out_len
+            ) != 0:
+                raise StarioError("zstd stream failed")
         elif self._gzip != NULL:
             if stario_gzip_block_borrowed(
                 self._gzip, <const unsigned char*>ptr, n, out, out_len
@@ -2553,6 +2597,12 @@ cdef class RequestExchange:
                 self._brotli, NULL, 0, out, out_len
             ) != 0:
                 raise StarioError("brotli finish failed")
+            return 1
+        if self._zstd != NULL:
+            if stario_zstd_finish_borrowed(
+                self._zstd, NULL, 0, out, out_len
+            ) != 0:
+                raise StarioError("zstd finish failed")
             return 1
         if self._gzip != NULL:
             if stario_gzip_finish_borrowed(
@@ -2772,7 +2822,7 @@ cdef class RequestExchange:
                 return -1
             self._req_content_length = parsed
         elif name_length == 15 and memcmp(name, "accept-encoding", 15) == 0:
-            if self._brotli_enabled or self._gzip_enabled:
+            if self._brotli_enabled or self._zstd_enabled or self._gzip_enabled:
                 self._scan_request_accept_encoding(value, value_length)
         self._req_raw_count += 1
         self._req_pending_header = False
@@ -2796,6 +2846,7 @@ cdef class RequestExchange:
         if not self._req_accept_present:
             self._req_accept_present = True
             self._req_br_q = -1
+            self._req_zstd_q = -1
             self._req_gzip_q = -1
             self._req_wildcard_q = -1
             self._req_identity_q = -1
@@ -2854,6 +2905,8 @@ cdef class RequestExchange:
                 param_start = param_end
             if _token_equals(value, start, token_end, "br", 2):
                 self._req_br_q = q
+            elif _token_equals(value, start, token_end, "zstd", 4):
+                self._req_zstd_q = q
             elif _token_equals(value, start, token_end, "gzip", 4):
                 self._req_gzip_q = q
             elif _token_equals(value, start, token_end, "*", 1):
@@ -2971,6 +3024,7 @@ cdef class RequestExchange:
         self._req_content_length = -1
         self._req_accept_present = False
         self._req_br_q = -1
+        self._req_zstd_q = -1
         self._req_gzip_q = -1
         self._req_wildcard_q = -1
         self._req_identity_q = -1
@@ -2979,11 +3033,12 @@ cdef class RequestExchange:
         """Select response encoding from exchange-local request-header state."""
         cdef int wildcard
         cdef int brotli_q
+        cdef int zstd_q
         cdef int gzip_q
         cdef int best_q = 0
         if (
             not self._req_accept_present
-            or not (self._brotli_enabled or self._gzip_enabled)
+            or not (self._brotli_enabled or self._zstd_enabled or self._gzip_enabled)
         ):
             self._req_encoding = ENCODING_NONE
             return
@@ -2993,6 +3048,7 @@ cdef class RequestExchange:
             else 0
         )
         brotli_q = self._req_br_q if self._req_br_q >= 0 else wildcard
+        zstd_q = self._req_zstd_q if self._req_zstd_q >= 0 else wildcard
         gzip_q = (
             self._req_gzip_q
             if self._req_gzip_q >= 0
@@ -3002,6 +3058,9 @@ cdef class RequestExchange:
         if self._brotli_enabled and brotli_q > best_q:
             best_q = brotli_q
             self._req_encoding = ENCODING_BR
+        if self._zstd_enabled and zstd_q > best_q:
+            best_q = zstd_q
+            self._req_encoding = ENCODING_ZSTD
         if self._gzip_enabled and gzip_q > best_q:
             best_q = gzip_q
             self._req_encoding = ENCODING_GZIP
@@ -3493,6 +3552,8 @@ cdef class RequestExchange:
         if allocate:
             if encoding == b"br":
                 self._ensure_brotli()
+            elif encoding == b"zstd":
+                self._ensure_zstd()
             else:
                 self._ensure_gzip()
         headers.c_set(b"content-encoding", encoding)
@@ -3622,7 +3683,7 @@ cdef class RequestExchange:
             else:
                 self._transport.write(data)
             return self
-        if self._brotli != NULL or self._gzip != NULL:
+        if self._brotli != NULL or self._zstd != NULL or self._gzip != NULL:
             if isinstance(data, (list, tuple)):
                 for part in data:
                     _require_bytes_like(part)
@@ -3688,7 +3749,7 @@ cdef class RequestExchange:
             self._done()
             return
         if self._declared_length < 0:
-            if self._brotli != NULL or self._gzip != NULL:
+            if self._brotli != NULL or self._zstd != NULL or self._gzip != NULL:
                 self._finish(&native_out, &native_len)
                 self._write_native_chunk(native_out, native_len)
                 self._free_compressors()

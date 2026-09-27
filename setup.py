@@ -1,7 +1,7 @@
 """Build the Cython HTTP runtime (``stario_cython``).
 
 Native libraries come from pkg-config: nghttp2 1.66+ (MadeYouReset,
-CVE-2025-8671) and Brotli. Gzip links system zlib. llhttp is vendored.
+CVE-2025-8671), Brotli, and zstd. Gzip links system zlib. llhttp is vendored.
 A distro nghttp2 older than 1.66 that carries the security backports can be
 used with ``STARIO_ALLOW_OLD_NGHTTP2=1``.
 
@@ -17,7 +17,7 @@ from Cython.Build import cythonize
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
-_NATIVE_PACKAGES = ("libnghttp2", "libbrotlienc", "libbrotlicommon")
+_NATIVE_PACKAGES = ("libnghttp2", "libbrotlienc", "libbrotlicommon", "libzstd")
 _MIN_NGHTTP2 = (1, 66)
 
 
@@ -32,9 +32,10 @@ def _pkg_config(option: str) -> list[str]:
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise RuntimeError(
-            "Building stario needs pkg-config plus the nghttp2 and Brotli "
-            "development packages (Debian/Ubuntu: libnghttp2-dev libbrotli-dev; "
-            "macOS: brew install pkg-config nghttp2 brotli). "
+            "Building stario needs pkg-config plus the nghttp2, Brotli, and "
+            "zstd development packages (Debian/Ubuntu: libnghttp2-dev "
+            "libbrotli-dev libzstd-dev; macOS: brew install pkg-config "
+            "nghttp2 brotli zstd). "
             f"pkg-config detail: {detail.strip()}"
         ) from exc
     return shlex.split(result.stdout)

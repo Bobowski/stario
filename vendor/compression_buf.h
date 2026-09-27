@@ -5,6 +5,7 @@
 
 typedef struct StarioBrotli StarioBrotli;
 typedef struct StarioGzip StarioGzip;
+typedef struct StarioZstd StarioZstd;
 
 /* Borrowed output is valid until the next call on the same encoder, or free. */
 
@@ -45,5 +46,24 @@ int stario_gzip_finish_borrowed(
 );
 void stario_gzip_free(StarioGzip* gzip);
 void stario_gzip_release(StarioGzip* gzip);
+
+StarioZstd* stario_zstd_new(int level, int window_log);
+StarioZstd* stario_zstd_acquire(int level, int window_log);
+int stario_zstd_block_borrowed(
+    StarioZstd* zstd,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+);
+int stario_zstd_finish_borrowed(
+    StarioZstd* zstd,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+);
+void stario_zstd_free(StarioZstd* zstd);
+void stario_zstd_release(StarioZstd* zstd);
 
 #endif

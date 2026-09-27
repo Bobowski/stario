@@ -235,7 +235,7 @@ Older committed baselines (`baseline-20260827.md` and later) used a single
 - `uv`
 - `wrk`
 - Python compatible with Stario (3.12+)
-- `libbrotli-dev` (or set `BROTLI_PKG_CONFIG`) for `stario-cython`
+- `libbrotli-dev` and `libzstd-dev` (or set `BROTLI_PKG_CONFIG`) for `stario-cython`
 
 Targets that support uvloop use it where applicable (Stario, Sanic, Granian
 RSGI, ASGI stacks). Socketify, Robyn, and Django-Bolt use their own native

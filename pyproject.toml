@@ -59,7 +59,7 @@ include = ["stario", "stario.*", "stario_cython"]
 [tool.setuptools.exclude-package-data]
 stario_cython = ["*.c", "*.pxd", "*.pxi", "*.pyx"]
 
-# Wheels bundle nghttp2 and Brotli built by scripts/build-native-deps.sh
+# Wheels bundle nghttp2, Brotli, and zstd built by scripts/build-native-deps.sh
 # (manylinux ships an nghttp2 that predates the CONTINUATION flood fix).
 [tool.cibuildwheel]
 build = ["cp312-*", "cp313-*", "cp314-*", "cp314t-*"]

@@ -1,7 +1,7 @@
 from libc.stddef cimport size_t
 from libc.stdint cimport int32_t, uint8_t, uint32_t, uint64_t
 
-from stario_cython.compression_buf cimport StarioBrotli, StarioGzip
+from stario_cython.compression_buf cimport StarioBrotli, StarioGzip, StarioZstd
 
 cdef inline void _lower_copy(
     char* dst,
@@ -243,11 +243,13 @@ cdef class RequestExchange:
     cdef Py_ssize_t _req_url_length
     cdef bint _req_accept_present
     cdef int _req_br_q
+    cdef int _req_zstd_q
     cdef int _req_gzip_q
     cdef int _req_wildcard_q
     cdef int _req_identity_q
     cdef public Headers headers
     cdef StarioBrotli* _brotli
+    cdef StarioZstd* _zstd
     cdef StarioGzip* _gzip
     cdef object _out_buf
     cdef Py_ssize_t _out_len
@@ -257,9 +259,12 @@ cdef class RequestExchange:
     cdef bint _close_delimited
     cdef Py_ssize_t _bytes_written
     cdef bint _brotli_enabled
+    cdef bint _zstd_enabled
     cdef bint _gzip_enabled
     cdef int _brotli_level
     cdef int _brotli_window
+    cdef int _zstd_level
+    cdef int _zstd_window
     cdef int _gzip_level
     cdef int _gzip_window
     cdef Py_ssize_t _compress_min_size
@@ -443,6 +448,7 @@ cdef class RequestExchange:
     cdef int _write_native_chunk(self, const unsigned char* data, size_t n) except -1
     cdef int _block_raw(self, const char* ptr, size_t n, const unsigned char** out, size_t* out_len) except -1
     cdef int _ensure_brotli(self) except -1
+    cdef int _ensure_zstd(self) except -1
     cdef int _ensure_gzip(self) except -1
     cdef void _free_compressors(self)
     cdef void _raise_abort(self)
