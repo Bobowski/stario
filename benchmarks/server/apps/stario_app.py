@@ -1,49 +1,74 @@
 # pyright: reportMissingImports=false
 
-import ujson
+try:
+    import ujson
+except ImportError:  # pragma: no cover - bench venvs install ujson
+    import json as ujson
 
-import stario.responses as responses
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    request_line,
+    yield_once,
+)
 from stario import App, Route, Span
 
-HELLO = "Hello, World!"
-JSON_CONTENT_TYPE = b"application/json"
 
-
-def json_response(w, value, status: int = 200) -> None:
-    w.respond(ujson.dumps(value).encode("utf-8"), JSON_CONTENT_TYPE, status)
+def text(w, line: str) -> None:
+    w.respond(line.encode("ascii"), TEXT_CONTENT_TYPE)
 
 
 async def plaintext(c, w):
-    responses.text(w, HELLO)
+    w.respond(PLAINTEXT_BODY, TEXT_CONTENT_TYPE)
 
 
-async def json_endpoint(c, w):
-    json_response(w, {"message": HELLO})
+async def read_request(c, w):
+    text(
+        w,
+        request_line(
+            c.match.params["user_id"],
+            c.req.query.get("q") or "",
+            as_str(c.req.headers.get(REQUEST_HEADER)),
+        ),
+    )
 
 
-async def get_user(c, w):
-    user_id = c.match.params["user_id"]
-    json_response(w, {"id": user_id, "name": f"User {user_id}"})
+async def post_json(c, w):
+    raw = await c.req.body()
+    await yield_once()
+    text(w, json_echo_line(ujson.loads(raw) if raw else {}))
 
 
-async def validate(c, w):
-    body = ujson.loads(await c.req.body())
-    name = body.get("name")
-    age = body.get("age")
+async def ingest_buffer(c, w):
+    body = await c.req.body()
+    await yield_once()
+    text(w, bytes_line(len(body)))
 
-    if not isinstance(name, str) or not name:
-        json_response(w, {"error": "name must be a non-empty string"}, 400)
-        return
-    if not isinstance(age, int) or age < 0 or age > 150:
-        json_response(w, {"error": "age must be an integer between 0 and 150"}, 400)
-        return
 
-    json_response(w, {"name": name, "age": age, "valid": True})
+async def ingest_stream(c, w):
+    total = 0
+    async for chunk in c.req.stream():
+        total += len(chunk)
+    await yield_once()
+    text(w, bytes_line(total))
+
+
+async def upload(c, w):
+    body = await c.req.body()
+    await yield_once()
+    text(w, bytes_line(len(body)))
 
 
 async def bootstrap(app: App, span: Span) -> None:
     app.add(Route("GET /plaintext"), plaintext)
-    app.add(Route("GET /json"), json_endpoint)
-    app.add(Route("GET /user/{user_id}"), get_user)
-    app.add(Route("POST /validate"), validate)
+    app.add(Route("GET /user/{user_id}"), read_request)
+    app.add(Route("POST /echo"), post_json)
+    app.add(Route("POST /ingest/64k"), ingest_buffer)
+    app.add(Route("POST /ingest/2m"), ingest_buffer)
+    app.add(Route("POST /ingest/stream/2m"), ingest_stream)
+    app.add(Route("POST /upload"), upload)
     yield

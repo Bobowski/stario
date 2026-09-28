@@ -7,12 +7,15 @@ from stario.cli.errors import CliError
 
 
 def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("STARIO_SSL_CERTFILE", raising=False)
+    monkeypatch.delenv("STARIO_SSL_KEYFILE", raising=False)
     monkeypatch.setenv("STARIO_HOST", "0.0.0.0")
     monkeypatch.setenv("STARIO_PORT", "9000")
     monkeypatch.setenv("STARIO_LOOP", "uvloop")
     monkeypatch.setenv("STARIO_UNIX_SOCKET", "/tmp/stario.sock")
     monkeypatch.setenv("STARIO_GRACEFUL_SHUTDOWN_TIMEOUT", "12.5")
     monkeypatch.setenv("STARIO_REUSE_ADDR", "0")
+    monkeypatch.setenv("STARIO_THREADS", "4")
 
     config = server_config_from_env()
     assert config.host == "0.0.0.0"
@@ -21,6 +24,8 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     assert config.unix_socket == "/tmp/stario.sock"
     assert config.graceful_shutdown_timeout == 12.5
     assert config.reuse_addr is False
+    assert config.ssl is None
+    assert config.threads == 4
 
 
 @pytest.mark.parametrize(
@@ -28,6 +33,7 @@ def test_server_config_from_env_reads_overrides(monkeypatch) -> None:
     [
         ("STARIO_PORT", "70000", "port must be between"),
         ("STARIO_LOOP", "nope", "STARIO_LOOP"),
+        ("STARIO_THREADS", "0", "threads must be at least 1"),
         ("STARIO_COMPRESS_ZSTD_LEVEL", "23", "zstd_level"),
         (
             "STARIO_REQUESTS_HEADER_TIMEOUT",

@@ -27,7 +27,7 @@ Stario is an asyncio-native HTTP stack: you write async handlers and register ro
 
 ## Requirements
 
-Python 3.12 or newer is required.
+Python 3.12 or newer is required, on Linux (glibc) or macOS. The HTTP server is compiled: PyPI ships wheels for Linux x86_64/aarch64 and macOS arm64 with nghttp2, Brotli, and zstd bundled. Elsewhere `pip` builds from source and needs a C compiler, `pkg-config`, and the nghttp2 (1.66+), Brotli, and zstd development packages. Windows is not supported.
 
 **uvloop (optional):** Stario defaults to the stdlib asyncio loop. For a faster event loop on Linux/macOS, install the optional extra and set `STARIO_LOOP=uvloop`:
 
@@ -36,7 +36,9 @@ uv add "stario[uvloop]"
 # or: pip install "stario[uvloop]"
 ```
 
-Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows.
+Then run with `STARIO_LOOP=uvloop stario serve main:bootstrap` (or `stario watch`). uvloop is not supported on Windows. `STARIO_THREADS=N` is N full servers on one TCP port (`SO_REUSEPORT`); each thread uses that same loop library, audited. Without `SO_REUSEPORT` the process stays at one thread.
+
+**Free-threaded workers (optional):** on Python 3.14t, `STARIO_THREADS=N` runs N event loops in one process so handler CPU can use more cores while `Relay` stays in-process. See [`docs/free-threading.md`](docs/free-threading.md).
 
 ### JSON codec
 
@@ -186,7 +188,7 @@ async def bootstrap(app: App, span: Span):
 ```
 
 `Assets` hashes names and 307s the logical path. Both send strong ETags
-and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
+and `X-Content-Type-Options: nosniff`.
 
 ## What you get
 
@@ -195,8 +197,7 @@ and `X-Content-Type-Options: nosniff`. `stario.staticassets` is obsolete.
 - Files: `Assets` and `Files` expose a directory at a URL prefix.
   `attach(app)` registers GET/HEAD and loads the tree. `Assets`
   hashes names and 307s the logical path. Both use strong ETags and 304.
-  Import from `stario` or `stario.filesystem`. `stario.staticassets` is
-  obsolete.
+  Import from `stario` or `stario.filesystem`.
 - Hypermedia by default: HTML and SSE are first-class; realtime layers are optional when the product needs them.
 - Observable runs: spans for startup and requests are part of how you structure apps, not an afterthought.
 
@@ -211,19 +212,19 @@ There is no autotag, and the build does not rewrite the version.
 
 1. Keep notes under `## Unreleased` in [`CHANGELOG.md`](CHANGELOG.md).
 2. When those notes are the release, one commit:
-   - set `version` in `pyproject.toml` (for example `4.3.0`)
-   - move `## Unreleased` to `## 4.3.0 - YYYY-MM-DD` and leave an empty
+   - set `version` in `pyproject.toml` (for example `5.0.0`)
+   - move `## Unreleased` to `## 5.0.0 - YYYY-MM-DD` and leave an empty
      `## Unreleased` above it
 3. Tag that commit and push:
 
 ```bash
-git tag 4.3.0
-git push origin 4.3.0
+git tag 5.0.0
+git push origin 5.0.0
 ```
 
 A GitHub Release with the same tag is the same event. The workflow tests
 3.12–3.14, checks that the tag, `pyproject.toml`, and changelog agree,
-then uploads `stario-4.3.0` to PyPI. If the tag does not match the
+then uploads `stario-5.0.0` to PyPI. If the tag does not match the
 committed version, the job fails.
 
 ## Contributing

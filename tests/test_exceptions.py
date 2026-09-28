@@ -3,8 +3,8 @@
 import pytest
 
 from stario.exceptions import (
-    HttpException,
     RedirectException,
+    RequestBodyError,
     StarioError,
 )
 
@@ -17,15 +17,15 @@ class TestStarioError:
         assert exc.context == {"k": 1}
 
 
-class TestHttpException:
-    @pytest.mark.parametrize("status", [200, 302])
-    def test_rejects_non_error_status_at_construction(self, status: int):
-        with pytest.raises(StarioError, match="requires a 4xx or 5xx"):
-            HttpException(status, "nope")
+class TestRequestBodyError:
+    @pytest.mark.parametrize("status", [404, 500, 422])
+    def test_rejects_non_body_status_at_construction(self, status: int):
+        with pytest.raises(StarioError, match="requires status 408 or 413"):
+            RequestBodyError(status, "nope")
 
-    def test_accepts_4xx_and_5xx_status(self):
-        HttpException(404, "missing")
-        HttpException(500, "broken")
+    def test_accepts_408_and_413(self):
+        RequestBodyError(413, "too large")
+        RequestBodyError(408, "stalled")
 
 
 class TestRedirectException:

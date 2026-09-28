@@ -29,10 +29,10 @@ class TestNormalizedLocation:
     def test_accepts_safe_targets(self, target: str) -> None:
         assert normalized_location(target)
 
-    def test_accepts_url_path_host_href(self) -> None:
-        from stario import UrlPath
+    def test_accepts_route_host_href(self) -> None:
+        from stario import Route
 
-        target = UrlPath("/users/{user_id}", host="{tenant}.example.com").href(
+        target = Route("GET //{tenant}.example.com/users/{user_id}").href(
             tenant="acme", user_id="42"
         )
         assert normalized_location(target) == target

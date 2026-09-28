@@ -2,48 +2,74 @@
 
 import ujson
 from blacksheep import Application, Content, Request, Response
-from blacksheep.server.responses import text as text_response
+from blacksheep.server.routing import Router
+from blacksheep.settings.json import json_settings
 
-HELLO = "Hello, World!"
-JSON_CONTENT_TYPE = b"application/json"
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
-app = Application(show_error_details=False)
+json_settings.use(loads=ujson.loads, dumps=ujson.dumps)
+
+app = Application(router=Router(), show_error_details=False)
 
 
-def json_response(value: object, status: int = 200) -> Response:
-    return Response(
-        status,
-        content=Content(JSON_CONTENT_TYPE, ujson.dumps(value).encode("utf-8")),
-    )
+def text_response(line: str | bytes) -> Response:
+    body = line if isinstance(line, bytes) else line.encode("ascii")
+    return Response(200, content=Content(TEXT_CONTENT_TYPE, body))
 
 
 @app.router.get("/plaintext")
-async def plaintext():
-    return text_response(HELLO)
-
-
-@app.router.get("/json")
-async def json_endpoint() -> Response:
-    return json_response({"message": HELLO})
+async def plaintext(request: Request) -> Response:
+    return text_response(PLAINTEXT_BODY)
 
 
 @app.router.get("/user/{user_id}")
-async def get_user(user_id: str) -> Response:
-    return json_response({"id": user_id, "name": f"User {user_id}"})
-
-
-@app.router.post("/validate")
-async def validate(request: Request) -> Response:
-    body = ujson.loads(await request.read())
-    name = body.get("name")
-    age = body.get("age")
-
-    if not isinstance(name, str) or not name:
-        return json_response({"error": "name must be a non-empty string"}, 400)
-    if not isinstance(age, int) or age < 0 or age > 150:
-        return json_response(
-            {"error": "age must be an integer between 0 and 150"},
-            400,
+async def read_request(request: Request) -> Response:
+    header = request.get_first_header(REQUEST_HEADER.encode("ascii"))
+    return text_response(
+        request_line(
+            request.route_values["user_id"],
+            query_value(request.query.get("q")),
+            as_str(header),
         )
+    )
 
-    return json_response({"name": name, "age": age, "valid": True})
+
+@app.router.post("/echo")
+async def post_json(request: Request) -> Response:
+    raw = await request.read()
+    await yield_once()
+    return text_response(json_echo_line(ujson.loads(raw) if raw else {}))
+
+
+@app.router.post("/ingest/64k")
+@app.router.post("/ingest/2m")
+async def ingest_buffer(request: Request) -> Response:
+    body = await request.read()
+    await yield_once()
+    return text_response(bytes_line(len(body)))
+
+
+@app.router.post("/ingest/stream/2m")
+async def ingest_stream(request: Request) -> Response:
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+    await yield_once()
+    return text_response(bytes_line(total))
+
+
+@app.router.post("/upload")
+async def upload(request: Request) -> Response:
+    body = await request.read()
+    await yield_once()
+    return text_response(bytes_line(len(body)))

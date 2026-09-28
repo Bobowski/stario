@@ -25,13 +25,22 @@ from stario.markup import html as h
 from stario.markup import render
 from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
 from stario.markup.types import Attrs
-from stario.testing.transport import decode_chunked as _decode_chunked
-from tests.helpers import (
-    make_writer_raw as _make_writer,
-)
-from tests.helpers import (
-    split_response as _split_response,
-)
+from stario.testing.harness import TestWriter
+
+
+class _ClosedLoop:
+    def close(self) -> None:
+        return None
+
+
+def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
+    writer = TestWriter()
+    return writer, writer.sink.buf, _ClosedLoop()
+
+
+def _sse_body(writer: TestWriter) -> bytes:
+    return writer.body
+
 
 Div = h.Div
 
@@ -76,11 +85,10 @@ class TestSseNavigate:
 
     def test_navigate_with_special_chars(self):
         """URL is embedded as a JSON string literal; single quotes survive as-is."""
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).navigate("/page?name=O'Brien")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert b'window.location = "/page?name=O\'Brien"' in result
         finally:
@@ -88,11 +96,10 @@ class TestSseNavigate:
 
     def test_navigate_with_unicode(self):
         """Non-ASCII path segments are percent-encoded before embedding."""
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).navigate("/users/日本語")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert b'window.location = "/users/%E6%97%A5%E6%9C%AC%E8%AA%9E"' in result
         finally:
@@ -100,11 +107,10 @@ class TestSseNavigate:
 
     def test_navigate_percent_encodes_script_breakout(self):
         """`</script>` in a redirect target cannot break out of the script patch."""
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).navigate("/page?q=</script><script>alert(1)</script>")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             # The angle brackets must be percent-encoded inside the JS string;
             # the only raw </script> on the wire is the patch's own closing tag.
@@ -124,11 +130,11 @@ class TestSseNavigate:
         ],
     )
     def test_navigate_rejects_forbidden_schemes(self, url: str):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             with pytest.raises(StarioError, match="app-relative path or absolute"):
                 SSE(w).navigate(url)
-            assert bytes(sink) == b""
+            assert w.body == b""
         finally:
             loop.close()
 
@@ -140,11 +146,11 @@ class TestSseNavigate:
         ],
     )
     def test_navigate_rejects_crlf_and_unsafe_paths(self, url: str):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             with pytest.raises(StarioError):
                 SSE(w).navigate(url)
-            assert bytes(sink) == b""
+            assert w.body == b""
         finally:
             loop.close()
 
@@ -153,36 +159,34 @@ class TestSseWireFormat:
     """Pin the exact SSE wire contract: data-line splitting, modes, encodings."""
 
     def test_constructor_does_not_start_response(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w)
 
             assert not w.started
-            assert bytes(sink) == b""
+            assert w.body == b""
         finally:
             loop.close()
 
     def test_open_sends_headers_before_first_event(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).open()
-            head, body = _split_response(bytes(sink))
 
-            assert b"content-type: text/event-stream" in head
-            assert b"cache-control: no-cache" in head
-            assert body == b""
+            assert w.headers.get("content-type") == "text/event-stream"
+            assert w.headers.get("cache-control") == "no-cache"
+            assert w.body == b""
         finally:
             loop.close()
 
     def test_first_event_opens_stream_lazily(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).patch_signals({"ok": True})
-            head, body = _split_response(bytes(sink))
 
-            assert b"content-type: text/event-stream" in head
-            assert b"cache-control: no-cache" in head
-            assert b'data: signals {"ok":true}' in _decode_chunked(body)
+            assert w.headers.get("content-type") == "text/event-stream"
+            assert w.headers.get("cache-control") == "no-cache"
+            assert b'data: signals {"ok":true}' in _sse_body(w)
         finally:
             loop.close()
 
@@ -206,44 +210,40 @@ class TestSseWireFormat:
         "mode", ["inner", "replace", "prepend", "append", "before", "after"]
     )
     def test_non_outer_modes_emit_mode_line(self, mode):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).patch_elements(h.Div("x"), mode=mode, selector="#t")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert f"data: mode {mode}".encode() in result
         finally:
             loop.close()
 
     def test_omitted_mode_omits_mode_line(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).patch_elements(h.Div("x"))
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert b"data: mode" not in result
         finally:
             loop.close()
 
     def test_mathml_namespace(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).patch_elements(b"<mi>x</mi>", namespace="mathml")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert b"data: namespace mathml" in result
         finally:
             loop.close()
 
     def test_multiline_html_splits_into_repeated_data_lines(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).patch_elements("<div>\n  <p>a</p>\n</div>")
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert (
                 b"data: elements <div>\n"
@@ -253,32 +253,44 @@ class TestSseWireFormat:
         finally:
             loop.close()
 
+    def test_bare_cr_in_patch_elements_becomes_data_line(self):
+        w, _sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements("<div>\revil")
+            result = _sse_body(w)
+            assert b"event: datastar-patch-elements\n" in result
+            assert b"\revil" not in result
+            assert b"data: elements <div>\n" in result
+            assert b"data: elements evil" in result
+            assert b"event: evil" not in result
+        finally:
+            loop.close()
+
     def test_patch_signals_rejects_raw_json_text(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             with pytest.raises(TypeError, match="mapping"):
                 SSE(w).patch_signals('{"raw":true}')  # type: ignore[arg-type]
-            assert bytes(sink) == b""
+            assert w.body == b""
         finally:
             loop.close()
 
     def test_unicode_signals_are_utf8_on_the_wire(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).patch_signals({"msg": "日本語"})
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert 'data: signals {"msg":"日本語"}'.encode() in result
         finally:
             loop.close()
 
     def test_patch_signals_rejects_raw_json_bytes(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             with pytest.raises(TypeError, match="mapping"):
                 SSE(w).patch_signals(b'{"raw":true}')  # type: ignore[arg-type]
-            assert bytes(sink) == b""
+            assert w.body == b""
         finally:
             loop.close()
 
@@ -292,25 +304,23 @@ class TestSseScriptTrustContract:
     """
 
     def test_execute_streams_code_verbatim_including_script_close(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).execute_script('console.log("</script>")', auto_remove=False)
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert b'data: elements <script>console.log("</script>")</script>' in result
         finally:
             loop.close()
 
     def test_multiline_code_splits_into_data_lines(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             SSE(w).execute_script(
                 "let a = 1;\nconsole.log(a);",
                 auto_remove=False,
             )
-            _, body = _split_response(bytes(sink))
-            result = _decode_chunked(body)
+            result = _sse_body(w)
 
             assert (
                 b"data: elements <script>let a = 1;\n"
@@ -340,11 +350,11 @@ class TestSseRemove:
     """Test remove helper."""
 
     def test_remove_rejects_line_breaks_in_selector(self):
-        w, sink, loop = _make_writer()
+        w, _sink, loop = _make_writer()
         try:
             with pytest.raises(StarioError, match="line breaks"):
                 SSE(w).remove("#old\ndata: mode append")
-            assert bytes(sink) == b""
+            assert w.body == b""
         finally:
             loop.close()
 
@@ -359,6 +369,14 @@ class TestDatastarAttributeValidation:
     def test_bind_rejects_non_snake_signal_path_segment(self):
         with pytest.raises(StarioError, match="snake_case"):
             data.bind("crane.selectedCrane")
+
+    def test_attr_rejects_quote_breakout_key(self):
+        with pytest.raises(StarioError, match="Invalid attribute name"):
+            data.attr('x" onfocus="alert(1)', "$x")
+
+    def test_on_rejects_breakout_event_name(self):
+        with pytest.raises(StarioError, match="Invalid attribute name"):
+            data.on('click" onfocus="alert(1)', "go()")
 
     @pytest.mark.parametrize(
         "time",
@@ -573,36 +591,17 @@ class TestDatastarActions:
         action = at.set_all("null", include=["draft"], exclude="tmp.*")
         assert action == "@setAll(null, {'include':'draft','exclude':'tmp.*'})"
 
-    def test_fetch_uses_route_method_and_href(self):
-        subscribe = Route("GET /rooms/7/subscribe")
-        send = Route("POST /rooms/7/send")
-        remove = Route("DELETE /rooms/7")
+    def test_actions_take_route_href(self):
+        subscribe = Route("GET /rooms/{room_id}/subscribe")
+        send = Route("POST /rooms/{room_id}/send")
 
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(subscribe, retry="always") == (
-                "@get('/rooms/7/subscribe', {retry: 'always'})"
-            )
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(send) == "@post('/rooms/7/send')"
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert at.fetch(remove) == "@delete('/rooms/7')"
-        with pytest.warns(DeprecationWarning, match="at.get"):
-            assert (
-                at.fetch(send, query={"src": "btn"}, fragment="latest")
-                == "@post('/rooms/7/send?src=btn#latest')"
-            )
-
-    def test_fetch_rejects_unknown_methods(self):
-        with (
-            pytest.warns(DeprecationWarning, match="at.get"),
-            pytest.raises(StarioError, match="no Datastar action"),
-        ):
-            at.fetch(Route("HEAD", "/page"))
-        with (
-            pytest.warns(DeprecationWarning, match="at.get"),
-            pytest.raises(StarioError, match="no Datastar action"),
-        ):
-            at.fetch(Route("QUERY", "/feed"))
+        assert at.get(subscribe.href("7"), retry="always") == (
+            "@get('/rooms/7/subscribe', {retry: 'always'})"
+        )
+        assert (
+            at.post(send.href("7", query={"src": "btn"}, fragment="latest"))
+            == "@post('/rooms/7/send?src=btn#latest')"
+        )
 
 
 class TestDatastarScriptTag:

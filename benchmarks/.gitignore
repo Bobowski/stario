@@ -1,2 +1,4 @@
 .venvs/
 results/
+fixtures/*.bin
+fixtures/*.json

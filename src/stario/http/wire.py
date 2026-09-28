@@ -2,8 +2,6 @@
 
 from functools import lru_cache
 
-_HEX_DIGITS = frozenset("0123456789ABCDEFabcdef")
-_PATH_CACHE_MAX_BYTES = 512
 _ACCEPT_ENCODING_CACHE_MAX_BYTES = 512
 
 
@@ -12,59 +10,18 @@ def decode_method(method_bytes: bytes) -> str:
     return method_bytes.decode("ascii")
 
 
-def _decode_path_segment(segment: str) -> str:
-    if "%" not in segment:
-        return segment
-
-    out = bytearray()
-    i = 0
-    n = len(segment)
-    while i < n:
-        ch = segment[i]
-        if ch != "%":
-            out.append(ord(ch))
-            i += 1
-            continue
-        if i + 2 >= n:
-            raise ValueError("invalid percent-encoding in request path")
-        hex_digits = segment[i + 1 : i + 3]
-        if hex_digits[0] not in _HEX_DIGITS or hex_digits[1] not in _HEX_DIGITS:
-            raise ValueError("invalid percent-encoding in request path")
-        out.append(int(hex_digits, 16))
-        i += 3
-
-    try:
-        decoded = out.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("invalid UTF-8 in request path") from exc
-    if "\x00" in decoded:
-        raise ValueError("request path contains a NUL byte")
-    return decoded
-
-
-def _decode_path_uncached(path_bytes: bytes) -> str:
-    path: str = path_bytes.decode("ascii")
-    if "%" in path:
-        # Decode each segment independently and keep encoded slashes encoded so
-        # percent-encoding cannot change route structure before trie matching.
-        parts: list[str] = []
-        for segment in path.split("/"):
-            decoded = _decode_path_segment(segment)
-            parts.append(decoded.replace("/", "%2F"))
-        path = "/".join(parts)
-    return path
-
-
-@lru_cache(maxsize=4096)
-def _decode_path_cached(path_bytes: bytes) -> str:
-    return _decode_path_uncached(path_bytes)
-
-
 def decode_path(path_bytes: bytes) -> str:
-    """Decode a request path from wire bytes to the canonical str used for routing."""
-    if len(path_bytes) > _PATH_CACHE_MAX_BYTES:
-        return _decode_path_uncached(path_bytes)
-    return _decode_path_cached(path_bytes)
+    """Fully percent-decode a request path (no query) to ``str``.
+
+    Every ``%XX`` is decoded, ``%2F`` included; routing splits the raw path on
+    ``/`` before decoding, so this is only the display/``req.path`` form.
+    Raises ``ValueError`` for a malformed escape, invalid UTF-8, or a decoded
+    control byte.
+    """
+    # stario_cython.exchange imports stario.http; resolve on first call.
+    from stario_cython.exchange import decode_request_path
+
+    return decode_request_path(path_bytes)
 
 
 def _parse_accept_encoding_uncached(accept_encoding: bytes) -> dict[bytes, float]:

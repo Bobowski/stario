@@ -3,53 +3,88 @@
 import ujson
 import falcon.asgi
 
-HELLO = "Hello, World!"
-JSON_MEDIA_TYPE = falcon.MEDIA_JSON
+from apps.common import (
+    PLAINTEXT_BODY,
+    REQUEST_HEADER,
+    TEXT_CONTENT_TYPE_STR,
+    as_str,
+    bytes_line,
+    json_echo_line,
+    query_value,
+    request_line,
+    yield_once,
+)
 
 
-def json_body(resp, value, status=falcon.HTTP_200):
-    resp.status = status
-    resp.content_type = JSON_MEDIA_TYPE
-    resp.data = ujson.dumps(value).encode("utf-8")
+async def _read_all(req) -> bytes:
+    return await req.stream.read()
+
+
+async def _read_stream(req) -> int:
+    total = 0
+    async for chunk in req.stream:
+        total += len(chunk)
+    return total
+
+
+def text(resp, line: str | bytes) -> None:
+    resp.content_type = TEXT_CONTENT_TYPE_STR
+    resp.data = line if isinstance(line, bytes) else line.encode("ascii")
 
 
 class Plaintext:
     async def on_get(self, req, resp):
-        resp.text = HELLO
-
-
-class JsonResource:
-    async def on_get(self, req, resp):
-        json_body(resp, {"message": HELLO})
+        text(resp, PLAINTEXT_BODY)
 
 
 class UserResource:
     async def on_get(self, req, resp, user_id):
-        json_body(resp, {"id": user_id, "name": f"User {user_id}"})
+        text(
+            resp,
+            request_line(
+                user_id,
+                query_value(req.get_param("q")),
+                as_str(
+                    req.get_header("X-REQUEST-ID")
+                    or req.get_header(REQUEST_HEADER)
+                ),
+            ),
+        )
 
 
-class ValidateResource:
+class EchoJson:
     async def on_post(self, req, resp):
-        body = ujson.loads(await req.stream.read())
-        name = body.get("name")
-        age = body.get("age")
+        raw = await _read_all(req)
+        await yield_once()
+        text(resp, json_echo_line(ujson.loads(raw) if raw else {}))
 
-        if not isinstance(name, str) or not name:
-            json_body(resp, {"error": "name must be a non-empty string"}, falcon.HTTP_400)
-            return
-        if not isinstance(age, int) or age < 0 or age > 150:
-            json_body(
-                resp,
-                {"error": "age must be an integer between 0 and 150"},
-                falcon.HTTP_400,
-            )
-            return
 
-        json_body(resp, {"name": name, "age": age, "valid": True})
+class IngestBuffer:
+    async def on_post(self, req, resp):
+        body = await _read_all(req)
+        await yield_once()
+        text(resp, bytes_line(len(body)))
+
+
+class IngestStream:
+    async def on_post(self, req, resp):
+        total = await _read_stream(req)
+        await yield_once()
+        text(resp, bytes_line(total))
+
+
+class Upload:
+    async def on_post(self, req, resp):
+        body = await _read_all(req)
+        await yield_once()
+        text(resp, bytes_line(len(body)))
 
 
 app = falcon.asgi.App()
 app.add_route("/plaintext", Plaintext())
-app.add_route("/json", JsonResource())
 app.add_route("/user/{user_id}", UserResource())
-app.add_route("/validate", ValidateResource())
+app.add_route("/echo", EchoJson())
+app.add_route("/ingest/64k", IngestBuffer())
+app.add_route("/ingest/2m", IngestBuffer())
+app.add_route("/ingest/stream/2m", IngestStream())
+app.add_route("/upload", Upload())
