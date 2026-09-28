@@ -303,8 +303,6 @@ cdef int TIMEOUT_IDLE = 2
 cdef int CLEANUP_OFF = 0
 cdef int CLEANUP_SWEEP = 1
 cdef object _SWEEPS_ATTR = "_stario_timeout_sweeps"
-# Empty / small bodies finish before the handler runs so body() is cached.
-# Large, chunked, and 100-continue still dispatch at headers.
 
 cdef object METH_DELETE = "DELETE"
 cdef object METH_GET = "GET"

@@ -1,16 +1,8 @@
-"""Compiled path/host trie. One node per segment; walk UTF-8 bytes.
+"""Compiled path/host trie. One node per segment.
 
-Lookup takes the raw request path (as sent, still percent-encoded). It is
-split on ``/`` first, then each segment is percent-decoded on its own, so an
-encoded ``%2F`` is data inside one segment and never adds structure. Route
-literals compare against decoded segments; params are fully decoded
-(``%2F`` -> ``/``). Paths without ``%`` are walked straight from the arena
-bytes, so static GET never allocates.
-
-At each segment an exact child wins, then ``{param}``, then ``{path...}``.
-Static hits return the 3-tuple stored at compile time (same Match identity).
-Param hits allocate one Match + one params dict. 404/405 tuples are interned
-on the node.
+Lookup walks the raw path (still percent-encoded), splits on ``/``, then
+decodes each segment so ``%2F`` stays data. Exact child, then ``{param}``,
+then ``{path...}``. Static GET never allocates.
 """
 
 import sys
@@ -257,12 +249,6 @@ cdef CNode _take_param(
     return None
 
 
-cdef inline dict _params(dict params):
-    if params is None:
-        return {}
-    return params
-
-
 cdef inline object _finish(
     CNode node,
     object method,
@@ -352,7 +338,8 @@ cdef object _resolve_tree_n(
             seg_start = dot + 1
             child = _match_exact(node, host_p + seg_start, end - seg_start)
             if child is None:
-                params = _params(params)
+                if params is None:
+                    params = {}
                 if node.catchall is not None:
                     child = _take_param(
                         node,
@@ -416,7 +403,8 @@ cdef object _resolve_tree_n(
                 dn = i - seg_start
             child = _match_exact(node, d, dn)
             if child is None:
-                params = _params(params)
+                if params is None:
+                    params = {}
                 if node.wildcard is None and node.catchall is not None:
                     # ``{path...}`` takes the rest of the path, decoded.
                     if decode:

@@ -1,9 +1,9 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, freethreading_compatible=True
-"""Python face of the native brotli / zstd codecs the HTTP writer already uses."""
+"""Brotli and zstd, using the same C codecs as the HTTP writer."""
 
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize, PyBytes_GET_SIZE
 
-from stario.exceptions import StarioError
+from stario.exceptions import StarioError, StarioRuntime
 
 from stario_cython.compression_buf cimport (
     StarioBrotli,
@@ -119,7 +119,7 @@ cdef class BrotliEncoder:
         cdef const unsigned char* ptr
         cdef size_t n
         if self._enc == NULL:
-            raise StarioError("brotli encoder is finished")
+            raise StarioRuntime("brotli encoder is finished")
         ptr = _bytes_ptr(data, &n)
         if stario_brotli_block_borrowed(self._enc, ptr, n, &out, &out_len) != 0:
             raise StarioError("brotli stream failed")
@@ -161,7 +161,7 @@ cdef class ZstdEncoder:
         cdef const unsigned char* ptr
         cdef size_t n
         if self._enc == NULL:
-            raise StarioError("zstd encoder is finished")
+            raise StarioRuntime("zstd encoder is finished")
         ptr = _bytes_ptr(data, &n)
         if stario_zstd_block_borrowed(self._enc, ptr, n, &out, &out_len) != 0:
             raise StarioError("zstd stream failed")

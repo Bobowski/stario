@@ -172,7 +172,6 @@ cdef object STARTED_ERROR = (
 )
 
 cdef object _POOL_LOCAL = threading.local()
-cdef object _UNBOUND = object()
 
 cdef extern from *:
     """
@@ -381,7 +380,9 @@ cdef inline object _encoding_wire(int enc) noexcept:
         return b"br"
     if enc == ENCODING_ZSTD:
         return b"zstd"
-    return b"gzip"
+    if enc == ENCODING_GZIP:
+        return b"gzip"
+    return None
 
 
 cdef inline bint _may_have_body(int status) noexcept:
@@ -390,18 +391,14 @@ cdef inline bint _may_have_body(int status) noexcept:
     return not (100 <= status < 200)
 
 
-cdef int _raise_bad_status(int status) except -1:
-    raise StarioError(
-        "Invalid response status",
-        context={"status": status},
-        help_text="Send a final status between 200 and 599.",
-    )
-
-
 cdef inline int _require_final_status(int status) except -1:
     # RFC 9110 §15: final responses are 200-599 (1xx is interim, >599 invalid).
     if status < 200 or status > 599:
-        return _raise_bad_status(status)
+        raise StarioError(
+            "Invalid response status",
+            context={"status": status},
+            help_text="Send a final status between 200 and 599.",
+        )
     return 0
 
 
@@ -432,7 +429,6 @@ cdef list _build_status_lines():
     return lines
 
 
-# Status lines 100-599, built once.
 cdef list _STATUS_LINES = _build_status_lines()
 
 
@@ -2062,8 +2058,6 @@ cdef class Request:
     def host(self):
         if self._host is None:
             self.prefetch_host()
-            if self._host is None:
-                self._host = ""
         return self._host
 
     @property
@@ -2188,7 +2182,7 @@ cdef class RequestExchange:
         self._stall_deadline = 0.0
         self._stall_touch = 0
         self._stall_seen = 0
-        self._compression = _UNBOUND
+        self._compression = None
         self._brotli_enabled = False
         self._zstd_enabled = False
         self._gzip_enabled = False
@@ -2222,17 +2216,17 @@ cdef class RequestExchange:
 
     cdef void _apply_compression(self, object compression):
         cdef object window
-        self._brotli_level = DEFAULT_BROTLI_LEVEL
-        self._brotli_window = 0
-        self._zstd_level = DEFAULT_ZSTD_LEVEL
-        self._zstd_window = 0
-        self._gzip_level = DEFAULT_GZIP_LEVEL
-        self._gzip_window = 15
-        self._brotli_enabled = False
-        self._zstd_enabled = False
-        self._gzip_enabled = False
-        self._compress_min_size = DEFAULT_MIN_SIZE
         if compression is None:
+            self._brotli_level = DEFAULT_BROTLI_LEVEL
+            self._brotli_window = 0
+            self._zstd_level = DEFAULT_ZSTD_LEVEL
+            self._zstd_window = 0
+            self._gzip_level = DEFAULT_GZIP_LEVEL
+            self._gzip_window = 15
+            self._brotli_enabled = False
+            self._zstd_enabled = False
+            self._gzip_enabled = False
+            self._compress_min_size = DEFAULT_MIN_SIZE
             return
         # Snapshot CompressionConfig so hot paths skip Python attribute access.
         self._brotli_level = compression.brotli_level
@@ -3447,10 +3441,10 @@ cdef class RequestExchange:
                 existing_cl = scanned[1]
             if not _may_have_body(status):
                 body = b""
-            elif existing_ce is None:
-                encoding = None
-                if self._may_compress(body, content_type, False, nbytes):
-                    encoding = _encoding_wire(self._req_encoding)
+            elif existing_ce is None and self._may_compress(
+                body, content_type, False, nbytes
+            ):
+                encoding = _encoding_wire(self._req_encoding)
                 if encoding is not None:
                     try:
                         if not self._head_request:
@@ -4053,10 +4047,10 @@ cdef class RequestExchange:
             self._wake()
             self._maybe_recycle()
             return 0
-        if self._consumed_as != CONSUMED_STREAM and self._cached is None:
+        if self._cached is None:
             try:
                 self._cached = self._body_to_bytes()
-            except Exception:
+            except MemoryError:
                 PyErr_Clear()
                 return -1
         self._wake()
@@ -4568,7 +4562,7 @@ cdef class RequestHeaders:
 
 
 cdef void wake_waiters(list waiters) noexcept:
-    """Resolve pending drain futures (skip ones a cancelled task left behind)."""
+    """Resolve pending drain futures; skip ones a cancelled task left behind."""
     cdef object fut
     if not waiters:
         return
@@ -4576,7 +4570,7 @@ cdef void wake_waiters(list waiters) noexcept:
         try:
             if not fut.done():
                 fut.set_result(None)
-        except Exception:
+        except asyncio.InvalidStateError:
             pass
     waiters.clear()
 
@@ -4710,14 +4704,6 @@ cdef class RequestHandle:
         return self
 
     async def drain(self):
-        """Wait until the client has taken enough of what was written.
-
-        ``write()`` never blocks, so a loop writing large chunks to a slow
-        client would buffer everything in memory. ``await w.drain()`` after
-        each chunk keeps that bounded. Returns immediately while the
-        connection keeps up, or once it is closed (check ``closing``).
-        On HTTP/2 this also waits for this stream's flow-control window.
-        """
         cdef RequestExchange ex = self._ex
         cdef object waiter
         if ex is None:

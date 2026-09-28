@@ -1,9 +1,8 @@
-"""Headers pair list. Included into ``exchange.pyx`` (one extension)."""
+"""Response header list (``w.headers``). Included into ``exchange.pyx``."""
 
 cdef enum:
     INTERN_MAX = 36
     INTERN_TABLE_SIZE = 64
-    NAME_STACK = 256
 
 cdef extern from *:
     """
@@ -201,7 +200,7 @@ _init_intern()
 
 
 cdef int _fold_header_name(object name, char* buf, Py_ssize_t* out_n) except -1:
-    return stario_fold_header_name(name, buf, <Py_ssize_t>NAME_STACK, out_n)
+    return stario_fold_header_name(name, buf, <Py_ssize_t>HEADER_NAME_STACK, out_n)
 
 
 cdef inline int _intern_lookup(const char* src, size_t n) noexcept:
@@ -223,9 +222,9 @@ cdef inline int _intern_lookup(const char* src, size_t n) noexcept:
 
 
 cdef object _intern_name(const char* src, size_t n):
-    cdef char buf[NAME_STACK]
+    cdef char buf[HEADER_NAME_STACK]
     cdef int index
-    if n >= NAME_STACK:
+    if n >= HEADER_NAME_STACK:
         raise ValueError("Invalid header name: too long")
     _lower_copy(buf, src, n)
     index = _intern_lookup(buf, n)
@@ -235,9 +234,9 @@ cdef object _intern_name(const char* src, size_t n):
 
 
 cdef object _intern_wire_name(const char* src, size_t n):
-    cdef char buf[NAME_STACK]
+    cdef char buf[HEADER_NAME_STACK]
     cdef int index
-    if n >= NAME_STACK - 2:
+    if n >= HEADER_NAME_STACK - 2:
         raise ValueError("Invalid header name: too long")
     _lower_copy(buf, src, n)
     index = _intern_lookup(buf, n)
@@ -294,9 +293,9 @@ cdef inline bint _wire_is(
 
 
 cdef object _encode_name(str name):
-    cdef char buf[NAME_STACK]
+    cdef char buf[HEADER_NAME_STACK]
     cdef Py_ssize_t n
-    stario_fold_header_name(name, buf, <Py_ssize_t>NAME_STACK, &n)
+    stario_fold_header_name(name, buf, <Py_ssize_t>HEADER_NAME_STACK, &n)
     return _intern_name(buf, <size_t>n)
 
 
@@ -416,9 +415,9 @@ cdef class Headers:
                     self.c_set(name, _trusted_bytes(value))
 
     cdef Py_ssize_t _find_n(self, const char* name, Py_ssize_t n) noexcept:
-        cdef char buf[NAME_STACK]
+        cdef char buf[HEADER_NAME_STACK]
         cdef Py_ssize_t i
-        if n >= NAME_STACK:
+        if n >= HEADER_NAME_STACK:
             return -1
         _lower_copy(buf, name, <size_t>n)
         for i in range(self._n):
@@ -427,10 +426,10 @@ cdef class Headers:
         return -1
 
     cdef Py_ssize_t _compact_except(self, const char* name, Py_ssize_t n) noexcept:
-        cdef char buf[NAME_STACK]
+        cdef char buf[HEADER_NAME_STACK]
         cdef Py_ssize_t i
         cdef Py_ssize_t w = 0
-        if n >= NAME_STACK:
+        if n >= HEADER_NAME_STACK:
             return self._n
         _lower_copy(buf, name, <size_t>n)
         for i in range(self._n):
@@ -708,12 +707,12 @@ cdef class Headers:
 
     def unsafe_getlist(self, bytes name not None):
         cdef bytes key = name
-        cdef char buf[NAME_STACK]
+        cdef char buf[HEADER_NAME_STACK]
         cdef const char* src = PyBytes_AS_STRING(key)
         cdef Py_ssize_t n = PyBytes_GET_SIZE(key)
         cdef list result = []
         cdef Py_ssize_t i
-        if n >= NAME_STACK:
+        if n >= HEADER_NAME_STACK:
             return result
         _lower_copy(buf, src, <size_t>n)
         for i in range(self._n):
@@ -744,7 +743,7 @@ cdef class Headers:
         return result
 
     def __contains__(self, name):
-        cdef char buf[NAME_STACK]
+        cdef char buf[HEADER_NAME_STACK]
         cdef Py_ssize_t n
         try:
             _fold_header_name(name, buf, &n)
