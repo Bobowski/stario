@@ -9,6 +9,7 @@ cimport cython
 
 import asyncio
 import http
+import os
 import threading
 from urllib.parse import quote as _url_quote
 
@@ -170,6 +171,25 @@ cdef object STARTED_ERROR = (
     "Response already started (headers sent). "
     "Set headers via w.headers.set() before the first write or one-shot respond()."
 )
+cdef object WRITE_AFTER_END_ERROR = (
+    "Cannot write after response is completed. "
+    "This happens after calling w.end() or a response helper has "
+    "already finalized the writer. "
+    "Each handler should only send one response."
+)
+cdef object WRITE_AFTER_END_HELP = (
+    "Send one response per handler: stream with write()/end(), "
+    "or finish with a response helper — not both."
+)
+cdef Py_ssize_t SENDFILE_SPAN = 1 << 20
+
+if hasattr(os, "pread"):
+    _pread = os.pread
+else:  # Windows has no os.pread; each fd here is exclusive to one response.
+
+    def _pread(fd, size, offset):
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, size)
 
 cdef object _POOL_LOCAL = threading.local()
 
@@ -3628,14 +3648,8 @@ cdef class RequestExchange:
             return self
         if self._completed:
             raise StarioRuntime(
-                "Cannot write after response is completed. "
-                "This happens after calling w.end() or a response helper has "
-                "already finalized the writer. "
-                "Each handler should only send one response.",
-                help_text=(
-                    "Send one response per handler: stream with write()/end(), "
-                    "or finish with a response helper — not both."
-                ),
+                WRITE_AFTER_END_ERROR,
+                help_text=WRITE_AFTER_END_HELP,
             )
         if not data:
             return self
@@ -4589,6 +4603,24 @@ cdef object RESPONSE_FINISHED_ERROR = (
 )
 
 
+cdef bint _native_sendfile_ok(RequestExchange ex):
+    """True when the socket can take raw file bytes (no framing/crypto)."""
+    if ex._http2:
+        return False
+    if ex._brotli != NULL or ex._zstd != NULL or ex._gzip != NULL:
+        return False
+    if ex._declared_length < 0 and not ex._close_delimited:
+        return False
+    if ex._transport is None:
+        return False
+    try:
+        if ex._transport.get_extra_info("ssl_object") is not None:
+            return False
+    except Exception:
+        return False
+    return True
+
+
 cdef inline void _raise_finished() except *:
     raise StarioRuntime(
         RESPONSE_FINISHED_ERROR,
@@ -4715,6 +4747,124 @@ cdef class RequestHandle:
             if ex is None:
                 return
             waiter = ex._connection.drain_waiter(ex)
+
+    async def sendfile(self, fd, offset, count):
+        """Send ``count`` bytes from ``fd`` starting at ``offset``. See Writer."""
+        cdef RequestExchange ex = self._ex
+        cdef Py_ssize_t start
+        cdef Py_ssize_t length
+        cdef Py_ssize_t sent
+        if ex is None:
+            _raise_finished()
+        if type(fd) is not int or type(offset) is not int or type(count) is not int:
+            raise StarioError(
+                "sendfile fd, offset, and count must be integers",
+                help_text=(
+                    "Open the file with os.open and pass the fd plus a byte range."
+                ),
+                example="await w.sendfile(fd, 0, size)",
+            )
+        if offset < 0 or count < 0:
+            raise StarioError(
+                "sendfile offset and count must be >= 0",
+                help_text="Pass a byte range inside the file.",
+            )
+        start = offset
+        length = count
+        if length == 0:
+            return
+        if ex._transport.is_closing():
+            return
+        if ex._completed:
+            raise StarioRuntime(
+                WRITE_AFTER_END_ERROR,
+                help_text=WRITE_AFTER_END_HELP,
+            )
+        if ex._status_code < 0:
+            ex.write_headers(200)
+        if ex._status_code >= 0 and not _may_have_body(ex._status_code):
+            raise StarioRuntime(
+                f"Cannot write a body for HTTP {ex._status_code} responses.",
+                help_text=(
+                    "204/304 and 1xx responses must not include a message body."
+                ),
+            )
+        if ex._skip_body:
+            return
+        if ex._declared_length >= 0 and ex._bytes_written + length > ex._declared_length:
+            raise StarioRuntime(
+                "Response body exceeds Content-Length: writing "
+                f"{length} bytes after {ex._bytes_written}, Content-Length is "
+                f"{ex._declared_length}",
+                help_text=(
+                    "When Content-Length is set, write exactly that many bytes. "
+                    "Nothing past it is sent."
+                ),
+            )
+        await self.drain()
+        ex = self._ex
+        if ex is None or self.closing:
+            return
+        if _native_sendfile_ok(ex):
+            sent = await self._native_sendfile(fd, start, length)
+            if sent >= 0:
+                return
+        await self._copy_sendfile(fd, start, length)
+
+    async def _native_sendfile(self, fd, start, length):
+        """``loop.sendfile`` or -1 if the kernel path is not available."""
+        cdef RequestExchange ex
+        cdef object loop
+        cdef object sendfile
+        cdef object transport
+        cdef object fileobj
+        cdef object sent
+        loop = asyncio.get_running_loop()
+        sendfile = getattr(loop, "sendfile", None)
+        if sendfile is None:
+            return -1
+        ex = self._ex
+        if ex is None:
+            return 0
+        transport = ex._transport
+        if transport is None or transport.is_closing():
+            return 0
+        fileobj = open(fd, "rb", closefd=False, buffering=0)
+        try:
+            try:
+                sent = await sendfile(
+                    transport, fileobj, start, length, fallback=False
+                )
+            except (asyncio.SendfileNotAvailableError, NotImplementedError, AttributeError):
+                return -1
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError):
+                return 0
+        finally:
+            fileobj.close()
+        ex = self._ex
+        if ex is not None and sent:
+            ex._bytes_written += sent
+        return 0 if sent is None else sent
+
+    async def _copy_sendfile(self, fd, offset, length):
+        """``pread`` in a worker thread, then ``write`` / ``drain``."""
+        cdef RequestExchange ex
+        cdef Py_ssize_t remaining = length
+        cdef Py_ssize_t pos = offset
+        cdef object chunk
+        while remaining > 0:
+            chunk = await asyncio.to_thread(
+                _pread, fd, min(<Py_ssize_t>SENDFILE_SPAN, remaining), pos
+            )
+            if not chunk:
+                break
+            pos += len(chunk)
+            remaining -= len(chunk)
+            ex = self._ex
+            if ex is None or self.closing:
+                return
+            ex.write(chunk)
+            await self.drain()
 
     def end(self, data=None):
         cdef RequestExchange ex = self._ex

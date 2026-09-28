@@ -72,6 +72,17 @@ class Writer(Protocol):
         """
         ...
 
+    async def sendfile(self, fd: int, offset: int, count: int) -> None:
+        """Send ``count`` bytes from an open regular file starting at ``offset``.
+
+        Does not call ``end()``. On HTTP/1 cleartext with ``Content-Length``
+        (or HTTP/1.0 close-delimited), this uses the event loop's ``sendfile``
+        so the kernel can copy file to socket without a userspace buffer.
+        HTTP/2, TLS, and compressed/chunked streams cannot take raw file
+        bytes; those fall back to ``pread`` + ``write`` + ``drain``.
+        """
+        ...
+
     def end(self, data: bytes | None = None) -> None:
         """Finish the response. Optional final body bytes."""
         ...

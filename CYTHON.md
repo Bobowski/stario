@@ -162,6 +162,9 @@ put a process-global increment on that path.
   check per call); `get_buffer` / `buffer_updated` call C directly.
 - `w.drain()`: write backpressure (transport `pause_writing`, HTTP/2 stream
   window). Used by `Files` / `Assets`.
+- `w.sendfile(fd, offset, count)`: OS `sendfile` on HTTP/1 cleartext when
+  `Content-Length` is set; otherwise the same `pread` + `write` + `drain`
+  path. HTTP/2 and TLS cannot take raw file bytes.
 
 ### Ordering, backpressure, drain
 
