@@ -7,7 +7,6 @@ that only need to accept a handler call and collect a status, headers, and body.
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
 
@@ -129,28 +128,6 @@ class TestWriter:
 
     async def drain(self) -> None:
         return None
-
-    async def sendfile(self, fd: int, offset: int, count: int) -> None:
-        if self._completed:
-            raise RuntimeError(
-                "Cannot write after response is completed. "
-                "This happens after calling w.end() or a response helper has "
-                "already finalized the writer."
-            )
-        remaining = count
-        pos = offset
-        while remaining > 0:
-            if hasattr(os, "pread"):
-                chunk = os.pread(fd, min(1 << 20, remaining), pos)
-            else:
-                os.lseek(fd, pos, os.SEEK_SET)
-                chunk = os.read(fd, min(1 << 20, remaining))
-            if not chunk:
-                break
-            self.write(chunk)
-            await self.drain()
-            pos += len(chunk)
-            remaining -= len(chunk)
 
     def end(self, data: bytes | None = None) -> None:
         if self._completed:

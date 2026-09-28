@@ -80,6 +80,14 @@ PATH_ERRNOS: Final = frozenset((errno.EACCES, errno.ENOENT, errno.ENOTDIR, errno
 OPEN_FLAGS: Final = (
     os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
+if hasattr(os, "pread"):
+    _pread = os.pread
+else:  # Windows has no os.pread; each fd here is exclusive to one response.
+
+    def _pread(fd: int, size: int, offset: int, /) -> bytes:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, size)
+
 
 COMPRESSION: Final = CompressionConfig(
     min_size=256,
@@ -91,6 +99,7 @@ COMPRESSION: Final = CompressionConfig(
     gzip_window_bits=15,
 )
 HASH_CHUNK: Final = 4 << 20
+STREAM_SPAN: Final = 1 << 20
 
 
 UNSAT: Final = object()
@@ -316,13 +325,23 @@ def _tally(stats: dict[str, int], entry: _Cached) -> None:
 async def _stream(writer: Writer, fd: int, start: int, length: int) -> None:
     """Send `length` bytes from `start` in an already-open fd. Caller closes it.
 
-    `w.sendfile` uses OS sendfile on HTTP/1 cleartext. Elsewhere each span is
-    one `os.pread` in a worker thread (regular files have no asyncio readiness
-    API; `epoll` reports them ready).
+    Regular files have no asyncio readiness API (`epoll` reports them ready).
+    Each span is one `os.pread` in a worker thread.
     """
-    await writer.sendfile(fd, start, length)
-    if not writer.closing:
-        writer.end()
+    offset = start
+    remaining = length
+    while remaining:
+        chunk = await asyncio.to_thread(_pread, fd, min(STREAM_SPAN, remaining), offset)
+        if not chunk:
+            break
+        offset += len(chunk)
+        remaining -= len(chunk)
+        if writer.closing:
+            return
+        writer.write(chunk)
+        # Bound memory for slow clients: do not read ahead of the socket.
+        await writer.drain()
+    writer.end()
 
 
 class _Mount:

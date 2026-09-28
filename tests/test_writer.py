@@ -2,8 +2,6 @@
 
 import asyncio
 import json
-import os
-from pathlib import Path
 
 import pytest
 
@@ -416,30 +414,6 @@ class TestWriterRaw:
         w.end()
         assert w.status_code == 204
         assert w.body == b""
-
-    @pytest.mark.asyncio
-    async def test_sendfile_copies_an_open_file(self, tmp_path: Path) -> None:
-        path = tmp_path / "blob.bin"
-        payload = b"abcdef" * 100
-        path.write_bytes(payload)
-        app = App()
-
-        async def handler(_c, w):
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                w.headers.set("content-type", "application/octet-stream")
-                w.headers.set("content-length", str(len(payload)))
-                w.write_headers(200)
-                await w.sendfile(fd, 10, 6)
-                w.end()
-            finally:
-                os.close(fd)
-
-        app.add(Route("GET /f"), handler)
-        async with TestClient(app) as client:
-            response = await client.get("/f")
-        assert response.status_code == 200
-        assert response.content == payload[10:16]
 
     def test_closing_follows_disconnect(self):
         loop = asyncio.new_event_loop()

@@ -6,15 +6,6 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
-### Added
-
-- `w.sendfile(fd, offset, count)` sends a regular file without copying it
-  through Python when the connection can take raw file bytes (HTTP/1
-  cleartext, `Content-Length` already set or HTTP/1.0 close-delimited).
-  HTTP/2, TLS, and compressed/chunked streams fall back to `pread` +
-  `write` + `drain`. `Files` / `Assets` use this for bodies that are not
-  cached in memory.
-
 ## 5.0.0 - 2026-09-27
 
 ### Breaking changes

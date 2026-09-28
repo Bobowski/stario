@@ -5,7 +5,6 @@ freely: `from tests.helpers import DummyWriter, make_context, ...`.
 """
 
 import asyncio
-import os
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, cast
 from urllib.parse import urlencode
@@ -87,21 +86,6 @@ class DummyWriter:
 
     async def drain(self) -> None:
         return None
-
-    async def sendfile(self, fd: int, offset: int, count: int) -> None:
-        remaining = count
-        pos = offset
-        while remaining > 0:
-            if hasattr(os, "pread"):
-                chunk = os.pread(fd, min(1 << 20, remaining), pos)
-            else:
-                os.lseek(fd, pos, os.SEEK_SET)
-                chunk = os.read(fd, min(1 << 20, remaining))
-            if not chunk:
-                break
-            self.write(chunk)
-            pos += len(chunk)
-            remaining -= len(chunk)
 
     def end(self, data: bytes | None = None) -> None:
         if data is not None:
