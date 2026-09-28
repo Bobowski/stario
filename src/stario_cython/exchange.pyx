@@ -4835,7 +4835,14 @@ cdef class RequestHandle:
                 sent = await sendfile(
                     transport, fileobj, start, length, fallback=False
                 )
-            except (asyncio.SendfileNotAvailableError, NotImplementedError, AttributeError):
+            except (
+                asyncio.SendfileNotAvailableError,
+                NotImplementedError,
+                AttributeError,
+                RuntimeError,
+            ):
+                # Stdlib loop.sendfile(..., fallback=False) raises RuntimeError
+                # when the transport has no sendfile (tests, exotic sockets).
                 return -1
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError):
                 return 0
