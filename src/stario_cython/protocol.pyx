@@ -59,7 +59,7 @@ from stario_cython.exchange cimport (
     PATH_REDIRECT,
     AppState,
     CRouter,
-    Connection,
+    HttpConnection,
     Headers,
     RequestExchange,
     RequestHandle,
@@ -648,7 +648,7 @@ def _stop_timeout_sweeper(loop, connections):
         task.cancel()
 
 
-cdef class CHttpProtocol(Connection):
+cdef class CHttpProtocol(HttpConnection):
     """asyncio connection: socket, parser, pipeline queue, and timeouts."""
 
     cdef llhttp_t* parser
@@ -3212,7 +3212,6 @@ cdef class CHttpProtocol(Connection):
         cdef Py_ssize_t want = sizehint
         cdef RequestExchange ex
         cdef Py_ssize_t remaining
-        cdef Py_ssize_t cap
         if want < 64 * 1024:
             want = 64 * 1024
         if want > 256 * 1024:
@@ -3233,10 +3232,10 @@ cdef class CHttpProtocol(Connection):
             # We never read past ``nbytes``.
             self._in_buf = PyByteArray_FromStringAndSize(NULL, want)
             self._in_view = memoryview(self._in_buf)
-        cap = PyByteArray_GET_SIZE(self._in_buf)
-        if want == cap:
-            return self._in_view
-        return self._in_view[:want]
+        # Return the whole cached view: ``want`` only bounds growth, and a
+        # slice would allocate one memoryview per sub-capacity read. uvloop
+        # reports what it actually wrote in ``buffer_updated``.
+        return self._in_view
 
     cdef void _buffer_updated(self, Py_ssize_t nbytes):
         cdef const char* ptr

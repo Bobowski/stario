@@ -42,6 +42,14 @@ cdef extern from *:
         Py_DECREF(proxy);
         return m;
     }
+
+    /* Hit tuples are always (handler, route, match): borrow the slot as an
+       owned reference, no bounds check. */
+    static PyObject* stario_hit_item(PyObject* hit, Py_ssize_t i) {
+        PyObject* item = PyTuple_GET_ITEM(hit, i);
+        Py_INCREF(item);
+        return item;
+    }
     """
     object stario_new_match(
         object cls,
@@ -50,6 +58,7 @@ cdef extern from *:
         object params_name,
         object params,
     )
+    object stario_hit_item(object hit, Py_ssize_t i)
 
 cdef object _ROUTER_EMPTY_ROUTE = None
 cdef object _ROUTER_EMPTY_MATCH = None
@@ -546,9 +555,9 @@ cdef class CRouter:
         cdef object hit
         _router_symbols()
         hit = _router_lookup_n(self, host, path_p, path_n, decode, method)
-        exchange._handler = (<tuple>hit)[0]
-        exchange._route = (<tuple>hit)[1]
-        exchange.match = (<tuple>hit)[2]
+        exchange._handler = stario_hit_item(hit, 0)
+        exchange._route = stario_hit_item(hit, 1)
+        exchange.match = stario_hit_item(hit, 2)
 
 
 @cython.final

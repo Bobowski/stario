@@ -211,3 +211,5 @@ __marimo__/
 
 
 .DS_Store
+# Local per-worktree lockfile; CI re-resolves via `uv sync`.
+uv.lock

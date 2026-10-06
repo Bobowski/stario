@@ -232,6 +232,49 @@ async def test_h2_write_copies_a_callers_bytearray() -> None:
 
 
 @pytest.mark.asyncio
+async def test_h1_chunked_write_snapshots_a_callers_bytearray() -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        w.headers.set("content-type", "text/plain")
+        chunk = bytearray(b"first")
+        w.write(chunk)
+        chunk[:] = b"XXXXX"
+        w.write(bytearray(b"-second"))
+        w.end()
+
+    app.add(Route("GET /"), page)
+    async with running_server(app) as port:
+        raw = await _raw_exchange(
+            port,
+            b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+    head, body = raw.split(b"\r\n\r\n", 1)
+    assert b"transfer-encoding: chunked" in head.lower()
+    assert _dechunk(body) == b"first-second"
+
+
+@pytest.mark.asyncio
+async def test_respond_snapshots_a_caller_bytearray() -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        body = bytearray(b"original")
+        w.respond(body, b"text/plain")
+        body[:] = b"corrupt!"
+
+    app.add(Route("GET /"), page)
+    async with running_server(app) as port:
+        raw = await _raw_exchange(
+            port,
+            b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+    head, body = raw.split(b"\r\n\r\n", 1)
+    assert b"content-length: 8" in head.lower()
+    assert body == b"original"
+
+
+@pytest.mark.asyncio
 async def test_wide_memoryview_body_is_rejected() -> None:
     app = App()
     errors: list[str] = []

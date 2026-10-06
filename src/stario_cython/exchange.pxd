@@ -130,7 +130,7 @@ cdef Request make_request(
     object body,
 )
 
-cdef class Connection:
+cdef class HttpConnection:
     """``cdef`` hooks implemented by ``CHttpProtocol``. Per-request flags live on RequestExchange."""
     cdef public int timeout_cleanup
     cdef void release_exchange(self, RequestExchange exchange)
@@ -214,7 +214,7 @@ cdef class CRouter:
 cpdef CRouter compile_router(object router)
 
 cdef class RequestExchange:
-    # Connection-owned writer targets (bound in reset(), live across keep-alive).
+    # HttpConnection-owned writer targets (bound in reset(), live across keep-alive).
     cdef object _transport
     cdef object _t_is_closing
     cdef object _t_writelines
@@ -273,7 +273,7 @@ cdef class RequestExchange:
     cdef public object app
     cdef public object span
     cdef public object match
-    cdef Connection _connection
+    cdef HttpConnection _connection
     cdef RequestHeaders _req_view
     cdef RequestHandle _handle
     # Unreferenced leftovers from the previous request, reused as-is.
@@ -356,7 +356,7 @@ cdef class RequestExchange:
 
     cdef void reset(
         self,
-        Connection connection,
+        HttpConnection connection,
         object app,
         object transport,
         list date_box,
@@ -422,6 +422,7 @@ cdef class RequestExchange:
     cdef int c_complete(self) noexcept
     cdef void c_abort(self)
     cdef void _clear_body_storage(self) noexcept
+    cdef char* _body_ptr(self) noexcept
     cdef int _body_reserve(self, Py_ssize_t need) noexcept
     cdef int _adopt_expected_body_buffer(self) noexcept
     cdef object _body_to_bytes(self)
@@ -492,7 +493,7 @@ cdef class RequestHeaders:
 cdef class RequestHandle:
     # Per-request ``c`` / ``w``. ``_ex`` is None once the exchange is recycled.
     cdef RequestExchange _ex
-    cdef Connection _conn
+    cdef HttpConnection _conn
     cdef public object app
     cdef public object span
     cdef public object match
@@ -503,7 +504,7 @@ cdef class RequestHandle:
     cpdef void respond(self, object body, object content_type, int status=*)
 
 cdef RequestExchange acquire_exchange(
-    Connection connection,
+    HttpConnection connection,
     object app,
     object transport,
     list date_box,

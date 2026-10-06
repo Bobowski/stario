@@ -9,7 +9,6 @@ cimport cython
 
 import asyncio
 import http
-import threading
 from urllib.parse import quote as _url_quote
 
 from libc.stddef cimport size_t
@@ -75,8 +74,8 @@ from stario_cython.compression_buf cimport (
 include "headers.pxi"
 include "router.pxi"
 
-cdef class Connection:
-    """Connection vtable. ``CHttpProtocol`` overrides every entry."""
+cdef class HttpConnection:
+    """HttpConnection vtable. ``CHttpProtocol`` overrides every entry."""
 
     def __cinit__(self):
         self.timeout_cleanup = 0
@@ -164,14 +163,12 @@ cdef bytes CL_PREFIX = b"\r\ncontent-length: "
 cdef bytes CRLF2 = b"\r\n\r\n"
 cdef bytes CRLF = b"\r\n"
 cdef bytes CHUNK_END = b"0\r\n\r\n"
-cdef tuple _DEC_SMALL = tuple(str(i).encode("ascii") for i in range(256))
+cdef tuple _DEC_SMALL = tuple(str(i).encode("ascii") for i in range(1024))
 
 cdef object STARTED_ERROR = (
     "Response already started (headers sent). "
     "Set headers via w.headers.set() before the first write or one-shot respond()."
 )
-
-cdef object _POOL_LOCAL = threading.local()
 
 cdef extern from *:
     """
@@ -199,10 +196,34 @@ cdef extern from *:
         return Py_REFCNT(obj) == 1;
     #endif
     }
+
+    /* Per-OS-thread exchange spare list. The pointer keeps its list alive
+       until process exit, like threading.local but without a getattr on
+       every acquire and release. */
+    static STARIO_TLS PyObject* stario_exchange_pool = NULL;
+
+    static PyObject* stario_pool_get(void) {
+        PyObject* pool = stario_exchange_pool;
+        if (pool == NULL) {
+            Py_INCREF(Py_None);
+            return Py_None;
+        }
+        Py_INCREF(pool);
+        return pool;
+    }
+
+    static void stario_pool_set(PyObject* pool) {
+        if (stario_exchange_pool == NULL) {
+            Py_INCREF(pool);
+            stario_exchange_pool = pool;
+        }
+    }
     """
     void stario_note_retained() noexcept
     Py_ssize_t stario_retained_count() noexcept
     bint stario_is_unique(object obj) noexcept
+    object stario_pool_get()
+    void stario_pool_set(object pool) noexcept
 
 
 def _retained_detach_count():
@@ -211,12 +232,11 @@ def _retained_detach_count():
 
 cdef inline list _thread_pool():
     """Same-OS-thread spare list. Never share an exchange across threads."""
-    cdef list pool
-    pool = getattr(_POOL_LOCAL, "pool", None)
+    cdef object pool = stario_pool_get()
     if pool is None:
         pool = []
-        _POOL_LOCAL.pool = pool
-    return pool
+        stario_pool_set(pool)
+    return <list>pool
 
 
 cdef inline bint _is_bytes_like(object obj) except -1:
@@ -441,10 +461,25 @@ cdef object _status_line(int status):
 cdef object _dec(size_t n):
     cdef char buf[16]
     cdef int i
-    if n < 256:
+    if n < 1024:
         return _DEC_SMALL[n]
     i = sprintf(buf, "%zu", n)
     return PyBytes_FromStringAndSize(buf, i)
+
+
+cdef object _chunk_header(Py_ssize_t n):
+    """``<hex>\\r\\n`` for one chunked frame."""
+    cdef char buf[26]
+    cdef int i = sprintf(buf, "%zx\r\n", <size_t>n)
+    return PyBytes_FromStringAndSize(buf, i)
+
+
+cdef inline object _wire_part(object part):
+    """``bytes`` stays zero-copy; a mutable body part is snapshotted once."""
+    if type(part) is bytes:
+        return part
+    _require_bytes_like(part)
+    return bytes(part)
 
 
 cdef inline int _hex_nibble(unsigned char c) noexcept:
@@ -2936,7 +2971,7 @@ cdef class RequestExchange:
 
     cdef void reset(
         self,
-        Connection connection,
+        HttpConnection connection,
         object app,
         object transport,
         list date_box,
@@ -3338,6 +3373,7 @@ cdef class RequestExchange:
         cdef object existing_ce
         cdef object existing_cl
         cdef Py_ssize_t nbytes
+        cdef object wire
         cdef const unsigned char* native_out = NULL
         cdef size_t native_len = 0
         if self._t_is_closing():
@@ -3381,6 +3417,16 @@ cdef class RequestExchange:
             not _may_have_body(status)
             or not self._may_compress(body, content_type, False, nbytes)
         ):
+            # Snapshot caller-mutable bodies: the transport may retain the
+            # object past this call. ``bytes`` snapshots to itself.
+            if body is None:
+                wire = b""
+            elif type(body) is bytes:
+                wire = body
+            elif isinstance(body, (list, tuple)):
+                wire = [_wire_part(p) for p in body]
+            else:
+                wire = _wire_part(body)
             if not _may_have_body(status):
                 # RFC 9110 §8.6: no Content-Length on 204; 304 omits it too.
                 self._t_writelines((
@@ -3389,7 +3435,18 @@ cdef class RequestExchange:
                     CRLF,
                 ))
             elif nbytes and not self._head_request:
-                if isinstance(body, (list, tuple)):
+                if type(wire) is bytes and nbytes <= OUTPUT_BUFFER_RETAIN_MAX:
+                    self._t_writelines((
+                        _status_line(status),
+                        self._date_box[0],
+                        CT_PREFIX,
+                        content_type,
+                        CL_PREFIX,
+                        _dec(<size_t>nbytes),
+                        CRLF2,
+                        wire,
+                    ))
+                elif type(wire) is bytes:
                     self._t_writelines((
                         _status_line(status),
                         self._date_box[0],
@@ -3399,18 +3456,7 @@ cdef class RequestExchange:
                         _dec(<size_t>nbytes),
                         CRLF2,
                     ))
-                    self._t_writelines(body)
-                elif nbytes <= OUTPUT_BUFFER_RETAIN_MAX:
-                    self._t_writelines((
-                        _status_line(status),
-                        self._date_box[0],
-                        CT_PREFIX,
-                        content_type,
-                        CL_PREFIX,
-                        _dec(<size_t>nbytes),
-                        CRLF2,
-                        body,
-                    ))
+                    self._transport.write(wire)
                 else:
                     self._t_writelines((
                         _status_line(status),
@@ -3421,7 +3467,7 @@ cdef class RequestExchange:
                         _dec(<size_t>nbytes),
                         CRLF2,
                     ))
-                    self._transport.write(body)
+                    self._t_writelines(wire)
             else:
                 self._t_writelines((
                     _status_line(status),
@@ -3689,15 +3735,32 @@ cdef class RequestExchange:
                 self._block(data, &native_out, &native_len)
                 self._write_native_chunk(native_out, native_len)
             return self
-        if self._close_delimited:
-            self._buf_body(data)
+        # Chunked and close-delimited bodies go straight to the transport as
+        # iovecs (writev under uvloop): ``bytes`` is sent without a copy and
+        # mutable parts are snapshotted once here instead of twice through
+        # ``_out_buf`` + ``_flush``.
+        if self._out_len:
             self._flush()
+        if type(data) is bytes:
+            if self._close_delimited:
+                self._t_writelines((data,))
+            else:
+                self._t_writelines((_chunk_header(n), data, CRLF))
             return self
-        self._buf_uint(<size_t>n, 16)
-        self._buf_bytes(CRLF)
-        self._buf_body(data)
-        self._buf_bytes(CRLF)
-        self._flush()
+        if isinstance(data, (list, tuple)):
+            parts = []
+            if not self._close_delimited:
+                parts.append(_chunk_header(n))
+            for part in data:
+                parts.append(_wire_part(part))
+            if not self._close_delimited:
+                parts.append(CRLF)
+            self._t_writelines(parts)
+            return self
+        if self._close_delimited:
+            self._t_writelines((_wire_part(data),))
+            return self
+        self._t_writelines((_chunk_header(n), _wire_part(data), CRLF))
         return self
 
     cpdef void end(self, object data=None):
@@ -3792,6 +3855,11 @@ cdef class RequestExchange:
         self._body_used = 0
         self._body_cap = 0
 
+    cdef inline char* _body_ptr(self) noexcept:
+        if type(self._body_buf) is bytes:
+            return PyBytes_AS_STRING(self._body_buf)
+        return PyByteArray_AS_STRING(self._body_buf)
+
     cdef int _body_reserve(self, Py_ssize_t need) noexcept:
         cdef object buf
         cdef Py_ssize_t cap
@@ -3800,22 +3868,31 @@ cdef class RequestExchange:
         if self._body_buf is not None and need <= self._body_cap:
             return 0
         if self._body_buf is None:
-            cap = DEFAULT_STREAM_CHUNK
             # Reserve the declared length only when it is small (the body
             # completes before dispatch) or body() is reading it; a declared
             # 10 MB that nobody reads yet must not allocate 10 MB.
-            if (
-                self._expected_size > 0
-                and (
-                    self._consumed_as == CONSUMED_BODY
-                    or (
-                        self._consumed_as == CONSUMED_NONE
-                        and self._expected_size <= SMALL_BODY
-                    )
+            if self._expected_size > 0 and (
+                self._consumed_as == CONSUMED_BODY
+                or (
+                    self._consumed_as == CONSUMED_NONE
+                    and self._expected_size <= SMALL_BODY
                 )
             ):
                 cap = self._expected_size
-            elif self._consumed_as == CONSUMED_STREAM:
+                if cap < need:
+                    cap = need
+                # A fixed Content-Length lands in an uninitialized bytes
+                # object. It stays private to this exchange until complete,
+                # then ``body()`` hands it out without a second copy.
+                buf = PyBytes_FromStringAndSize(NULL, cap)
+                if buf is None:
+                    PyErr_Clear()
+                    return -1
+                self._body_buf = buf
+                self._body_cap = cap
+                return 0
+            cap = DEFAULT_STREAM_CHUNK
+            if self._consumed_as == CONSUMED_STREAM:
                 cap = self._stream_max_chunk
             if cap < need:
                 cap = need
@@ -3825,6 +3902,42 @@ cdef class RequestExchange:
                 return -1
             self._body_buf = buf
             self._body_cap = cap
+            return 0
+        if (
+            self._expected_size > 0
+            and self._consumed_as == CONSUMED_BODY
+            and type(self._body_buf) is not bytes
+            and need <= self._expected_size
+        ):
+            # body() started after chunks already buffered: move what has
+            # arrived into a full-size bytes buffer, then feed the rest in
+            # place so completion needs no copy.
+            buf = PyBytes_FromStringAndSize(NULL, self._expected_size)
+            if buf is None:
+                PyErr_Clear()
+                return -1
+            memcpy(
+                PyBytes_AS_STRING(buf),
+                PyByteArray_AS_STRING(self._body_buf),
+                <size_t>self._body_used,
+            )
+            self._body_buf = buf
+            self._body_cap = self._expected_size
+            return 0
+        if type(self._body_buf) is bytes:
+            # bytes cannot grow: a declared length that still needs room is
+            # defensive only — fall back to a bytearray.
+            buf = bytearray()
+            if PyByteArray_Resize(buf, need) < 0:
+                PyErr_Clear()
+                return -1
+            memcpy(
+                PyByteArray_AS_STRING(buf),
+                PyBytes_AS_STRING(self._body_buf),
+                <size_t>self._body_used,
+            )
+            self._body_buf = buf
+            self._body_cap = need
             return 0
         cap = self._body_cap * 2
         if cap < need:
@@ -3838,11 +3951,28 @@ cdef class RequestExchange:
 
     cdef int _adopt_expected_body_buffer(self) noexcept:
         """Grow the one body buffer to the declared Content-Length."""
+        cdef object buf
         if self._expected_size <= 0 or self._consumed_as == CONSUMED_STREAM:
             return 0
         if self._body_complete:
             return 0
         if self._body_used > self._expected_size:
+            return 0
+        if type(self._body_buf) is not bytes:
+            # Move what already arrived into a full-size bytes object; the
+            # rest feeds in place and completion hands it out as-is.
+            buf = PyBytes_FromStringAndSize(NULL, self._expected_size)
+            if buf is None:
+                PyErr_Clear()
+                return -1
+            if self._body_used > 0:
+                memcpy(
+                    PyBytes_AS_STRING(buf),
+                    self._body_ptr(),
+                    <size_t>self._body_used,
+                )
+            self._body_buf = buf
+            self._body_cap = self._expected_size
             return 0
         return self._body_reserve(self._expected_size)
 
@@ -3852,7 +3982,16 @@ cdef class RequestExchange:
         if used <= 0 or self._body_buf is None:
             self._clear_body_storage()
             return b""
-        out = PyBytes_FromStringAndSize(PyByteArray_AS_STRING(self._body_buf), used)
+        if (
+            type(self._body_buf) is bytes
+            and used == PyBytes_GET_SIZE(self._body_buf)
+        ):
+            # The whole Content-Length body is already in a private bytes
+            # object: hand it over, no copy.
+            out = self._body_buf
+            self._clear_body_storage()
+            return out
+        out = PyBytes_FromStringAndSize(self._body_ptr(), used)
         self._clear_body_storage()
         if out is None:
             raise MemoryError()
@@ -3865,7 +4004,7 @@ cdef class RequestExchange:
         if self._body_used <= 0 or self._body_buf is None:
             return b""
         take = self._body_used if max_n <= 0 or max_n > self._body_used else max_n
-        src = PyByteArray_AS_STRING(self._body_buf)
+        src = self._body_ptr()
         out = PyBytes_FromStringAndSize(src, take)
         if take < self._body_used:
             memmove(src, src + take, <size_t>(self._body_used - take))
@@ -4000,7 +4139,7 @@ cdef class RequestExchange:
             return -1
         if length:
             memcpy(
-                PyByteArray_AS_STRING(self._body_buf) + self._body_used,
+                self._body_ptr() + self._body_used,
                 at,
                 length,
             )
@@ -4739,7 +4878,7 @@ cdef class RequestHandle:
 
 
 cdef RequestExchange acquire_exchange(
-    Connection connection,
+    HttpConnection connection,
     object app,
     object transport,
     list date_box,
