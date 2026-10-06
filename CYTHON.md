@@ -35,8 +35,7 @@ parser-only microbench, but end-to-end HTTP/1 is about even on GET
 (0.98–1.07×) and behind on a tiny JSON POST (0.85×). HTTP/1 stays on
 llhttp. HTTP/2 GETs on the same process are ~1.8× HTTP/1 when `h2load`
 uses 100 streams per connection. TLS ALPN selects `h2` or `http/1.1`;
-a self-signed cert serves both. See
-[`benchmarks/server/pico-h2-20260831.md`](benchmarks/server/pico-h2-20260831.md).
+a self-signed cert serves both.
 
 ## Current snapshot (2026-09-21)
 
@@ -46,8 +45,7 @@ The Python httptools protocol is gone in 5.0. Production HTTP is Cython:
 `stario serve` and `python -m stario_cython` are the same protocol.
 
 Official wrk suite, one worker, `10s` × 5 measured + 1 warmup, 4 vCPU
-cloud Xeon, same-host loopback. Full tables:
-[`benchmarks/server/baseline-20260921-core.md`](benchmarks/server/baseline-20260921-core.md).
+cloud Xeon, same-host loopback.
 
 ### How we're doing
 
@@ -226,14 +224,11 @@ Old endpoint set (plaintext / JSON GET / single-URL params, no `sleep(0)`).
 Granian led GET (plaintext **0.87×**, JSON **0.85×**, params **0.70×**).
 Params was 4.2 dropping the lookup LRU; restoring it brought params in
 line with plaintext (**0.93× / 0.89× / 0.85×**) on a cached `/user/42`.
-Full tables:
-[`benchmarks/server/baseline-20260919.md`](benchmarks/server/baseline-20260919.md).
 
 ## Merge snapshot (2026-08-28)
 
 Official `benchmarks/server` suite, one worker, `10s` × 5 measured + 1
-warmup, IQR trimming. Full lab log:
-[`benchmarks/server/baseline-20260828.md`](benchmarks/server/baseline-20260828.md).
+warmup, IQR trimming.
 
 ### vs unmodified `cython-core` (current Cython)
 
@@ -282,8 +277,7 @@ GET ~1.8×. Small POST ~2.0× (was ~1.2× on 27 Aug). 2MB stream 1.23×.
 Median req/s. Same knobs, one worker. Stario: `20260828T193136Z`. Granian /
 Socketify / Robyn / Django-Bolt: `20260828T183308Z`. BlackSheep+Granian:
 `20260828T180757Z`. Bold is best in that column. Granian is RSGI, no
-framework. Full ± and lab log:
-[`benchmarks/server/baseline-20260828.md`](benchmarks/server/baseline-20260828.md).
+framework.
 
 | Server | Plaintext | JSON | Params | Validate | Form | JSON 1KB | 64KB | 2MB buf | 2MB stream | Multipart |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
