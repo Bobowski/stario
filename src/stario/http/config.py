@@ -1,10 +1,12 @@
 """Process-level HTTP server configuration (listen, limits, compression, shutdown).
 
-Body and header size defaults for `RequestPolicy` are defined in `request.py`
-alongside `BodyReader`; this module re-exports them for env wiring.
+Body and header size defaults for `RequestPolicy` are defined in `request.py`;
+this module re-exports them for env wiring.
 """
 
 from collections.abc import Callable
+from pathlib import Path
+from ssl import SSLContext
 from typing import Literal, TypedDict
 
 from stario._env import (
@@ -16,6 +18,7 @@ from stario._env import (
     env_str,
 )
 from stario.exceptions import StarioError
+from stario.http.tls import load_tls_context
 
 from .compression import CompressionConfig, compression_config_from_env
 from .request import (
@@ -31,9 +34,11 @@ DEFAULT_BACKLOG = 2048
 DEFAULT_UNIX_SOCKET_MODE = 0o660
 DEFAULT_HEADER_TIMEOUT = 5.0
 DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
+DEFAULT_WRITE_TIMEOUT = 30.0
 DEFAULT_REUSE_ADDR = True
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
 DEFAULT_EVENT_LOOP = "asyncio"
+DEFAULT_THREADS = 1
 
 type EventLoopKind = Literal["asyncio", "uvloop"]
 
@@ -48,6 +53,7 @@ class RequestPolicy:
         "max_body_bytes",
         "max_header_bytes",
         "max_pipelined_requests",
+        "write_timeout",
     )
 
     def __init__(
@@ -59,21 +65,33 @@ class RequestPolicy:
         body_timeout: float = DEFAULT_BODY_TIMEOUT,
         keep_alive_timeout: float = DEFAULT_KEEP_ALIVE_TIMEOUT,
         max_pipelined_requests: int = DEFAULT_MAX_PIPELINED_REQUESTS,
+        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
     ) -> None:
         if max_header_bytes < 256:
             raise StarioError(
                 "max_header_bytes must be at least 256",
                 help_text="Increase the limit or use the default Server settings.",
             )
+        if max_header_bytes > 2_147_483_647:
+            raise StarioError(
+                "max_header_bytes must be at most 2^31-1",
+                help_text="The Cython protocol stores this cap as a 32-bit int.",
+            )
         if max_body_bytes < 1:
             raise StarioError(
                 "max_body_bytes must be at least 1",
                 help_text="Use a positive byte limit for request bodies.",
             )
+        if max_body_bytes > 2_147_483_647:
+            raise StarioError(
+                "max_body_bytes must be at most 2^31-1",
+                help_text="The Cython protocol stores this cap as a 32-bit int.",
+            )
         for field, value in (
             ("header_timeout", header_timeout),
             ("body_timeout", body_timeout),
             ("keep_alive_timeout", keep_alive_timeout),
+            ("write_timeout", write_timeout),
         ):
             if value <= 0:
                 raise StarioError(
@@ -92,6 +110,7 @@ class RequestPolicy:
         self.body_timeout = body_timeout
         self.keep_alive_timeout = keep_alive_timeout
         self.max_pipelined_requests = max_pipelined_requests
+        self.write_timeout = write_timeout
 
 
 def _config_from_env[T](build: Callable[[], T]) -> T:
@@ -102,7 +121,7 @@ def _config_from_env[T](build: Callable[[], T]) -> T:
 
 
 def request_policy_from_env() -> RequestPolicy:
-    """Read `STARIO_REQUESTS_*` size caps, read timeouts, and keep-alive idle timeout."""
+    """Read `STARIO_REQUESTS_*` size caps, read/write timeouts, and keep-alive idle timeout."""
     return _config_from_env(
         lambda: RequestPolicy(
             max_header_bytes=env_int(
@@ -122,6 +141,9 @@ def request_policy_from_env() -> RequestPolicy:
             ),
             max_pipelined_requests=env_int(
                 "STARIO_REQUESTS_MAX_PIPELINED_REQUESTS", DEFAULT_MAX_PIPELINED_REQUESTS
+            ),
+            write_timeout=env_float(
+                "STARIO_REQUESTS_WRITE_TIMEOUT", DEFAULT_WRITE_TIMEOUT
             ),
         )
     )
@@ -151,6 +173,8 @@ class ServerConfig:
         "port",
         "requests",
         "reuse_addr",
+        "ssl",
+        "threads",
         "unix_socket",
         "unix_socket_mode",
     )
@@ -168,6 +192,10 @@ class ServerConfig:
         backlog: int = DEFAULT_BACKLOG,
         reuse_addr: bool = DEFAULT_REUSE_ADDR,
         event_loop: EventLoopKind = DEFAULT_EVENT_LOOP,
+        threads: int = DEFAULT_THREADS,
+        ssl: SSLContext | None = None,
+        ssl_certfile: str | Path | None = None,
+        ssl_keyfile: str | Path | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
             raise StarioError(
@@ -204,6 +232,26 @@ class ServerConfig:
                 "event_loop must be 'asyncio' or 'uvloop'",
                 help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
             )
+        if threads < 1:
+            raise StarioError(
+                "threads must be at least 1",
+                help_text="Set STARIO_THREADS to 1 (default) or a positive worker count.",
+            )
+        if threads > 256:
+            raise StarioError(
+                "threads must be at most 256",
+                help_text="Set STARIO_THREADS to a smaller worker count.",
+            )
+        if ssl is not None and (ssl_certfile is not None or ssl_keyfile is not None):
+            raise StarioError(
+                "pass either ssl= or ssl_certfile=, not both",
+                help_text="Use a prepared SSLContext or certificate paths.",
+            )
+        if ssl_keyfile is not None and ssl_certfile is None:
+            raise StarioError(
+                "ssl_keyfile requires ssl_certfile",
+                help_text="Set STARIO_SSL_CERTFILE with STARIO_SSL_KEYFILE.",
+            )
 
         self.host = host
         self.port = port
@@ -217,6 +265,16 @@ class ServerConfig:
         self.backlog = backlog
         self.reuse_addr = reuse_addr
         self.event_loop: EventLoopKind = event_loop
+        self.threads = threads
+        if ssl is not None:
+            self.ssl = ssl
+        elif ssl_certfile is not None:
+            self.ssl = load_tls_context(
+                certfile=ssl_certfile,
+                keyfile=ssl_keyfile,
+            )
+        else:
+            self.ssl = None
 
 
 class ServerOptions(TypedDict, total=False):
@@ -232,6 +290,10 @@ class ServerOptions(TypedDict, total=False):
     backlog: int
     reuse_addr: bool
     event_loop: EventLoopKind
+    threads: int
+    ssl: SSLContext
+    ssl_certfile: str | Path | None
+    ssl_keyfile: str | Path | None
 
 
 def _event_loop_from_env() -> EventLoopKind:
@@ -262,5 +324,8 @@ def server_config_from_env() -> ServerConfig:
             backlog=env_int("STARIO_BACKLOG", DEFAULT_BACKLOG),
             reuse_addr=env_bool("STARIO_REUSE_ADDR", DEFAULT_REUSE_ADDR),
             event_loop=_event_loop_from_env(),
+            threads=env_int("STARIO_THREADS", DEFAULT_THREADS),
+            ssl_certfile=env_optional_str("STARIO_SSL_CERTFILE"),
+            ssl_keyfile=env_optional_str("STARIO_SSL_KEYFILE"),
         )
     )

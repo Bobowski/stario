@@ -8,9 +8,7 @@ from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
 
-import zstandard as zstd
-
-from stario.http.compression import brotli_decompress
+from stario.http.compression import brotli_decompress, zstd_decompress
 from stario.http.headers import Headers
 from stario.json import dumps_bytes as json_dumps_bytes
 from stario.testing.cookies import parse_set_cookie_headers
@@ -148,7 +146,7 @@ def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
     if normalized == "br":
         return brotli_decompress(body)
     if normalized == "zstd":
-        return zstd.decompress(body)
+        return zstd_decompress(body)
     raise RuntimeError(
         f"TestClient does not support Content-Encoding={encoding!r}; "
         "use Accept-Encoding that yields identity."
