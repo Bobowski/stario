@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import array
 import asyncio
+import gzip
 import zlib
 
 import pytest
 
 import stario.responses as responses
 from stario import App, Route
-from stario.http.compression import CompressionConfig
+from stario.http.compression import (
+    CompressionConfig,
+    brotli_decompress,
+    zstd_decompress,
+)
 from tests.cython import h2wire as h2
 from tests.cython.http import read_response, running_server
 
@@ -106,6 +111,76 @@ async def test_h2_head_with_accept_encoding_sends_no_data() -> None:
     assert b"\x88" in h2.stream_headers_blob(frames, 1)
     assert h2.stream_data(frames, 1) == b""
     assert not h2.has_rst(frames, 1)
+
+
+@pytest.mark.asyncio
+async def test_h2_respond_gzip_round_trip() -> None:
+    app = App()
+    body = b"h2 compressed body " * 1024
+
+    async def page(_c, w) -> None:
+        w.respond(body, b"text/plain")
+
+    app.add(Route("GET /"), page)
+    async with running_server(app, compression=CompressionConfig(min_size=1)) as port:
+        reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
+        writer.write(_h2_get(1, "/", extra=[(b"accept-encoding", b"gzip")]))
+        frames, _buf = await h2.read_stream(reader, buf, 1)
+        writer.close()
+    assert gzip.decompress(h2.stream_data(frames, 1)) == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoding", "decompress"),
+    [
+        (b"gzip", gzip.decompress),
+        (b"br", brotli_decompress),
+        (b"zstd", zstd_decompress),
+    ],
+)
+async def test_h2_streaming_compression_round_trip(encoding, decompress) -> None:
+    app = App()
+
+    async def stream(_c, w) -> None:
+        w.headers.set("content-type", "text/event-stream")
+        w.write_headers(200)
+        w.write(b"data: 0\n\n")
+        w.write(bytearray(b"data: 1\n\n"))
+        w.end()
+
+    app.add(Route("GET /stream"), stream)
+    async with running_server(app, compression=CompressionConfig(min_size=1)) as port:
+        reader, writer, buf = await h2.h2_handshake("127.0.0.1", port)
+        writer.write(_h2_get(1, "/stream", extra=[(b"accept-encoding", encoding)]))
+        frames, _buf = await h2.read_stream(reader, buf, 1)
+        writer.close()
+    assert decompress(h2.stream_data(frames, 1)) == b"data: 0\n\ndata: 1\n\n"
+
+
+@pytest.mark.asyncio
+async def test_h1_streaming_gzip_large_body_round_trip() -> None:
+    app = App()
+    parts = [bytes(range(256)) * 256] * 4
+
+    async def page(_c, w) -> None:
+        w.headers.set("content-type", "application/octet-stream")
+        w.write_headers(200)
+        for part in parts:
+            w.write(part)
+        w.end()
+
+    app.add(Route("GET /"), page)
+    async with running_server(app, compression=CompressionConfig(min_size=1)) as port:
+        raw = await _raw_exchange(
+            port,
+            b"GET / HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n"
+            b"Connection: close\r\n\r\n",
+        )
+    head, body = raw.split(b"\r\n\r\n", 1)
+    assert b"content-encoding: gzip" in head.lower()
+    assert b"transfer-encoding: chunked" in head.lower()
+    assert gzip.decompress(_dechunk(body)) == b"".join(parts)
 
 
 @pytest.mark.asyncio
@@ -252,6 +327,30 @@ async def test_h1_chunked_write_snapshots_a_callers_bytearray() -> None:
     head, body = raw.split(b"\r\n\r\n", 1)
     assert b"transfer-encoding: chunked" in head.lower()
     assert _dechunk(body) == b"first-second"
+
+
+@pytest.mark.asyncio
+async def test_declared_length_write_snapshots_a_caller_bytearray() -> None:
+    app = App()
+
+    async def page(_c, w) -> None:
+        w.headers.set("content-type", "text/plain")
+        w.headers.set("content-length", "8")
+        w.write_headers(200)
+        body = bytearray(b"original")
+        w.write(body)
+        body[:] = b"corrupt!"
+        w.end()
+
+    app.add(Route("GET /"), page)
+    async with running_server(app) as port:
+        raw = await _raw_exchange(
+            port,
+            b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+    head, body = raw.split(b"\r\n\r\n", 1)
+    assert b"content-length: 8" in head.lower()
+    assert body == b"original"
 
 
 @pytest.mark.asyncio

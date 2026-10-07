@@ -3630,13 +3630,15 @@ cdef class RequestExchange:
             # GET only learns while streaming. Everything else matches GET.
             headers.c_remove(b"transfer-encoding")
             self._declared_length = 0
-            if not self._http2:
-                self._stream_encoding(headers, False)
+            self._stream_encoding(headers, False)
         elif self._skip_body:
             headers.c_remove(b"transfer-encoding")
             headers.c_set(b"content-length", b"0")
             self._declared_length = 0
-        elif not self._http2:
+        elif self._http2:
+            # DATA frames carry the compressed stream; no chunked coding.
+            self._stream_encoding(headers, True)
+        else:
             if self._version == "1.0":
                 # RFC 9112 7: HTTP/1.0 has no chunked coding.
                 headers.c_remove(b"transfer-encoding")
@@ -3709,6 +3711,29 @@ cdef class RequestExchange:
             )
         if self._http2:
             self._bytes_written += n
+            if self._brotli != NULL or self._zstd != NULL or self._gzip != NULL:
+                if isinstance(data, (list, tuple)):
+                    for part in data:
+                        _require_bytes_like(part)
+                        if part:
+                            self._block(part, &native_out, &native_len)
+                            self._connection.h2_write_data(
+                                self,
+                                PyBytes_FromStringAndSize(
+                                    <char*>native_out, <Py_ssize_t>native_len
+                                ),
+                                False,
+                            )
+                else:
+                    self._block(data, &native_out, &native_len)
+                    self._connection.h2_write_data(
+                        self,
+                        PyBytes_FromStringAndSize(
+                            <char*>native_out, <Py_ssize_t>native_len
+                        ),
+                        False,
+                    )
+                return self
             if isinstance(data, (list, tuple)):
                 for part in data:
                     if part:
@@ -3719,9 +3744,9 @@ cdef class RequestExchange:
         if self._declared_length >= 0:
             self._bytes_written += n
             if isinstance(data, (list, tuple)):
-                self._transport.writelines(data)
+                self._transport.writelines([_wire_part(part) for part in data])
             else:
-                self._transport.write(data)
+                self._transport.write(_wire_part(data))
             return self
         if self._brotli != NULL or self._zstd != NULL or self._gzip != NULL:
             if isinstance(data, (list, tuple)):
@@ -3801,6 +3826,17 @@ cdef class RequestExchange:
                 ),
             )
         if self._http2:
+            if self._brotli != NULL or self._zstd != NULL or self._gzip != NULL:
+                self._finish(&native_out, &native_len)
+                if native_len:
+                    self._connection.h2_write_data(
+                        self,
+                        PyBytes_FromStringAndSize(
+                            <char*>native_out, <Py_ssize_t>native_len
+                        ),
+                        False,
+                    )
+                self._free_compressors()
             self._completed = True
             self._connection.h2_end(self)
             self._done()

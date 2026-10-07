@@ -249,6 +249,10 @@ def test_request_headers_pass_through(headers):
         ),
         min_size=1,
         max_size=24,
+    ).filter(
+        # RFC 3986: "." and ".." segments are removed during normalization,
+        # so "/u/." never reaches the router as a parameter.
+        lambda s: s not in (".", "..")
     )
 )
 @settings(max_examples=40, deadline=None)
