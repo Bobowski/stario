@@ -124,7 +124,7 @@ cd my-app
 uv add stario
 ```
 
-For an app rather than a one-file experiment, copy [`AGENTS.md`](AGENTS.md) into the repo root and follow it. It is the app guide for people and agents: layout, the CQRS default, signals, tests. Optional stacks live under [`skills/`](skills/).
+For an app rather than a one-file experiment, start from the app guide in [bobowski/stario-skills](https://github.com/bobowski/stario-skills): copy its `AGENTS.md` into the repo root and install the skills with `npx skills add bobowski/stario-skills`.
 
 Put this in `main.py`:
 

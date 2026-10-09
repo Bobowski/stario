@@ -27,7 +27,7 @@ Per feature the pattern is the same:
 Files are optional per feature — the lobby is UI over the room domain, so
 it has no models.py, data.py, or subjects.py of its own.
 
-Layout trees and conventions: AGENTS.md in the stario repo root and
+Layout trees and conventions: AGENTS.md from https://github.com/bobowski/stario-skills and
 https://stario.dev/docs/how-tos/structuring-apps
 """
 
