@@ -5,40 +5,31 @@ The lobby is UI over the room domain: it imports queries from
 `app.features.room.data` instead of owning tables of its own.
 """
 
-import stario.responses as responses
-from app.common.identity import VisitorIdentity, identity_for_page, resolve_identity
+from app.common.identity import identity_for_page, resolve_identity
 from app.db import Database
 from app.features.room import data as room_data
 from app.features.room import subjects as room_subjects
 from app.features.room.urls import CREATE, DELETE, ROOM
-from stario import App, Context, Relay, Writer
-from stario.datastar import SSE
+from stario import App, Context, HttpException, Relay, Writer, responses
+from stario.datastar import SSE, read_signals
 
-from . import subjects as lobby_subjects
-from .signals import read_lobby_signals
 from .urls import LOBBY, SUBSCRIBE
-from .views import LOBBY_LIVE_SELECTOR, lobby_live_view, lobby_view
+from .views import render
 
 MAX_TITLE_LENGTH = 60
 MAX_DESCRIPTION_LENGTH = 200
 
+ROOMS_CHANGED = "lobby.rooms"
 _LOBBY_REFRESH_SUFFIXES = (".presence", ".deleted")
 
 
-def patch_lobby(sse: SSE, db: Database, identity: VisitorIdentity) -> None:
-    rooms = room_data.list_rooms(db)
-    online = room_data.count_users_by_room(db)
-    sse.patch_elements(
-        lobby_live_view(rooms=rooms, online_counts=online),
-        selector=LOBBY_LIVE_SELECTOR,
-        mode="outer",
-    )
+class Lobby:
+    def __init__(self, db: Database, relay: Relay[str]) -> None:
+        self.db = db
+        self.relay = relay
 
-
-def show_lobby(db: Database):
-    """GET / — mint or restore visitor identity and list rooms."""
-
-    async def handler(c: Context, w: Writer) -> None:
+    async def show(self, c: Context, w: Writer) -> None:
+        """GET / — mint or restore visitor identity and list rooms."""
         identity = identity_for_page(c)
         c.span.attrs(
             {
@@ -46,80 +37,75 @@ def show_lobby(db: Database):
                 "username": identity.username,
             }
         )
-        rooms = room_data.list_rooms(db)
-        online = room_data.count_users_by_room(db)
         responses.html(
             w,
-            lobby_view(rooms=rooms, online_counts=online, identity=identity),
+            render(
+                identity=identity,
+                rooms=room_data.list_rooms(self.db),
+                online_counts=room_data.count_users_by_room(self.db),
+            ),
         )
 
-    return handler
-
-
-def subscribe(db: Database, relay: Relay[str]):
-    """GET /subscribe — SSE patches when rooms or presence change."""
-
-    async def handler(c: Context, w: Writer) -> None:
+    async def live(self, c: Context, w: Writer) -> None:
+        """GET /subscribe — SSE repaints when rooms or presence change."""
         identity = await resolve_identity(c)
         if identity is None:
-            responses.redirect(w, LOBBY.href())
-            return
+            raise HttpException(400, "Missing identity signals")
 
-        async with relay.subscribe("room.*", "lobby.*") as live:
+        async with self.relay.subscribe("room.*", "lobby.*") as events:
             sse = SSE(w)
-            patch_lobby(sse, db, identity)
+            sse.patch_elements(
+                render(
+                    identity=identity,
+                    rooms=room_data.list_rooms(self.db),
+                    online_counts=room_data.count_users_by_room(self.db),
+                )
+            )
 
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 if subject.startswith("lobby.") or any(
                     subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES
                 ):
-                    patch_lobby(sse, db, identity)
+                    sse.patch_elements(
+                        render(
+                            identity=identity,
+                            rooms=room_data.list_rooms(self.db),
+                            online_counts=room_data.count_users_by_room(self.db),
+                        )
+                    )
 
-    return handler
-
-
-def create_room(db: Database, relay: Relay[str]):
-    """POST /rooms — add a room from lobby dialog signals."""
-
-    async def handler(c: Context, w: Writer) -> None:
-        signals = await read_lobby_signals(c)
-        title = signals.room_title.strip()[:MAX_TITLE_LENGTH]
+    async def create(self, c: Context, w: Writer) -> None:
+        """POST /rooms — add a room from lobby dialog signals."""
+        signals = await read_signals(c.req)
+        title = str(signals.get("room_title", "")).strip()[:MAX_TITLE_LENGTH]
         if not title:
-            responses.redirect(w, LOBBY.href(), 303)
+            responses.empty(w)
             return
 
-        description = (signals.room_description.strip() or title)[
+        description = (str(signals.get("room_description", "")).strip() or title)[
             :MAX_DESCRIPTION_LENGTH
         ]
-        room = room_data.add_room(db, title=title, description=description)
+        room = room_data.add_room(self.db, title=title, description=description)
         c.span.event("Room created", {"room_id": room.id, "title": room.title})
-        relay.publish(lobby_subjects.rooms(), "created")
-        responses.redirect(w, ROOM.href(room_id=room.id), 303)
+        self.relay.publish(ROOMS_CHANGED, "created")
+        SSE(w).navigate(ROOM.href(room_id=room.id))
 
-    return handler
+    async def delete(self, c: Context, w: Writer) -> None:
+        """DELETE /rooms/{room_id} — remove room and its chat data.
 
-
-def delete_room(db: Database, relay: Relay[str]):
-    """DELETE /rooms/{room_id} — remove room and its chat data.
-
-    Publishes a deleted event so live subscribers get navigated back to the
-    lobby instead of chatting into a void.
-    """
-
-    async def handler(c: Context, w: Writer) -> None:
-        room_id = c.match.params.get("room_id", "")
-        if room_data.delete_room(db, room_id):
+        Publishes a deleted event so live subscribers get navigated back to the
+        lobby instead of chatting into a void.
+        """
+        room_id = c.match.params["room_id"]
+        if room_data.delete_room(self.db, room_id):
             c.span.event("Room deleted", {"room_id": room_id})
-            relay.publish(room_subjects.deleted(room_id), "deleted")
-            relay.publish(lobby_subjects.rooms(), "deleted")
-        responses.redirect(w, LOBBY.href(), 303)
+            self.relay.publish(room_subjects.deleted(room_id), "deleted")
+            self.relay.publish(ROOMS_CHANGED, "deleted")
+        SSE(w).navigate(LOBBY.href())
 
-    return handler
-
-
-def register_lobby(app: App, db: Database, relay: Relay[str]) -> None:
-    app.add(LOBBY, show_lobby(db))
-    app.add(SUBSCRIBE, subscribe(db, relay))
-    app.add(CREATE, create_room(db, relay))
-    app.add(DELETE, delete_room(db, relay))
+    def register(self, app: App) -> None:
+        app.add(LOBBY, self.show)
+        app.add(SUBSCRIBE, self.live)
+        app.add(CREATE, self.create)
+        app.add(DELETE, self.delete)

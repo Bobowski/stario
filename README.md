@@ -124,6 +124,8 @@ cd my-app
 uv add stario
 ```
 
+For an app rather than a one-file experiment, copy [`AGENTS.md`](AGENTS.md) into the repo root and follow it. It is the app guide for people and agents: layout, the CQRS default, signals, tests. Optional stacks live under [`skills/`](skills/).
+
 Put this in `main.py`:
 
 ```python

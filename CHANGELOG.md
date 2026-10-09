@@ -6,6 +6,15 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- `AGENTS.md`: the app guide for people and agents. One folder per screen, strict CQRS for any screen with an action, one `render(state)` for the full document, signals for form input only, inline code shape, and a stream test per screen.
+- `skills/`: `stario-feature`, `stario-litewriter`, and `stario-tailwind-daisyui` for the optional stacks. `llms.txt` indexes the guide, the skills, and the docs.
+
+### Changed
+
+- `examples/chat-room` follows the guide: one class per feature with `register(app)`, one `render` per screen morphed whole over the stream, signals read inline, `SSE.navigate` for commands that move the user, and a stream test per screen.
+
 ## 4.3.0 - 2026-09-25
 
 ### Added

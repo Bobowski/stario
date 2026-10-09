@@ -1,0 +1,39 @@
+# Stario
+
+Stario is a Python framework for server-rendered hypermedia apps. Handlers are async functions that write HTML through a `Writer`. Routes are explicit `Route` values. Datastar morphs the page in the browser. A long-lived SSE stream keeps a screen live. State lives on the server. Stario is not ASGI; run it with `stario serve app.main:bootstrap` or `stario watch app.main:bootstrap`.
+
+## Start here
+
+- [AGENTS.md](https://stario.dev/AGENTS.md): the app guide. Copy it into every Stario repo. Layout, invariants, the CQRS default, render from state, signals, code shape, tests, common mistakes.
+- [llms-full.txt](https://stario.dev/llms-full.txt): the guide and the three skills in one file, for tools that want more context.
+- [The Stario way](https://stario.dev/docs/the-stario-way): the direction behind the rules.
+
+## Skills (optional stacks)
+
+- [stario-feature](https://stario.dev/skills/stario-feature/SKILL.md): add or remove one screen, step by step.
+- [stario-litewriter](https://stario.dev/skills/stario-litewriter/SKILL.md): SQLite through `litewriter`; `watch` repaints the stream.
+- [stario-tailwind-daisyui](https://stario.dev/skills/stario-tailwind-daisyui/SKILL.md): Tailwind v4 and DaisyUI with the standalone binary, no Node.
+
+## Docs
+
+- [Hello world](https://stario.dev/docs/tutorials/hello-world): first bootstrap, handler, page.
+- [Realtime tiles](https://stario.dev/docs/tutorials/realtime-tiles): one live screen in one file.
+- [Chat room](https://stario.dev/docs/tutorials/chat-room): the same idea as a project tree.
+- [Go-to architecture](https://stario.dev/docs/explanation/go-to-architecture): one stream, short commands, `ui = f(state)`.
+- [Structuring apps](https://stario.dev/docs/how-tos/structuring-apps): the file tree.
+- [Datastar SDK](https://stario.dev/docs/how-tos/datastar-sdk): `data`, `at`, `SSE`, `read_signals`.
+- [Routing](https://stario.dev/docs/reference/routing): `Route`, `app.add`, middleware.
+- [Runtime](https://stario.dev/docs/reference/runtime): bootstrap lifecycle, `STARIO_*` variables.
+- [Testing](https://stario.dev/docs/reference/testing): `TestClient`, `stream`, `iter_events`.
+- [Telemetry](https://stario.dev/docs/reference/telemetry): spans and tracers.
+- [JSON](https://stario.dev/docs/reference/json): the process-wide codec.
+
+## Examples
+
+- [chat-room](https://github.com/bobowski/stario/tree/main/examples/chat-room): the reference project tree.
+- [tiles](https://github.com/bobowski/stario/tree/main/examples/tiles): single-file live board.
+- [hello-world](https://github.com/bobowski/stario/tree/main/examples/hello-world): one route, one page.
+
+## Defaults in one paragraph
+
+One folder per screen under `app/features/<screen>/` with `urls.py`, `views.py`, `handlers.py`, and `data.py` when the screen owns tables. A screen with no action is one `GET`. A screen with any action is `GET /page`, `GET /page/live`, and `POST` commands that reply 204 and publish. One `render(state)` returns the full document; the stream sends it again on each change. Signals hold form input only. Tests run through `TestClient(bootstrap)` and read the stream with `iter_events()`.
