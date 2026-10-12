@@ -203,9 +203,7 @@ async def test_serve_then_caller_continues(short_socket_path: str) -> None:
             assert status == 200
             assert body == b"hello"
         finally:
-            drain = apps[0].shutdown
-            if not drain.done():
-                drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await task
 

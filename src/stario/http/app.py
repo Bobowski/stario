@@ -21,25 +21,9 @@ from stario_cython.exchange import AppState
 from .dispatch import Router
 
 
-def _complete_loop_future(fut: asyncio.Future[None]) -> None:
-    if fut.done():
-        return
-    try:
-        # Bypass `_LoopShutdown.set_result`, which fans out through signal_shutdown.
-        asyncio.Future.set_result(fut, None)  # pyright: ignore[reportUnknownMemberType]
-    except asyncio.InvalidStateError:
-        return
-
-
-class _LoopShutdown(asyncio.Future[None]):
-    """Per-loop wait handle. `set_result` fans out through `App.signal_shutdown`."""
-
-    def __init__(self, *, loop: asyncio.AbstractEventLoop, app: App) -> None:
-        super().__init__(loop=loop)
-        self._stario_app = app
-
-    def set_result(self, result: None) -> None:  # type: ignore[override]
-        self._stario_app.signal_shutdown()
+def _finish(fut: asyncio.Future[None]) -> None:
+    if not fut.done():
+        fut.set_result(None)
 
 
 class App(Router):
@@ -51,9 +35,9 @@ class App(Router):
     or write error responses in handlers. Use `create_task` for work tied to a running server
     so drain can observe it.
 
-    `shutdown` is the **current loop's** Future. `signal_shutdown()` completes
-    every attached loop so worker threads wake together. `tasks` is per-thread
-    so drain only sees work on this loop.
+    `shutdown` is a per-loop Future for the calling loop. `signal_shutdown()`
+    completes it on every attached loop so worker threads wake together.
+    `tasks` is per-thread so drain only sees work on this loop.
     """
 
     def __init__(self) -> None:
@@ -76,7 +60,7 @@ class App(Router):
 
         self._shutdown_event = threading.Event()
         self._shutdown_lock = threading.Lock()
-        self._loop_shutdown: dict[asyncio.AbstractEventLoop, _LoopShutdown] = {}
+        self._loop_shutdown: dict[asyncio.AbstractEventLoop, asyncio.Future[None]] = {}
         self._task_local = threading.local()
         self.attach_loop(loop)
 
@@ -94,32 +78,36 @@ class App(Router):
                 ) from exc
         return self._future_for(loop)
 
-    def _future_for(self, loop: asyncio.AbstractEventLoop) -> _LoopShutdown:
+    def _future_for(self, loop: asyncio.AbstractEventLoop) -> asyncio.Future[None]:
         with self._shutdown_lock:
             fut = self._loop_shutdown.get(loop)
             if fut is None:
-                fut = _LoopShutdown(loop=loop, app=self)
+                fut = loop.create_future()
                 self._loop_shutdown[loop] = fut
-        if self._shutdown_event.is_set() and not fut.done():
-            if loop.is_closed():
-                return fut
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if running is loop:
-                _complete_loop_future(fut)
-            else:
-                try:
-                    loop.call_soon_threadsafe(_complete_loop_future, fut)
-                except RuntimeError:
-                    if not loop.is_closed():
-                        raise
+        if self._shutdown_event.is_set():
+            self._wake(loop, fut)
         return fut
+
+    def _wake(self, loop: asyncio.AbstractEventLoop, fut: asyncio.Future[None]) -> None:
+        """Complete `fut`, hopping to its loop when called from another thread."""
+        if fut.done() or loop.is_closed():
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            _finish(fut)
+            return
+        try:
+            loop.call_soon_threadsafe(_finish, fut)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
 
     @property
     def shutdown(self) -> asyncio.Future[None]:
-        """This thread's shutdown Future — await it; `set_result` signals all loops."""
+        """This loop's shutdown Future — await it; `signal_shutdown()` completes all loops."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as exc:
@@ -127,7 +115,8 @@ class App(Router):
                 "app.shutdown requires a running event loop",
                 help_text="Await app.shutdown from async code on the loop that serves requests.",
             ) from exc
-        return self._future_for(loop)
+        # Shield: a cancelled waiter must not cancel the loop's shared future.
+        return asyncio.shield(self._future_for(loop))
 
     @property
     def shutting_down(self) -> bool:
@@ -140,23 +129,8 @@ class App(Router):
         self._app_state.shutting_down = True
         with self._shutdown_lock:
             items = list(self._loop_shutdown.items())
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
         for loop, fut in items:
-            if fut.done():
-                continue
-            if running is loop:
-                _complete_loop_future(fut)
-                continue
-            if loop.is_closed():
-                continue
-            try:
-                loop.call_soon_threadsafe(_complete_loop_future, fut)
-            except RuntimeError:
-                if not loop.is_closed():
-                    raise
+            self._wake(loop, fut)
 
     @property
     def tasks(self) -> set[asyncio.Task[Any]]:

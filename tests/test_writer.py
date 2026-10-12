@@ -353,7 +353,7 @@ class TestWriterRaw:
 
         assert not context.closing
 
-        context.app.shutdown.set_result(None)
+        context.app.signal_shutdown()
 
         assert context.shutting_down
         assert context.closing

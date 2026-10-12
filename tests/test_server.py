@@ -191,10 +191,7 @@ class TestServerRunLifecycle:
             assert body == b"hello"
         finally:
             # Trigger shutdown the same way the signal handler does.
-            drain = apps[0].shutdown
-            assert drain is not None
-            if not drain.done():
-                drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -262,8 +259,7 @@ class TestServerRunLifecycle:
         reader, writer = await _connect_with_retry(socket_path)
         try:
             # Idle connection: never sends a request; drain closes it immediately.
-            drain = apps[0].shutdown
-            drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -313,7 +309,7 @@ class TestServerRunLifecycle:
             assert status == 200
             assert body == b"hello"
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -359,7 +355,7 @@ class TestServerRunLifecycle:
             await writer.drain()
             await handler_started.wait()
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             server._urgent_drain = True
 
             async with asyncio.timeout(2.0):
@@ -405,7 +401,7 @@ class TestServerRunLifecycle:
             await writer.drain()
             await _read_http_response(reader)
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             await asyncio.sleep(0.01)
             os.kill(os.getpid(), signal.SIGINT)
 
