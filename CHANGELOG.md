@@ -4,6 +4,17 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- A handler that streamed a body and returned without calling `end()` now
+  finishes the response cleanly instead of aborting the connection mid-body.
+  One-shot `SSE` writes (`sse.navigate(...)`, `sse.patch_elements(...)` as the
+  last handler statement) work again as they did in 4.x. The 500 path still
+  applies only when the handler never sent anything, and a handler that fails
+  after headers still aborts.
+
 ## 5.0.0 - 2026-10-12
 
 ### Breaking changes

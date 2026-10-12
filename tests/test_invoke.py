@@ -94,6 +94,29 @@ def test_on_handler_done_writes_500_when_handler_writes_nothing(
     asyncio.run(run())
 
 
+def test_on_handler_done_ends_started_response_on_clean_return(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        ctx = make_context("/x", app=app, loop=asyncio.get_running_loop())
+        w = DummyWriter()
+        w.write_headers(200)
+
+        async def streamed() -> None:
+            return None
+
+        task = app.create_task(streamed(), eager_start=True)
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+        assert w.completed
+        assert w.ended
+        assert "without sending a response" not in caplog.text
+        assert "Handler failed" not in caplog.text
+
+    asyncio.run(run())
+
+
 def test_on_handler_done_aborts_if_headers_already_started(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

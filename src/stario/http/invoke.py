@@ -95,6 +95,9 @@ def on_handler_done(c: Context, w: Writer, task: asyncio.Task[Any]) -> None:
                     span.fail(str(exc))
                     span.exception(exc)
                 _finish_incomplete(w)
+        elif w.started and not w.completed:
+            # Streamed body, clean return: finish the frame the handler left open.
+            w.end()
         elif not w.completed:
             _log.error(
                 "Handler returned without sending a response (%s %s)",
