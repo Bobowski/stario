@@ -3,9 +3,8 @@
 HTTP/1 is [llhttp](https://github.com/nodejs/llhttp); HTTP/2 is nghttp2.
 Both live in one `HttpProtocol` and share `RequestExchange` in
 `src/stario_cython`. `serve()` is the only server entry point; uvloop is
-optional (`uvloop.run(serve(bootstrap))`). Measurements over time:
-[`benchmarks/HISTORY.md`](benchmarks/HISTORY.md). Multi-threaded free-threaded
-runtime (`STARIO_THREADS`, `SO_REUSEPORT`, CPU pinning):
+optional (`uvloop.run(serve(bootstrap))`). The free-threaded runtime
+(`STARIO_THREADS`, `SO_REUSEPORT`, CPU pinning):
 [`docs/free-threading.md`](docs/free-threading.md).
 
 Building needs `pkg-config`, nghttp2 1.66+ (older distro builds that carry
