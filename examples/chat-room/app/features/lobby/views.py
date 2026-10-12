@@ -6,15 +6,51 @@ from app.common.identity import VISITOR_SESSION_INIT, VisitorIdentity
 from app.common.shell import page
 from app.features.room.models import Room
 from app.features.room.urls import CREATE, DELETE, ROOM
+from stario import h
 from stario.datastar import at, data
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement
-from stario.markup import html as h
 
 from .urls import SUBSCRIBE
 
 
-def render(
+def lobby_live_view(
+    *,
+    rooms: list[Room],
+    online_counts: dict[str, int],
+) -> HtmlElement:
+    """Patch target for SSE — excludes the #lobby shell that owns data.init."""
+    return h.Div(
+        {"id": "lobby-live"},
+        h.Div(
+            {"class": "lobby-header"},
+            h.H1({"class": "lobby-title"}, "Stario Chat 🐾"),
+            h.Button(
+                {"type": "button", "class": "lobby-new-btn"},
+                data.on(
+                    "click",
+                    "document.getElementById('create-room-dialog').showModal()",
+                ),
+                "New room",
+            ),
+        ),
+        h.P(
+            {"class": "lobby-lead"},
+            "Pick a room — each has its own URL, messages, and presence.",
+        ),
+        h.Ul(
+            {"class": "room-list"},
+            [_room_card(room, online=online_counts.get(room.id, 0)) for room in rooms]
+            or h.Li(h.P({"class": "lobby-empty"}, "No rooms yet — create one above.")),
+        ),
+        _create_room_dialog(),
+    )
+
+
+LOBBY_LIVE_SELECTOR = "#lobby-live"
+
+
+def lobby_view(
     *,
     identity: VisitorIdentity,
     rooms: list[Room],
@@ -38,95 +74,69 @@ def render(
                 data.init(
                     f"{VISITOR_SESSION_INIT}\n{at.get(SUBSCRIBE.href(), retry='always')}"
                 ),
-                h.Div(
-                    {"class": "lobby-header"},
-                    h.H1({"class": "lobby-title"}, "Stario Chat 🐾"),
-                    h.Button(
-                        {"type": "button", "class": "lobby-new-btn"},
-                        data.on(
-                            "click",
-                            "document.getElementById('create-room-dialog').showModal()",
-                        ),
-                        "New room",
-                    ),
-                ),
-                h.P(
-                    {"class": "lobby-lead"},
-                    "Pick a room — each has its own URL, messages, and presence.",
-                ),
-                h.Ul(
-                    {"class": "room-list"},
-                    [
-                        _room_card(room, online=online_counts.get(room.id, 0))
-                        for room in rooms
-                    ]
-                    or h.Li(
-                        h.P(
-                            {"class": "lobby-empty"}, "No rooms yet — create one above."
-                        )
-                    ),
-                ),
-                h.Dialog(
-                    {"id": "create-room-dialog", "class": "room-dialog"},
-                    # The user opens the dialog; the morph must not close it.
-                    data.preserve_attr("open"),
-                    h.Form(
-                        {"class": "room-dialog-form"},
-                        data.on("submit", "evt.preventDefault()"),
-                        h.H2({"class": "room-dialog-title"}, "New room"),
-                        h.Label(
-                            {"class": "room-dialog-label"},
-                            "Name",
-                            h.Input(
-                                {
-                                    "type": "text",
-                                    "class": "room-dialog-input",
-                                    "placeholder": "e.g. Design",
-                                    "autocomplete": "off",
-                                },
-                                data.bind("room_title"),
-                            ),
-                        ),
-                        h.Label(
-                            {"class": "room-dialog-label"},
-                            "Description",
-                            h.Textarea(
-                                {
-                                    "class": "room-dialog-textarea",
-                                    "placeholder": "What is this room for?",
-                                    "rows": "3",
-                                },
-                                data.bind("room_description"),
-                            ),
-                        ),
-                        h.Div(
-                            {"class": "room-dialog-actions"},
-                            h.Button(
-                                {"type": "button", "class": "room-dialog-cancel"},
-                                data.on("click", "el.closest('dialog').close()"),
-                                "Cancel",
-                            ),
-                            h.Button(
-                                {"type": "button", "class": "room-dialog-create"},
-                                data.attrs({"disabled": "!$room_title.trim()"}),
-                                data.on(
-                                    "click",
-                                    f"""
-                                    if ($room_title.trim()) {{
-                                        {at.post(CREATE.href())};
-                                        $room_title = '';
-                                        $room_description = '';
-                                        el.closest('dialog').close();
-                                    }}
-                                    """,
-                                ),
-                                "Create",
-                            ),
-                        ),
-                    ),
-                ),
+                lobby_live_view(rooms=rooms, online_counts=online_counts),
             ),
         ]
+    )
+
+
+def _create_room_dialog() -> HtmlElement:
+    return h.Dialog(
+        {"id": "create-room-dialog", "class": "room-dialog"},
+        h.Form(
+            {"class": "room-dialog-form"},
+            data.on("submit", "evt.preventDefault()"),
+            h.H2({"class": "room-dialog-title"}, "New room"),
+            h.Label(
+                {"class": "room-dialog-label"},
+                "Name",
+                h.Input(
+                    {
+                        "type": "text",
+                        "class": "room-dialog-input",
+                        "placeholder": "e.g. Design",
+                        "autocomplete": "off",
+                    },
+                    data.bind("room_title"),
+                ),
+            ),
+            h.Label(
+                {"class": "room-dialog-label"},
+                "Description",
+                h.Textarea(
+                    {
+                        "class": "room-dialog-textarea",
+                        "placeholder": "What is this room for?",
+                        "rows": "3",
+                    },
+                    data.bind("room_description"),
+                ),
+            ),
+            h.Div(
+                {"class": "room-dialog-actions"},
+                h.Button(
+                    {"type": "button", "class": "room-dialog-cancel"},
+                    data.on("click", "el.closest('dialog').close()"),
+                    "Cancel",
+                ),
+                h.Button(
+                    {"type": "button", "class": "room-dialog-create"},
+                    data.attrs({"disabled": "!$room_title.trim()"}),
+                    data.on(
+                        "click",
+                        f"""
+                        if ($room_title.trim()) {{
+                            {at.post(CREATE.href())};
+                            $room_title = '';
+                            $room_description = '';
+                            el.closest('dialog').close();
+                        }}
+                        """,
+                    ),
+                    "Create",
+                ),
+            ),
+        ),
     )
 
 

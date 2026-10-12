@@ -2,9 +2,8 @@
 
 import pytest
 
-import stario.responses as responses
 from stario.exceptions import StarioError
-from stario.responses import normalized_location
+from stario.http.redirect import normalized_location
 from tests.helpers import make_writer_raw
 
 SAFE_REDIRECT_TARGETS = [
@@ -29,10 +28,10 @@ class TestNormalizedLocation:
     def test_accepts_safe_targets(self, target: str) -> None:
         assert normalized_location(target)
 
-    def test_accepts_url_path_host_href(self) -> None:
-        from stario import UrlPath
+    def test_accepts_route_host_href(self) -> None:
+        from stario import Route
 
-        target = UrlPath("/users/{user_id}", host="{tenant}.example.com").href(
+        target = Route("GET //{tenant}.example.com/users/{user_id}").href(
             tenant="acme", user_id="42"
         )
         assert normalized_location(target) == target
@@ -47,6 +46,6 @@ def test_redirect_rejects_non_3xx_status() -> None:
     w, _sink, loop = make_writer_raw()
     try:
         with pytest.raises(StarioError, match="3xx"):
-            responses.redirect(w, "/ok", 200)
+            w.redirect("/ok", 200)
     finally:
         loop.close()

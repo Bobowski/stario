@@ -340,6 +340,14 @@ class TestAttributeTypes:
         with pytest.raises(StarioError, match="Invalid CSS property name"):
             render(h.Div(styles({"x;background:red": "1"})))
 
+    def test_styles_helper_rejects_css_separators_in_values(self):
+        with pytest.raises(StarioError, match="Invalid CSS value"):
+            render(h.Div(styles({"color": "red;position:fixed"})))
+
+    def test_styles_helper_rejects_backslash_in_values(self):
+        with pytest.raises(StarioError, match="Invalid CSS value"):
+            render(h.Div(styles({"color": r"red\3b color:blue"})))
+
     def test_styles_helper_rejects_non_string_keys(self):
         with pytest.raises(StarioError, match="Invalid CSS property name type"):
             render(h.Div(styles(cast(Any, {1: "red"}))))

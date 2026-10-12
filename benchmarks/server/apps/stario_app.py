@@ -2,7 +2,6 @@
 
 import ujson
 
-import stario.responses as responses
 from stario import App, Route, Span
 
 HELLO = "Hello, World!"
@@ -14,7 +13,7 @@ def json_response(w, value, status: int = 200) -> None:
 
 
 async def plaintext(c, w):
-    responses.text(w, HELLO)
+    w.text(HELLO)
 
 
 async def json_endpoint(c, w):

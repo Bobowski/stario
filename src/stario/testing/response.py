@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -12,11 +11,16 @@ from uuid import UUID
 from stario.http.headers import Headers
 from stario.json import loads as json_loads
 from stario.testing.models import ClientRequest
-from stario.testing.transport import (
-    GrowingSink,
-    parse_chunk_size_line,
-    wait_sink,
-)
+from stario.testing.wire import Exchange
+
+
+def _charset(headers: Headers) -> str:
+    if ct := headers.get("content-type"):
+        for part in ct.split(";")[1:]:
+            key, _, value = part.strip().partition("=")
+            if key.lower() == "charset" and value:
+                return value.strip()
+    return "utf-8"
 
 
 @dataclass(slots=True)
@@ -35,24 +39,12 @@ class TestResponse:
     content: bytes
     request: ClientRequest
     span_id: UUID
-    _disconnect_future: asyncio.Future[None] = field(repr=False)
     history: list[TestResponse] = field(default_factory=lambda: [])
     cookies: dict[str, str] = field(default_factory=lambda: {})
 
     @property
-    def disconnect(self) -> asyncio.Future[None]:
-        return self._disconnect_future
-
-    @property
     def text(self) -> str:
-        charset = "utf-8"
-        if ct := self.headers.get("content-type"):
-            for part in ct.split(";")[1:]:
-                key, _, value = part.strip().partition("=")
-                if key.lower() == "charset" and value:
-                    charset = value.strip()
-                    break
-        return self.content.decode(charset, errors="replace")
+        return self.content.decode(_charset(self.headers), errors="replace")
 
     def json(self) -> Any:
         return json_loads(self.content)
@@ -85,8 +77,9 @@ class TestResponse:
 class TestStreamResponse:
     """Streaming result from `TestClient.stream` once response headers exist.
 
-    Use `body`, `iter_bytes`, or `iter_events` to read the entity body.
-    Leaving the `stream` context disconnects this exchange and awaits the app task.
+    Use `body`, `iter_bytes`, or `iter_events` to read the entity body as the
+    handler writes it. Leaving the `stream` context hangs up the connection
+    (the handler sees `c.disconnected`) and waits for the handler to finish.
     """
 
     __test__ = False
@@ -97,101 +90,36 @@ class TestStreamResponse:
     request: ClientRequest
     span_id: UUID
     cookies: dict[str, str]
-    sink: GrowingSink
-    _body_start: int
-    _chunked: bool
-    _content_length: int | None
-    _disconnect_future: asyncio.Future[None]
-    _app_task: asyncio.Task[None]
+    _exchange: Exchange = field(repr=False)
     _deadline: float | None = field(repr=False, default=None)
 
     @property
-    def disconnect(self) -> asyncio.Future[None]:
-        return self._disconnect_future
+    def disconnected(self) -> bool:
+        """True once the test (or the server) closed this connection."""
+        return self._exchange.transport.is_closing()
+
+    def disconnect(self) -> None:
+        """Hang up now instead of at the end of the `stream` block."""
+        self._exchange.disconnect()
 
     async def body(self) -> bytes:
-        """Concatenate all body chunks after transfer decoding (same as iterating `iter_bytes`)."""
-
-        parts: list[bytes] = []
-        async for chunk in self.iter_bytes():
-            parts.append(chunk)
-        return b"".join(parts)
+        """Concatenate all body chunks after they arrive."""
+        return b"".join([chunk async for chunk in self.iter_bytes()])
 
     async def iter_bytes(self) -> AsyncIterator[bytes]:
-        """Yield decoded body chunks as they arrive (chunked / fixed-length / until close).
-
-        Only `identity` `Content-Encoding` is supported; request
-        `Accept-Encoding: identity` or use buffered methods for compression.
-        """
-
+        """Yield body chunks as the handler writes them (framing removed)."""
         ce = (self.headers.get("content-encoding") or "").strip().lower()
         if ce and ce != "identity":
             raise RuntimeError(
                 "TestClient.iter_bytes does not support Content-Encoding="
-                f"{ce!r}; use accept-encoding that yields identity or use buffered client.get()."
+                f"{ce!r}; send Accept-Encoding: identity or use the buffered client.get()."
             )
-
-        sink = self.sink
-        pos = self._body_start
-        deadline = self._deadline
-
-        if self.status_code in {204, 304} or self.request.method == "HEAD":
-            return
-
-        if self._chunked:
-            while True:
-                parsed = parse_chunk_size_line(sink.buf, pos)
-                while parsed is None:
-                    if sink.app_done:
-                        raise RuntimeError("Incomplete chunked encoding in stream.")
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                    parsed = parse_chunk_size_line(sink.buf, pos)
-                chunk_size, pos = parsed
-                if chunk_size == 0:
-                    return
-                end_data = pos + chunk_size
-                while len(sink.buf) < end_data + 2:
-                    if sink.app_done and len(sink.buf) < end_data:
-                        raise RuntimeError("Truncated chunked body in stream.")
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                payload = bytes(sink.buf[pos:end_data])
-                pos = end_data + 2
-                if payload:
-                    yield payload
-
-        elif self._content_length is not None:
-            remain = self._content_length
-            while remain > 0:
-                avail = len(sink.buf) - pos
-                while avail <= 0:
-                    if sink.app_done:
-                        raise RuntimeError("Truncated fixed-length body in stream.")
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                    avail = len(sink.buf) - pos
-                take = min(avail, remain)
-                yield bytes(sink.buf[pos : pos + take])
-                pos += take
-                remain -= take
-
-        else:
-            while True:
-                avail = len(sink.buf) - pos
-                while avail <= 0 and not sink.app_done:
-                    seen = sink.gen
-                    await wait_sink(sink, seen, deadline=deadline)
-                    avail = len(sink.buf) - pos
-                if avail > 0:
-                    yield bytes(sink.buf[pos:])
-                    pos = len(sink.buf)
-                if sink.app_done:
-                    return
+        reader = self._exchange.reader
+        while (chunk := await reader.next_chunk(self._deadline)) is not None:
+            yield chunk
 
     async def iter_events(self) -> AsyncIterator[dict[str, str]]:
         """Parse `text/event-stream` into dicts (keys such as `event`, `id`, `data`)."""
-
         buffer = b""
         async for chunk in self.iter_bytes():
             buffer += chunk
@@ -205,26 +133,30 @@ class TestStreamResponse:
                     break
                 raw = buffer[:idx]
                 buffer = buffer[idx + sep_len :]
-                text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
-                data_lines: list[str] = []
-                ev: dict[str, str] = {}
-                for line in text.split("\n"):
-                    if not line or line.startswith(":"):
-                        continue
-                    if line.startswith(" "):
-                        if data_lines:
-                            data_lines[-1] += line[1:]
-                        continue
-                    if ":" in line:
-                        fld, _, rest = line.partition(":")
-                        rest = rest.lstrip(" ")
-                    else:
-                        fld, rest = line, ""
-                    fld = fld.strip()
-                    if fld == "data":
-                        data_lines.append(rest)
-                    elif fld in ("event", "id"):
-                        ev[fld] = rest
-                if data_lines:
-                    ev["data"] = "\n".join(data_lines)
-                yield ev
+                yield _parse_event(raw)
+
+
+def _parse_event(raw: bytes) -> dict[str, str]:
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    data_lines: list[str] = []
+    ev: dict[str, str] = {}
+    for line in text.split("\n"):
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith(" "):
+            if data_lines:
+                data_lines[-1] += line[1:]
+            continue
+        if ":" in line:
+            fld, _, rest = line.partition(":")
+            rest = rest.lstrip(" ")
+        else:
+            fld, rest = line, ""
+        fld = fld.strip()
+        if fld == "data":
+            data_lines.append(rest)
+        elif fld in ("event", "id"):
+            ev[fld] = rest
+    if data_lines:
+        ev["data"] = "\n".join(data_lines)
+    return ev

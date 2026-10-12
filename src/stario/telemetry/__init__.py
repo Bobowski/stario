@@ -11,10 +11,12 @@ from stario.telemetry.noop import NoOpTracer
 from stario.telemetry.sqlite import SqliteTracer
 ```
 
-CLI reads `STARIO_TRACER` via `stario.cli.env.tracer_from_env()`.
+`stario.serve` reads `STARIO_TRACER` via `tracer_from_env()` when no
+tracer is passed.
 """
 
 from .core import EventBody, Span, TelemetryStats, Tracer
+from .env import tracer_from_env
 from .spans import NoOpSpan, ProxySpan, RecordedEvent, RecordedLink, RecordingSpan
 
 __all__ = [
@@ -27,4 +29,5 @@ __all__ = [
     "Span",
     "TelemetryStats",
     "Tracer",
+    "tracer_from_env",
 ]

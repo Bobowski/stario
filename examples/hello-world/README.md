@@ -11,7 +11,7 @@ This example is Stario only. It does not load Datastar. For the live board
 git clone https://github.com/bobowski/stario.git
 cd stario/examples/hello-world
 uv sync
-uv run stario watch main:bootstrap
+uv run python -m main
 ```
 
 Open http://127.0.0.1:8000.

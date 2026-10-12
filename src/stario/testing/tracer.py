@@ -54,11 +54,16 @@ class TestTracer:
     they only return finished span snapshots.
     """
 
+    __test__ = False
+
     def __init__(self) -> None:
         self._entry_depth = 0
         self._open: set[UUID] = set()
         self._finished: list[TelemetrySpan] = []
         self._finished_by_id: dict[UUID, TelemetrySpan] = {}
+        # Id of the newest root span. `TestClient` reads it right after feeding
+        # a request, which is when the protocol opens that request's span.
+        self.last_created: UUID | None = None
 
     def __enter__(self) -> Self:
         self._entry_depth += 1
@@ -86,6 +91,8 @@ class TestTracer:
             raise RuntimeError("TestTracer must be entered before creating spans.")
         span = RecordingSpan.create(self, name, attributes, parent=parent)
         self._open.add(span.id)
+        if parent is None:
+            self.last_created = span.id
         return span
 
     def on_end(self, span: Span) -> None:
@@ -208,3 +215,8 @@ class TestTracer:
         """`True` while any span created through this tracer has not been ended."""
 
         return bool(self._open)
+
+    def finished_spans(self) -> tuple[TelemetrySpan, ...]:
+        """Finished spans in start-time order."""
+
+        return tuple(self._finished)

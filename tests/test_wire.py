@@ -1,13 +1,9 @@
-"""Tests for wire-level path/method decoding."""
+"""Tests for wire-level path/method decoding and request-path canonicalization."""
 
 import pytest
 
-from stario.http.wire import (
-    _PATH_CACHE_MAX_BYTES,
-    _decode_path_cached,
-    decode_method,
-    decode_path,
-)
+from stario.http.wire import decode_method, decode_path
+from stario_cython.exchange import canonical_request_path
 
 
 class TestDecodeMethod:
@@ -21,9 +17,6 @@ class TestDecodeMethod:
 
 
 class TestDecodePath:
-    def setup_method(self) -> None:
-        _decode_path_cached.cache_clear()
-
     def test_plain_path(self) -> None:
         assert decode_path(b"/users") == "/users"
         assert decode_path(b"/") == "/"
@@ -31,34 +24,66 @@ class TestDecodePath:
     def test_percent_encoded_space(self) -> None:
         assert decode_path(b"/hello%20world") == "/hello world"
 
-    def test_encoded_slash_stays_encoded(self) -> None:
-        assert decode_path(b"/files/a%2Fb") == "/files/a%2Fb"
+    def test_encoded_slash_is_fully_decoded(self) -> None:
+        assert decode_path(b"/files/a%2Fb") == "/files/a/b"
+        assert decode_path(b"/files/a%252Fb") == "/files/a%2Fb"
 
-    def test_invalid_percent_encoding(self) -> None:
-        with pytest.raises(ValueError, match="invalid percent-encoding"):
-            decode_path(b"/bad%")
+    def test_utf8(self) -> None:
+        assert decode_path(b"/caf%C3%A9") == "/café"
+        assert decode_path("/café".encode()) == "/café"
 
-        with pytest.raises(ValueError, match="invalid percent-encoding"):
-            decode_path(b"/bad%zz")
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"/bad%",
+            b"/bad%2",
+            b"/bad%zz",
+            b"/%00",
+            b"/a%0D%0Ab",
+            b"/%7F",
+            b"/%C3%28",
+            b"/%C0%AF",
+            b"/%ED%A0%80",
+            b"/%C3/%A9",
+            b"/a#b",
+            b"/a b",
+            b"relative",
+            b"",
+        ],
+    )
+    def test_invalid_paths_raise(self, raw: bytes) -> None:
+        with pytest.raises(ValueError, match="invalid request path"):
+            decode_path(raw)
 
-    def test_nul_byte_rejected(self) -> None:
-        with pytest.raises(ValueError, match="NUL byte"):
-            decode_path(b"/%00")
 
-    def test_invalid_utf8_rejected(self) -> None:
-        with pytest.raises(ValueError, match="invalid UTF-8"):
-            decode_path(b"/%C3%28")
+class TestCanonicalRequestPath:
+    @pytest.mark.parametrize(
+        "raw",
+        [b"/", b"/users", b"/a//b", b"/a/%2F", b"/%2e%2ex", b"/a/...", b"/a;b"],
+    )
+    def test_canonical_paths_route_as_is(self, raw: bytes) -> None:
+        assert canonical_request_path(raw) == (200, None)
 
-    def test_long_path_bypasses_cache(self) -> None:
-        long_segment = b"a" * (_PATH_CACHE_MAX_BYTES + 1)
-        path = b"/" + long_segment
-        assert decode_path(path) == "/" + long_segment.decode("ascii")
-        assert _decode_path_cached.cache_info().misses == 0
+    @pytest.mark.parametrize(
+        ("raw", "target"),
+        [
+            (b"/users/", b"/users"),
+            (b"/users//", b"/users"),
+            (b"/a/./b", b"/a/b"),
+            (b"/a/../b", b"/b"),
+            (b"/../../a", b"/a"),
+            (b"/a/%2e%2E/b", b"/b"),
+            (b"/a/.%2e", b"/"),
+            (b"/a/b/.", b"/a/b"),
+            (b"/x%2Fy/./z", b"/x%2Fy/z"),
+            (b"//evil.test/", b"/evil.test"),
+            (b"/.//evil.test", b"/evil.test"),
+            (b"/\\evil.test/", b"/%5Cevil.test"),
+        ],
+    )
+    def test_redirect_targets(self, raw: bytes, target: bytes) -> None:
+        assert canonical_request_path(raw) == (308, target)
 
-    def test_cache_hit(self) -> None:
-        path = b"/cached"
-        assert decode_path(path) == "/cached"
-        info = _decode_path_cached.cache_info()
-        assert info.misses == 1
-        assert decode_path(path) == "/cached"
-        assert _decode_path_cached.cache_info().hits == 1
+    @pytest.mark.parametrize("raw", [b"/%zz", b"/%00", b"/\xc3\xa9", b"*", b"/a?b"])
+    def test_invalid_paths(self, raw: bytes) -> None:
+        assert canonical_request_path(raw) == (400, None)

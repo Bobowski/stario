@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioError
 from stario.http.config import RequestPolicy, ServerConfig
@@ -42,6 +41,48 @@ class TestContextCreateTask:
 
         await asyncio.sleep(0)
         assert not context.app.tasks
+
+    async def test_eager_task_completes_without_registration(self) -> None:
+        context = make_context(loop=asyncio.get_running_loop())
+        started = False
+
+        async def worker() -> int:
+            nonlocal started
+            started = True
+            return 42
+
+        task = context.app.create_task(worker(), eager_start=True)
+
+        assert started
+        assert task.done()
+        assert task.result() == 42
+        assert task not in context.app.tasks
+
+    async def test_task_construction_bypasses_loop_task_factory(self) -> None:
+        loop = asyncio.get_running_loop()
+        context = make_context(loop=loop)
+        calls = 0
+        previous = loop.get_task_factory()
+
+        def factory(loop, coro, **kwargs):
+            nonlocal calls
+            calls += 1
+            return asyncio.Task(coro, loop=loop, **kwargs)
+
+        async def worker() -> int:
+            await asyncio.sleep(0)
+            return 42
+
+        loop.set_task_factory(factory)
+        try:
+            task = context.app.create_task(worker(), name="direct-task")
+        finally:
+            loop.set_task_factory(previous)
+
+        assert calls == 0
+        assert task.get_loop() is loop
+        assert task.get_name() == "direct-task"
+        assert await task == 42
 
 
 class TestServerConstructorValidation:
@@ -127,9 +168,9 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
-            app.add(Route("GET", "/"), hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -150,10 +191,7 @@ class TestServerRunLifecycle:
             assert body == b"hello"
         finally:
             # Trigger shutdown the same way the signal handler does.
-            drain = apps[0].shutdown
-            assert drain is not None
-            if not drain.done():
-                drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -163,6 +201,8 @@ class TestServerRunLifecycle:
         names = [s["name"] for s in spans]
         assert "server.startup" in names
         assert "GET /" in names
+        request_span = next(s for s in spans if s["name"] == "GET /")
+        assert request_span["attributes"]["request.method"] == "GET"
         shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
         assert shutdown_span["attributes"]["server.shutdown.trigger"] == "expected_stop"
         assert shutdown_span["status"] == "ok"
@@ -219,8 +259,7 @@ class TestServerRunLifecycle:
         reader, writer = await _connect_with_retry(socket_path)
         try:
             # Idle connection: never sends a request; drain closes it immediately.
-            drain = apps[0].shutdown
-            drain.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -250,9 +289,9 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
-            app.add(Route("GET", "/"), hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -270,7 +309,7 @@ class TestServerRunLifecycle:
             assert status == 200
             assert body == b"hello"
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             async with asyncio.timeout(2.0):
                 await run_task
 
@@ -300,7 +339,7 @@ class TestServerRunLifecycle:
                 handler_started.set()
                 await asyncio.Event().wait()
 
-            app.add(Route("GET", "/"), slow)
+            app.add(Route("GET /"), slow)
             yield
 
         server = Server(
@@ -316,7 +355,7 @@ class TestServerRunLifecycle:
             await writer.drain()
             await handler_started.wait()
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             server._urgent_drain = True
 
             async with asyncio.timeout(2.0):
@@ -344,9 +383,9 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
-            app.add(Route("GET", "/"), hello)
+            app.add(Route("GET /"), hello)
             yield
 
         server = Server(
@@ -362,7 +401,7 @@ class TestServerRunLifecycle:
             await writer.drain()
             await _read_http_response(reader)
 
-            apps[0].shutdown.set_result(None)
+            apps[0].signal_shutdown()
             await asyncio.sleep(0.01)
             os.kill(os.getpid(), signal.SIGINT)
 

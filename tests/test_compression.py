@@ -2,10 +2,12 @@
 
 from stario.http.compression import (
     CompressionConfig,
+    brotli_decompress,
     content_type_is_compressible,
     merge_vary,
     negotiate_content_encoding,
     parse_accept_encoding,
+    zstd_decompress,
 )
 from stario.http.headers import Headers
 
@@ -66,3 +68,18 @@ def test_select_prefers_zstd_over_gzip() -> None:
     )
     assert compressor is not None
     assert compressor.encoding == b"zstd"
+
+
+def test_native_compressors_round_trip() -> None:
+    body = b"native python compressor " * 32
+    decode = {b"br": brotli_decompress, b"zstd": zstd_decompress}
+    for encoding in (b"br", b"zstd"):
+        framed = CompressionConfig(min_size=0).make_compressor(encoding)
+        assert decode[encoding](framed.frame(body)) == body
+        streamed = CompressionConfig(min_size=0).make_compressor(encoding)
+        assert (
+            decode[encoding](
+                streamed.block(b"one") + streamed.block(b"two") + streamed.finish()
+            )
+            == b"onetwo"
+        )

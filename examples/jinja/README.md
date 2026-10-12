@@ -4,7 +4,7 @@ An interactive counter shared across browser tabs, using Jinja templates,
 Datastar, SSE, and an in-process Relay.
 
 [`templates/home.html.jinja`](templates/home.html.jinja) renders the initial page
-with `responses.html()`. It includes
+with `w.html()`. It includes
 [`templates/counter.html.jinja`](templates/counter.html.jinja), which is also
 rendered for each SSE update and sent through `SSE.patch_elements()`. The stable
 `id="counter"` tells Datastar which element to update.
@@ -19,7 +19,7 @@ inside single-quoted HTML attributes.
 git clone https://github.com/bobowski/stario.git
 cd stario/examples/jinja
 uv sync
-uv run stario watch main:bootstrap
+uv run python -m main
 ```
 
 Open http://127.0.0.1:8000 in two tabs. Click **Add one** or **Reset** in either

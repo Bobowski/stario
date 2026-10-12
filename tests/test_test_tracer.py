@@ -4,7 +4,6 @@ import asyncio
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.testing import TestClient
 from stario.testing import TestTracer as StarioTestTracer
@@ -29,7 +28,7 @@ async def _telemetry_bootstrap(app: App, span):
         with c.span.step("db.query", {"table": "items"}) as s:
             s.attr("rows", 3)
             s.event("slow", {"ms": 12})
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET", "/t"), handler)
     yield
@@ -65,7 +64,7 @@ async def test_find_span_root_id_scopes_to_request_subtree() -> None:
     async def handler(c, w):
         with c.span.step("work") as s:
             s.attr("route", c.req.path)
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET", "/a"), handler)
     app.add(Route("GET", "/b"), handler)
@@ -93,7 +92,7 @@ async def test_get_span_returns_none_while_span_open() -> None:
         with c.span.step("slow") as s:
             await gate.wait()
             s.attr("done", True)
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET", "/slow"), handler)
 

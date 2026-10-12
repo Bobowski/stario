@@ -2,19 +2,14 @@
 
 import zlib
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
-from email.utils import format_datetime
 from typing import Any
 from urllib.parse import urlencode
 from uuid import uuid4
 
-import zstandard as zstd
-
-from stario.http.compression import brotli_decompress
+from stario.http.compression import brotli_decompress, zstd_decompress
 from stario.http.headers import Headers
 from stario.json import dumps_bytes as json_dumps_bytes
 from stario.testing.cookies import parse_set_cookie_headers
-from stario.testing.transport import decode_chunked, try_parse_http_head
 from stario.testing.types import FileData, FormData, QueryParamInput
 
 
@@ -124,18 +119,6 @@ def encode_request_body(
     return b"", None
 
 
-def parse_http_response(raw: bytes) -> tuple[int, Headers, bytes]:
-    parsed = try_parse_http_head(raw)
-    if parsed is None:
-        raise RuntimeError("Malformed test response: missing header separator.")
-
-    status_code, headers, header_end = parsed
-    body = raw[header_end:]
-    if "chunked" in (headers.get("transfer-encoding") or "").lower():
-        body = decode_chunked(raw, start=header_end)
-    return status_code, headers, body
-
-
 def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
     # HEAD responses carry Content-Encoding with an empty body; nothing to decode.
     if not encoding or not body:
@@ -148,7 +131,7 @@ def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
     if normalized == "br":
         return brotli_decompress(body)
     if normalized == "zstd":
-        return zstd.decompress(body)
+        return zstd_decompress(body)
     raise RuntimeError(
         f"TestClient does not support Content-Encoding={encoding!r}; "
         "use Accept-Encoding that yields identity."
@@ -157,8 +140,3 @@ def decode_content_encoding(body: bytes, encoding: str | None) -> bytes:
 
 def parse_response_cookies(headers: Headers) -> dict[str, str]:
     return parse_set_cookie_headers(headers.getlist("set-cookie"))
-
-
-def date_header() -> bytes:
-    now = datetime.now(UTC)
-    return b"date: " + format_datetime(now, usegmt=True).encode("ascii") + b"\r\n"

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from stario import App, Assets, Files, UrlPath
+from stario import App, Assets, Files
 from stario.exceptions import StarioError
 from stario.http.compression import CompressionConfig
 from stario.testing import TestClient
@@ -52,12 +52,6 @@ class TestFiles:
             files.href("file.txt", query={"download": 1}, fragment="top")
             == "/media/file.txt?download=1#top"
         )
-
-    def test_rejects_urlpath_prefix(self, tmp_path: Path) -> None:
-        with pytest.raises(StarioError, match="must be a string"):
-            Files(tmp_path, UrlPath("/media"))  # pyright: ignore[reportArgumentType]
-        with pytest.raises(StarioError, match="must be a string"):
-            Assets(tmp_path, UrlPath("/static"))  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
         "path",
@@ -934,6 +928,24 @@ class TestAssets:
         assert cached.status_code == 304
         assert cached.content == b""
         assert cached.headers.get("etag") == etag
+
+    @pytest.mark.asyncio
+    async def test_head_on_cached_asset_keeps_get_content_length(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "app.js").write_text("console.log(1)")
+        files = Assets(tmp_path)
+        href = files.href("app.js")
+        await files.load(precompress=())
+
+        async with TestClient(_app(files)) as client:
+            get = await client.get(href)
+            head = await client.head(href)
+
+        assert get.status_code == 200
+        assert head.status_code == 200
+        assert head.content == b""
+        assert head.headers.get("content-length") == get.headers.get("content-length")
 
     @pytest.mark.asyncio
     async def test_streamed_etag_and_304(self, tmp_path: Path) -> None:

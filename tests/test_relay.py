@@ -456,6 +456,46 @@ class TestRelayThreadSafety:
         await asyncio.wait_for(task, timeout=1.0)
         assert received == [("room.1", {"x": 1})]
 
+    async def test_worker_thread_burst_is_ordered_and_coalesces_wakes(self) -> None:
+        """1000 cross-thread publishes arrive in order with far fewer loop hops."""
+        relay = Relay[int]()
+        loop = asyncio.get_running_loop()
+        hops = 0
+        real = loop.call_soon_threadsafe
+
+        def counting(callback, *args, **kwargs):
+            nonlocal hops
+            hops += 1
+            return real(callback, *args, **kwargs)
+
+        loop.call_soon_threadsafe = counting  # type: ignore[method-assign]
+        ready = asyncio.Event()
+        received: list[int] = []
+        count = 1000
+        try:
+
+            async def subscriber() -> None:
+                async with relay.subscribe("n") as sub:
+                    ready.set()
+                    async for _subject, value in sub:
+                        received.append(value)
+                        if len(received) == count:
+                            return
+
+            task = asyncio.create_task(subscriber())
+            await ready.wait()
+            thread = threading.Thread(
+                target=lambda: [relay.publish("n", i) for i in range(count)]
+            )
+            thread.start()
+            await asyncio.wait_for(task, timeout=5.0)
+            thread.join(timeout=1.0)
+        finally:
+            del loop.call_soon_threadsafe
+        assert received == list(range(count))
+        # One hop per burst while receive() is blocked, none while it keeps up.
+        assert hops < count // 2
+
     async def test_publish_fans_out_to_subscribers_on_multiple_loops(self) -> None:
         relay = Relay[str]()
         ready = threading.Event()

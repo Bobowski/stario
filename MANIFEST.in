@@ -1,0 +1,7 @@
+include CHANGELOG.md CYTHON.md
+include src/stario_cython/*.pyx src/stario_cython/*.pxd src/stario_cython/*.pxi
+exclude src/stario_cython/*.c
+recursive-include vendor *.c *.h LICENSE*
+recursive-include scripts *.sh
+global-exclude *.so *.py[cod]
+prune tests

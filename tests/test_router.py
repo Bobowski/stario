@@ -37,6 +37,27 @@ class TestFindHandler:
         with pytest.raises(TypeError):
             hit.params["user_id"] = "9"  # type: ignore[index]
 
+    def test_param_find_is_stable_without_result_cache(self):
+        router = Router()
+        router.add(Route("GET /users/{user_id}"), noop_handler)
+
+        _, _, first = router.find_handler("", "/users/42", "GET")
+        _, _, second = router.find_handler("", "/users/42", "GET")
+
+        assert first.pattern == second.pattern
+        assert dict(first.params) == dict(second.params) == {"user_id": "42"}
+
+    def test_add_after_miss_is_visible(self):
+        router = Router()
+        handler, _, hit = router.find_handler("", "/later", "GET")
+        assert hit is EMPTY_MATCH
+        assert handler is default_not_found
+
+        router.add(Route("GET /later"), noop_handler)
+        _, route, found = router.find_handler("", "/later", "GET")
+        assert found.pattern == "GET /later"
+        assert route.target == "/later"
+
     def test_escaped_braces_register_and_match(self):
         router = Router()
         curly = Route("GET /curly/{{id}}")
@@ -47,7 +68,7 @@ class TestFindHandler:
         assert route is curly
         assert hit.pattern == "GET /curly/{id}"
 
-    def test_radix_exact_chain_and_split(self):
+    def test_static_chain_and_prefix(self):
         router = Router()
         deep = Route("GET /a/b/c/d/e")
         other = Route("GET /a/b/c/d/f")
@@ -63,6 +84,72 @@ class TestFindHandler:
         assert route_e is deep
         assert route_f is other
         assert route_b is prefix
+
+    def test_add_order_does_not_change_static_matches(self):
+        deep = Route("GET /a/b/c/d/e")
+        other = Route("GET /a/b/c/d/f")
+        prefix = Route("GET /a/b")
+
+        def hits(order: list[Route]) -> tuple[Route, Route, Route]:
+            router = Router()
+            for route in order:
+                router.add(route, noop_handler)
+            return (
+                router.find_handler("", "/a/b/c/d/e", "GET")[1],
+                router.find_handler("", "/a/b/c/d/f", "GET")[1],
+                router.find_handler("", "/a/b", "GET")[1],
+            )
+
+        assert hits([deep, other, prefix]) == (deep, other, prefix)
+        assert hits([prefix, other, deep]) == (deep, other, prefix)
+        assert hits([other, prefix, deep]) == (deep, other, prefix)
+
+    def test_add_order_does_not_change_exact_vs_param(self):
+        users = Route("GET", "/t/{tenant}/users/{id}")
+        acme = Route("GET", "/t/acme/users/{id}")
+
+        def hit(first: Route, second: Route) -> tuple[str, str]:
+            router = Router()
+            router.add(first, noop_handler)
+            router.add(second, noop_handler)
+            return (
+                router.find_handler("", "/t/acme/users/1", "GET")[1].target,
+                router.find_handler("", "/t/beta/users/1", "GET")[1].target,
+            )
+
+        assert hit(acme, users) == ("/t/acme/users/{id}", "/t/{tenant}/users/{id}")
+        assert hit(users, acme) == ("/t/acme/users/{id}", "/t/{tenant}/users/{id}")
+
+    def test_add_order_does_not_change_exact_vs_catchall(self):
+        catchall = Route("GET", "/files/{path...}")
+        readme = Route("GET", "/files/readme")
+
+        def hit(first: Route, second: Route) -> tuple[str, dict[str, str]]:
+            router = Router()
+            router.add(first, noop_handler)
+            router.add(second, noop_handler)
+            _, route, match = router.find_handler("", "/files/readme", "GET")
+            _, _, other = router.find_handler("", "/files/docs/a.txt", "GET")
+            assert dict(other.params) == {"path": "docs/a.txt"}
+            return route.target, dict(match.params)
+
+        assert hit(catchall, readme) == ("/files/readme", {})
+        assert hit(readme, catchall) == ("/files/readme", {})
+
+    def test_add_order_does_not_change_host_vs_hostless(self):
+        host = Route("GET //api.example.com/api")
+        hostless = Route("POST", "/api")
+
+        def hit(first: Route, second: Route) -> tuple[str, str]:
+            router = Router()
+            router.add(first, noop_handler)
+            router.add(second, noop_handler)
+            get_route = router.find_handler("api.example.com", "/api", "GET")[1]
+            post_route = router.find_handler("api.example.com", "/api", "POST")[1]
+            return get_route.target, post_route.target
+
+        assert hit(host, hostless) == ("//api.example.com/api", "/api")
+        assert hit(hostless, host) == ("//api.example.com/api", "/api")
 
     def test_matches_catchall_params(self):
         router = Router()
@@ -187,22 +274,6 @@ class TestFindHandler:
         assert other.target == "/t/{tenant}/users/{id}"
         assert dict(other_hit.params) == {"tenant": "beta", "id": "1"}
 
-    def test_verb_helpers_are_deprecated(self):
-        router = Router()
-        with pytest.warns(DeprecationWarning, match=r"add\(Route\('GET'"):
-            router.get("/x", noop_handler)  # pyright: ignore[reportDeprecated]
-
-        _, route, _ = router.find_handler("", "/x", "GET")
-        assert route.target == "/x"
-
-    def test_handle_is_deprecated(self):
-        router = Router()
-        with pytest.warns(DeprecationWarning, match=r"add\(Route"):
-            router.handle("GET", "/y", noop_handler)  # pyright: ignore[reportDeprecated]
-
-        _, route, _ = router.find_handler("", "/y", "GET")
-        assert route.target == "/y"
-
     def test_query_registers_rfc_query_method(self):
         router = Router()
         router.add(Route("QUERY", "/feed"), noop_handler)
@@ -246,14 +317,16 @@ class TestRouterUse:
 
         assert calls == ["scope"]
 
-    def test_use_rejects_middleware_after_routes(self):
+    def test_use_after_routes_applies_to_them(self):
+        calls: list[str] = []
         router = Router()
         router.add(Route("GET", "/users"), noop_handler)
+        router.use("/users", track(calls, "late"))
 
-        with pytest.raises(
-            StarioError, match="Middleware must be registered before matching routes"
-        ):
-            router.use("/users", lambda h: h)
+        handler, _, _ = router.find_handler("", "/users", "GET")
+        run_handler(handler, "/users")
+
+        assert calls == ["late"]
 
     def test_use_middleware_runs_in_registration_order(self):
         calls: list[str] = []
@@ -313,3 +386,20 @@ class TestRouterUse:
         assert hit.pattern == ""
         run_handler(handler, "/missing", host="api.example.com")
         assert calls == ["host-404"]
+
+
+def test_registering_many_routes_compiles_once() -> None:
+    """Each `add` is a tree insert; the trie compiles on the first lookup."""
+    import time
+
+    router = Router()
+    started = time.perf_counter()
+    for i in range(3000):
+        router.add(Route(f"GET /api/v1/res{i}/{{id}}/sub{i % 7}"), noop_handler)
+    assert router._cy_router is None
+    _handler, route, match = router.find_handler("", "/api/v1/res42/7/sub0", "GET")
+    assert route.path == "/api/v1/res42/{id}/sub0"
+    assert match.params == {"id": "7"}
+    assert router._cy_router is not None
+    # 3000 routes took ~20 s when every add recompiled.
+    assert time.perf_counter() - started < 2.0

@@ -14,7 +14,8 @@
 **Threading**: `Relay.lock` protects the subscriber registry. Each subscription
 has an `_inbox_lock` guarding its pending queue and waiter future so a worker
 thread can `publish` while a handler awaits the next message on the owning loop.
-Cross-loop delivery always uses `loop.call_soon_threadsafe`.
+A cross-loop publish appends under that lock and schedules one
+`loop.call_soon_threadsafe` wake per burst, only while a `receive()` is blocked.
 
 `RelaySubscription` is an opaque handle — enter with `async with`, then
 consume with `receive()` or `async for`.
@@ -116,6 +117,7 @@ class RelaySubscription[T]:
         "_items",
         "_relay",
         "_waiter",
+        "_wake_pending",
         "active",
         "generation",
         "loop",
@@ -141,6 +143,8 @@ class RelaySubscription[T]:
         self.loop: AbstractEventLoop | None = None
         # The future a blocked receive() is awaiting, if any (at most one).
         self._waiter: Future[Msg[T]] | None = None
+        # A cross-loop enqueue() already scheduled wake() on the owning loop.
+        self._wake_pending = False
 
     def _register(self) -> None:
         loop = get_running_loop()
@@ -152,6 +156,7 @@ class RelaySubscription[T]:
             self._items.clear()
             self.loop = loop
             self._waiter = None
+            self._wake_pending = False
         # Join the registry while still inactive; publish skips until active is set.
         with self._relay.lock:
             for pat in self.patterns:
@@ -207,22 +212,51 @@ class RelaySubscription[T]:
                     self._waiter = None
 
     def deliver(self, msg: Msg[T], generation: int) -> None:
-        # Always runs on the subscription's own loop — inline for same-loop
-        # publishers, or via call_soon_threadsafe for cross-loop ones — so it never
-        # races a receive() or cancel happening on that loop.
+        # Runs on the subscription's own loop (same-loop publishers call it
+        # inline), so it may complete the waiter Future directly.
         with self._inbox_lock:
             # Stale delivery for a torn-down / re-registered subscription: drop it.
             if not self.active or self.generation != generation:
                 return
-            waiter = self._waiter
-            if waiter is not None:
-                self._waiter = None
-                # Hand straight to the blocked receive(); if it was already cancelled
-                # (done) fall through and buffer the message instead.
-                if not waiter.done():
-                    waiter.set_result(msg)
-                    return
             self._items.append(msg)
+            self._hand_off_locked()
+
+    def enqueue(self, msg: Msg[T], generation: int) -> bool:
+        """Buffer ``msg`` from any thread. True when the owning loop needs a wake.
+
+        Only the Future hand-off is loop-affine; the deque is not. A
+        cross-loop publisher appends under the inbox lock and hops to the
+        loop only when a ``receive()`` is blocked and no hop is already in
+        flight. A subscriber that keeps up costs its publisher no
+        ``call_soon_threadsafe`` at all; a burst of N messages costs one.
+        """
+        with self._inbox_lock:
+            if not self.active or self.generation != generation:
+                return False
+            self._items.append(msg)
+            if self._waiter is None or self._wake_pending:
+                return False
+            self._wake_pending = True
+            return True
+
+    def wake(self, generation: int) -> None:
+        """Hand buffered messages to a blocked receive(); scheduled by a cross-loop enqueue()."""
+        with self._inbox_lock:
+            self._wake_pending = False
+            if not self.active or self.generation != generation:
+                return
+            self._hand_off_locked()
+
+    def _hand_off_locked(self) -> None:
+        # Caller holds _inbox_lock and runs on the owning loop. Give the
+        # oldest buffered message to a blocked receive(); a cancelled (done)
+        # waiter leaves the message buffered for the next receive().
+        waiter = self._waiter
+        if waiter is None or not self._items:
+            return
+        self._waiter = None
+        if not waiter.done():
+            waiter.set_result(self._items.popleft())
 
     async def __aenter__(self) -> Self:
         # Register on enter; unregister on exit — otherwise handles stay in
@@ -351,20 +385,17 @@ class Relay[T]:
         for subscription in dead:
             self.drop_subscription(subscription)
 
-        # Cross-loop subscribers: hop onto each owning loop to deliver safely.
+        # Cross-loop subscribers: buffer here, hop onto the owning loop only
+        # when a blocked receive() needs waking (one hop per burst, not per
+        # message).
         for subscription, generation, loop in deferred:
-            # Re-check the snapshot: the sub may have torn down since we sampled it.
-            if not subscription.active or subscription.generation != generation:
-                continue
             if loop.is_closed():
                 self.drop_subscription(subscription)
                 continue
+            if not subscription.enqueue(msg, generation):
+                continue
             try:
-                loop.call_soon_threadsafe(
-                    subscription.deliver,
-                    msg,
-                    generation,
-                )
+                loop.call_soon_threadsafe(subscription.wake, generation)
             except RuntimeError:
                 # Lost a race with loop shutdown; only swallow the closed-loop case.
                 if not loop.is_closed():

@@ -1,37 +1,42 @@
 """HTTP content-coding negotiation and compressor implementations."""
 
+from __future__ import annotations
+
 import zlib
 from collections.abc import Iterable
-from typing import Any, ClassVar, cast
-
-import brotli  # pyright: ignore[reportMissingTypeStubs]
-import zstandard as zstd
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from stario._env import env_int, env_optional_int
 from stario.exceptions import StarioError
 
-from .headers import Headers
 from .wire import parse_accept_encoding
 
-# brotli is an untyped C extension; alias as Any so strict pyright stays quiet
-# without vendoring or tracking third-party stub packages.
-_brotli: Any = brotli
-
-
-def brotli_decompress(data: bytes) -> bytes:
-    return cast(bytes, _brotli.decompress(data))
-
+if TYPE_CHECKING:
+    from .headers import Headers
 
 # `CompressionConfig.select` honors `Accept-Encoding` q-values, then prefers
 # br -> zstd -> gzip when the client weights supported encodings equally.
+# Window bounds match libzstd / libbrotli (same libs the Cython writer uses).
 
-_ZSTD_WINDOW_LOG_MIN = zstd.WINDOWLOG_MIN
-_ZSTD_WINDOW_LOG_MAX = zstd.WINDOWLOG_MAX
+_ZSTD_WINDOW_LOG_MIN = 10
+_ZSTD_WINDOW_LOG_MAX = 31
 _BROTLI_WINDOW_LOG_MIN = 10
 _BROTLI_WINDOW_LOG_MAX = 24
 _GZIP_WINDOW_BITS_MIN = 9
 _GZIP_WINDOW_BITS_MAX = 15
 _ENCODING_PREFERENCE = (b"br", b"zstd", b"gzip")
+
+
+def brotli_decompress(data: bytes) -> bytes:
+    from stario_cython.codecs import brotli_decompress as decode
+
+    return decode(data)
+
+
+def zstd_decompress(data: bytes) -> bytes:
+    from stario_cython.codecs import zstd_decompress as decode
+
+    return decode(data)
 
 
 def negotiate_content_encoding(
@@ -134,13 +139,6 @@ def content_type_is_compressible(content_type: bytes) -> bool:
     return not media_type.startswith(_NONCOMPRESSIBLE_CONTENT_TYPE_PREFIXES)
 
 
-def _zstd_compressor(level: int, window: int | None) -> zstd.ZstdCompressor:
-    if window is None:
-        return zstd.ZstdCompressor(level=level)
-    params = zstd.ZstdCompressionParameters(compression_level=level, window_log=window)
-    return zstd.ZstdCompressor(compression_params=params)
-
-
 class Compressor:
     """
     Base compressor with shared logic.
@@ -175,64 +173,53 @@ class Compressor:
 
 
 class _Zstd(Compressor):
-    """Zstandard (`zstandard` package)."""
+    """Zstandard (libzstd via `stario_cython.codecs`)."""
 
     encoding = b"zstd"
 
     def frame(self, data: bytes) -> bytes:
-        return _zstd_compressor(self._level, self._window).compress(data)
+        from stario_cython.codecs import zstd_compress
+
+        return zstd_compress(data, self._level, self._window or 0)
 
     def block(self, data: bytes) -> bytes:
+        from stario_cython.codecs import ZstdEncoder
+
         if self._stream is None:
-            self._stream = _zstd_compressor(self._level, self._window).compressobj()
-        return self._stream.compress(data) + self._stream.flush(
-            zstd.COMPRESSOBJ_FLUSH_BLOCK
-        )
+            self._stream = ZstdEncoder(self._level, self._window or 0)
+        return self._stream.block(data)
 
     def finish(self) -> bytes:
         if self._stream is None:
             return b""
-        return self._stream.flush(zstd.COMPRESSOBJ_FLUSH_FINISH)
+        out = self._stream.finish()
+        self._stream = None
+        return out
 
 
 class _Brotli(Compressor):
-    """Brotli - great ratio, excellent browser support."""
+    """Brotli (libbrotli via `stario_cython.codecs`)."""
 
     encoding = b"br"
 
-    def __init__(
-        self,
-        level: int,
-        *,
-        window: int | None = None,
-    ) -> None:
-        super().__init__(level, window=window)
-        self._stream = None
-
     def frame(self, data: bytes) -> bytes:
-        if self._window is not None:
-            return cast(
-                bytes,
-                _brotli.compress(data, quality=self._level, lgwin=self._window),
-            )
-        return cast(bytes, _brotli.compress(data, quality=self._level))
+        from stario_cython.codecs import brotli_compress
+
+        return brotli_compress(data, self._level, self._window or 0)
 
     def block(self, data: bytes) -> bytes:
+        from stario_cython.codecs import BrotliEncoder
+
         if self._stream is None:
-            if self._window is not None:
-                self._stream = _brotli.Compressor(
-                    quality=self._level,
-                    lgwin=self._window,
-                )
-            else:
-                self._stream = _brotli.Compressor(quality=self._level)
-        stream = self._stream
-        return cast(bytes, stream.process(data) + stream.flush())
+            self._stream = BrotliEncoder(self._level, self._window or 0)
+        return self._stream.block(data)
 
     def finish(self) -> bytes:
         if self._stream is None:
             return b""
-        return cast(bytes, self._stream.finish())
+        out = self._stream.finish()
+        self._stream = None
+        return out
 
 
 class _Gzip(Compressor):
@@ -269,7 +256,7 @@ DEFAULT_ZSTD_LEVEL = 3
 DEFAULT_ZSTD_WINDOW_LOG: int | None = None
 DEFAULT_BROTLI_LEVEL = 4
 DEFAULT_BROTLI_WINDOW_LOG: int | None = None
-DEFAULT_GZIP_LEVEL = 6
+DEFAULT_GZIP_LEVEL = 1
 DEFAULT_GZIP_WINDOW_BITS: int | None = None
 
 

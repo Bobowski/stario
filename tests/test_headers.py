@@ -4,6 +4,7 @@ import pytest
 
 from stario.http.headers import (
     Headers,
+    RequestHeaders,
     encode_header_value,
 )
 
@@ -106,6 +107,22 @@ class TestHeadersUnsafe:
         h.unsafe_remove(b"x-custom")
         assert h.unsafe_get(b"x-custom") is None
 
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("unsafe_set", ("content-type", b"text/html")),
+            ("unsafe_set", (b"content-type", "text/html")),
+            ("unsafe_add", (b"x", bytearray(b"v"))),
+            ("unsafe_get", ("x",)),
+            ("unsafe_getlist", (None,)),
+            ("unsafe_remove", (memoryview(b"x"),)),
+        ],
+    )
+    def test_unsafe_methods_reject_non_bytes(self, method: str, args: tuple) -> None:
+        h = Headers()
+        with pytest.raises(TypeError):
+            getattr(h, method)(*args)
+
 
 class TestHeaderMutators:
     """Test header mutators."""
@@ -120,6 +137,18 @@ class TestHeaderMutators:
     def test_constructor_with_raw_header_data(self):
         h = Headers({b"host": b"example.com"})
         assert h.unsafe_get(b"host") == b"example.com"
+
+    def test_constructor_accepts_str_mappings(self):
+        h = Headers({"X-Name": "value", "X-Many": ["a", "b"]})
+        assert h.items() == [("x-name", "value"), ("x-many", "a"), ("x-many", "b")]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [{b"x": 12345}, {12: b"v"}, {b"x": [b"a", None]}, {b"x": bytearray(b"v")}],
+    )
+    def test_constructor_rejects_non_text_keys_and_values(self, raw):
+        with pytest.raises(TypeError):
+            Headers(raw)
 
     def test_remove_missing_is_noop(self):
         h = Headers()
@@ -190,3 +219,21 @@ class TestHeadersEdgeCases:
         h.add("Set-Cookie", "b=2")
         assert h.setdefault("Set-Cookie", "c=3") == "a=1"
         assert h.getlist("Set-Cookie") == ["a=1", "b=2"]
+
+
+class TestRequestHeadersLookup:
+    """A name no request can carry is simply absent."""
+
+    @pytest.mark.parametrize("name", ["x y", "", "é", "x" * 300, "Bad@Name"])
+    def test_get_and_getlist_treat_invalid_names_as_absent(self, name):
+        h = RequestHeaders({"host": "a", "x-y": "1"})
+        assert h.get(name) is None
+        assert h.get(name, "default") == "default"
+        assert h.getlist(name) == []
+        assert name not in h
+
+    def test_valid_names_fold_case(self):
+        h = RequestHeaders({"host": "a", "x-y": ["1", "2"]})
+        assert h.get("X-Y") == "1"
+        assert h.getlist("X-Y") == ["1", "2"]
+        assert "HOST" in h

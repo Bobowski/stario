@@ -92,8 +92,9 @@ they do not bundle a Pydantic-style request validation layer.
 - `wrk`
 - Python compatible with Stario (3.12+)
 
-All targets run on `uvloop`: Stario uses `STARIO_LOOP=uvloop`, FastAPI/Uvicorn
-uses `--loop uvloop`, and Sanic uses its uvloop-backed default when installed.
+All targets run on `uvloop`: Stario starts its server with `uvloop.run`,
+FastAPI/Uvicorn uses `--loop uvloop`, and Sanic uses its uvloop-backed
+default when installed.
 
 The runner creates dedicated virtual environments under
 `benchmarks/server/.venvs/` with `uv venv` and `uv pip install`, then starts

@@ -3,7 +3,7 @@
 import pytest
 
 from stario.exceptions import StarioError
-from stario.http.route import EMPTY_ROUTE, Route, UrlPath
+from stario.http.route import EMPTY_ROUTE, Route
 
 
 class TestRoute:
@@ -69,13 +69,6 @@ class TestRoute:
         with pytest.raises(StarioError, match="does not store query or fragment"):
             Route(path="/search?q=1")
 
-    def test_accepts_obsolete_urlpath_as_string(self):
-        api = UrlPath("/users", host="api.example.com")
-        users = Route("GET", api.target)
-
-        assert users.path == "/users"
-        assert users.host == "api.example.com"
-
     def test_constructor_canonicalizes_method(self):
         route = Route(" patch ", "/items")
 
@@ -114,14 +107,6 @@ class TestRoute:
 
         with pytest.raises(AttributeError, match="immutable"):
             home.path = "/other"
-
-    def test_obsolete_factories_still_work(self):
-        with pytest.warns(DeprecationWarning, match="Route\\('GET /path'\\)"):
-            home = Route.get("/")  # pyright: ignore[reportDeprecated]
-        with pytest.warns(DeprecationWarning, match="Route\\('QUERY /path'\\)"):
-            feed = Route.query("/feed")  # pyright: ignore[reportDeprecated]
-        assert home == Route("GET /")
-        assert feed == Route("QUERY /feed")
 
     def test_stores_host_and_path_strings(self):
         users = Route("GET //API.Example.COM/users/{id}")
@@ -222,6 +207,8 @@ class TestRouteHref:
             self.hosted.href("acme.eu", 1)
         with pytest.raises(StarioError, match="invalid character"):
             self.hosted.href("acme/eu", 1)
+        with pytest.raises(StarioError, match="invalid character"):
+            self.hosted.href("evil?", 1)
         catchall = Route("GET /", host="{tenant...}.example.com")
         assert catchall.href("acme.eu") == "//acme.eu.example.com/"
         with pytest.raises(StarioError, match="empty host label"):

@@ -1,9 +1,14 @@
-"""In-process async HTTP test client."""
+"""In-process async HTTP test client on the production protocol."""
+
+from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import format_datetime
 from types import TracebackType
 from typing import Any, Self
 from urllib.parse import urljoin
@@ -11,24 +16,15 @@ from urllib.parse import urljoin
 from stario.http.app import App
 from stario.http.bootstrap import Bootstrap
 from stario.http.compression import CompressionConfig
+from stario.http.config import RequestPolicy
 from stario.http.headers import Headers
 from stario.testing.cookies import merge_cookie_jar
-from stario.testing.dispatch import (
-    merge_headers,
-    prepare_request,
-    run_dispatch,
-    wire_dispatch,
-)
-from stario.testing.encode import (
-    decode_content_encoding,
-    parse_http_response,
-    parse_response_cookies,
-)
+from stario.testing.encode import decode_content_encoding, parse_response_cookies
 from stario.testing.load import aload_app
 from stario.testing.models import ClientRequest
+from stario.testing.request import merge_headers, prepare_request
 from stario.testing.response import TestResponse, TestStreamResponse
 from stario.testing.tracer import TestTracer
-from stario.testing.transport import GrowingSink, try_parse_http_head, wait_sink
 from stario.testing.types import (
     CookieMap,
     FileData,
@@ -36,6 +32,8 @@ from stario.testing.types import (
     HeaderMap,
     QueryParamInput,
 )
+from stario.testing.wire import Exchange, open_exchange, request_bytes
+from stario_cython.protocol import Connections
 
 
 @dataclass(slots=True, frozen=True)
@@ -47,28 +45,29 @@ class TestExchange:
 
 
 class TestClient:
-    """Async HTTP client: exercise an `App` in-process.
+    """Async HTTP client that drives an `App` through the real server protocol.
 
-    Pass a fully wired app or the same bootstrap async generator your program
-    uses in production. Always enter `async with TestClient(...)` before calling
-    `request` / `stream` / …; then `app` is the live application.
+    Pass a wired `App` or the bootstrap async generator your program uses in
+    production. Enter `async with TestClient(...)` first; `app` is then the
+    live application. Every request is serialized to HTTP/1.1 bytes and fed to
+    the same `HttpProtocol` that `serve()` runs, on an in-memory
+    connection. Routing, 308 / 400 target answers, framing, compression, and
+    the request span all come from production code.
 
-    Buffered requests — `request` waits for the entire response body and returns
-    `TestResponse`. The `get` / `head` / … helpers are thin wrappers with the
-    same keyword arguments. Redirects are followed up to `max_redirects` unless
-    overridden per call.
+    Buffered requests — `get` / `post` / … return a `TestResponse` once the
+    handler has finished: the whole body is in `content` and the request span
+    is closed, so `client.tracer.get_span(response.span_id)` works right away.
+    Redirects are followed up to `max_redirects` unless overridden per call.
 
-    Streaming — `stream` provides `TestStreamResponse` after headers; it does
-    not follow redirects. Prefer `Accept-Encoding: identity` when using
-    `TestStreamResponse.iter_bytes`. `timeout` applies to the full exchange
-    (headers and body reads). Leaving the `stream` block disconnects
-    that exchange and awaits the handler.
+    Streaming — `stream` yields a `TestStreamResponse` as soon as headers are
+    in; read with `iter_bytes` / `iter_events`. Leaving the block hangs up
+    (the handler sees `c.disconnected`) and waits for the handler to finish.
 
-    Telemetry — each response exposes `span_id`; finished data is on `tracer`.
-    Buffered calls append `TestExchange` rows to `exchanges`.
+    `timeout` / `request_timeout` cap one exchange. Past it the client hangs
+    up, cancels that handler, and raises `TimeoutError`.
 
-    Exit — buffered exchanges are disconnected, `drain_tasks` runs, then
-    bootstrap teardown (if any) matches normal app shutdown.
+    Exit — open connections close, `drain_tasks` runs, then bootstrap
+    teardown (if any) matches normal app shutdown.
     """
 
     __test__ = False
@@ -85,6 +84,7 @@ class TestClient:
         follow_redirects: bool = True,
         max_redirects: int = 20,
         compression: CompressionConfig | None = None,
+        requests: RequestPolicy | None = None,
         request_timeout: float | None = 30.0,
     ) -> None:
         """Wire the client.
@@ -99,7 +99,9 @@ class TestClient:
         - `cookies`: Initial cookie jar (`dict`-like).
         - `follow_redirects`: Default for buffered requests; ignored by `stream`.
         - `max_redirects`: Buffered redirect cap.
-        - `compression`: Passed to the synthetic `Writer`.
+        - `compression`: Server compression policy (default `CompressionConfig()`).
+          Responses compress only when the request sends `Accept-Encoding`.
+        - `requests`: Server request limits (default `RequestPolicy()`).
         - `request_timeout`: Default seconds per request; `None` means no timeout.
         """
         if isinstance(app_or_bootstrap, App):
@@ -125,7 +127,12 @@ class TestClient:
         self.compression = (
             compression if compression is not None else CompressionConfig()
         )
+        self.requests = requests if requests is not None else RequestPolicy()
         self.request_timeout = request_timeout
+        # One registry for every connection this client opens. The Server's
+        # Date tick would sweep it; here timeouts are off, so it only counts.
+        self._connections = Connections(server_driven=True)
+        self._date_box = [b""]
         self._async_app_cm: AbstractAsyncContextManager[App] | None = None
         self._entered = False
 
@@ -139,6 +146,8 @@ class TestClient:
                     self._bootstrap, app_factory=self._app_factory, tracer=self.tracer
                 )
                 self._app = await self._async_app_cm.__aenter__()
+            now = format_datetime(datetime.now(UTC), usegmt=True).encode("ascii")
+            self._date_box[0] = b"date: " + now + b"\r\n"
             self._entered = True
             return self
         except BaseException:
@@ -152,10 +161,10 @@ class TestClient:
         exc_tb: TracebackType | None,
     ) -> None:
         try:
-            for ex in self.exchanges:
-                fut = ex.response.disconnect
-                if not fut.done():
-                    fut.set_result(None)
+            for protocol in list(self._connections):
+                transport = protocol.transport
+                if transport is not None and not transport.is_closing():
+                    transport.close()
             if self._app is not None:
                 if self._async_app_cm is None and self._owns_shutdown:
                     self._app.signal_shutdown()
@@ -171,10 +180,10 @@ class TestClient:
     async def drain_tasks(self) -> None:
         """Wait until `App.drain_tasks` is quiet and `tracer` has no open spans.
 
-        Called automatically after signalling disconnect when exiting the client context.
-        Unsafe to call from work scheduled via `app.create_task` (can deadlock).
+        Called automatically after hanging up every connection when exiting
+        the client context. Unsafe to call from work scheduled via
+        `app.create_task` (can deadlock).
         """
-
         if not self._entered:
             raise RuntimeError(
                 "TestClient must be entered before drain_tasks(). Use `async with TestClient(...)`."
@@ -192,7 +201,6 @@ class TestClient:
     @property
     def app(self) -> App:
         """The running `App` (available inside `async with TestClient(...)`)."""
-
         if not self._entered:
             raise RuntimeError(
                 "TestClient must be used as an async context manager. "
@@ -204,6 +212,85 @@ class TestClient:
                 "Enter the context manager before calling await .get() / .post() / …."
             )
         return self._app
+
+    # --- one connection -------------------------------------------------
+
+    def _open(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: QueryParamInput | None,
+        headers: HeaderMap | None,
+        cookies: CookieMap | None,
+        json: Any | None,
+        data: FormData | bytes | str | None,
+        files: FileData | None,
+        content: bytes | str | None,
+    ) -> tuple[Exchange, ClientRequest]:
+        pm, purl, ppath, pqs, phdrs, pbody = prepare_request(
+            method=method,
+            url=url,
+            base_url=self.base_url,
+            base_headers=self.default_headers,
+            request_headers=headers,
+            client_cookies=self.cookies,
+            request_cookies=cookies,
+            params=params,
+            json=json,
+            data=data,
+            files=files,
+            content=content,
+        )
+        policy = self.requests
+        exchange = open_exchange(
+            app=self.app,
+            tracer=self.tracer,
+            date_box=self._date_box,
+            compression=self.compression,
+            connections=self._connections,
+            policy={
+                "max_header_bytes": policy.max_header_bytes,
+                "max_body_bytes": policy.max_body_bytes,
+                "header_timeout": policy.header_timeout,
+                "keep_alive_timeout": policy.keep_alive_timeout,
+                "body_timeout": policy.body_timeout,
+                "max_pipelined_requests": policy.max_pipelined_requests,
+                "write_timeout": policy.write_timeout,
+            },
+            raw=request_bytes(pm, ppath, pqs, phdrs, pbody),
+            head_request=pm == "HEAD",
+        )
+        request = ClientRequest(
+            method=pm,
+            url=purl,
+            path=ppath,
+            query_string=pqs,
+            headers=phdrs,
+            content=pbody,
+        )
+        return exchange, request
+
+    def _deadline(self, timeout: float | None) -> float | None:
+        seconds = self.request_timeout if timeout is None else timeout
+        if seconds is None:
+            return None
+        return asyncio.get_running_loop().time() + seconds
+
+    async def _timed_out(
+        self, exchange: Exchange, seconds: float | None
+    ) -> TimeoutError:
+        """Hang up and cancel the handler, then describe the timeout."""
+        exchange.disconnect()
+        exchange.cancel()
+        if exchange.task is not None:
+            await asyncio.gather(exchange.task, return_exceptions=True)
+        return TimeoutError(
+            f"TestClient: no complete response within {seconds}s "
+            f"({exchange.reader.status_code or 'no headers'} so far)."
+        )
+
+    # --- streaming ------------------------------------------------------
 
     @asynccontextmanager
     async def stream(
@@ -222,103 +309,50 @@ class TestClient:
     ) -> AsyncGenerator[TestStreamResponse]:
         """Start a request and yield `TestStreamResponse` once headers are available.
 
-        Does not follow redirects (inspect `Location` yourself). On context exit,
-        signals client disconnect for this exchange and awaits the handler coroutine.
-        `timeout` caps the whole exchange, including body iteration after headers.
-        Use `Accept-Encoding: identity` when reading `iter_bytes` so the body is not compressed.
+        Does not follow redirects (inspect `Location` yourself). Leaving the
+        block hangs up this connection and waits for the handler coroutine.
+        `timeout` caps the whole exchange, including body iteration after
+        headers. Send `Accept-Encoding: identity` when reading `iter_bytes`
+        so the body is not compressed.
         """
-
-        pm, purl, ppath, pqs, phdrs, pbody = prepare_request(
-            method=method,
-            url=url,
-            base_url=self.base_url,
-            base_headers=self.default_headers,
-            request_headers=headers,
-            client_cookies=self.cookies,
-            request_cookies=cookies,
+        exchange, request = self._open(
+            method,
+            url,
             params=params,
+            headers=headers,
+            cookies=cookies,
             json=json,
             data=data,
             files=files,
             content=content,
         )
-
-        sink = GrowingSink()
-        wired = wire_dispatch(
-            app=self.app,
-            tracer=self.tracer,
-            pm=pm,
-            purl=purl,
-            ppath=ppath,
-            pqs=pqs,
-            phdrs=phdrs,
-            pbody=pbody,
-            compression=self.compression,
-            transport_write=sink.extend,
-        )
-        disconnect = wired.disconnect
-        timeout_secs = self.request_timeout if timeout is None else timeout
-        loop = asyncio.get_running_loop()
-        exchange_deadline = None if timeout_secs is None else loop.time() + timeout_secs
-
-        async def run_stream() -> None:
-            await run_dispatch(
-                self.app,
-                wired,
-                deadline=timeout_secs,
-                on_finished=sink.mark_app_done,
-            )
-
-        app_task = asyncio.create_task(run_stream(), name="stario.testclient.stream")
-
+        seconds = self.request_timeout if timeout is None else timeout
+        deadline = self._deadline(timeout)
+        reader = exchange.reader
         try:
-            seen = sink.gen
-            parsed = try_parse_http_head(sink.buf)
-            while parsed is None:
-                if sink.app_done:
-                    await app_task
-                    raise RuntimeError(
-                        "Application exited before response headers were sent."
-                    )
-                await wait_sink(sink, seen, deadline=exchange_deadline)
-                seen = sink.gen
-                parsed = try_parse_http_head(sink.buf)
-
-            status_code, response_headers, body_start = parsed
-            response_cookies = parse_response_cookies(response_headers)
+            try:
+                status_code, response_headers = await reader.wait_headers(deadline)
+            except TimeoutError:
+                raise await self._timed_out(exchange, seconds) from None
             merge_cookie_jar(self.cookies, response_headers)
-            client_request = wired.client_request
-
-            te = (response_headers.get("transfer-encoding") or "").lower()
-            chunked = "chunked" in te
-            cl_raw = response_headers.get("content-length")
-            content_length: int | None = None
-            if cl_raw is not None:
-                try:
-                    content_length = int(cl_raw)
-                except ValueError:
-                    content_length = None
-
-            st = TestStreamResponse(
+            yield TestStreamResponse(
                 status_code=status_code,
-                url=purl,
+                url=request.url,
                 headers=response_headers,
-                request=client_request,
-                span_id=wired.root_span.id,
-                cookies=response_cookies,
-                sink=sink,
-                _body_start=body_start,
-                _chunked=chunked,
-                _content_length=content_length,
-                _disconnect_future=disconnect,
-                _app_task=app_task,
-                _deadline=exchange_deadline,
+                request=request,
+                span_id=exchange.span_id,
+                cookies=parse_response_cookies(response_headers),
+                _exchange=exchange,
+                _deadline=deadline,
             )
-            yield st
         finally:
-            if not disconnect.done():
-                disconnect.set_result(None)
-            await app_task
+            exchange.disconnect()
+            # A handler that ignores the hang-up until the deadline is
+            # cancelled; the test's own assertions decide the outcome.
+            with contextlib.suppress(TimeoutError):
+                await exchange.finish(deadline)
+
+    # --- buffered -------------------------------------------------------
 
     async def request(
         self,
@@ -336,62 +370,6 @@ class TestClient:
         timeout: float | None = None,
     ) -> TestResponse:
         """Issue an arbitrary HTTP method and return a fully buffered `TestResponse`."""
-
-        return await self._request(
-            method,
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            json=json,
-            data=data,
-            files=files,
-            content=content,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-        )
-
-    # --- Shortcuts: same `**kwargs` as `request` ---
-
-    async def get(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("GET", url, **kwargs)
-
-    async def query(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("QUERY", url, **kwargs)
-
-    async def head(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("HEAD", url, **kwargs)
-
-    async def post(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("POST", url, **kwargs)
-
-    async def put(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("PUT", url, **kwargs)
-
-    async def patch(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("PATCH", url, **kwargs)
-
-    async def delete(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("DELETE", url, **kwargs)
-
-    async def options(self, url: str, **kwargs: Any) -> TestResponse:
-        return await self.request("OPTIONS", url, **kwargs)
-
-    async def _request(
-        self,
-        method: str,
-        url: str,
-        *,
-        params: QueryParamInput | None = None,
-        headers: HeaderMap | None = None,
-        cookies: CookieMap | None = None,
-        json: Any | None = None,
-        data: FormData | bytes | str | None = None,
-        files: FileData | None = None,
-        content: bytes | str | None = None,
-        follow_redirects: bool | None = None,
-        timeout: float | None = None,
-    ) -> TestResponse:
         redirect_mode = (
             self.default_follow_redirects
             if follow_redirects is None
@@ -451,6 +429,32 @@ class TestClient:
             f"Too many redirects. Exceeded configured limit of {self.max_redirects}."
         )
 
+    # --- Shortcuts: same `**kwargs` as `request` ---
+
+    async def get(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("GET", url, **kwargs)
+
+    async def query(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("QUERY", url, **kwargs)
+
+    async def head(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("HEAD", url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("POST", url, **kwargs)
+
+    async def put(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("PUT", url, **kwargs)
+
+    async def patch(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("PATCH", url, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("DELETE", url, **kwargs)
+
+    async def options(self, url: str, **kwargs: Any) -> TestResponse:
+        return await self.request("OPTIONS", url, **kwargs)
+
     async def _send_once(
         self,
         method: str,
@@ -465,59 +469,41 @@ class TestClient:
         content: bytes | str | None = None,
         timeout: float | None = None,
     ) -> TestResponse:
-        pm, purl, ppath, pqs, phdrs, pbody = prepare_request(
-            method=method,
-            url=url,
-            base_url=self.base_url,
-            base_headers=self.default_headers,
-            request_headers=headers,
-            client_cookies=self.cookies,
-            request_cookies=cookies,
+        exchange, request = self._open(
+            method,
+            url,
             params=params,
+            headers=headers,
+            cookies=cookies,
             json=json,
             data=data,
             files=files,
             content=content,
         )
-
-        sink = bytearray()
-        wired = wire_dispatch(
-            app=self.app,
-            tracer=self.tracer,
-            pm=pm,
-            purl=purl,
-            ppath=ppath,
-            pqs=pqs,
-            phdrs=phdrs,
-            pbody=pbody,
-            compression=self.compression,
-            transport_write=sink.extend,
-        )
-        deadline = self.request_timeout if timeout is None else timeout
-        await run_dispatch(self.app, wired, deadline=deadline)
-
-        status_code, response_headers, response_body = parse_http_response(bytes(sink))
-        response_body = decode_content_encoding(
-            response_body,
-            response_headers.get("content-encoding"),
-        )
-        response_cookies = parse_response_cookies(response_headers)
+        seconds = self.request_timeout if timeout is None else timeout
+        deadline = self._deadline(timeout)
+        reader = exchange.reader
+        try:
+            # The whole response, then the handler itself: post-response work
+            # (`app.create_task` excepted) is done when this returns.
+            status_code, response_headers = await reader.wait_headers(deadline)
+            body = await reader.body(deadline)
+            await exchange.finish(deadline)
+        except TimeoutError:
+            raise await self._timed_out(exchange, seconds) from None
+        finally:
+            exchange.disconnect()
         merge_cookie_jar(self.cookies, response_headers)
-        client_request = wired.client_request
         response = TestResponse(
             status_code=status_code,
-            url=purl,
+            url=request.url,
             headers=response_headers,
-            content=response_body,
-            request=client_request,
-            span_id=wired.root_span.id,
-            cookies=response_cookies,
-            _disconnect_future=wired.disconnect,
+            content=decode_content_encoding(
+                body, response_headers.get("content-encoding")
+            ),
+            request=request,
+            span_id=exchange.span_id,
+            cookies=parse_response_cookies(response_headers),
         )
-        self.exchanges.append(
-            TestExchange(
-                request=client_request,
-                response=response,
-            )
-        )
+        self.exchanges.append(TestExchange(request=request, response=response))
         return response

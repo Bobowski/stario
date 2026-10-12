@@ -158,6 +158,13 @@ def parse_path_segments(path: str) -> tuple[Segment, ...]:
                 "Route pattern contains empty path segment",
                 context={"path": path},
             )
+        if raw in {".", ".."}:
+            raise StarioError(
+                "Route pattern contains a dot segment",
+                context={"path": path, "segment": raw},
+                help_text="Requests with '.' or '..' segments are redirected to the "
+                "normalized path, so this route could never match.",
+            )
         segments.append(Segment.parse(path, raw))
     for segment in segments[:-1]:
         if segment.kind == "catchall":

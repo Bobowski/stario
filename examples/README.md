@@ -1,6 +1,6 @@
 # Stario examples
 
-Runnable reference apps for Stario 4. Clone the [stario repository](https://github.com/bobowski/stario) and run one locally, or copy an example directory into your own project. Each example pins `stario>=4,<5` in `pyproject.toml`. The CLI (`stario serve`, `stario watch`) only runs apps — it does not scaffold projects.
+Runnable reference apps for Stario. Clone the [stario repository](https://github.com/bobowski/stario) and run one locally, or copy an example directory into your own project. Each example runs with `uv run python -m …` — `serve()` is the only server entry point.
 
 | Example | Size | Start here? |
 |---------|------|-------------|
@@ -15,7 +15,7 @@ Runnable reference apps for Stario 4. Clone the [stario repository](https://gith
 git clone https://github.com/bobowski/stario.git
 cd stario/examples/tiles
 uv sync
-uv run stario watch main:bootstrap
+uv run python -m main
 ```
 
 Open http://127.0.0.1:8000 — paint in two tabs to see live sync.

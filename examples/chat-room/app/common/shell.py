@@ -1,8 +1,8 @@
 """Shared document shell — feature views supply the body only."""
 
 from app.assets import DATASTAR_JS, STYLE_CSS
+from stario import h
 from stario.markup import HtmlElement, baked
-from stario.markup import html as h
 
 
 @baked

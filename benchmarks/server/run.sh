@@ -150,13 +150,13 @@ command_for() {
     stario)
       export STARIO_HOST="$HOST"
       export STARIO_PORT="$SERVER_PORT"
-      export STARIO_LOOP=uvloop
       export STARIO_TRACER=noop
       export STARIO_COMPRESS_ZSTD_LEVEL=-1
       export STARIO_COMPRESS_BROTLI_LEVEL=-1
       export STARIO_COMPRESS_GZIP_LEVEL=-1
       SERVER_CMD=(
-        "$(python_for stario)" -m stario.cli serve apps.stario_app:bootstrap
+        "$(python_for stario)" -c \
+          "import uvloop; from stario import serve; from apps.stario_app import bootstrap; uvloop.run(serve(bootstrap))"
       )
       ;;
     fastapi)

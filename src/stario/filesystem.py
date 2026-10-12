@@ -31,7 +31,6 @@ from typing import Final, NamedTuple
 import xxhash
 from typing_extensions import TypeIs
 
-import stario.responses as responses
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.app import App
 from stario.http.compression import (
@@ -41,7 +40,7 @@ from stario.http.compression import (
     negotiate_content_encoding,
 )
 from stario.http.context import Context
-from stario.http.headers import Headers, encode_header_value
+from stario.http.headers import RequestHeaders, encode_header_value
 from stario.http.route import Route, append_query_fragment, public_prefix
 from stario.http.writer import Writer
 
@@ -265,7 +264,9 @@ def _last_modified(modified: float) -> bytes:
     ).encode("ascii")
 
 
-def _range_header(request: Headers, identity_etag: bytes, modified: float) -> bytes:
+def _range_header(
+    request: RequestHeaders, identity_etag: bytes, modified: float
+) -> bytes:
     range_header = request.unsafe_get(b"range", b"")
     if (if_range := request.unsafe_get(b"if-range")) is None:
         return range_header
@@ -277,7 +278,7 @@ def _range_header(request: Headers, identity_etag: bytes, modified: float) -> by
     return range_header if _date_matches(stripped, modified) else b""
 
 
-def _fresh(request: Headers, etag: bytes, modified: float) -> bool:
+def _fresh(request: RequestHeaders, etag: bytes, modified: float) -> bool:
     if_none_match = request.unsafe_get(b"if-none-match")
     if if_none_match is None:
         since = request.unsafe_get(b"if-modified-since")
@@ -287,7 +288,7 @@ def _fresh(request: Headers, etag: bytes, modified: float) -> bool:
 
 def _not_found(writer: Writer) -> None:
     writer.headers.unsafe_set(b"x-content-type-options", b"nosniff")
-    responses.text(writer, "Not Found", 404)
+    writer.text("Not Found", 404)
 
 
 def _date_matches(value: bytes, modified: float) -> bool:
@@ -337,6 +338,8 @@ async def _stream(writer: Writer, fd: int, start: int, length: int) -> None:
         if writer.closing:
             return
         writer.write(chunk)
+        # Bound memory for slow clients: do not read ahead of the socket.
+        await writer.drain()
     writer.end()
 
 
@@ -673,9 +676,6 @@ class _Mount:
             body = cached.encodings[encoding]
             headers.unsafe_set(b"content-encoding", encoding)
         headers.unsafe_set(b"content-length", b"%d" % len(body))
-        if context.req.method == "HEAD":
-            writer.write_headers(200, body=False).end()
-            return
         writer.write_headers(200).end(body)
 
     def _headers(
@@ -701,7 +701,7 @@ class _Mount:
     ) -> None:
         writer.headers.unsafe_set(b"content-length", b"%d" % size)
         if context.req.method == "HEAD":
-            writer.write_headers(200, body=False).end()
+            writer.write_headers(200).end()
             return
         writer.write_headers(200)
         await _stream(writer, fd, 0, size)
@@ -731,7 +731,7 @@ class _Mount:
         headers.unsafe_set(b"content-range", b"bytes %d-%d/%d" % (start, end, size))
         headers.unsafe_set(b"content-length", b"%d" % (end - start + 1))
         if context.req.method == "HEAD":
-            writer.write_headers(206, body=False).end()
+            writer.write_headers(206).end()
             return
         if body is not None:
             writer.write_headers(206).end(body[start : end + 1])
@@ -912,7 +912,7 @@ class Assets(_Mount):
             await self._stream_pinned(context, writer, hashed)
             return
         if logical := self._catalog.get(path):
-            responses.redirect(writer, logical.url, 307)
+            writer.redirect(logical.url, 307)
             return
         _not_found(writer)
 

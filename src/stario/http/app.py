@@ -1,62 +1,55 @@
 """
-Single entrypoint for request handling above the router: error surface, tracing, and `writer.end()` guarantees.
+Application object: route table plus shutdown-aware tasks.
 
-The protocol dispatches a callable; this class is where policy lives so the route trie stays a pure match/registration
-structure. `create_task` registers work the server can wait on during shutdown—use it instead of orphan `asyncio.create_task` calls for request-adjacent work.
+The HTTP protocol does not call this class per request. It reads the compiled
+trie (`compiled()`) and constructs `asyncio.Task(handler(c, w))`, registering
+incomplete tasks on `app.tasks` for shutdown drain. `create_task` puts app
+background work on that same set. `TestClient` drives the protocol too, so
+there is one dispatch path.
 """
 
+from __future__ import annotations
+
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine
-from functools import lru_cache
+import threading
+from collections.abc import Coroutine
 from typing import Any
 
-import stario.responses as responses
-from stario.exceptions import (
-    ClientDisconnected,
-    HttpException,
-    RedirectException,
-    StarioError,
-    StarioRuntime,
-)
-from stario.http.context import Context
-from stario.http.route import normalize_path
+from stario.exceptions import StarioError
+from stario_cython.exchange import AppState
 
 from .dispatch import Router
-from .writer import Writer
-
-type ErrorHandler[E: Exception] = Callable[[Context, Writer, E], Awaitable[None]]
 
 
-async def _default_http_exception(_c: Context, w: Writer, exc: HttpException) -> None:
-    responses.text(w, exc.detail or "Error", exc.status_code)
-
-
-async def _default_redirect_exception(
-    _c: Context, w: Writer, exc: RedirectException
-) -> None:
-    responses.redirect(w, exc.location, exc.status_code)
-
-
-async def _default_client_disconnected(
-    _c: Context, w: Writer, _exc: ClientDisconnected
-) -> None:
-    w.abort()
+def _finish(fut: asyncio.Future[None]) -> None:
+    if not fut.done():
+        fut.set_result(None)
 
 
 class App(Router):
-    """Concrete app type: everything on `Router` plus errors and shutdown-aware tasks.
+    """Route table plus task tracking for graceful shutdown.
 
-    Uncaught exceptions become HTTP responses only before headers are sent; after that, telemetry still records the failure.
-    Use `create_task` for work tied to a running server so graceful shutdown can observe it.
+    Handlers are `async def` and must write a complete response. Uncaught
+    exceptions are logged; if nothing was sent, the framework writes 500.
+    A response already on the wire is not rewritten. Use `catch_errors` middleware
+    or write error responses in handlers. Use `create_task` for work tied to a running server
+    so drain can observe it.
+
+    `shutdown` is a per-loop Future for the calling loop. `signal_shutdown()`
+    completes it on every attached loop so worker threads wake together.
+    `tasks` is per-thread so drain only sees work on this loop.
     """
 
     def __init__(self) -> None:
-        """Create an application (a `Router` with error handling and tasks).
+        """Create an application (a `Router` with tracked tasks).
 
         Requires a running event loop — create inside `serve()`, bootstrap,
         or async test code. `shutdown` completes when the runner begins draining.
         """
         super().__init__()
+        self._app_state = AppState()
+        self._app_state.host_routing = self._host_routing
+        self._app_state.router = None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as exc:
@@ -65,55 +58,88 @@ class App(Router):
                 help_text="Create App inside serve(), bootstrap, or async test code.",
             ) from exc
 
-        self.shutdown = loop.create_future()
-        self.tasks: set[asyncio.Task[Any]] = set()
-        self._error_handlers: dict[type[Exception], ErrorHandler[Any]] = {
-            HttpException: _default_http_exception,
-            RedirectException: _default_redirect_exception,
-            ClientDisconnected: _default_client_disconnected,
-        }
+        self._shutdown_event = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._loop_shutdown: dict[asyncio.AbstractEventLoop, asyncio.Future[None]] = {}
+        self._task_local = threading.local()
+        self.attach_loop(loop)
 
-        @lru_cache(maxsize=64)
-        def find_handler(exc_type: type[Exception]) -> ErrorHandler[Any] | None:
-            # Most-specific registered type wins by walking the MRO.
-            for t in exc_type.__mro__:
-                if t is Exception:
-                    return None
-                if handler := self._error_handlers.get(t):
-                    return handler
-            return None
+    def attach_loop(
+        self, loop: asyncio.AbstractEventLoop | None = None
+    ) -> asyncio.Future[None]:
+        """Register `loop` (default: running loop) so shutdown reaches it."""
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError as exc:
+                raise StarioError(
+                    "attach_loop() requires a running event loop",
+                    help_text="Call App.attach_loop() from the worker thread's loop.",
+                ) from exc
+        return self._future_for(loop)
 
-        self._find_error_handler = find_handler
+    def _future_for(self, loop: asyncio.AbstractEventLoop) -> asyncio.Future[None]:
+        with self._shutdown_lock:
+            fut = self._loop_shutdown.get(loop)
+            if fut is None:
+                fut = loop.create_future()
+                self._loop_shutdown[loop] = fut
+        if self._shutdown_event.is_set():
+            self._wake(loop, fut)
+        return fut
+
+    def _wake(self, loop: asyncio.AbstractEventLoop, fut: asyncio.Future[None]) -> None:
+        """Complete `fut`, hopping to its loop when called from another thread."""
+        if fut.done() or loop.is_closed():
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            _finish(fut)
+            return
+        try:
+            loop.call_soon_threadsafe(_finish, fut)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+
+    @property
+    def shutdown(self) -> asyncio.Future[None]:
+        """This loop's shutdown Future — await it; `signal_shutdown()` completes all loops."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            raise StarioError(
+                "app.shutdown requires a running event loop",
+                help_text="Await app.shutdown from async code on the loop that serves requests.",
+            ) from exc
+        # Shield: a cancelled waiter must not cancel the loop's shared future.
+        return asyncio.shield(self._future_for(loop))
 
     @property
     def shutting_down(self) -> bool:
         """`True` once the runner has started draining this app."""
-        return self.shutdown.done()
+        return self._shutdown_event.is_set()
 
     def signal_shutdown(self) -> None:
-        """Complete the shutdown future if still pending."""
-        if not self.shutdown.done():
-            self.shutdown.set_result(None)
+        """Complete shutdown on every attached loop."""
+        self._shutdown_event.set()
+        self._app_state.shutting_down = True
+        with self._shutdown_lock:
+            items = list(self._loop_shutdown.items())
+        for loop, fut in items:
+            self._wake(loop, fut)
 
-    # --- error handler registry ---
-
-    def on_error(
-        self, exc_type: type[Exception], handler: ErrorHandler[Exception]
-    ) -> None:
-        """Register a handler for uncaught exceptions of type `exc_type` (subclasses use MRO; most specific wins).
-
-        - `exc_type`: Exception class to match.
-        - `handler`: Async callable receiving `(context, writer, exc)`.
-
-        Only runs while the writer has not started (`w.started` is false); after
-        headers are sent, failures use `w.abort()` in the `finally` block.
-        `HttpException`, `RedirectException`, and `ClientDisconnected` are
-        registered by default.
-        """
-        self._error_handlers[exc_type] = handler
-        self._find_error_handler.cache_clear()
-
-    # --- background tasks (tracked until drain_tasks or server shutdown) ---
+    @property
+    def tasks(self) -> set[asyncio.Task[Any]]:
+        """Tasks scheduled via `create_task` on this OS thread."""
+        stored: set[asyncio.Task[Any]] | None = getattr(self._task_local, "tasks", None)
+        if stored is None:
+            stored = set()
+            self._task_local.tasks = stored
+        return stored
 
     def create_task[T](
         self,
@@ -121,16 +147,18 @@ class App(Router):
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         name: str | None = None,
+        eager_start: bool = False,
     ) -> asyncio.Task[T]:
         """Schedule a coroutine on the running loop and retain the task until it completes.
 
-        The HTTP protocol schedules each request's `App.__call__` through this
-        method so graceful shutdown can await in-flight handlers. App code can use
-        the same API for background work; both share `tasks` until shutdown drain.
+        The HTTP protocol schedules each request handler through this method so
+        graceful shutdown can await in-flight work. App code can use the same
+        API for background work; both share `tasks` until shutdown drain.
 
         - `coro`: Coroutine to run.
         - `loop`: Optional loop to schedule on when the caller already has it.
         - `name`: Optional task name for debuggers.
+        - `eager_start`: Run immediately until the first suspension.
 
         The new `asyncio.Task`.
 
@@ -144,9 +172,16 @@ class App(Router):
                     "app.create_task() requires a running event loop",
                     help_text="Call app.create_task() from async code while the app is running.",
                 ) from exc
-        task = loop.create_task(coro, name=name)
-        self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task = asyncio.Task(
+            coro,
+            loop=loop,
+            name=name,
+            eager_start=eager_start,
+        )
+        if not task.done():
+            tasks = self.tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
         return task
 
     async def drain_tasks(self) -> None:
@@ -160,84 +195,3 @@ class App(Router):
             if not pending:
                 return
             await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
-
-    # --- protocol entrypoint (called once per HTTP request) ---
-
-    async def __call__(self, c: Context, w: Writer) -> None:
-        """Protocol entrypoint: open a span, resolve routes, handle errors, and finish started responses.
-
-        - `c`: Request context (`app`, `req`, `span`, `match`, `state`).
-        - `w`: Response writer for this message on the connection.
-
-        Trailing slashes (except `/`) get `308` to a canonical path (leading `/`, no trailing
-        slash) before `find_handler` runs. Wrong method on a matching path yields `405`.
-
-        Uncaught exceptions while headers are not sent: `HttpException` →
-        `responses.text`, `RedirectException` → `responses.redirect`,
-        `ClientDisconnected` → `w.abort()` (no body); anything else falls back
-        to 500 unless `on_error` handled it. If a registered error handler
-        raises, the request span is marked failed and 500 is sent when the
-        handler did not start or complete the writer. Handlers must explicitly
-        send a response on the success path.
-        """
-        span = c.span
-        span.start()
-        span.attr("request.method", c.req.method)
-        span.attr("request.path", c.req.path)
-        failed_after_start = False
-
-        try:
-            path = c.req.path
-            host = c.req.host if self.host_routing else ""
-            if path != "/" and path.endswith("/"):
-                target = normalize_path(path)
-                _, _, hit = self.find_handler(host, target, c.req.method)
-                if hit.pattern:
-                    span.rename(hit.pattern)
-                if c.req.query_bytes:
-                    target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
-                responses.redirect(w, target, 308)
-                return
-
-            handler, route, c.match = self.find_handler(host, path, c.req.method)
-            if c.match.pattern:
-                span.rename(c.match.pattern)
-                span.attr("http.route", route.path)
-            await handler(c, w)
-            if not w.started and not w.completed:
-                raise StarioRuntime(
-                    "Handler returned without sending a response",
-                    context={
-                        "method": c.req.method,
-                        "path": c.req.path,
-                        "route": c.match.pattern or None,
-                    },
-                    help_text=(
-                        "Call a response helper such as responses.text/json/html/empty, "
-                        "or explicitly use Writer.write_headers()/write()/end()."
-                    ),
-                )
-
-        except Exception as exc:
-            handler_responded = False
-            failed_after_start = w.started
-            if not w.started:
-                if handler := self._find_error_handler(type(exc)):
-                    try:
-                        await handler(c, w, exc)
-                        handler_responded = w.started or w.completed
-                    except Exception as handler_exc:
-                        failed_after_start = w.started
-                        exc = handler_exc
-                if not handler_responded:
-                    responses.text(w, "Internal Server Error", 500)
-            if not handler_responded:
-                span.fail(str(exc))
-                span.exception(exc)
-        finally:
-            if failed_after_start and not w.completed:
-                w.abort()
-            else:
-                w.end()
-            span.attr("response.status_code", w.status_code)
-            span.end()

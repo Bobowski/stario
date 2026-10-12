@@ -10,10 +10,10 @@ from typing import Any, Literal
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.redirect import normalized_location
 from stario.http.writer import Writer
+from stario.json import JsonValue
 from stario.json import dumps as json_dumps
 from stario.json import dumps_bytes as json_dumps_bytes
 from stario.markup.render import render
-from stario.responses import JsonValue
 
 from .format import require_mapping, validate_signal_name
 
@@ -51,6 +51,11 @@ def _sse_field_value(name: str, value: str) -> bytes:
             ),
         )
     return value.encode()
+
+
+def _sse_payload_lines(data: bytes) -> list[bytes]:
+    """Split an SSE payload on CR, LF, or CRLF (HTML event-stream line endings)."""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
 
 
 class SSE:
@@ -120,7 +125,9 @@ class SSE:
             html_bytes = render(content).encode("utf-8")
 
         # SSE represents multiline payloads as repeated `data:` lines.
-        for line in html_bytes.split(b"\n"):
+        # Split on CR, LF, and CRLF: a bare CR is a line terminator in the
+        # event-stream parser and must not remain inside a `data:` field.
+        for line in _sse_payload_lines(html_bytes):
             lines.append(b"data: elements " + line)
 
         self._prepare_headers()
@@ -140,7 +147,7 @@ class SSE:
         lines = [_EVENT_PATCH_SIGNALS]
         if only_if_missing:
             lines.append(b"data: onlyIfMissing true")
-        for line in json_bytes.split(b"\n"):
+        for line in _sse_payload_lines(json_bytes):
             lines.append(b"data: signals " + line)
         self._prepare_headers()
         self.w.write(b"\n".join(lines) + b"\n\n")
@@ -179,7 +186,7 @@ class SSE:
                 "Cannot send SSE events after the response is completed",
                 help_text=(
                     "Create and use `SSE(w)` before response helpers like "
-                    "`responses.html()`, `responses.redirect()`, `responses.empty()`, or `w.end()`."
+                    "`w.html()`, `w.redirect()`, `w.empty()`, or `w.end()`."
                 ),
                 example=(
                     "from stario.datastar import SSE\n\n"

@@ -14,19 +14,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import NoReturn, cast
 from urllib.parse import quote, urlencode
-from warnings import warn
-
-from typing_extensions import deprecated
 
 from stario.exceptions import StarioError
 from stario.http.segment import Segment, parse_route
 
 HTTP_METHODS = ("GET", "QUERY", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
-
-_URLPATH_OBSOLETE = (
-    "UrlPath is obsolete. Pass a string that starts with '/' or '//' "
-    "(or Route('GET /path'))."
-)
 
 
 def normalize_path(path: str) -> str:
@@ -101,92 +93,6 @@ def append_query_fragment(
     return href
 
 
-class UrlPath:
-    """Obsolete parsed path. Prefer `Route` or a `/` / `//` string.
-
-    Input contract only. `Route` is the live object.
-    `.path` is the segment tuple (not the path string).
-    """
-
-    __slots__ = (
-        "_path_text",
-        "host",
-        "host_text",
-        "path",
-        "text",
-    )
-
-    def __init__(self, path: str, *, host: str | None = None) -> None:
-        if path and not path.startswith("/"):
-            raise StarioError(
-                "UrlPath path must start with '/'",
-                context={"path": path},
-                help_text="Use '/path' or Route('GET /path').",
-            )
-        if host is not None and not host:
-            raise StarioError(
-                "UrlPath host must not be empty",
-                context={"path": path, "host": host},
-                help_text="Omit host= for path-only routes.",
-            )
-        path_text = normalize_path(path)
-        host_segments, path_segments = parse_route(host, path_text)
-        self.path = path_segments
-        self.host = host_segments
-        self._path_text = path_text
-        if self.host:
-            self.host_text = ".".join(segment.pattern for segment in self.host)
-            self.text = self.host_text + path_text
-        else:
-            self.host_text = None
-            self.text = path_text
-
-    def __repr__(self) -> str:
-        if self.host_text is None:
-            return f"UrlPath({self._path_text!r})"
-        return f"UrlPath({self._path_text!r}, host={self.host_text!r})"
-
-    @property
-    def path_text(self) -> str:
-        return self._path_text
-
-    @property
-    def target(self) -> str:
-        """`/path` or `//host/path` — the string `Route` accepts."""
-        if self.host_text is None:
-            return self._path_text
-        return f"//{self.host_text}{self._path_text}"
-
-    def __truediv__(self, suffix: str) -> UrlPath:
-        extra = suffix.strip("/")
-        if not extra:
-            return self
-        return UrlPath(
-            self._path_text.rstrip("/") + "/" + extra,
-            host=self.host_text,
-        )
-
-    def href(
-        self,
-        *args: object,
-        query: Mapping[str, object] | None = None,
-        fragment: str | None = None,
-        **params: object,
-    ) -> str:
-        """Browser URL. Same arguments as `Route.href`."""
-        return Route("GET", self.target).href(
-            *args, query=query, fragment=fragment, **params
-        )
-
-
-def as_target(value: str | UrlPath) -> str:
-    """Turn an obsolete `UrlPath` into `/path` or `//host/path`."""
-    if isinstance(value, str):
-        return value
-    warn(_URLPATH_OBSOLETE, DeprecationWarning, stacklevel=3)
-    return value.target
-
-
 def _method_token(method: str) -> str:
     token = method.strip().upper()
     if not token or any(ch.isspace() for ch in token):
@@ -239,7 +145,7 @@ def _enc_catchall_path(value: object, name: str) -> str:
 
 def _host_text(value: object, name: str) -> str:
     text = _require(value, name, where="host").lower()
-    if any(ch in text for ch in "/:@[]"):
+    if any(ch in text for ch in "/:@[]?#\\ \t\r\n"):
         _value_error(
             "Route host parameter contains invalid character", name, value=text
         )
@@ -532,46 +438,6 @@ class Route:
     def empty(cls) -> Route:
         """Unmatched 404 / 405 sentinel. Do not register it."""
         return EMPTY_ROUTE
-
-    @classmethod
-    @deprecated("Use Route('GET /path') or Route('GET', path).")
-    def get(cls, path: str | UrlPath) -> Route:
-        return cls("GET", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('QUERY /path') or Route('QUERY', path).")
-    def query(cls, path: str | UrlPath) -> Route:
-        return cls("QUERY", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('POST /path') or Route('POST', path).")
-    def post(cls, path: str | UrlPath) -> Route:
-        return cls("POST", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('PUT /path') or Route('PUT', path).")
-    def put(cls, path: str | UrlPath) -> Route:
-        return cls("PUT", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('DELETE /path') or Route('DELETE', path).")
-    def delete(cls, path: str | UrlPath) -> Route:
-        return cls("DELETE", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('PATCH /path') or Route('PATCH', path).")
-    def patch(cls, path: str | UrlPath) -> Route:
-        return cls("PATCH", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('HEAD /path') or Route('HEAD', path).")
-    def head(cls, path: str | UrlPath) -> Route:
-        return cls("HEAD", as_target(path))
-
-    @classmethod
-    @deprecated("Use Route('OPTIONS /path') or Route('OPTIONS', path).")
-    def options(cls, path: str | UrlPath) -> Route:
-        return cls("OPTIONS", as_target(path))
 
 
 EMPTY_ROUTE = Route.__new__(Route)

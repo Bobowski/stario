@@ -1,10 +1,9 @@
 """
-Stario Chat Room — multi-file example (the reference app layout).
+Stario Chat Room — multi-file example (larger-app layout).
 
 Run from the project root:
 
-  uv run stario watch app.main:bootstrap
-  uv run stario serve app.main:bootstrap
+  uv run python -m app.main
 
 Start here, then open each layer:
 
@@ -17,26 +16,27 @@ Start here, then open each layer:
 
 Per feature the pattern is the same:
 
-  urls.py      Route values for this screen (room/urls.py owns /rooms paths)
-  models.py    domain dataclasses (room owns Room, Message, User)
+  urls.py      Route endpoints (room/urls.py owns /rooms paths)
+  models.py    domain dataclasses (room feature owns Room, Message, User)
   data.py      SCHEMA + query functions against the shared Database
   subjects.py  relay subject helpers (room.{id}.message, .presence, …)
-  views.py     render(state) -> the full document
-  handlers.py  one class; register(app) adds the routes
+  signals.py   Datastar signal shape for this page
+  views.py     pure HTML (common.shell.page wraps body content)
+  handlers.py  handler factories + register_* at the bottom
 
 Files are optional per feature — the lobby is UI over the room domain, so
-it has no models.py, data.py, or subjects.py of its own.
+it has no models.py or data.py of its own.
 
-Layout trees and conventions: AGENTS.md from https://github.com/bobowski/stario-skills and
+Layout trees and conventions: examples/chat-room/README.md and
 https://stario.dev/docs/how-tos/structuring-apps
 """
 
 from app.assets import ASSETS
 from app.config import Config
 from app.db import Database
-from app.features.lobby.handlers import Lobby
+from app.features.lobby.handlers import register_lobby
 from app.features.room import data as room_data
-from app.features.room.handlers import Room
+from app.features.room.handlers import register_room
 from stario import App, Relay, Span
 
 
@@ -46,7 +46,7 @@ async def bootstrap(app: App, span: Span):
     db = Database(config.db_path)
     db.apply_schema(room_data.SCHEMA)
 
-    relay: Relay[str] = Relay()
+    relay = Relay()
 
     span.attrs(
         {
@@ -59,6 +59,14 @@ async def bootstrap(app: App, span: Span):
     with span.step("static_assets") as s:
         s.attrs(await ASSETS.attach(app))
 
-    Lobby(db, relay).register(app)
-    Room(db, relay).register(app)
+    register_lobby(app, db, relay)
+    register_room(app, db, relay)
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))

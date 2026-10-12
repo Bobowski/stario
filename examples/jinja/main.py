@@ -1,15 +1,13 @@
 """
 Shared counter with Jinja templates, Datastar, and SSE.
 
-Run with: uv run stario watch main:bootstrap
-      or: uv run stario serve main:bootstrap
+Run with: uv run python -m main
 """
 
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-import stario.responses as responses
 from stario import App, Context, Relay, Route, Span, Writer
 from stario.datastar import DATASTAR_CDN_URL, SSE
 
@@ -52,7 +50,7 @@ def home(counter: Counter):
             increment_url=INCREMENT.href(),
             reset_url=RESET.href(),
         )
-        responses.html(w, page)
+        w.html(page)
 
     return handler
 
@@ -73,7 +71,7 @@ def increment(counter: Counter, relay: Relay[None]):
     async def handler(c: Context, w: Writer) -> None:
         counter.increment()
         relay.publish("counter", None)
-        responses.empty(w)
+        w.empty()
 
     return handler
 
@@ -82,7 +80,7 @@ def reset(counter: Counter, relay: Relay[None]):
     async def handler(c: Context, w: Writer) -> None:
         counter.reset()
         relay.publish("counter", None)
-        responses.empty(w)
+        w.empty()
 
     return handler
 
@@ -97,3 +95,11 @@ async def bootstrap(app: App, span: Span):
     app.add(INCREMENT, increment(counter, relay))
     app.add(RESET, reset(counter, relay))
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))
