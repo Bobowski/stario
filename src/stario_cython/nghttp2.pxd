@@ -6,18 +6,12 @@ cdef extern from *:
 
 cdef extern from "nghttp2/nghttp2.h":
     cdef enum:
-        NGHTTP2_PROTO_VERSION_ID_LEN
         NGHTTP2_FLAG_NONE
         NGHTTP2_FLAG_END_STREAM
-        NGHTTP2_FLAG_END_HEADERS
         NGHTTP2_DATA
         NGHTTP2_HEADERS
-        NGHTTP2_SETTINGS
-        NGHTTP2_WINDOW_UPDATE
-        NGHTTP2_GOAWAY
         NGHTTP2_PING
         NGHTTP2_FLAG_ACK
-        NGHTTP2_RST_STREAM
         NGHTTP2_NO_ERROR
         NGHTTP2_PROTOCOL_ERROR
         NGHTTP2_INTERNAL_ERROR
@@ -26,21 +20,15 @@ cdef extern from "nghttp2/nghttp2.h":
         NGHTTP2_ERR_CALLBACK_FAILURE
         NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
         NGHTTP2_ERR_DEFERRED
-        NGHTTP2_ERR_PAUSE
-        NGHTTP2_DATA_FLAG_NONE
         NGHTTP2_DATA_FLAG_EOF
         NGHTTP2_DATA_FLAG_NO_COPY
         NGHTTP2_NV_FLAG_NONE
-        NGHTTP2_NV_FLAG_NO_INDEX
-        NGHTTP2_NV_FLAG_NO_COPY_NAME
-        NGHTTP2_NV_FLAG_NO_COPY_VALUE
         NGHTTP2_SETTINGS_HEADER_TABLE_SIZE
         NGHTTP2_SETTINGS_ENABLE_PUSH
         NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
         NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE
         NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE
         NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES
-        NGHTTP2_HCAT_REQUEST
 
     ctypedef struct nghttp2_option:
         pass
@@ -190,11 +178,6 @@ cdef extern from "nghttp2/nghttp2.h":
         uint64_t rate,
     )
 
-    int nghttp2_session_server_new(
-        nghttp2_session** session_ptr,
-        const nghttp2_session_callbacks* callbacks,
-        void* user_data,
-    )
     int nghttp2_session_server_new2(
         nghttp2_session** session_ptr,
         const nghttp2_session_callbacks* callbacks,
@@ -218,15 +201,6 @@ cdef extern from "nghttp2/nghttp2.h":
     int32_t nghttp2_session_get_stream_local_window_size(
         nghttp2_session* session,
         int32_t stream_id,
-    )
-    int nghttp2_session_consume(
-        nghttp2_session* session,
-        int32_t stream_id,
-        size_t size,
-    )
-    int nghttp2_session_consume_connection(
-        nghttp2_session* session,
-        size_t size,
     )
     void nghttp2_session_del(nghttp2_session* session)
     ssize_t nghttp2_session_mem_recv(
@@ -260,12 +234,6 @@ cdef extern from "nghttp2/nghttp2.h":
         const nghttp2_nv* nva,
         size_t nvlen,
         void* stream_user_data,
-    )
-    int nghttp2_submit_data(
-        nghttp2_session* session,
-        uint8_t flags,
-        int32_t stream_id,
-        const nghttp2_data_provider* data_prd,
     )
     int nghttp2_submit_rst_stream(
         nghttp2_session* session,

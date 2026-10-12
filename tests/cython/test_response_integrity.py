@@ -9,7 +9,6 @@ import zlib
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.http.compression import (
     CompressionConfig,
@@ -39,7 +38,7 @@ def _header_map(head: bytes) -> dict[bytes, bytes]:
 
 
 async def _page_respond_text(_c, w) -> None:
-    responses.text(w, "x" * 4096)
+    w.text("x" * 4096)
 
 
 async def _page_respond_image(_c, w) -> None:
@@ -97,7 +96,7 @@ async def test_h2_head_with_accept_encoding_sends_no_data() -> None:
     app = App()
 
     async def page(_c, w) -> None:
-        responses.text(w, "x" * 4096)
+        w.text("x" * 4096)
 
     app.add(Route("GET /"), page)
     app.add(Route("HEAD /"), page)
@@ -214,7 +213,7 @@ async def test_chunked_trailers_are_not_merged_into_headers() -> None:
     async def upload(c, w) -> None:
         body = await c.req.body()
         seen.append(c.req.headers.get("x-trailer"))
-        responses.text(w, body.decode())
+        w.text(body.decode())
 
     app.add(Route("POST /"), upload)
     async with running_server(app) as port:
@@ -235,7 +234,7 @@ async def test_oversized_trailers_do_not_break_the_request() -> None:
     app = App()
 
     async def upload(c, w) -> None:
-        responses.text(w, (await c.req.body()).decode())
+        w.text((await c.req.body()).decode())
 
     app.add(Route("POST /"), upload)
     async with running_server(app, max_header_bytes=1024) as port:
@@ -384,7 +383,7 @@ async def test_wide_memoryview_body_is_rejected() -> None:
             w.write(wide)
         except TypeError as exc:
             errors.append(str(exc))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), page)
     async with running_server(app) as port:
@@ -526,7 +525,7 @@ async def test_non_flat_memoryview_body_is_rejected(view: memoryview) -> None:
             w.write(view)
         except TypeError as exc:
             errors.append(str(exc))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), page)
     async with running_server(app) as port:

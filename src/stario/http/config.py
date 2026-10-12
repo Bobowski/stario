@@ -7,7 +7,6 @@ this module re-exports them for env wiring.
 from collections.abc import Callable
 from pathlib import Path
 from ssl import SSLContext
-from typing import Literal, TypedDict
 
 from stario._env import (
     env_bool,
@@ -37,10 +36,8 @@ DEFAULT_KEEP_ALIVE_TIMEOUT = 5.0
 DEFAULT_WRITE_TIMEOUT = 30.0
 DEFAULT_REUSE_ADDR = True
 DEFAULT_MAX_PIPELINED_REQUESTS = 8
-DEFAULT_EVENT_LOOP = "asyncio"
+DEFAULT_PIN_THREADS = False
 DEFAULT_THREADS = 1
-
-type EventLoopKind = Literal["asyncio", "uvloop"]
 
 
 class RequestPolicy:
@@ -167,9 +164,9 @@ class ServerConfig:
     __slots__ = (
         "backlog",
         "compression",
-        "event_loop",
         "graceful_shutdown_timeout",
         "host",
+        "pin_threads",
         "port",
         "requests",
         "reuse_addr",
@@ -191,8 +188,8 @@ class ServerConfig:
         graceful_shutdown_timeout: float = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
         backlog: int = DEFAULT_BACKLOG,
         reuse_addr: bool = DEFAULT_REUSE_ADDR,
-        event_loop: EventLoopKind = DEFAULT_EVENT_LOOP,
         threads: int = DEFAULT_THREADS,
+        pin_threads: bool = DEFAULT_PIN_THREADS,
         ssl: SSLContext | None = None,
         ssl_certfile: str | Path | None = None,
         ssl_keyfile: str | Path | None = None,
@@ -227,11 +224,6 @@ class ServerConfig:
                 "host must be non-empty for TCP listen",
                 help_text="Set STARIO_HOST or pass a non-empty host to ServerConfig.",
             )
-        if event_loop not in ("asyncio", "uvloop"):
-            raise StarioError(
-                "event_loop must be 'asyncio' or 'uvloop'",
-                help_text="Set STARIO_LOOP or pass event_loop to ServerConfig.",
-            )
         if threads < 1:
             raise StarioError(
                 "threads must be at least 1",
@@ -264,8 +256,12 @@ class ServerConfig:
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
         self.backlog = backlog
         self.reuse_addr = reuse_addr
-        self.event_loop: EventLoopKind = event_loop
         self.threads = threads
+        # With threads>1, each worker thread sticks to one allowed CPU
+        # (Linux sched_setaffinity). Opt-in: threads a pinned worker spawns
+        # (asyncio.to_thread executors, writer threads) inherit that one-CPU
+        # mask. Off: the kernel migrates threads freely.
+        self.pin_threads = pin_threads
         if ssl is not None:
             self.ssl = ssl
         elif ssl_certfile is not None:
@@ -276,34 +272,10 @@ class ServerConfig:
         else:
             self.ssl = None
 
-
-class ServerOptions(TypedDict, total=False):
-    """Keyword fields for `stario.serve()`; same names as `ServerConfig`."""
-
-    host: str
-    port: int
-    unix_socket: str | None
-    unix_socket_mode: int
-    requests: RequestPolicy
-    compression: CompressionConfig
-    graceful_shutdown_timeout: float
-    backlog: int
-    reuse_addr: bool
-    event_loop: EventLoopKind
-    threads: int
-    ssl: SSLContext
-    ssl_certfile: str | Path | None
-    ssl_keyfile: str | Path | None
-
-
-def _event_loop_from_env() -> EventLoopKind:
-    loop = env_str("STARIO_LOOP", DEFAULT_EVENT_LOOP).lower()
-    if loop not in ("asyncio", "uvloop"):
-        raise StarioError(
-            "STARIO_LOOP must be 'asyncio' or 'uvloop'",
-            help_text="Set STARIO_LOOP to asyncio or uvloop.",
-        )
-    return loop
+    @classmethod
+    def from_env(cls) -> "ServerConfig":
+        """Read `STARIO_*` listen, limit, compression, and shutdown settings."""
+        return server_config_from_env()
 
 
 def server_config_from_env() -> ServerConfig:
@@ -323,8 +295,8 @@ def server_config_from_env() -> ServerConfig:
             ),
             backlog=env_int("STARIO_BACKLOG", DEFAULT_BACKLOG),
             reuse_addr=env_bool("STARIO_REUSE_ADDR", DEFAULT_REUSE_ADDR),
-            event_loop=_event_loop_from_env(),
             threads=env_int("STARIO_THREADS", DEFAULT_THREADS),
+            pin_threads=env_bool("STARIO_PIN_THREADS", DEFAULT_PIN_THREADS),
             ssl_certfile=env_optional_str("STARIO_SSL_CERTFILE"),
             ssl_keyfile=env_optional_str("STARIO_SSL_KEYFILE"),
         )

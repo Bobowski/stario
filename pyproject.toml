@@ -26,7 +26,6 @@ classifiers = [
 ]
 dependencies = [
     "typing_extensions>=4.13.0,<5",
-    "watchfiles>=1.1.0,<2",
     "xxhash>=3.5.0,<4",
 ]
 
@@ -39,9 +38,6 @@ Issues = "https://github.com/bobowski/stario/issues"
 
 [project.optional-dependencies]
 uvloop = ["uvloop>=0.21.0,<1"]
-
-[project.scripts]
-stario = "stario.cli.main:main"
 
 [build-system]
 requires = ["setuptools>=77", "Cython>=3.1,<4"]

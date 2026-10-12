@@ -5,7 +5,6 @@ The lobby is UI over the room domain: it imports queries from
 `app.features.room.data` instead of owning tables of its own.
 """
 
-import stario.responses as responses
 from app.common.identity import VisitorIdentity, identity_for_page, resolve_identity
 from app.db import Database
 from app.features.room import data as room_data
@@ -48,8 +47,7 @@ def show_lobby(db: Database):
         )
         rooms = room_data.list_rooms(db)
         online = room_data.count_users_by_room(db)
-        responses.html(
-            w,
+        w.html(
             lobby_view(rooms=rooms, online_counts=online, identity=identity),
         )
 
@@ -62,7 +60,7 @@ def subscribe(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         identity = await resolve_identity(c)
         if identity is None:
-            responses.redirect(w, LOBBY.href())
+            w.redirect(LOBBY.href())
             return
 
         async with relay.subscribe("room.*", "lobby.*") as live:
@@ -86,7 +84,7 @@ def create_room(db: Database, relay: Relay[str]):
         signals = await read_lobby_signals(c)
         title = signals.room_title.strip()[:MAX_TITLE_LENGTH]
         if not title:
-            responses.redirect(w, LOBBY.href(), 303)
+            w.redirect(LOBBY.href(), 303)
             return
 
         description = (signals.room_description.strip() or title)[
@@ -95,7 +93,7 @@ def create_room(db: Database, relay: Relay[str]):
         room = room_data.add_room(db, title=title, description=description)
         c.span.event("Room created", {"room_id": room.id, "title": room.title})
         relay.publish(lobby_subjects.rooms(), "created")
-        responses.redirect(w, ROOM.href(room_id=room.id), 303)
+        w.redirect(ROOM.href(room_id=room.id), 303)
 
     return handler
 
@@ -113,7 +111,7 @@ def delete_room(db: Database, relay: Relay[str]):
             c.span.event("Room deleted", {"room_id": room_id})
             relay.publish(room_subjects.deleted(room_id), "deleted")
             relay.publish(lobby_subjects.rooms(), "deleted")
-        responses.redirect(w, LOBBY.href(), 303)
+        w.redirect(LOBBY.href(), 303)
 
     return handler
 

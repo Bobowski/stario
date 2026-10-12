@@ -31,7 +31,6 @@ from typing import Final, NamedTuple
 import xxhash
 from typing_extensions import TypeIs
 
-import stario.responses as responses
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.app import App
 from stario.http.compression import (
@@ -289,7 +288,7 @@ def _fresh(request: RequestHeaders, etag: bytes, modified: float) -> bool:
 
 def _not_found(writer: Writer) -> None:
     writer.headers.unsafe_set(b"x-content-type-options", b"nosniff")
-    responses.text(writer, "Not Found", 404)
+    writer.text("Not Found", 404)
 
 
 def _date_matches(value: bytes, modified: float) -> bool:
@@ -677,9 +676,6 @@ class _Mount:
             body = cached.encodings[encoding]
             headers.unsafe_set(b"content-encoding", encoding)
         headers.unsafe_set(b"content-length", b"%d" % len(body))
-        if context.req.method == "HEAD":
-            writer.write_headers(200, body=False).end()
-            return
         writer.write_headers(200).end(body)
 
     def _headers(
@@ -705,7 +701,7 @@ class _Mount:
     ) -> None:
         writer.headers.unsafe_set(b"content-length", b"%d" % size)
         if context.req.method == "HEAD":
-            writer.write_headers(200, body=False).end()
+            writer.write_headers(200).end()
             return
         writer.write_headers(200)
         await _stream(writer, fd, 0, size)
@@ -735,7 +731,7 @@ class _Mount:
         headers.unsafe_set(b"content-range", b"bytes %d-%d/%d" % (start, end, size))
         headers.unsafe_set(b"content-length", b"%d" % (end - start + 1))
         if context.req.method == "HEAD":
-            writer.write_headers(206, body=False).end()
+            writer.write_headers(206).end()
             return
         if body is not None:
             writer.write_headers(206).end(body[start : end + 1])
@@ -916,7 +912,7 @@ class Assets(_Mount):
             await self._stream_pinned(context, writer, hashed)
             return
         if logical := self._catalog.get(path):
-            responses.redirect(writer, logical.url, 307)
+            writer.redirect(logical.url, 307)
             return
         _not_found(writer)
 

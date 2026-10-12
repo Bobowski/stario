@@ -2,7 +2,6 @@
 
 import pytest
 
-import stario.responses as responses
 import stario.testing as stio_testing
 from stario import App, Route
 from stario.telemetry.core import Span
@@ -11,7 +10,7 @@ from stario.testing import TestClient, aload_app
 
 async def _minimal_bootstrap(app: App, span):
     async def ping(c, w):
-        responses.text(w, "pong")
+        w.text("pong")
 
     app.add(Route("GET", "/ping"), ping)
     yield
@@ -55,7 +54,7 @@ async def test_test_client_inside_aload_app_does_not_own_app_shutdown() -> None:
         nonlocal shutdown_seen
 
         async def ping(c, w):
-            responses.text(w, "pong")
+            w.text("pong")
 
         app.add(Route("GET", "/ping"), ping)
         yield
@@ -79,7 +78,7 @@ async def test_aload_app_emits_server_startup_and_shutdown_like_cli() -> None:
         span.attr("phase.boot", "teardown")
 
     async def ping(c, w):
-        responses.text(w, "pong")
+        w.text("pong")
 
     tracer = stio_testing.TestTracer()
 
@@ -166,7 +165,7 @@ async def test_aload_app_body_failure_emits_runtime_failure_shutdown() -> None:
 async def test_test_client_query_sends_body() -> None:
     async def bootstrap(app: App, span):
         async def search(c, w):
-            responses.text(w, (await c.req.body()).decode())
+            w.text((await c.req.body()).decode())
 
         app.add(Route("QUERY", "/feed"), search)
         yield

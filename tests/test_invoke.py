@@ -5,7 +5,6 @@ import logging
 
 import pytest
 
-import stario.responses as responses
 from stario.http.app import App
 from stario.http.context import Context
 from stario.http.invoke import finish_request_span, on_handler_done
@@ -40,7 +39,7 @@ def test_find_handler_is_the_resolve_step() -> None:
         app = App()
 
         async def hello(_c: Context, w: Writer) -> None:
-            responses.text(w, "ok")
+            w.text("ok")
 
         app.add(Route("GET /hello"), hello)
         ctx = make_context("/hello", app=app, loop=asyncio.get_running_loop())

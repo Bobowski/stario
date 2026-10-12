@@ -10,9 +10,18 @@ from typing import Any
 
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
-from stario_cython.protocol import HttpProtocol
+from stario_cython.protocol import Connections, HttpProtocol
 
 DATE = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
+
+# Production sweeps with the Date header (1s). Tests use 50ms so header/idle
+# cases finish in a few hundred milliseconds.
+SWEEP_INTERVAL = 0.05
+
+
+def connection_set() -> Connections:
+    """A test registry: no Server, so it runs its own 50ms sweep."""
+    return Connections(sweep_interval=SWEEP_INTERVAL)
 
 
 class RecordingTransport(asyncio.Transport):
@@ -58,7 +67,7 @@ def make_protocol(
     app,
     *,
     tracer=None,
-    connections: set[HttpProtocol] | None = None,
+    connections: Connections | None = None,
     date: bytes = DATE,
     compression: CompressionConfig | None = None,
     max_header_bytes: int = 64 * 1024,
@@ -70,7 +79,7 @@ def make_protocol(
     write_timeout: float = 30.0,
 ) -> HttpProtocol:
     if connections is None:
-        connections = set()
+        connections = connection_set()
     return HttpProtocol(
         loop,
         app,
@@ -104,7 +113,7 @@ async def running_server(
     tracer=None,
 ) -> AsyncIterator[int]:
     loop = asyncio.get_running_loop()
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: make_protocol(
             loop,

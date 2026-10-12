@@ -11,10 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.http.tls import load_tls_context
-from stario_cython.protocol import HttpProtocol
 from tests.cython.h2wire import (
     FLAG_END_HEADERS,
     FLAG_END_STREAM,
@@ -45,6 +43,7 @@ from tests.cython.h2wire import (
 )
 from tests.cython.http import (
     RecordingTransport,
+    connection_set,
     free_port,
     make_protocol,
     response_status,
@@ -99,11 +98,11 @@ async def test_h2_prior_knowledge_plaintext() -> None:
     async def hello(c, w) -> None:
         assert c.req.protocol_version == "2"
         assert c.req.query.get("q") == "1"
-        responses.text(w, f"h2:{c.req.path}")
+        w.text(f"h2:{c.req.path}")
 
     app.add(Route("GET /hi"), hello)
     loop = asyncio.get_running_loop()
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     port = free_port()
     server = await loop.create_server(
         lambda: make_protocol(loop, app, connections=connections),
@@ -129,7 +128,7 @@ async def test_h2_trailing_slash_redirects() -> None:
     app = App()
 
     async def search(c, w) -> None:
-        responses.text(w, "nope")
+        w.text("nope")
 
     app.add(Route("GET /search"), search)
     loop = asyncio.get_running_loop()
@@ -344,7 +343,7 @@ async def test_tls_http11_and_h2_alpn() -> None:
     app = App()
 
     async def hello(c, w) -> None:
-        responses.text(w, f"v={c.req.protocol_version}")
+        w.text(f"v={c.req.protocol_version}")
 
     app.add(Route("GET /tls"), hello)
     loop = asyncio.get_running_loop()
@@ -388,7 +387,7 @@ async def test_h2_connect_is_rejected() -> None:
 
     async def boom(c, w) -> None:
         seen.append(c.req.method)
-        responses.text(w, "nope")
+        w.text("nope")
 
     app.add(Route("GET /"), boom)
     loop = asyncio.get_running_loop()
@@ -479,7 +478,7 @@ async def test_h2_small_get_under_header_budget() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), hello)
     loop = asyncio.get_running_loop()
@@ -523,7 +522,7 @@ async def test_h2_header_over_limit_returns_431_without_dispatch() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "should not run")
+        w.text("should not run")
 
     app.add(Route("GET /"), hello)
     loop = asyncio.get_running_loop()
@@ -563,7 +562,7 @@ async def test_h2_oversize_headers_do_not_kill_connection() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), hello)
     loop = asyncio.get_running_loop()
@@ -622,7 +621,7 @@ async def test_h2_oversize_path_returns_431() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "should not run")
+        w.text("should not run")
 
     app.add(Route("GET /{path...}"), hello)
     loop = asyncio.get_running_loop()
@@ -663,7 +662,7 @@ async def test_h2_declared_body_over_limit_returns_413() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "should not run")
+        w.text("should not run")
 
     app.add(Route("POST /"), hello)
     loop = asyncio.get_running_loop()
@@ -704,7 +703,7 @@ async def test_h2_oversize_body_does_not_kill_connection() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), hello)
     app.add(Route("POST /"), hello)
@@ -768,12 +767,12 @@ async def test_h2_no_cl_body_overflow_does_not_kill_connection() -> None:
 
     async def read_body(c, w) -> None:
         await c.req.body()
-        responses.text(w, "should not run")
+        w.text("should not run")
 
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), read_body)
     app.add(Route("GET /"), hello)
@@ -833,12 +832,12 @@ async def test_h2_discarded_oversize_data_does_not_kill_connection() -> None:
     hits = 0
 
     async def ignore_body(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), ignore_body)
     app.add(Route("GET /"), hello)
@@ -899,11 +898,11 @@ async def test_h2_incomplete_headers_timeout_does_not_kill_connection() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), hello)
     loop = asyncio.get_running_loop()
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     port = free_port()
     server = await loop.create_server(
         lambda: make_protocol(loop, app, connections=connections, header_timeout=0.15),
@@ -1059,7 +1058,7 @@ async def test_h2_duplicate_pseudo_header_is_rejected(headers: bytes) -> None:
 
     async def boom(c, w) -> None:
         seen.append(c.req.method)
-        responses.text(w, "nope")
+        w.text("nope")
 
     app.add(Route("GET /"), boom)
     app.add(Route("GET /other"), boom)
@@ -1104,7 +1103,7 @@ async def test_h2_authority_host_mismatch_is_rejected() -> None:
 
     async def boom(c, w) -> None:
         seen.append(c.req.host)
-        responses.text(w, "nope")
+        w.text("nope")
 
     app.add(Route("GET /"), boom)
     loop = asyncio.get_running_loop()
@@ -1149,7 +1148,7 @@ async def test_h2_authority_host_match_keeps_one_host() -> None:
 
     async def hello(c, w) -> None:
         seen.append((c.req.host, c.req.headers.getlist("host")))
-        responses.text(w, c.req.host)
+        w.text(c.req.host)
 
     app.add(Route("GET /"), hello)
     loop = asyncio.get_running_loop()
@@ -1193,7 +1192,7 @@ async def test_h2_host_routing_normalizes_authority() -> None:
     app = App()
 
     async def hello(c, w) -> None:
-        responses.text(w, f"host:{c.req.host}")
+        w.text(f"host:{c.req.host}")
 
     app.add(Route("GET //example.com/"), hello)
     loop = asyncio.get_running_loop()
@@ -1276,7 +1275,7 @@ async def test_h2_head_omits_data_payload() -> None:
     app = App()
 
     async def hello(_c, w) -> None:
-        responses.text(w, "hello")
+        w.text("hello")
 
     app.add(Route("HEAD /"), hello)
     loop = asyncio.get_running_loop()
@@ -1334,7 +1333,7 @@ async def test_h2_skips_connection_specific_response_headers() -> None:
     async def hello(_c, w) -> None:
         w.headers.set("connection", "close")
         w.headers.set("keep-alive", "timeout=5")
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), hello)
     loop = asyncio.get_running_loop()
@@ -1367,7 +1366,7 @@ async def test_h2_authority_with_question_mark_is_rejected() -> None:
     app = App()
 
     async def boom(_c, w) -> None:
-        responses.text(w, "nope")
+        w.text("nope")
 
     app.add(Route("GET /"), boom)
     loop = asyncio.get_running_loop()

@@ -1,17 +1,14 @@
-"""Tests for catch_errors middleware."""
+"""Tests for catch_errors middleware and framework-mapped exceptions."""
 
+import asyncio
 import logging
 
-import stario.responses as responses
-from stario import Route
-from stario.exceptions import RequestBodyError
+from stario import App, Route
+from stario.exceptions import RedirectException, RequestBodyError
 from stario.http.context import Context
-from stario.http.middleware import (
-    catch_errors,
-    catch_request_body_errors,
-    respond_request_body_error,
-)
+from stario.http.middleware import catch_errors
 from stario.http.writer import Writer
+from stario.testing import TestClient
 from tests.helpers import run_with_app
 
 
@@ -21,7 +18,7 @@ class TestCatchErrors:
             pass
 
         async def respond(_c: Context, w: Writer, exc: BaseException) -> None:
-            responses.text(w, str(exc), 422)
+            w.text(str(exc), 422)
 
         async def handler(_c: Context, _w: Writer) -> None:
             raise AppError("nope")
@@ -41,48 +38,78 @@ class TestCatchErrors:
             pass
 
         async def respond(_c: Context, w: Writer, _exc: BaseException) -> None:
-            responses.text(w, "handled", 422)
+            w.text("handled", 422)
 
         async def handler(_c: Context, w: Writer) -> None:
             w.respond(b"partial", b"text/plain", 200)
             raise AppError("after write")
 
-        def setup(app) -> None:
+        async def run() -> None:
+            app = App()
             app.use("/", catch_errors(AppError, respond=respond))
             app.add(Route("GET /x"), handler)
+            async with TestClient(app) as client:
+                response = await client.get("/x")
+            assert response.status_code == 200
+            assert response.text == "partial"
 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
-            _context, writer = run_with_app(setup, "/x")
+            asyncio.run(run())
 
-        assert writer.status == 200
-        assert writer.body == "partial"
-        assert writer.completed
         assert "Handler failed" in caplog.text
 
-    def test_request_body_error_preset(self):
+
+class TestFrameworkExceptions:
+    """The protocol answers RedirectException/RequestBodyError itself."""
+
+    def test_request_body_error_maps_to_its_status(self):
         async def handler(_c: Context, _w: Writer) -> None:
             raise RequestBodyError(413, "too big")
 
-        def setup(app) -> None:
-            app.use("/", catch_request_body_errors())
+        async def run() -> None:
+            app = App()
             app.add(Route("POST /upload"), handler)
+            async with TestClient(app) as client:
+                response = await client.post("/upload")
+            assert response.status_code == 413
+            assert response.text == "too big"
+            span = client.tracer.get_span(response.span_id)
+            assert span is not None
+            assert span.ok is True
 
-        _context, writer = run_with_app(setup, "/upload", method="POST")
+        asyncio.run(run())
 
-        assert writer.status == 413
-        assert writer.body == "too big"
-
-    def test_respond_request_body_error_writes_status(self):
+    def test_redirect_exception_maps_to_its_location(self):
         async def handler(_c: Context, _w: Writer) -> None:
-            raise RequestBodyError(408, "slow")
+            raise RedirectException(301, "/new")
 
-        def setup(app) -> None:
-            app.use(
-                "/", catch_errors(RequestBodyError, respond=respond_request_body_error)
-            )
-            app.add(Route("POST /upload"), handler)
+        async def run() -> None:
+            app = App()
+            app.add(Route("GET /old"), handler)
+            async with TestClient(app) as client:
+                response = await client.get("/old", follow_redirects=False)
+            assert response.status_code == 301
+            assert response.headers.get("location") == "/new"
+            span = client.tracer.get_span(response.span_id)
+            assert span is not None
+            assert span.ok is True
 
-        _context, writer = run_with_app(setup, "/upload", method="POST")
+        asyncio.run(run())
 
-        assert writer.status == 408
-        assert writer.body == "slow"
+    def test_redirect_exception_after_response_started_keeps_it(self, caplog):
+        async def handler(_c: Context, w: Writer) -> None:
+            w.text("kept")
+            raise RedirectException(301, "/new")
+
+        async def run() -> None:
+            app = App()
+            app.add(Route("GET /old"), handler)
+            async with TestClient(app) as client:
+                response = await client.get("/old", follow_redirects=False)
+            assert response.status_code == 200
+            assert response.text == "kept"
+
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            asyncio.run(run())
+
+        assert "Handler failed" in caplog.text

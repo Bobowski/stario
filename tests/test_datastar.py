@@ -25,7 +25,7 @@ from stario.markup import html as h
 from stario.markup import render
 from stario.markup.escape import escape_attribute_value, escape_sq_attribute_value
 from stario.markup.types import Attrs
-from stario.testing.harness import TestWriter
+from tests.helpers import TestWriter
 
 
 class _ClosedLoop:
@@ -35,7 +35,7 @@ class _ClosedLoop:
 
 def _make_writer() -> tuple[TestWriter, bytearray, _ClosedLoop]:
     writer = TestWriter()
-    return writer, writer.sink.buf, _ClosedLoop()
+    return writer, writer.buf, _ClosedLoop()
 
 
 def _sse_body(writer: TestWriter) -> bytes:

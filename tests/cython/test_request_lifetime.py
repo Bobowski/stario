@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioRuntime
 from stario_cython.exchange import _retained_detach_count
@@ -24,11 +23,11 @@ async def test_retained_request_keeps_its_own_data_after_keep_alive_reuse() -> N
 
     async def keep(c, w) -> None:
         kept.append(c.req)
-        responses.text(w, "kept")
+        w.text("kept")
 
     async def other(c, w) -> None:
         await c.req.body()
-        responses.text(w, "other")
+        w.text("other")
 
     app.add(Route("GET /keep/{who}"), keep)
     app.add(Route("POST /other"), other)
@@ -64,7 +63,7 @@ async def test_retained_request_views_survive_a_freed_arena() -> None:
 
     async def keep(c, w) -> None:
         kept.append((c.req.headers, c.req.query))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /keep"), keep)
     query = b"q=" + b"z" * 9000
@@ -94,11 +93,11 @@ async def test_retained_request_body_is_cached_or_gone() -> None:
     async def read_it(c, w) -> None:
         await c.req.body()
         kept.append(c.req)
-        responses.text(w, "read")
+        w.text("read")
 
     async def ignore_it(c, w) -> None:
         kept.append(c.req)
-        responses.text(w, "ignored")
+        w.text("ignored")
 
     app.add(Route("POST /read"), read_it)
     app.add(Route("POST /ignore"), ignore_it)
@@ -155,11 +154,11 @@ async def test_finished_writer_raises_and_never_reaches_another_client() -> None
             outcome["path"] = c.req.path
 
         app.create_task(late())
-        responses.text(w, "alice ok")
+        w.text("alice ok")
 
     async def bob(_c, w) -> None:
         await asyncio.sleep(0.4)
-        responses.text(w, "bob ok")
+        w.text("bob ok")
 
     app.add(Route("GET /alice"), alice)
     app.add(Route("GET /bob"), bob)
@@ -193,11 +192,11 @@ async def test_kept_response_headers_do_not_leak_into_the_next_response() -> Non
 
     async def first(_c, w) -> None:
         kept.append(w.headers)
-        responses.text(w, "first")
+        w.text("first")
 
     async def second(_c, w) -> None:
         kept[0].set("x-leak", "yes")
-        responses.text(w, "second")
+        w.text("second")
 
     app.add(Route("GET /first"), first)
     app.add(Route("GET /second"), second)
@@ -222,20 +221,20 @@ async def test_plain_requests_never_take_the_retained_copy_path() -> None:
         c.req.query.get("q")
         c.req.cookies.get("a")
         c.state["x"] = 1
-        responses.text(w, "sync")
+        w.text("sync")
 
     async def suspended(c, w) -> None:
         await asyncio.sleep(0)
         w.headers.set("x-kind", "async")
-        responses.text(w, c.req.path)
+        w.text(c.req.path)
 
     async def post_respond(c, w) -> None:
-        responses.text(w, "early")
+        w.text("early")
         await asyncio.sleep(0.01)
         c.req.headers.get("host")
 
     async def body(c, w) -> None:
-        responses.text(w, (await c.req.body()).decode())
+        w.text((await c.req.body()).decode())
 
     async def streamed(c, w) -> None:
         w.write_headers(200)
@@ -287,7 +286,7 @@ async def test_plain_requests_never_take_the_retained_copy_path() -> None:
 
     async def keeper(c, w) -> None:
         kept.append(c)
-        responses.text(w, "kept")
+        w.text("kept")
 
     app.add(Route("GET /keep"), keeper)
     async with running_server(app) as port:
@@ -309,7 +308,7 @@ async def test_handle_is_per_request_but_exchange_is_reused() -> None:
         handles.append(c)
         exchange_ids.append(c._exchange_id)
         c.state["n"] = len(handles)
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), endpoint)
     async with running_server(app) as port:
@@ -333,11 +332,11 @@ async def test_h2_streams_never_take_the_retained_copy_path() -> None:
 
     async def sync(c, w) -> None:
         c.req.headers.get("host")
-        responses.text(w, "sync")
+        w.text("sync")
 
     async def suspended(c, w) -> None:
         await asyncio.sleep(0)
-        responses.text(w, c.req.path)
+        w.text(c.req.path)
 
     app.add(Route("GET /sync"), sync)
     app.add(Route("GET /async"), suspended)
@@ -393,7 +392,7 @@ async def test_body_stream_outliving_its_request_cannot_read_the_next_body() -> 
             asyncio.get_running_loop().create_task(drain_later(chunks))
         else:
             second.append(await c.req.body())
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), upload)
     chunked = b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"

@@ -7,7 +7,6 @@ import socket
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.telemetry.noop import NoOpTracer
 from tests.cython import h2wire as h2
@@ -39,7 +38,7 @@ async def test_h2_pings_do_not_keep_an_idle_connection_open() -> None:
     app = App()
 
     async def page(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), page)
     async with running_server(app, keep_alive_timeout=_TIMEOUT) as port:
@@ -72,7 +71,7 @@ async def test_h2_half_open_stream_is_reset_after_the_response() -> None:
     app = App()
 
     async def page(_c, w) -> None:
-        responses.text(w, "early")
+        w.text("early")
 
     app.add(Route("POST /"), page)
     async with running_server(app) as port:
@@ -102,7 +101,7 @@ async def test_h2_handler_reading_body_after_responding_is_not_reset() -> None:
     got: list[bytes] = []
 
     async def page(c, w) -> None:
-        responses.text(w, "early")
+        w.text("early")
         got.append(await c.req.body())
 
     app.add(Route("POST /"), page)
@@ -132,7 +131,7 @@ async def test_h1_bare_crlfs_do_not_keep_an_idle_connection_open() -> None:
     app = App()
 
     async def page(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), page)
     async with running_server(app, keep_alive_timeout=_TIMEOUT) as port:
@@ -162,10 +161,10 @@ async def test_h1_pipelined_requests_held_by_the_server_are_not_timed_out() -> N
 
     async def slow(_c, w) -> None:
         await release.wait()
-        responses.text(w, "slow")
+        w.text("slow")
 
     async def fast(_c, w) -> None:
-        responses.text(w, "fast")
+        w.text("fast")
 
     app.add(Route("GET /slow"), slow)
     app.add(Route("GET /fast"), fast)
@@ -198,7 +197,7 @@ async def test_h2_connection_window_caps_bodies_nobody_reads() -> None:
 
     async def upload(_c, w) -> None:
         await release.wait()
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), upload)
     streams = [1, 3, 5, 7, 9, 11, 13, 15]
@@ -325,7 +324,7 @@ async def test_h2_idle_timeout_sends_goaway_before_closing() -> None:
     app = App()
 
     async def page(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), page)
     async with running_server(app, keep_alive_timeout=_TIMEOUT) as port:
@@ -364,7 +363,7 @@ async def test_h2_dispatch_failure_resets_only_its_stream(caplog) -> None:
 
     async def slow(_c, w) -> None:
         await release.wait()
-        responses.text(w, "slow")
+        w.text("slow")
 
     app.add(Route("GET /slow"), slow)
     app.add(Route("GET /fast"), slow)

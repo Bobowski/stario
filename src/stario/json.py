@@ -10,6 +10,8 @@ from collections.abc import Callable
 from typing import Protocol
 
 type JsonDefault = Callable[[object], object]
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 class JsonCodec(Protocol):
@@ -118,6 +120,8 @@ def loads(data: str | bytes | bytearray, /) -> object:
 __all__ = [
     "JsonCodec",
     "JsonDefault",
+    "JsonScalar",
+    "JsonValue",
     "StdlibJsonCodec",
     "dumps",
     "dumps_bytes",

@@ -8,20 +8,21 @@ import random
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Relay, Route
 from stario.datastar import SSE
 from stario.testing.tracer import TestTracer
 from stario_cython.exchange import Request
+from stario_cython.protocol import Connections
 from tests.cython.http import (
     RecordingTransport,
+    connection_set,
     make_protocol,
     response_status,
     response_statuses,
 )
 from tests.helpers import assert_status_span
 
-# Production sweeps with the Date tick (1s). Tests force 50ms via conftest.
+# Production sweeps with the Date tick (1s). Tests use a 50ms registry (http.py).
 # Timeouts here must exceed two periods; waits must exceed timeout + one period.
 _TIMEOUT = 0.15
 _WAIT = 0.40
@@ -124,7 +125,7 @@ async def test_write_then_raise_logs_and_keeps_response(
     """NoOp + eager complete must still log; the 200 already on the wire stays."""
 
     async def handler(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
         raise RuntimeError("after write")
 
     app = App()
@@ -190,7 +191,7 @@ async def test_split_headers_then_body() -> None:
 
     async def echo(c, w) -> None:
         bodies.append(await c.req.body())
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), echo)
     proto, app, transport = _attach(app=app)
@@ -228,7 +229,7 @@ async def test_header_total_over_limit_returns_431() -> None:
     async def handler(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "should not run")
+        w.text("should not run")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app, max_header_bytes=limit)
@@ -254,7 +255,7 @@ async def test_keep_alive_431_does_not_keep_header_timer() -> None:
     app = App()
 
     async def handler(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
@@ -280,12 +281,12 @@ async def test_body_over_limit_returns_413() -> None:
 
     async def read_body(c, w) -> None:
         await c.req.body()
-        responses.text(w, "ok")
+        w.text("ok")
 
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), read_body)
     app.add(Route("GET /"), hello)
@@ -315,7 +316,7 @@ async def test_declared_body_over_limit_fails_before_handler_runs() -> None:
     async def ignore_body(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
@@ -342,7 +343,7 @@ async def test_huge_declared_body_over_limit_closes() -> None:
     async def ignore_body(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
@@ -365,7 +366,7 @@ async def test_keep_alive_413_does_not_keep_header_timer() -> None:
     app = App()
 
     async def ignore_body(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(
@@ -390,7 +391,7 @@ async def test_keep_alive_413_idle_times_out() -> None:
     app = App()
 
     async def ignore_body(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(
@@ -419,7 +420,7 @@ async def test_keep_alive_413_deferred_body_then_second_get() -> None:
     async def hello(_c, w) -> None:
         nonlocal hits
         hits += 1
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), hello)
     proto, app, transport = _attach(app=app, max_body_bytes=20)
@@ -483,7 +484,7 @@ async def test_percent_encoded_path_reaches_handler() -> None:
 
     async def handler(c, w) -> None:
         seen.append(c.req.path)
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /hello world"), handler)
     proto, app, transport = _attach(app=app)
@@ -506,7 +507,7 @@ async def test_percent_encoded_letter_matches_static_route() -> None:
 
     async def plaintext(c, w) -> None:
         seen.append(c.req.path)
-        responses.text(w, "plain")
+        w.text("plain")
 
     app.add(Route("GET /plaintext"), plaintext)
     proto, app, transport = _attach(app=app)
@@ -534,7 +535,7 @@ async def test_req_identity_stable_within_handler() -> None:
         assert first is second
         assert first.path == "/stable"
         assert first.method == "GET"
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /stable"), handler)
     proto, app, transport = _attach(app=app)
@@ -556,11 +557,11 @@ async def test_percent_encoded_slash_does_not_change_route_structure() -> None:
 
     async def wildcard(c, w) -> None:
         seen.append(c.match.params["name"])
-        responses.text(w, "wildcard")
+        w.text("wildcard")
 
     async def nested(_c, w) -> None:
         seen.append("nested")
-        responses.text(w, "nested")
+        w.text("nested")
 
     app.add(Route("GET /files/{name}"), wildcard)
     app.add(Route("GET /files/a/b"), nested)
@@ -606,7 +607,7 @@ async def test_chunked_request_body_reaches_handler() -> None:
 
     async def echo(c, w) -> None:
         bodies.append(await c.req.body())
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), echo)
     proto, app, transport = _attach(app=app)
@@ -635,7 +636,7 @@ async def test_expect_100_continue_sends_interim_response() -> None:
 
     async def echo(c, w) -> None:
         body = await c.req.body()
-        responses.text(w, body.decode())
+        w.text(body.decode())
 
     app.add(Route("POST /"), echo)
     proto, app, transport = _attach(app=app)
@@ -666,7 +667,7 @@ async def test_connection_close_header_closes_socket_after_response() -> None:
     app = App()
 
     async def handler(_c, w) -> None:
-        responses.text(w, "bye")
+        w.text("bye")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app)
@@ -690,7 +691,7 @@ async def test_keep_alive_uses_a_new_request_object() -> None:
     async def echo(c, w) -> None:
         held.append(c.req)
         ids.append(id(c.req))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), echo)
     proto, app, transport = _attach(app=app)
@@ -716,11 +717,11 @@ async def test_keep_alive_serves_second_request_on_same_connection() -> None:
 
     async def a(_c, w) -> None:
         hits.append("a")
-        responses.text(w, "a")
+        w.text("a")
 
     async def b(_c, w) -> None:
         hits.append("b")
-        responses.text(w, "b")
+        w.text("b")
 
     app.add(Route("GET /a"), a)
     app.add(Route("GET /b"), b)
@@ -751,11 +752,11 @@ async def test_pipelined_requests_are_served_in_order() -> None:
         order.append("slow.start")
         await asyncio.sleep(0.01)
         order.append("slow.end")
-        responses.text(w, "slow")
+        w.text("slow")
 
     async def fast(_c, w) -> None:
         order.append("fast")
-        responses.text(w, "fast")
+        w.text("fast")
 
     app.add(Route("GET /slow"), slow)
     app.add(Route("GET /fast"), fast)
@@ -837,7 +838,7 @@ async def test_close_if_idle_closes_keep_alive_socket() -> None:
     app = App()
 
     async def handler(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app)
@@ -929,7 +930,7 @@ async def test_stalled_deferred_small_body_times_out() -> None:
         nonlocal hits
         hits += 1
         await c.req.body()
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), handler)
     proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
@@ -949,7 +950,7 @@ async def test_complete_request_does_not_keep_header_timer() -> None:
     app = App()
 
     async def handler(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
@@ -972,7 +973,7 @@ async def test_idle_keep_alive_times_out() -> None:
     app = App()
 
     async def handler(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
@@ -1000,7 +1001,7 @@ async def test_in_flight_handler_is_not_header_timed_out() -> None:
     async def handler(_c, w) -> None:
         started.set()
         await hang.wait()
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
@@ -1021,7 +1022,7 @@ async def test_http10_transfer_encoding_closes_after_response() -> None:
     app = App()
 
     async def handler(c, w) -> None:
-        responses.text(w, (await c.req.body()).decode())
+        w.text((await c.req.body()).decode())
 
     app.add(Route("POST /"), handler)
     proto, app, transport = _attach(app=app)
@@ -1047,7 +1048,7 @@ async def test_pipelined_trickled_headers_time_out_after_response() -> None:
 
     async def handler(_c, w) -> None:
         await release.wait()
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), handler)
     proto, app, transport = _attach(
@@ -1076,12 +1077,13 @@ async def test_pipelined_trickled_headers_time_out_after_response() -> None:
 async def test_stalled_chunked_body_aborts_without_hanging() -> None:
     """Chunked / large bodies dispatch at headers-complete. A stalled
     ``body()`` wait must abort via the shared connection sweeper, not hang.
+    The protocol answers the raised ``RequestBodyError`` with 408.
     """
     app = App()
 
     async def handler(c, w) -> None:
         await c.req.body()
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), handler)
     proto, app, transport = _attach(app=app, body_timeout=_TIMEOUT, header_timeout=5.0)
@@ -1092,7 +1094,10 @@ async def test_stalled_chunked_body_aborts_without_hanging() -> None:
         )
         await asyncio.sleep(_WAIT)
         await _drain(app)
-        assert response_status(transport.writes) == 500
+        assert response_status(transport.writes) == 408
+        # RFC 9110 15.5.9: a 408 carries the close option; the stalled
+        # upload is not waited for.
+        assert b"connection: close" in b"".join(transport.writes).lower()
         assert transport.is_closing()
     finally:
         if not transport.is_closing():
@@ -1101,48 +1106,43 @@ async def test_stalled_chunked_body_aborts_without_hanging() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timeout_sweeper_is_one_task_per_connection_set() -> None:
-    from stario_cython.timeouts import timeout_cleanup_mode
-
-    if timeout_cleanup_mode() != "sweep":
-        pytest.skip("default cleanup is the connection sweeper")
-    _proto, app, transport = _attach(header_timeout=5.0)
+async def test_connections_run_one_sweep_task_until_the_last_close() -> None:
+    """A registry without a Server sweeps itself; two connections share the task."""
+    connections = connection_set()
+    _p1, app1, t1 = _attach(connections=connections, header_timeout=5.0)
+    _p2, app2, t2 = _attach(connections=connections, header_timeout=5.0)
     try:
+        assert len(connections) == 2
+        assert connections.sweeping
+        t1.close()
+        assert connections.sweeping
+        t2.close()
+        assert not connections.sweeping
+        assert len(connections) == 0
+    finally:
+        for t in (t1, t2):
+            if not t.is_closing():
+                t.close()
+        await _drain(app1)
+        await _drain(app2)
+
+
+@pytest.mark.asyncio
+async def test_server_driven_connections_start_no_sweep_task() -> None:
+    """The Server's Date tick calls sweep(); the registry must not add a task."""
+    connections = Connections(server_driven=True)
+    _proto, app, transport = _attach(connections=connections, header_timeout=_TIMEOUT)
+    try:
+        assert not connections.sweeping
+        # The Server would call this once a second; one call past the deadline closes.
         loop = asyncio.get_running_loop()
-        sweeps = getattr(loop, "_stario_timeout_sweeps", None)
-        assert sweeps, "connection_made should start a sweeper"
-        live = [
-            task for task in sweeps.values() if task is not None and not task.done()
-        ]
-        assert len(live) == 1
+        connections.sweep(loop.time())  # arms the deadline
+        connections.sweep(loop.time() + _TIMEOUT + 1.0)
+        assert transport.is_closing()
     finally:
         if not transport.is_closing():
             transport.close()
         await _drain(app)
-
-
-@pytest.mark.asyncio
-async def test_server_date_tick_skips_fallback_sweeper() -> None:
-    from stario_cython.timeouts import DATE_TICK_SWEEP_ATTR, timeout_cleanup_mode
-
-    if timeout_cleanup_mode() != "sweep":
-        pytest.skip("default cleanup is the connection sweeper")
-    loop = asyncio.get_running_loop()
-    setattr(loop, DATE_TICK_SWEEP_ATTR, True)
-    app = transport = None
-    try:
-        _proto, app, transport = _attach(header_timeout=5.0)
-        sweeps = getattr(loop, "_stario_timeout_sweeps", None) or {}
-        live = [
-            task for task in sweeps.values() if task is not None and not task.done()
-        ]
-        assert live == []
-    finally:
-        setattr(loop, DATE_TICK_SWEEP_ATTR, False)
-        if transport is not None and not transport.is_closing():
-            transport.close()
-        if app is not None:
-            await _drain(app)
 
 
 @pytest.mark.asyncio
@@ -1156,7 +1156,7 @@ async def test_pipeline_cap_rejects_ninth_queued_request() -> None:
         handled.append(index)
         if index == 0:
             await release.wait()
-        responses.text(w, str(index))
+        w.text(str(index))
 
     app.add(Route("GET /"), endpoint)
     proto, app, transport = _attach(app=app, max_pipelined_requests=8)
@@ -1239,7 +1239,7 @@ async def test_head_response_omits_body_and_keeps_pipeline_in_sync() -> None:
     app = App()
 
     async def hello(_c, w) -> None:
-        responses.text(w, "hello")
+        w.text("hello")
 
     app.add(Route("GET /"), hello)
     app.add(Route("HEAD /"), hello)
@@ -1308,7 +1308,7 @@ async def test_unread_body_trickle_does_not_reset_idle_timeout() -> None:
     app = App()
 
     async def ignore_body(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /"), ignore_body)
     proto, app, transport = _attach(
@@ -1391,7 +1391,7 @@ async def test_respond_before_body_does_not_emit_100_continue() -> None:
     app = App()
 
     async def early(c, w) -> None:
-        responses.text(w, "early")
+        w.text("early")
         await c.req.body()
 
     app.add(Route("POST /"), early)
@@ -1475,7 +1475,7 @@ async def test_mixed_case_transfer_encoding_is_rejected_by_respond() -> None:
 
     async def bad(_c, w) -> None:
         w.headers.unsafe_set(b"Transfer-Encoding", b"chunked")
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), bad)
     proto, app, transport = _attach(app)
@@ -1534,3 +1534,37 @@ async def test_protocol_span_failure_is_logged_with_traceback(caplog) -> None:
         if not transport.is_closing():
             transport.close()
         await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_handler_task_goes_through_a_loop_task_factory() -> None:
+    """A loop with a task factory sees the handler task; the default path skips it."""
+    loop = asyncio.get_running_loop()
+    seen: list[str] = []
+
+    def factory(loop, coro, **kwargs):
+        seen.append(coro.__name__)
+        return asyncio.Task(coro, loop=loop, **kwargs)
+
+    app = App()
+
+    async def endpoint(_c, w) -> None:
+        await asyncio.sleep(0)
+        w.text("ok")
+
+    app.add(Route("GET /"), endpoint)
+    previous = loop.get_task_factory()
+    loop.set_task_factory(factory)
+    try:
+        _proto, _app, transport = _attach(app)
+        try:
+            _proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            await _drain(app)
+            assert response_status(transport.writes) == 200
+            assert "endpoint" in seen
+        finally:
+            if not transport.is_closing():
+                transport.close()
+            await _drain(app)
+    finally:
+        loop.set_task_factory(previous)

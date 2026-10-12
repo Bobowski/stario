@@ -274,6 +274,66 @@ void stario_brotli_free(StarioBrotli* brotli) {
     free(brotli);
 }
 
+/* One-shot output for a complete body. Brotli has no encoder reset, so a
+   pooled stream encoder is created and destroyed per response anyway; the
+   one-shot API skips the stream state entirely and writes straight into
+   this per-thread scratch buffer. Valid until the next one-shot call. */
+static STARIO_TLS unsigned char* brotli_oneshot_scratch = NULL;
+static STARIO_TLS size_t brotli_oneshot_scratch_cap = 0;
+
+int stario_brotli_compress_borrowed(
+    int level,
+    int window_log,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+) {
+    size_t need;
+    size_t encoded;
+    int lgwin = window_log > 0 ? window_log : STARIO_BROTLI_HTTP_WINDOW;
+
+    if (out == NULL || out_len == NULL || (in == NULL && in_len != 0)) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+    need = BrotliEncoderMaxCompressedSize(in_len);
+    if (need == 0) {
+        return -1;
+    }
+    /* Grow to fit; shrink again once a huge body has left so one large
+       response does not pin its buffer on this thread for good. */
+    if (
+        brotli_oneshot_scratch_cap < need ||
+        (brotli_oneshot_scratch_cap > STARIO_RETAINED_OUTPUT_MAX * 4 &&
+         need <= STARIO_RETAINED_OUTPUT_MAX)
+    ) {
+        size_t cap = need < 4096 ? 4096 : need;
+        unsigned char* next = (unsigned char*)realloc(brotli_oneshot_scratch, cap);
+        if (next == NULL) {
+            return -1;
+        }
+        brotli_oneshot_scratch = next;
+        brotli_oneshot_scratch_cap = cap;
+    }
+    encoded = brotli_oneshot_scratch_cap;
+    if (!BrotliEncoderCompress(
+        level,
+        lgwin,
+        BROTLI_DEFAULT_MODE,
+        in_len,
+        in,
+        &encoded,
+        brotli_oneshot_scratch
+    )) {
+        return -1;
+    }
+    *out = brotli_oneshot_scratch;
+    *out_len = encoded;
+    return 0;
+}
+
 void stario_brotli_release(StarioBrotli* brotli) {
     if (brotli == NULL) {
         return;

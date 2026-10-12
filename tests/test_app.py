@@ -4,7 +4,6 @@ import logging
 
 import pytest
 
-import stario.responses as responses
 from stario import Route
 from stario.exceptions import StarioError
 from stario.http.app import App
@@ -49,13 +48,15 @@ class TestHostRouting:
         assert context.match.pattern == "GET //{subhost}.example.com/dashboard"
         assert seen == [("acme", "GET //{subhost}.example.com/dashboard")]
 
-    def test_trailing_slash_redirect_preserves_query_string(self):
-        _context, writer = run_with_app(
-            lambda _app: None, "/search/", query={"q": "cats", "page": 2}
-        )
+    @pytest.mark.asyncio
+    async def test_trailing_slash_redirect_preserves_query_string(self):
+        async with TestClient(App()) as client:
+            response = await client.get(
+                "/search/", params={"q": "cats", "page": 2}, follow_redirects=False
+            )
 
-        assert writer.status == 308
-        assert writer.headers.unsafe_get(b"location") == b"/search?q=cats&page=2"
+        assert response.status_code == 308
+        assert response.headers.get("location") == "/search?q=cats&page=2"
 
     @pytest.mark.asyncio
     async def test_trailing_slash_redirect_finishes_span(self):
@@ -76,27 +77,31 @@ class TestHostRouting:
             assert span.ok
             assert not client.tracer.has_open_spans()
 
-    def test_trailing_slash_on_double_slash_is_not_protocol_relative(self):
-        _context, writer = run_with_app(lambda _app: None, "//aftra.io/")
+    @pytest.mark.asyncio
+    async def test_trailing_slash_on_double_slash_is_not_protocol_relative(self):
+        async with TestClient(App()) as client:
+            response = await client.get("//aftra.io/", follow_redirects=False)
 
-        assert writer.status == 308
-        assert writer.headers.get("location") == "/aftra.io"
+        assert response.status_code == 308
+        assert response.headers.get("location") == "/aftra.io"
 
 
 class TestAppErrorSurface:
-    def test_unhandled_exception_writes_500(self, caplog: pytest.LogCaptureFixture):
+    @pytest.mark.asyncio
+    async def test_unhandled_exception_writes_500(
+        self, caplog: pytest.LogCaptureFixture
+    ):
         async def boom(_c: Context, _w: Writer) -> None:
             raise RuntimeError("boom")
 
-        def setup(app: App) -> None:
-            app.add(Route("GET /boom"), boom)
-
+        app = App()
+        app.add(Route("GET /boom"), boom)
         with caplog.at_level(logging.ERROR, logger="stario.http"):
-            _context, writer = run_with_app(setup, "/boom")
+            async with TestClient(app) as client:
+                response = await client.get("/boom")
 
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-        assert writer.completed
+        assert response.status_code == 500
+        assert response.text == "Internal Server Error"
         assert "Handler failed" in caplog.text
 
     @pytest.mark.asyncio
@@ -117,58 +122,59 @@ class TestAppErrorSurface:
             assert not span.ok
             assert not client.tracer.has_open_spans()
 
-    def test_handler_must_send_explicit_response(self):
+    @pytest.mark.asyncio
+    async def test_handler_must_send_explicit_response(self):
         async def missing_response(_c: Context, _w: Writer) -> None:
             return None
 
-        def setup(app: App) -> None:
-            app.add(Route("GET /missing"), missing_response)
+        app = App()
+        app.add(Route("GET /missing"), missing_response)
+        async with TestClient(app) as client:
+            response = await client.get("/missing")
 
-        _context, writer = run_with_app(setup, "/missing")
+        assert response.status_code == 500
+        assert response.text == "Internal Server Error"
 
-        assert writer.completed
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
-
-    def test_write_then_raise_keeps_response_and_is_logged(
+    @pytest.mark.asyncio
+    async def test_write_then_raise_keeps_response_and_is_logged(
         self, caplog: pytest.LogCaptureFixture
     ):
         async def handler(_c: Context, w: Writer) -> None:
             w.respond(b"ok", b"text/plain", 200)
             raise RuntimeError("after write")
 
-        def setup(app: App) -> None:
-            app.add(Route("GET /x"), handler)
-
+        app = App()
+        app.add(Route("GET /x"), handler)
         with caplog.at_level(logging.ERROR, logger="stario.http"):
-            _context, writer = run_with_app(setup, "/x")
+            async with TestClient(app) as client:
+                response = await client.get("/x")
 
-        assert writer.status == 200
-        assert writer.body == "ok"
-        assert writer.completed
+        assert response.status_code == 200
+        assert response.text == "ok"
         assert "Handler failed" in caplog.text
 
-    def test_uncaught_app_error_becomes_500_without_middleware(self):
+    @pytest.mark.asyncio
+    async def test_uncaught_app_error_becomes_500_without_middleware(self):
         class AppError(Exception):
             pass
 
         async def handler(_c: Context, _w: Writer) -> None:
             raise AppError("nope")
 
-        def setup(app: App) -> None:
-            app.add(Route("GET /x"), handler)
+        app = App()
+        app.add(Route("GET /x"), handler)
+        async with TestClient(app) as client:
+            response = await client.get("/x")
 
-        _context, writer = run_with_app(setup, "/x")
-
-        assert writer.status == 500
-        assert writer.body == "Internal Server Error"
+        assert response.status_code == 500
+        assert response.text == "Internal Server Error"
 
     def test_catch_errors_middleware_maps_app_exception(self):
         class AppError(Exception):
             pass
 
         async def respond(_c: Context, w: Writer, exc: BaseException) -> None:
-            responses.text(w, str(exc), 422)
+            w.text(str(exc), 422)
 
         async def handler(_c: Context, _w: Writer) -> None:
             raise AppError("nope")
@@ -182,7 +188,7 @@ class TestAppErrorSurface:
         assert writer.status == 422
         assert writer.body == "nope"
 
-    def test_call_uses_find_handler(self):
+    def test_dispatch_uses_find_handler(self):
         seen: list[tuple[str, str, str]] = []
 
         async def handler(_c: Context, w: Writer) -> None:
@@ -212,7 +218,7 @@ class TestAppErrorSurface:
 class TestRequestSpanName:
     async def test_matched_route_renames_span(self):
         async def ok(c: Context, w: Writer) -> None:
-            responses.empty(w, 204)
+            w.empty(204)
 
         app = App()
         app.add(Route("GET /users/{user_id}"), ok)
@@ -226,7 +232,7 @@ class TestRequestSpanName:
 
     async def test_trailing_slash_uses_canonical_route_name(self):
         async def ok(c: Context, w: Writer) -> None:
-            responses.empty(w, 204)
+            w.empty(204)
 
         app = App()
         app.add(Route("GET /search"), ok)

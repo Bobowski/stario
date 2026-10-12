@@ -4,7 +4,6 @@ import asyncio
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.testing import TestClient
 
@@ -36,7 +35,7 @@ async def test_empty_response_then_background_child_span_finished_on_client_exit
                 followup.end()
 
         c.app.create_task(bg())
-        responses.empty(w, 204)
+        w.empty(204)
 
     app.add(Route("POST", "/action"), handler)
 

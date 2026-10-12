@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from stario.markup import baked, classes, data, render, styles
-from stario.markup import html as h
+from stario import h
 from stario.markup.escape import escape_attribute_value
 from stario.markup.types import Attrs
 

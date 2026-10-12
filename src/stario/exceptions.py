@@ -17,12 +17,11 @@ Failure types:
   outside `async with`. `str(exc)` keeps structured context and help text.
 
 - `RequestBodyError` — request body read failed (413 payload too large or 408
-  upload stall). Raised by the Cython exchange. Not mapped to
-  HTTP by the protocol; use `stario.http.middleware.catch_errors` (or write the
-  response in the handler) to turn it into a client-facing status.
+  upload stall). Raised by the Cython exchange. Uncaught in a handler with
+  nothing sent, the protocol answers with that status and `detail` as the body.
 
-- `RedirectException` — optional handler shortcut for 3xx redirects. The
-  protocol does not map it; call `responses.redirect` (or catch and write).
+- `RedirectException` — optional handler shortcut for 3xx redirects. Uncaught
+  in a handler with nothing sent, the protocol answers with the redirect.
 
 - `ClientDisconnected` — peer closed during request body read. The protocol
   logs the failure and aborts if the handler did not finish a response.
@@ -35,7 +34,7 @@ writes **500**; bytes already on the wire are not rewritten.
 
 Wrong status codes on redirect constructors raise `StarioError` (a usage
 mistake), not an HTTP response. `RedirectException` validates `location` when
-`responses.redirect` runs, not at construction.
+`w.redirect()` runs, not at construction.
 
 On `StarioError`, `message` is the short summary; `str(exc)` adds context, help, and
 example lines for logs and telemetry.
@@ -93,14 +92,15 @@ class RequestBodyError(StarioRuntime):
     """
     Request body read failed: payload too large (413) or upload stalled (408).
 
-    Raised while buffering or streaming the request body. Uncaught in a handler
-    becomes a framework **500**; map to the intended status with middleware:
+    Raised while buffering or streaming the request body. Uncaught in a handler,
+    the protocol answers with `status_code` and `detail` as a plain-text body
+    when nothing was sent — no middleware needed:
 
     ```python
     from stario.exceptions import RequestBodyError
-    from stario.http.middleware import catch_errors, respond_request_body_error
 
-    app.use("/", catch_errors(RequestBodyError, respond=respond_request_body_error))
+    async def upload(c, w):
+        data = await c.req.body()  # may raise RequestBodyError -> 413/408
     ```
     """
 
@@ -122,7 +122,7 @@ class RedirectException(Exception):
     Intentional HTTP redirect (3xx).
 
     `location` is the `Location` URL or path. URL safety is checked when
-    `responses.redirect` runs, not at construction. A non-3xx `status_code`
+    `w.redirect()` runs, not at construction. A non-3xx `status_code`
     raises `StarioError` at construction time.
     """
 
@@ -132,7 +132,7 @@ class RedirectException(Exception):
         if not (300 <= status_code < 400):
             raise StarioError(
                 f"RedirectException requires a 3xx status_code, got {status_code}",
-                help_text="Use responses.text/json/html for response bodies (4xx/5xx).",
+                help_text="Use w.text/w.json/w.html for response bodies (4xx/5xx).",
             )
         self.status_code = status_code
         self.location = location

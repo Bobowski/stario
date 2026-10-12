@@ -6,11 +6,11 @@ import asyncio
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from tests.cython import h2wire as h2
 from tests.cython.http import (
     RecordingTransport,
+    connection_set,
     make_protocol,
     read_response,
     response_statuses,
@@ -43,7 +43,7 @@ async def test_closing_error_waits_behind_in_flight_pipelined_response() -> None
     async def post(c, w) -> None:
         await asyncio.sleep(0.05)
         ran.append(c.req.path)
-        responses.text(w, "posted")
+        w.text("posted")
 
     app.add(Route("POST /a"), post)
     async with running_server(app) as port:
@@ -67,10 +67,10 @@ async def test_keep_alive_431_is_answered_in_pipeline_order() -> None:
 
     async def slow(_c, w) -> None:
         await asyncio.sleep(0.05)
-        responses.text(w, "slow")
+        w.text("slow")
 
     async def fast(_c, w) -> None:
-        responses.text(w, "fast")
+        w.text("fast")
 
     app.add(Route("GET /slow"), slow)
     app.add(Route("GET /fast"), fast)
@@ -91,7 +91,7 @@ async def test_many_small_headers_hit_the_header_budget() -> None:
     app = App()
 
     async def ok(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), ok)
     async with running_server(app) as port:
@@ -113,7 +113,7 @@ async def test_unread_upload_pauses_reading_until_the_handler_asks() -> None:
     async def upload(c, w) -> None:
         await release.wait()
         sizes.append(len(await c.req.body()))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("POST /up"), upload)
     proto = make_protocol(loop, app)
@@ -151,10 +151,10 @@ async def test_h2_slow_body_consumer_does_not_stall_other_streams() -> None:
 
     async def upload(c, w) -> None:
         await release.wait()
-        responses.text(w, str(len(await c.req.body())))
+        w.text(str(len(await c.req.body())))
 
     async def fast(_c, w) -> None:
-        responses.text(w, "fast")
+        w.text("fast")
 
     app.add(Route("POST /up"), upload)
     app.add(Route("GET /fast"), fast)
@@ -195,11 +195,11 @@ async def test_h2_drain_sends_goaway_and_finishes_in_flight_streams() -> None:
     loop = asyncio.get_running_loop()
     app = App()
     release = asyncio.Event()
-    connections: set = set()
+    connections = connection_set()
 
     async def slow(_c, w) -> None:
         await release.wait()
-        responses.text(w, "done")
+        w.text("done")
 
     app.add(Route("GET /slow"), slow)
     server = await loop.create_server(
@@ -230,7 +230,7 @@ async def test_h2_drain_sends_goaway_and_finishes_in_flight_streams() -> None:
 async def test_h2_idle_connection_closes_with_goaway_on_drain() -> None:
     loop = asyncio.get_running_loop()
     app = App()
-    connections: set = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: make_protocol(loop, app, connections=connections), "127.0.0.1", 0
     )
@@ -252,7 +252,7 @@ async def test_h2_idle_connection_closes_with_goaway_on_drain() -> None:
 async def test_h2_drain_sends_final_goaway_without_ping_ack() -> None:
     loop = asyncio.get_running_loop()
     app = App()
-    connections: set = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: make_protocol(loop, app, connections=connections), "127.0.0.1", 0
     )
@@ -277,7 +277,7 @@ async def test_fully_qualified_host_matches_host_routes() -> None:
 
     async def hosted(c, w) -> None:
         seen.append(c.req.host)
-        responses.text(w, "hosted")
+        w.text("hosted")
 
     app.add(Route("GET //api.example.com/x"), hosted)
     async with running_server(app) as port:
@@ -306,7 +306,7 @@ async def test_handler_start_failure_answers_500_and_keeps_serving() -> None:
     app = App()
 
     async def ok(_c, w) -> None:
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), ok)
     if True:

@@ -98,23 +98,13 @@ cdef extern from *:
     int stario_header_value_ok(const unsigned char* p, Py_ssize_t n) noexcept
 
 
+# Open-addressed name→index table: 0 is empty, else the intern index + 1.
 cdef const char* _INTERN_C[INTERN_MAX]
 cdef Py_ssize_t _INTERN_N[INTERN_MAX]
 cdef uint8_t _INTERN_SLOT[INTERN_TABLE_SIZE]
 cdef list _INTERN_PY = []
 cdef list _INTERN_WIRE = []
 cdef int _INTERN_COUNT = 0
-cdef object WIRE_DATE
-cdef object WIRE_CONTENT_TYPE
-cdef object WIRE_CONTENT_LENGTH
-cdef object WIRE_CONTENT_ENCODING
-cdef object WIRE_TRANSFER_ENCODING
-cdef object RESPOND_DATE_ERROR = (
-    "Date is emitted by respond(); do not set it on w.headers."
-)
-cdef object RESPOND_TE_ERROR = (
-    "respond() always sends Content-Length; do not set Transfer-Encoding."
-)
 
 
 cdef inline uint32_t _hash_bytes(const char* src, size_t n) noexcept:
@@ -245,11 +235,12 @@ cdef object _intern_wire_name(const char* src, size_t n):
     return _INTERN_WIRE[index]
 
 
-WIRE_DATE = _intern_wire_name("date", 4)
-WIRE_CONTENT_TYPE = _intern_wire_name("content-type", 12)
-WIRE_CONTENT_LENGTH = _intern_wire_name("content-length", 14)
-WIRE_CONTENT_ENCODING = _intern_wire_name("content-encoding", 16)
-WIRE_TRANSFER_ENCODING = _intern_wire_name("transfer-encoding", 17)
+# Identity-compared wire names for the headers respond() writes itself.
+cdef object WIRE_DATE = _intern_wire_name("date", 4)
+cdef object WIRE_CONTENT_TYPE = _intern_wire_name("content-type", 12)
+cdef object WIRE_CONTENT_LENGTH = _intern_wire_name("content-length", 14)
+cdef object WIRE_CONTENT_ENCODING = _intern_wire_name("content-encoding", 16)
+cdef object WIRE_TRANSFER_ENCODING = _intern_wire_name("transfer-encoding", 17)
 
 
 cdef object _value_line(object value):
@@ -393,6 +384,14 @@ cdef inline bytes _trusted_bytes(object value):
     raise TypeError(
         f"Headers() keys and values must be str or bytes, not {type(value).__name__}"
     )
+
+
+cdef object RESPOND_DATE_ERROR = (
+    "Date is emitted by respond(); do not set it on w.headers."
+)
+cdef object RESPOND_TE_ERROR = (
+    "respond() always sends Content-Length; do not set Transfer-Encoding."
+)
 
 
 @cython.final
@@ -592,6 +591,11 @@ cdef class Headers:
         return 0
 
     cdef object c_scan_respond(self, object content_type):
+        """Validate ``w.headers`` against a one-shot respond; collect CE/CL.
+
+        Identity hits on the interned wire names: anything the writer emits
+        itself (Date, TE, a mismatched Content-Type) is a usage error.
+        """
         cdef Py_ssize_t i
         cdef object name
         cdef object value

@@ -27,6 +27,16 @@ int stario_brotli_finish_borrowed(
 );
 void stario_brotli_free(StarioBrotli* brotli);
 void stario_brotli_release(StarioBrotli* brotli);
+/* Whole body in one call, no stream state. Output is a per-thread scratch
+   buffer valid until the next call on this thread. */
+int stario_brotli_compress_borrowed(
+    int level,
+    int window_log,
+    const unsigned char* in,
+    size_t in_len,
+    const unsigned char** out,
+    size_t* out_len
+);
 
 StarioGzip* stario_gzip_new(int level, int window_bits);
 StarioGzip* stario_gzip_acquire(int level, int window_bits);

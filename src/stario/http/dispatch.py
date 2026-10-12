@@ -7,13 +7,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 
-import stario.responses as responses
 from stario.exceptions import StarioError
 from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.route import EMPTY_ROUTE, Route
 from stario.http.segment import Segment
 from stario.http.writer import Writer
-from stario_cython.exchange import compile_router
+from stario_cython.exchange import CRouter, compile_router
 
 type MethodNotAllowedHandler = Callable[[frozenset[str]], Handler]
 type RouteMatch = tuple[Handler, Route, Match]
@@ -62,7 +61,7 @@ def _exact_nodes() -> dict[str, Node]:
 
 
 async def default_not_found(_c: Context, w: Writer) -> None:
-    responses.text(w, "Not Found", 404)
+    w.text("Not Found", 404)
 
 
 @lru_cache(maxsize=256)
@@ -71,7 +70,7 @@ def method_not_allowed_handler(allowed: frozenset[str]) -> Handler:
 
     async def respond(_c: Context, w: Writer) -> None:
         w.headers.set("Allow", allow_header)
-        responses.text(w, "Method Not Allowed", 405)
+        w.text("Method Not Allowed", 405)
 
     return respond
 
@@ -80,11 +79,13 @@ def method_not_allowed_handler(allowed: frozenset[str]) -> Handler:
 class Endpoint:
     handler: Handler
     route: Route
+    middleware: tuple[Middleware, ...] = ()
 
 
 @dataclass(slots=True)
 class Node:
     not_found_handler: Handler | None = None
+    not_found_custom: bool = False
     method_not_allowed_handler: MethodNotAllowedHandler | None = None
     middleware: tuple[Middleware, ...] = ()
     exact: dict[str, Node] = field(default_factory=_exact_nodes)
@@ -141,14 +142,49 @@ def _collect_middleware(
     return middlewares
 
 
-def _branch_has_endpoints(node: Node) -> bool:
-    if node.endpoints:
-        return True
-    return (
-        (node.wildcard is not None and _branch_has_endpoints(node.wildcard))
-        or (node.catchall is not None and _branch_has_endpoints(node.catchall))
-        or any(_branch_has_endpoints(child) for child in node.exact.values())
+def _wrap(handler: Handler, middleware: Sequence[Middleware]) -> Handler:
+    wrapped = handler
+    for mw in reversed(middleware):
+        wrapped = mw(wrapped)
+    return wrapped
+
+
+def _path_step(node: Node, kind: str, name: str) -> Node | None:
+    if kind == "exact":
+        return node.exact.get(name)
+    if kind == "catchall":
+        if node.catchall_name != name:
+            return None
+        return node.catchall
+    if node.wildcard_name != name:
+        return None
+    return node.wildcard
+
+
+class _Composed:
+    """Router-shaped view with middleware already applied, for `compile_router`."""
+
+    __slots__ = (
+        "_has_param_hosts",
+        "_host_routing",
+        "_hosts_exact",
+        "_hosts_param",
+        "_path",
     )
+
+    def __init__(
+        self,
+        path: Node,
+        hosts_exact: dict[str, Node],
+        hosts_param: Node,
+        has_param_hosts: bool,
+        host_routing: bool,
+    ) -> None:
+        self._path = path
+        self._hosts_exact = hosts_exact
+        self._hosts_param = hosts_param
+        self._has_param_hosts = has_param_hosts
+        self._host_routing = host_routing
 
 
 def _open_param(current: Node, segment: Segment) -> Node:
@@ -208,7 +244,6 @@ class Router:
         "_host_routing",
         "_hosts_exact",
         "_hosts_param",
-        "_lookup",
         "_path",
     )
 
@@ -218,8 +253,9 @@ class Router:
         self._hosts_param = Node()
         self._has_param_hosts = False
         self._host_routing = False
-        self._cy_router = compile_router(self)
-        self._lookup = self._cy_router.lookup
+        # Compiled on the first lookup after a change. Registering N routes
+        # is then N tree inserts and one compile, not N compiles.
+        self._cy_router: CRouter | None = None
 
     @property
     def host_routing(self) -> bool:
@@ -234,15 +270,162 @@ class Router:
         never adds a segment. Plain paths like `/users/42` are the same either
         way.
         """
-        return self._lookup(host, path, method)
+        return self.compiled().lookup(host, path, method)
+
+    def compiled(self) -> CRouter:
+        """The compiled trie, built now if a registration changed it."""
+        compiled = self._cy_router
+        if compiled is None:
+            compiled = compile_router(self._composed())
+            self._cy_router = compiled
+            state = getattr(self, "_app_state", None)
+            if state is not None:
+                state.host_routing = self._host_routing
+                state.router = compiled
+        return compiled
 
     def _invalidate_lookup(self) -> None:
-        self._cy_router = compile_router(self)
-        self._lookup = self._cy_router.lookup
+        self._cy_router = None
         state = getattr(self, "_app_state", None)
         if state is not None:
             state.host_routing = self._host_routing
-            state.router = self._cy_router
+            state.router = None
+
+    def _composed(self) -> _Composed:
+        """Copy of the three trees with middleware folded into every handler."""
+        return _Composed(
+            self._compose_node(self._path, self._path, param_host=False),
+            {
+                host: self._compose_node(
+                    tree,
+                    tree,
+                    param_host=False,
+                    path_node=self._path,
+                    path_chain=self._path.middleware,
+                )
+                for host, tree in self._hosts_exact.items()
+            },
+            self._compose_node(self._hosts_param, self._hosts_param, param_host=True),
+            self._has_param_hosts,
+            self._host_routing,
+        )
+
+    def _compose_node(
+        self,
+        node: Node,
+        orig_tree: Node,
+        *,
+        param_host: bool,
+        chain: tuple[Middleware, ...] = (),
+        not_found: Handler | None = None,
+        not_found_custom: bool = False,
+        method_na: MethodNotAllowedHandler | None = None,
+        path_node: Node | None = None,
+        path_chain: tuple[Middleware, ...] = (),
+    ) -> Node:
+        """One new `Node` with this node's scope middleware applied.
+
+        `chain` is this tree's middleware root→node; `not_found`/`method_na`
+        are the nearest registered custom handlers in scope. `path_node` /
+        `path_chain` track the hostless `_path` tree along the same segments
+        for `_hosts_exact` trees (`None` elsewhere).
+        """
+        chain = (*chain, *node.middleware)
+        if node.not_found_handler is not None:
+            not_found = node.not_found_handler
+            not_found_custom = node.not_found_custom
+        if node.method_not_allowed_handler is not None:
+            method_na = node.method_not_allowed_handler
+        scoped = (*chain, *path_chain)
+
+        out = Node(not_found_custom=not_found_custom)
+        if scoped or not_found is not None:
+            out.not_found_handler = _wrap(not_found or default_not_found, scoped)
+        if method_na is not None and not scoped:
+            out.method_not_allowed_handler = method_na
+        elif scoped or method_na is not None:
+            factory = method_na or method_not_allowed_handler
+
+            def wrapped_na(
+                allowed: frozenset[str],
+                f: MethodNotAllowedHandler = factory,
+                mws: tuple[Middleware, ...] = scoped,
+            ) -> Handler:
+                return _wrap(f(allowed), mws)
+
+            out.method_not_allowed_handler = wrapped_na
+        if node.endpoints:
+            out.endpoints = {}
+            for method, endpoint in node.endpoints.items():
+                endpoint_mws = self._endpoint_scope(
+                    endpoint.route, orig_tree, param_host
+                )
+                wrapped = _wrap(endpoint.handler, (*endpoint_mws, *endpoint.middleware))
+                if wrapped is not endpoint.handler:
+                    require_async_handler(wrapped, what="Composed handler")
+                out.endpoints[method] = Endpoint(
+                    handler=wrapped,
+                    route=endpoint.route,
+                    middleware=endpoint.middleware,
+                )
+
+        def child_args(
+            kind: str, name: str
+        ) -> tuple[Node | None, tuple[Middleware, ...]]:
+            if path_node is None:
+                return None, path_chain
+            pchild = _path_step(path_node, kind, name)
+            if pchild is None:
+                return None, path_chain
+            return pchild, (*path_chain, *pchild.middleware)
+
+        for name, child in node.exact.items():
+            pnode, pchain = child_args("exact", name)
+            out.exact[name] = self._compose_node(
+                child,
+                orig_tree,
+                param_host=param_host,
+                chain=chain,
+                not_found=not_found,
+                not_found_custom=not_found_custom,
+                method_na=method_na,
+                path_node=pnode,
+                path_chain=pchain,
+            )
+        for kind, cname, cnode in (
+            ("wildcard", node.wildcard_name, node.wildcard),
+            ("catchall", node.catchall_name, node.catchall),
+        ):
+            if cnode is None or cname is None:
+                continue
+            pnode, pchain = child_args(kind, cname)
+            composed = self._compose_node(
+                cnode,
+                orig_tree,
+                param_host=param_host,
+                chain=chain,
+                not_found=not_found,
+                not_found_custom=not_found_custom,
+                method_na=method_na,
+                path_node=pnode,
+                path_chain=pchain,
+            )
+            if kind == "wildcard":
+                out.wildcard_name = cname
+                out.wildcard = composed
+            else:
+                out.catchall_name = cname
+                out.catchall = composed
+        return out
+
+    def _endpoint_scope(
+        self, route: Route, orig_tree: Node, param_host: bool
+    ) -> list[Middleware]:
+        walk_host = route.host_segments if param_host else ()
+        scoped = _collect_middleware(orig_tree, walk_host, route.path_segments)
+        if route.host:
+            scoped += _collect_middleware(self._path, (), route.path_segments)
+        return scoped
 
     def _tree_for(self, route: Route) -> Node:
         if not route.host:
@@ -281,17 +464,14 @@ class Router:
         current = self._policy_node(pattern)
         if not middleware:
             return
-        if _branch_has_endpoints(current):
-            raise StarioError(
-                "Middleware must be registered before matching routes",
-                context={"pattern": pattern},
-            )
         current.middleware = current.middleware + tuple(middleware)
         self._invalidate_lookup()
 
     def not_found(self, pattern: str, handler: Handler) -> None:
         require_async_handler(handler, what="Not-found handler")
-        self._policy_node(pattern).not_found_handler = handler
+        node = self._policy_node(pattern)
+        node.not_found_handler = handler
+        node.not_found_custom = True
         self._invalidate_lookup()
 
     def method_not_allowed(
@@ -323,21 +503,8 @@ class Router:
                 context={"target": route.target},
             )
         method = route.method
-        host_segments = route.host_segments
-        path_segments = route.path_segments
         tree = self._tree_for(route)
-        walk_host = host_segments if tree is self._hosts_param else ()
-        scoped_middleware = _collect_middleware(tree, walk_host, path_segments)
-        if route.host:
-            scoped_middleware.extend(_collect_middleware(self._path, (), path_segments))
-
         current = self._descend(tree, route)
-
-        wrapped = handler
-        for mw in reversed([*scoped_middleware, *middleware]):
-            wrapped = mw(wrapped)
-        if wrapped is not handler:
-            require_async_handler(wrapped, what="Composed handler")
 
         existing = None if current.endpoints is None else current.endpoints.get(method)
         if existing is not None:
@@ -346,7 +513,7 @@ class Router:
                 context={"method": method, "target": route.target},
             )
 
-        endpoint = Endpoint(handler=wrapped, route=route)
+        endpoint = Endpoint(handler=handler, route=route, middleware=tuple(middleware))
         if current.endpoints is None:
             current.endpoints = {method: endpoint}
         else:

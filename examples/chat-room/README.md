@@ -10,7 +10,7 @@ Rooms live in SQLite — the lobby starts empty. Create or delete from the lobby
 git clone https://github.com/bobowski/stario.git
 cd stario/examples/chat-room
 uv sync
-uv run stario watch app.main:bootstrap
+uv run python -m app.main
 ```
 
 Open http://127.0.0.1:8000 — create a room, then chat in two tabs to see live updates.
@@ -21,7 +21,7 @@ Open http://127.0.0.1:8000 — create a room, then chat in two tabs to see live 
 uv run pytest
 ```
 
-Tests use `TestClient(app.main.bootstrap)` — same bootstrap the CLI loads. One test file per feature (`test_lobby.py`, `test_room.py`).
+Tests use `TestClient(app.main.bootstrap)` — the same bootstrap `serve()` runs. One test file per feature (`test_lobby.py`, `test_room.py`).
 
 ## Layout
 

@@ -6,13 +6,12 @@ import json
 import pytest
 
 import stario.cookies as cookies
-import stario.responses as responses
 from stario import App, Route
 from stario.datastar import SSE
 from stario.exceptions import StarioRuntime
 from stario.markup import html as h
 from stario.testing import TestClient
-from stario.testing.harness import TestWriter
+from tests.helpers import TestWriter
 from tests.helpers import (
     make_context as _make_context,
 )
@@ -22,33 +21,32 @@ def _make_app() -> App:
     app = App()
 
     async def text_route(c, w):
-        responses.text(w, "Hello, World!")
+        w.text("Hello, World!")
 
     async def html_route(c, w):
-        responses.html(w, h.H1("Hello"))
+        w.html(h.H1("Hello"))
 
     async def json_route(c, w):
-        responses.json(w, {"message": "hello"})
+        w.json({"message": "hello"})
 
     async def redirect_route(c, w):
-        responses.redirect(w, "/final", 302)
+        w.redirect("/final", 302)
 
     async def final_route(c, w):
-        responses.text(w, "redirected")
+        w.text("redirected")
 
     async def redirect_cookie_route(c, w):
         cookies.set_cookie(w, "session", "fresh")
-        responses.redirect(w, "/redirect-cookie/final", 302)
+        w.redirect("/redirect-cookie/final", 302)
 
     async def redirect_cookie_final(c, w):
-        responses.text(w, c.req.cookies.get("session") or "missing")
+        w.text(c.req.cookies.get("session") or "missing")
 
     async def json_echo(c, w):
-        responses.json(w, json.loads(await c.req.body()))
+        w.json(json.loads(await c.req.body()))
 
     async def form_echo(c, w):
-        responses.json(
-            w,
+        w.json(
             {
                 "body": (await c.req.body()).decode(),
                 "content_type": c.req.headers.get("content-type"),
@@ -56,16 +54,15 @@ def _make_app() -> App:
         )
 
     async def upload_echo(c, w):
-        responses.text(w, (await c.req.body()).decode("utf-8", errors="replace"))
+        w.text((await c.req.body()).decode("utf-8", errors="replace"))
 
     async def login(c, w):
         cookies.set_cookie(w, "session", "abc123", httponly=True)
         cookies.set_cookie(w, "theme", "dark")
-        responses.empty(w)
+        w.empty()
 
     async def me(c, w):
-        responses.json(
-            w,
+        w.json(
             {
                 "session": c.req.cookies.get("session"),
                 "theme": c.req.cookies.get("theme"),
@@ -74,10 +71,10 @@ def _make_app() -> App:
 
     async def telemetry_route(c, w):
         c.span.event("handler.hit", {"path": c.req.path})
-        responses.json(w, {"ok": True})
+        w.json({"ok": True})
 
     async def error_route(c, w):
-        responses.text(w, "teapot", 418)
+        w.text("teapot", 418)
 
     app.add(Route("GET /"), text_route)
     app.add(Route("GET /html"), html_route)
@@ -206,7 +203,7 @@ class TestClientBasics:
                 state["n"] = 1
 
             c.app.create_task(bg())
-            responses.text(w, "ok")
+            w.text("ok")
 
         app.add(Route("GET /"), handler)
         async with TestClient(app) as client:
@@ -224,7 +221,7 @@ class TestClientBasics:
                 stopped.set()
 
             c.app.create_task(bg())
-            responses.text(w, "ok")
+            w.text("ok")
 
         app.add(Route("GET /"), handler)
         async with asyncio.timeout(0.5):
@@ -237,7 +234,7 @@ class TestClientBasics:
         app = App()
 
         async def loop_route(c, w):
-            responses.redirect(w, "/loop", 302)
+            w.redirect("/loop", 302)
 
         app.add(Route("GET /loop"), loop_route)
         async with TestClient(app, max_redirects=3) as client:
@@ -258,7 +255,7 @@ class TestClientBasics:
 
         async def slow(c, w):
             await asyncio.sleep(10)
-            responses.text(w, "late")
+            w.text("late")
 
         app.add(Route("GET /slow"), slow)
         async with TestClient(app, request_timeout=client_timeout) as client:
@@ -318,7 +315,7 @@ class TestClientBasics:
                 done.set()
 
             c.app.create_task(watch())
-            responses.text(w, "ok")
+            w.text("ok")
 
         app.add(Route("GET /"), handler)
         async with TestClient(app) as client:

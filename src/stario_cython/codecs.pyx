@@ -12,6 +12,7 @@ from stario_cython.compression_buf cimport (
     StarioZstdDecoder,
     stario_brotli_acquire,
     stario_brotli_block_borrowed,
+    stario_brotli_compress_borrowed,
     stario_brotli_decoder_finished,
     stario_brotli_decoder_free,
     stario_brotli_decoder_new,
@@ -32,6 +33,8 @@ from stario_cython.compression_buf cimport (
 
 
 cdef object _owned_bytes(const unsigned char* data, size_t n):
+    # ``*_borrowed`` out-pointers live in the codec's scratch buffer, valid
+    # only until its next call — copy into owned bytes before returning.
     if n == 0:
         return b""
     return PyBytes_FromStringAndSize(<const char*>data, <Py_ssize_t>n)
@@ -45,20 +48,15 @@ cdef inline const unsigned char* _bytes_ptr(bytes data, size_t* n) noexcept:
 
 
 def brotli_compress(bytes data, int level=4, int window=0) -> bytes:
-    cdef StarioBrotli* enc = stario_brotli_acquire(level, window)
+    """Whole buffer in one call (no stream encoder)."""
     cdef const unsigned char* out = NULL
     cdef size_t out_len = 0
     cdef const unsigned char* ptr
     cdef size_t n
-    if enc == NULL:
-        raise StarioError("brotli stream init failed")
-    try:
-        ptr = _bytes_ptr(data, &n)
-        if stario_brotli_finish_borrowed(enc, ptr, n, &out, &out_len) != 0:
-            raise StarioError("brotli compression failed")
-        return _owned_bytes(out, out_len)
-    finally:
-        stario_brotli_release(enc)
+    ptr = _bytes_ptr(data, &n)
+    if stario_brotli_compress_borrowed(level, window, ptr, n, &out, &out_len) != 0:
+        raise StarioError("brotli compression failed")
+    return _owned_bytes(out, out_len)
 
 
 def brotli_decompress(bytes data) -> bytes:

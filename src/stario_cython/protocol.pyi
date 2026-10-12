@@ -1,5 +1,25 @@
 import asyncio
+from collections.abc import Iterator
 from typing import Any
+
+class Connections:
+    """One event loop's live connections plus their timeout sweep."""
+
+    server_driven: bool
+    def __init__(
+        self, *, sweep_interval: float = 1.0, server_driven: bool = False
+    ) -> None: ...
+    def add(self, proto: Any) -> None: ...
+    def discard(self, proto: Any) -> None: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[Any]: ...
+    def __contains__(self, proto: object) -> bool: ...
+    def __bool__(self) -> bool: ...
+    @property
+    def sweep_interval(self) -> float: ...
+    @property
+    def sweeping(self) -> bool: ...
+    def sweep(self, now: float) -> None: ...
 
 # Runtime base is asyncio.BufferedProtocol. data_received is implemented too,
 # so the class also satisfies asyncio.Protocol.
@@ -9,6 +29,7 @@ class HttpProtocol(asyncio.Protocol):
     disconnect: asyncio.Future[None] | None
     closed: bool
     parse_mode: int
+    last_task: asyncio.Task[Any] | None
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
@@ -16,7 +37,7 @@ class HttpProtocol(asyncio.Protocol):
         tracer: Any,
         date_box: list[bytes],
         compression: Any,
-        connections: set[Any],
+        connections: Connections,
         max_header_bytes: int = ...,
         max_body_bytes: int = ...,
         header_timeout: float = ...,
@@ -25,7 +46,6 @@ class HttpProtocol(asyncio.Protocol):
         max_pipelined_requests: int = ...,
         write_timeout: float = ...,
         timeout_cleanup: str | int | None = None,
-        timeout_sweep_interval: float | None = None,
     ) -> None: ...
     def data_received(self, data: bytes | bytearray | memoryview) -> None: ...
     def get_buffer(self, sizehint: int) -> memoryview: ...

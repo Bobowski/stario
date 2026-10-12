@@ -930,6 +930,24 @@ class TestAssets:
         assert cached.headers.get("etag") == etag
 
     @pytest.mark.asyncio
+    async def test_head_on_cached_asset_keeps_get_content_length(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "app.js").write_text("console.log(1)")
+        files = Assets(tmp_path)
+        href = files.href("app.js")
+        await files.load(precompress=())
+
+        async with TestClient(_app(files)) as client:
+            get = await client.get(href)
+            head = await client.head(href)
+
+        assert get.status_code == 200
+        assert head.status_code == 200
+        assert head.content == b""
+        assert head.headers.get("content-length") == get.headers.get("content-length")
+
+    @pytest.mark.asyncio
     async def test_streamed_etag_and_304(self, tmp_path: Path) -> None:
         (tmp_path / "big.bin").write_bytes(b"0123456789")
         files = Assets(tmp_path)

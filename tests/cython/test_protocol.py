@@ -2,14 +2,13 @@ import asyncio
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioRuntime
 from stario.http.compression import CompressionConfig
 from stario.telemetry.noop import NoOpTracer
 from stario.testing.tracer import TestTracer
 from stario_cython.protocol import HttpProtocol
-from tests.cython.http import free_port, read_response
+from tests.cython.http import connection_set, free_port, read_response
 from tests.helpers import assert_status_span
 
 
@@ -31,10 +30,10 @@ async def test_trailing_slash_redirects_without_create_task() -> None:
     app = TrackingApp()
 
     async def search(_c, w):
-        responses.text(w, "hit")
+        w.text("hit")
 
     app.add(Route("GET /search"), search)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     def factory():
@@ -75,7 +74,7 @@ async def test_trailing_slash_redirects_without_create_task() -> None:
 async def test_trailing_slash_redirect_finishes_span_without_fail() -> None:
     loop = asyncio.get_running_loop()
     app = TrackingApp()
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     with TestTracer() as tracer:
@@ -116,24 +115,24 @@ async def test_not_found_and_method_not_allowed_use_handlers() -> None:
     seen: list[str] = []
 
     async def hello(_c, w):
-        responses.text(w, "hi")
+        w.text("hi")
 
     async def custom_404(_c, w):
         seen.append("404")
-        responses.text(w, "gone", 404)
+        w.text("gone", 404)
 
     def custom_405(allowed: frozenset[str]):
         async def respond(_c, w):
             seen.append("405")
             w.headers.set("Allow", ", ".join(sorted(allowed)))
-            responses.text(w, "nope", 405)
+            w.text("nope", 405)
 
         return respond
 
     app.add(Route("GET /hello"), hello)
     app.not_found("/", custom_404)
     app.method_not_allowed("/", custom_405)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     def factory():
@@ -182,7 +181,7 @@ async def test_handler_exception_writes_500() -> None:
         raise RuntimeError("boom")
 
     app.add(Route("GET /boom"), boom)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     def factory():
@@ -221,7 +220,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
         assert type(w).__name__ == "RequestHandle"
         assert _c is w
         writers.append(w._exchange_id)
-        responses.text(w, "Hello, World!")
+        w.text("Hello, World!")
 
     async def echo(c, w):
         writers.append(w._exchange_id)
@@ -231,7 +230,7 @@ async def test_plaintext_and_post_and_keepalive() -> None:
     app.add(Route("GET /plaintext"), plaintext)
     app.add(Route("POST /echo"), echo)
 
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     def factory():
@@ -282,7 +281,7 @@ async def test_small_content_length_body_is_complete_when_handler_runs() -> None
         w.respond(payload, b"text/plain; charset=utf-8")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -322,10 +321,10 @@ async def test_fragmented_headers_materialize_correctly() -> None:
     async def inspect(c, w):
         assert c.req.host == "example.com"
         assert c.req.headers.getlist("x-test") == ["one", "two"]
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), inspect)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -376,10 +375,10 @@ async def test_request_headers_scan_arena_without_copy() -> None:
         assert "X-Request-ID" in headers
         assert "authorization" in headers
         seen.append(headers.items())
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), inspect)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -425,10 +424,10 @@ async def test_request_header_view_resets_when_exchange_is_reused() -> None:
     async def inspect(c, w):
         headers = c.req.headers
         seen_local.append(headers.get("x-local"))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), inspect)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -471,7 +470,7 @@ async def test_stream_large_and_chunked_upload() -> None:
 
     app.add(Route("POST /upload"), upload)
 
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     def factory():
@@ -530,15 +529,15 @@ async def test_ignored_slow_body_stays_owned_until_message_complete() -> None:
 
     async def ignore(c, w):
         seen.append(c._exchange_id)
-        responses.text(w, "ignored")
+        w.text("ignored")
 
     async def next_request(c, w):
         seen.append(c._exchange_id)
-        responses.text(w, c.req.path)
+        w.text(c.req.path)
 
     app.add(Route("POST /ignore"), ignore)
     app.add(Route("GET /next"), next_request)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -586,14 +585,14 @@ async def test_abandoned_stream_discards_remainder_and_advances_pipeline() -> No
     async def partial(c, w):
         async for _ in c.req.stream():
             break
-        responses.text(w, "partial")
+        w.text("partial")
 
     async def next_request(_c, w):
-        responses.text(w, "next")
+        w.text("next")
 
     app.add(Route("POST /partial"), partial)
     app.add(Route("GET /next"), next_request)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -642,7 +641,7 @@ async def test_small_expect_continue_is_sent_before_body() -> None:
         w.respond(await c.req.body(), b"text/plain")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -692,10 +691,10 @@ async def test_disconnect_future_is_lazy() -> None:
         assert c.disconnected is False
         fut = c.disconnect
         assert not fut.done()
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /watch"), watch)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date = b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"
 
     def factory():
@@ -734,7 +733,7 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
     async def first(c, w):
         exchanges["first"] = c
         assert c is w
-        responses.text(w, "first")
+        w.text("first")
         await asyncio.sleep(0)
         events.append(("first-done", c.req.path))
 
@@ -743,11 +742,11 @@ async def test_pipeline_waits_for_handler_and_uses_each_request_keepalive() -> N
         assert c is w
         assert c is not exchanges["first"]
         events.append(("second-start", c.req.path))
-        responses.text(w, "second")
+        w.text("second")
 
     app.add(Route("GET /first"), first)
     app.add(Route("GET /second"), second)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date_box = [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"]
 
     server = await loop.create_server(
@@ -795,17 +794,17 @@ async def test_handler_after_respond_stays_on_app_tasks_and_next_request_starts(
     second_started = asyncio.Event()
 
     async def first(c, w):
-        responses.text(w, "first")
+        w.text("first")
         first_responded.set()
         await release.wait()
 
     async def second(c, w):
         second_started.set()
-        responses.text(w, "second")
+        w.text("second")
 
     app.add(Route("GET /first"), first)
     app.add(Route("GET /second"), second)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -861,7 +860,7 @@ async def test_large_single_read_pipeline_is_bounded() -> None:
         w.respond(str(index).encode("ascii"), b"text/plain")
 
     app.add(Route("GET /"), endpoint)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -918,7 +917,7 @@ async def test_pipelined_streaming_bodies_are_request_owned() -> None:
         w.respond(str(total).encode("ascii"), b"text/plain; charset=utf-8")
 
     app.add(Route("POST /upload"), upload)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     date_box = [b"date: Tue, 18 Aug 2026 00:00:00 GMT\r\n"]
     server = await loop.create_server(
         lambda: HttpProtocol(
@@ -966,10 +965,10 @@ async def test_exchange_pool_reuses_across_connections() -> None:
     async def endpoint(c, w):
         assert c is w
         exchanges.append(c._exchange_id)
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), endpoint)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1015,7 +1014,7 @@ async def test_handler_starts_before_content_length_body_arrives() -> None:
         w.respond(body, b"text/plain")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1061,7 +1060,7 @@ async def test_body_wait_survives_multi_segment_upload() -> None:
         w.respond(body, b"text/plain")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1112,7 +1111,7 @@ async def test_content_length_body_survives_many_64k_segments() -> None:
         w.respond(body, b"application/octet-stream")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1158,7 +1157,7 @@ async def test_content_length_body_in_same_packet_as_headers() -> None:
         w.respond(await c.req.body(), b"application/octet-stream")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1215,7 +1214,7 @@ async def test_next_request_starts_after_respond_before_handler_returns() -> Non
 
     app.add(Route("GET /first"), first)
     app.add(Route("GET /second"), second)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1268,7 +1267,7 @@ async def test_stream_max_chunk_must_be_below_limit() -> None:
         w.respond(b"ok", b"text/plain")
 
     app.add(Route("POST /upload"), upload)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1318,7 +1317,7 @@ async def test_stream_respects_max_chunk_batches() -> None:
         w.respond(str(sum(sizes)).encode("ascii"), b"text/plain")
 
     app.add(Route("POST /upload"), upload)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1367,7 +1366,7 @@ async def test_medium_content_length_body_is_complete_when_handler_runs() -> Non
         w.respond(payload, b"text/plain; charset=utf-8")
 
     app.add(Route("POST /echo"), echo)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1414,7 +1413,7 @@ async def test_stream_default_chunk_follows_content_length() -> None:
         w.respond(str(sum(sizes)).encode("ascii"), b"text/plain")
 
     app.add(Route("POST /upload"), upload)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1463,10 +1462,10 @@ async def test_request_headers_are_read_only() -> None:
         with pytest.raises(StarioRuntime, match="read-only"):
             c.req.headers.remove("host")
         errors.append("raised")
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), inspect)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1515,10 +1514,10 @@ async def test_lazy_cookies_and_query_from_arena() -> None:
         assert c.req.query.get("eq") == "1=2"
         assert c.req.headers.get("authorization") == "Bearer abc"
         seen["ok"] = True
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /search"), inspect)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1561,10 +1560,10 @@ async def test_cookies_do_not_leak_across_keepalive() -> None:
 
     async def inspect(c, w):
         seen.append(dict(c.req.cookies))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), inspect)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,
@@ -1605,10 +1604,10 @@ async def test_host_routing_normalizes_host_header() -> None:
     app = App()
 
     async def hello(c, w):
-        responses.text(w, f"host:{c.req.host}")
+        w.text(f"host:{c.req.host}")
 
     app.add(Route("GET //example.com/"), hello)
-    connections: set[HttpProtocol] = set()
+    connections = connection_set()
     server = await loop.create_server(
         lambda: HttpProtocol(
             loop,

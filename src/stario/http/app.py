@@ -1,28 +1,24 @@
 """
-Application object: route table, shutdown-aware tasks, thin test entrypoint.
+Application object: route table plus shutdown-aware tasks.
 
-The HTTP protocol does not call this class per request. It binds compiled
-trie lookup (`_cy_router`) and constructs `asyncio.Task(handler(c, w))`,
-registering incomplete tasks on `app.tasks` for shutdown drain. `App.__call__`
-and `create_task` exist so tests and `TestClient` share that same drain set.
+The HTTP protocol does not call this class per request. It reads the compiled
+trie (`compiled()`) and constructs `asyncio.Task(handler(c, w))`, registering
+incomplete tasks on `app.tasks` for shutdown drain. `create_task` puts app
+background work on that same set. `TestClient` drives the protocol too, so
+there is one dispatch path.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import threading
 from collections.abc import Coroutine
-from typing import Any, cast
+from typing import Any
 
 from stario.exceptions import StarioError
-from stario.http.context import Context
-from stario.http.invoke import finish_request_span, on_handler_done
-from stario.telemetry.spans import NoOpSpan
-from stario_cython.exchange import AppState, canonical_request_path
+from stario_cython.exchange import AppState
 
 from .dispatch import Router
-from .writer import Writer
 
 
 def _complete_loop_future(fut: asyncio.Future[None]) -> None:
@@ -69,7 +65,7 @@ class App(Router):
         super().__init__()
         self._app_state = AppState()
         self._app_state.host_routing = self._host_routing
-        self._app_state.router = self._cy_router
+        self._app_state.router = None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as exc:
@@ -225,63 +221,3 @@ class App(Router):
             if not pending:
                 return
             await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
-
-    async def __call__(self, c: Context, w: Writer) -> None:
-        """Test / `TestClient` entrypoint: `find_handler` then the handler coroutine.
-
-        The request-path rules (400 for an invalid path, 308 to the canonical
-        path for dot segments or a trailing slash) are the HTTP protocol's;
-        this applies the same shared check so TestClient sees identical
-        behavior. Routing uses the raw (percent-encoded) path.
-        """
-        path = c.req.path
-        raw_path = c.req.raw_path
-        host = c.req.host if self.host_routing else ""
-        status, canonical = canonical_request_path(raw_path)
-        if status == 400:
-            w.respond(b"Invalid HTTP request", b"text/plain; charset=utf-8", 400)
-            finish_request_span(c.span, status=400, method=c.req.method, path=path)
-            return
-        if canonical is not None:
-            target = canonical.decode("ascii")
-            _, _, hit = self.find_handler(host, target, c.req.method)
-            if type(c.span) is not NoOpSpan and hit.pattern:
-                c.span.rename(hit.pattern)
-            if c.req.query_bytes:
-                target = f"{target}?{c.req.query_bytes.decode('latin-1')}"
-            w.headers.set("location", target)
-            w.respond(b"", b"text/plain; charset=utf-8", 308)
-            finish_request_span(c.span, status=308, method=c.req.method, path=path)
-            return
-
-        handler, route, c.match = self.find_handler(
-            host, raw_path.decode("latin-1"), c.req.method
-        )
-        span = c.span
-        if type(span) is not NoOpSpan:
-            span.start()
-            span.attrs({"request.method": c.req.method, "request.path": path})
-            if c.match.pattern:
-                span.rename(c.match.pattern)
-                span.attr("http.route", route.path)
-
-        task = self.create_task(
-            cast(Coroutine[Any, Any, None], handler(c, w)), eager_start=True
-        )
-        try:
-            if not task.done():
-                await task
-        except asyncio.CancelledError:
-            if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            raise
-        finally:
-            if task.done():
-                on_handler_done(c, w, task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None and not w.started:
-            raise exc

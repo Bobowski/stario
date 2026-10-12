@@ -7,10 +7,14 @@ import struct
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from tests.cython import h2wire as h2
-from tests.cython.http import RecordingTransport, make_protocol, running_server
+from tests.cython.http import (
+    RecordingTransport,
+    connection_set,
+    make_protocol,
+    running_server,
+)
 
 
 @pytest.mark.asyncio
@@ -95,7 +99,7 @@ async def test_drain_bounds_memory_for_a_slow_client() -> None:
         w.end()
 
     app.add(Route("GET /big"), big)
-    servers: set = set()
+    servers = connection_set()
     loop = asyncio.get_running_loop()
     server = await loop.create_server(
         lambda: make_protocol(loop, app, connections=servers), "127.0.0.1", 0
@@ -166,7 +170,7 @@ async def test_drain_after_the_handler_finished_is_a_no_op() -> None:
 
     async def quick(_c, w) -> None:
         kept.append(w)
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), quick)
     async with running_server(app) as port:

@@ -10,10 +10,10 @@ from typing import Any, Literal
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.redirect import normalized_location
 from stario.http.writer import Writer
+from stario.json import JsonValue
 from stario.json import dumps as json_dumps
 from stario.json import dumps_bytes as json_dumps_bytes
 from stario.markup.render import render
-from stario.responses import JsonValue
 
 from .format import require_mapping, validate_signal_name
 
@@ -186,7 +186,7 @@ class SSE:
                 "Cannot send SSE events after the response is completed",
                 help_text=(
                     "Create and use `SSE(w)` before response helpers like "
-                    "`responses.html()`, `responses.redirect()`, `responses.empty()`, or `w.end()`."
+                    "`w.html()`, `w.redirect()`, `w.empty()`, or `w.end()`."
                 ),
                 example=(
                     "from stario.datastar import SSE\n\n"

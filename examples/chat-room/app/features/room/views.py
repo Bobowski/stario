@@ -5,10 +5,10 @@ import time
 from app.common.identity import VISITOR_SESSION_INIT
 from app.common.shell import page
 from app.features.lobby.urls import LOBBY
+from stario import h
 from stario.datastar import at, data
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement, SafeString, classes, styles
-from stario.markup import html as h
 
 from .models import Message, Room, User
 from .urls import SEND, SUBSCRIBE, TYPING

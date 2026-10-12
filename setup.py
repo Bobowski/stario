@@ -73,8 +73,12 @@ class native_build_ext(build_ext):
     def build_extensions(self) -> None:
         _pkg_config("--exists")
         _require_nghttp2_version()
-        include_dirs = [f[2:] for f in _pkg_config("--cflags-only-I") if f.startswith("-I")]
-        library_dirs = [f[2:] for f in _pkg_config("--libs-only-L") if f.startswith("-L")]
+        include_dirs = [
+            f[2:] for f in _pkg_config("--cflags-only-I") if f.startswith("-I")
+        ]
+        library_dirs = [
+            f[2:] for f in _pkg_config("--libs-only-L") if f.startswith("-L")
+        ]
         libraries = [f[2:] for f in _pkg_config("--libs-only-l") if f.startswith("-l")]
         if "z" not in libraries:
             libraries.append("z")

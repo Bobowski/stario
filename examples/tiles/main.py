@@ -4,8 +4,7 @@ Stario Tiles — your first realtime hypermedia app (single file).
 Collaborative painting board: HTTP for the page and commands, SSE for live
 updates, in-process Relay to fan out between open tabs.
 
-Run with: uv run stario watch main:bootstrap
-      or: uv run stario serve main:bootstrap
+Run with: uv run python -m main
 
 Read top to bottom:
 
@@ -31,7 +30,6 @@ import threading
 import uuid
 from pathlib import Path
 
-import stario.responses as responses
 from stario import (
     App,
     Assets,
@@ -40,11 +38,11 @@ from stario import (
     Route,
     Span,
     Writer,
+    h,
 )
 from stario.datastar import SSE, at, data, read_signals
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement, baked, classes, styles
-from stario.markup import html as h
 
 # Stario apps center on: Context (per-request), Writer (transport), and plain Python
 # instead of a template language. HTML tags live under `stario.markup.html`;
@@ -81,7 +79,7 @@ CLICK = Route("POST", "/click")
 # Views are pure functions that build HTML using the callables in
 # `stario.markup.html` (each tag is a function-like object: Div, Span, …). You nest
 # them like a normal function call tree; the framework turns that tree into
-# markup when you pass it to `responses.html()` or
+# markup when you pass it to `w.html()` or
 # `SSE(w).patch_elements()`, with escaping applied
 # to ordinary strings so user-controlled text is safe by default.
 # This file imports `stario.markup.html` as `h` so tag constructors read as `h.Div`,
@@ -305,7 +303,7 @@ def home(game: Game):
         # Fresh id per tab — becomes a Datastar signal for later POSTs and SSE.
         user_id = str(uuid.uuid4())[:8]
         c.span.attr("user_id", user_id)
-        responses.html(w, home_view(user_id, game))
+        w.html(home_view(user_id, game))
 
     return handler
 
@@ -317,7 +315,7 @@ def subscribe(game: Game, relay: Relay[str]):
         user_id = await read_user_id(c)
         if not user_id:
             c.span.event("Missing user id", {})
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         # Queue must exist before publish — otherwise this tab misses its own join.
@@ -357,21 +355,21 @@ def click(game: Game, relay: Relay[str]):
         user_id = await read_user_id(c)
         # Membership in user_colors means /subscribe succeeded for this tab.
         if user_id not in game.user_colors:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         cell_id_param = c.req.query.get("cellId")
         if cell_id_param is None:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         try:
             cell_id = int(cell_id_param)
         except ValueError:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
         if not 0 <= cell_id < game.total_cells:
-            responses.redirect(w, HOME.href())
+            w.redirect(HOME.href())
             return
 
         c.span.attrs({"user_id": user_id, "cell_id": cell_id})
@@ -380,7 +378,7 @@ def click(game: Game, relay: Relay[str]):
         # a response first in Starlette/FastAPI and then running a background task:
         # the client is done waiting, but this coroutine continues and may do I/O or
         # broadcast (here: update shared state and notify other tabs).
-        responses.empty(w, 204)  # ack before fan-out — browser isn't waiting for HTML
+        w.empty(204)  # ack before fan-out — browser isn't waiting for HTML
 
         action = game.paint_cell(user_id, cell_id)
         c.span.event("Cell toggled", {"cell_id": cell_id, "action": action})
@@ -426,3 +424,11 @@ async def bootstrap(app: App, span: Span):
     # Commands — mutate Game, nudge relay; updates arrive on SSE
     app.add(CLICK, click(game, relay))
     yield
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from stario import serve
+
+    asyncio.run(serve(bootstrap))

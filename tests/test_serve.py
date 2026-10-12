@@ -10,11 +10,7 @@ from typing import Any
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
-from stario.cli.errors import CliError
-from stario.cli.runtime import serve_once
-from stario.exceptions import StarioError
 from stario.http.config import ServerConfig
 from stario.http.server import Server, serve
 from stario.telemetry.json import JsonTracer
@@ -30,12 +26,11 @@ def test_server_uses_config_defaults() -> None:
     server = Server(bootstrap, NoOpTracer())
     assert server.config.host == "127.0.0.1"
     assert server.config.port == 8000
-    assert server.config.event_loop == "asyncio"
     assert server.config.unix_socket is None
 
 
-async def test_serve_listen_fields_build_server_config(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_serve_reads_env_when_config_omitted(
+    monkeypatch: Any,
 ) -> None:
     captured: list[ServerConfig] = []
 
@@ -48,13 +43,15 @@ async def test_serve_listen_fields_build_server_config(
         async def serve(self) -> None:
             return None
 
+    monkeypatch.setenv("STARIO_PORT", "8123")
+    monkeypatch.setenv("STARIO_HOST", "0.0.0.0")
     monkeypatch.setattr("stario.http.server.Server", FakeServer)
-    await serve(bootstrap, port=8123, host="0.0.0.0")
+    await serve(bootstrap)
     assert captured[0].port == 8123
     assert captured[0].host == "0.0.0.0"
 
 
-async def test_serve_accepts_prepared_config(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_serve_config_ignores_env(monkeypatch: Any) -> None:
     captured: list[ServerConfig] = []
     cfg = ServerConfig(port=9001)
 
@@ -67,17 +64,14 @@ async def test_serve_accepts_prepared_config(monkeypatch: pytest.MonkeyPatch) ->
         async def serve(self) -> None:
             return None
 
+    monkeypatch.setenv("STARIO_PORT", "8123")
     monkeypatch.setattr("stario.http.server.Server", FakeServer)
     await serve(bootstrap, config=cfg)
     assert captured[0] is cfg
+    assert captured[0].port == 9001
 
 
-async def test_serve_rejects_config_and_listen_fields() -> None:
-    with pytest.raises(StarioError, match="config= or listen fields"):
-        await serve(bootstrap, config=ServerConfig(), port=9000)
-
-
-def test_server_config_does_not_read_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_server_config_does_not_read_env(monkeypatch: Any) -> None:
     monkeypatch.setenv("STARIO_PORT", "9000")
     monkeypatch.setenv("STARIO_HOST", "0.0.0.0")
 
@@ -87,7 +81,7 @@ def test_server_config_does_not_read_env(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 async def test_serve_creates_default_tty_tracer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: Any,
 ) -> None:
     captured: list[object] = []
 
@@ -98,14 +92,14 @@ async def test_serve_creates_default_tty_tracer(
         async def serve(self) -> None:
             return None
 
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setenv("STARIO_TRACER", "tty")
     monkeypatch.setattr("stario.http.server.Server", FakeServer)
     await serve(bootstrap)
     assert isinstance(captured[0], TTYTracer)
 
 
 async def test_serve_enters_and_exits_default_tracer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: Any,
 ) -> None:
     events: list[str] = []
 
@@ -126,6 +120,9 @@ async def test_serve_enters_and_exits_default_tracer(
         def stats(self) -> None:
             return None
 
+    def probe_factory() -> Probe:
+        return Probe()
+
     class FakeServer:
         def __init__(self, bootstrap: object, tracer: object, **kwargs: object) -> None:
             assert events == ["enter"]
@@ -133,15 +130,14 @@ async def test_serve_enters_and_exits_default_tracer(
         async def serve(self) -> None:
             assert events == ["enter"]
 
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("stario.telemetry.tty.TTYTracer", Probe)
+    monkeypatch.setattr("stario.http.server.tracer_from_env", probe_factory)
     monkeypatch.setattr("stario.http.server.Server", FakeServer)
     await serve(bootstrap)
     assert events == ["enter", "exit"]
 
 
 async def test_serve_creates_default_json_tracer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: Any,
 ) -> None:
     captured: list[object] = []
 
@@ -152,47 +148,10 @@ async def test_serve_creates_default_json_tracer(
         async def serve(self) -> None:
             return None
 
-    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setenv("STARIO_TRACER", "json")
     monkeypatch.setattr("stario.http.server.Server", FakeServer)
     await serve(bootstrap)
     assert isinstance(captured[0], JsonTracer)
-
-
-def test_serve_once_constructs_server_from_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: list[Server] = []
-
-    class RecordingServer(Server):
-        def run(self) -> None:
-            captured.append(self)
-
-    tracer = NoOpTracer()
-    monkeypatch.setenv("STARIO_PORT", "9000")
-    monkeypatch.setenv("STARIO_HOST", "0.0.0.0")
-    monkeypatch.setattr("stario.cli.runtime.load_bootstrap", lambda spec: bootstrap)
-    monkeypatch.setattr("stario.cli.runtime.tracer_from_env", lambda: tracer)
-    monkeypatch.setattr("stario.cli.runtime.Server", RecordingServer)
-
-    serve_once("demo:bootstrap")
-
-    server = captured[0]
-    assert server.bootstrap is bootstrap
-    assert server.tracer is tracer
-    assert server.config.port == 9000
-    assert server.config.host == "0.0.0.0"
-
-
-def test_serve_once_wraps_stario_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def boom(self: Server) -> None:
-        raise StarioError("bind failed")
-
-    monkeypatch.setattr("stario.cli.runtime.load_bootstrap", lambda spec: bootstrap)
-    monkeypatch.setattr("stario.cli.runtime.tracer_from_env", lambda: NoOpTracer())
-    monkeypatch.setattr("stario.cli.runtime.Server.run", boom)
-
-    with pytest.raises(CliError, match="bind failed"):
-        serve_once("demo:bootstrap")
 
 
 @pytest.fixture
@@ -212,7 +171,7 @@ async def test_serve_then_caller_continues(short_socket_path: str) -> None:
         apps.append(app)
 
         async def hello(c: Any, w: Any) -> None:
-            responses.text(w, "hello")
+            w.text("hello")
 
         app.add(Route("GET", "/"), hello)
         yield
@@ -222,9 +181,11 @@ async def test_serve_then_caller_continues(short_socket_path: str) -> None:
         task = asyncio.create_task(
             serve(
                 serve_bootstrap,
-                tracer,
-                unix_socket=short_socket_path,
-                graceful_shutdown_timeout=0.5,
+                tracer=tracer,
+                config=ServerConfig(
+                    unix_socket=short_socket_path,
+                    graceful_shutdown_timeout=0.5,
+                ),
             )
         )
         try:

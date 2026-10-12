@@ -317,14 +317,16 @@ class TestRouterUse:
 
         assert calls == ["scope"]
 
-    def test_use_rejects_middleware_after_routes(self):
+    def test_use_after_routes_applies_to_them(self):
+        calls: list[str] = []
         router = Router()
         router.add(Route("GET", "/users"), noop_handler)
+        router.use("/users", track(calls, "late"))
 
-        with pytest.raises(
-            StarioError, match="Middleware must be registered before matching routes"
-        ):
-            router.use("/users", lambda h: h)
+        handler, _, _ = router.find_handler("", "/users", "GET")
+        run_handler(handler, "/users")
+
+        assert calls == ["late"]
 
     def test_use_middleware_runs_in_registration_order(self):
         calls: list[str] = []
@@ -384,3 +386,20 @@ class TestRouterUse:
         assert hit.pattern == ""
         run_handler(handler, "/missing", host="api.example.com")
         assert calls == ["host-404"]
+
+
+def test_registering_many_routes_compiles_once() -> None:
+    """Each `add` is a tree insert; the trie compiles on the first lookup."""
+    import time
+
+    router = Router()
+    started = time.perf_counter()
+    for i in range(3000):
+        router.add(Route(f"GET /api/v1/res{i}/{{id}}/sub{i % 7}"), noop_handler)
+    assert router._cy_router is None
+    _handler, route, match = router.find_handler("", "/api/v1/res42/7/sub0", "GET")
+    assert route.path == "/api/v1/res42/{id}/sub0"
+    assert match.params == {"id": "7"}
+    assert router._cy_router is not None
+    # 3000 routes took ~20 s when every add recompiled.
+    assert time.perf_counter() - started < 2.0

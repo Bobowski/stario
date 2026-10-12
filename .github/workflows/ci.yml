@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        # 3.14t is the free-threaded build: the cp314t wheel and
+        # STARIO_THREADS>1 are only real if the suite runs with the GIL off.
+        python-version: ["3.12", "3.13", "3.14", "3.14t"]
     runs-on: ubuntu-latest
     env:
       # Ubuntu's 1.59 is new enough to test against; release wheels bundle 1.70.
@@ -25,7 +27,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras
-      - run: uv run ruff check src tests
-      - run: uv run ruff format --check src tests
+      - name: GIL is off on the free-threaded build
+        if: matrix.python-version == '3.14t'
+        run: |
+          uv run python -c "import sys, stario_cython.exchange, stario_cython.protocol; assert not sys._is_gil_enabled(), 'an extension re-enabled the GIL'"
+      - run: uv run ruff check src tests setup.py
+      - run: uv run ruff format --check src tests setup.py
       - run: uv run pyright
       - run: uv run pytest

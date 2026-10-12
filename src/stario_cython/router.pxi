@@ -116,7 +116,7 @@ cdef CNode _compile_node(object node):
     out.mna_hit = None
     out.method_set = None
     out.not_found = node.not_found_handler
-    out.not_found_custom = node.not_found_handler is not None
+    out.not_found_custom = node.not_found_custom
     out.method_na = node.method_not_allowed_handler
     for i in range(256):
         out.edge_start[i] = -1
@@ -137,6 +137,8 @@ cdef CNode _compile_node(object node):
     out.n_edges = <Py_ssize_t>len(edges)
     if out.n_edges == 1:
         out.one_edge = <CEdge>edges[0]
+
+    # Sorted edges indexed by first byte: edge_start/count give a run to scan.
     last_first = -1
     run_start = 0
     for i in range(out.n_edges):
@@ -156,6 +158,7 @@ cdef CNode _compile_node(object node):
             out.edge_start[first] = <int>i
     if last_first >= 0:
         out.edge_count[last_first] = <int>out.n_edges - run_start
+
     if node.wildcard is not None:
         out.wildcard_name = node.wildcard_name
         out.wildcard = _compile_node(node.wildcard)
@@ -164,6 +167,8 @@ cdef CNode _compile_node(object node):
         out.catchall = _compile_node(node.catchall)
     if out.not_found is not None:
         out.nf_hit = _pack(out.not_found, _ROUTER_EMPTY_ROUTE, _ROUTER_EMPTY_MATCH)
+
+    # Prepack hits: lookup returns a tuple without building one per request.
     endpoints = node.endpoints
     if endpoints:
         out.endpoints = {}
@@ -275,6 +280,7 @@ cdef inline object _finish(
     if endpoints is None:
         status[0] = 2
         return nf_hit if nf_hit is not None else _NF_HIT
+
     if node.one_method is not None and method is node.one_method:
         hit = node.one_hit
     else:
@@ -293,6 +299,7 @@ cdef inline object _finish(
                 ),
             )
         return hit
+
     status[0] = 1
     if method_na is None and node.mna_hit is not None:
         return node.mna_hit
@@ -336,6 +343,8 @@ cdef object _resolve_tree_n(
     if path_p == NULL:
         path_p = ""
         path_n = 0
+    # Host trie: labels match right-to-left ("www.a.b" → b, a.b, www.a.b),
+    # so the deepest suffix wins.
     if host_n > 0 and host_p != NULL:
         nf_before = nf_hit
         custom_before = cust
@@ -376,15 +385,17 @@ cdef object _resolve_tree_n(
                 end = dot if dot >= 0 else 0
             if child.not_found is not None:
                 nf_hit = child.nf_hit
-                cust = True
+                cust = child.not_found_custom
             if child.method_na is not None:
                 method_na = child.method_na
             node = child
+
     nf_before = nf_hit
     custom_before = cust
     if path_n == 0 or (path_n == 1 and path_p[0] == 47):
         custom[0] = cust
         return _finish(node, method, params, nf_hit, method_na, status)
+
     # Split the raw path on raw '/' only, decoding each segment on its own
     # into ``dbuf`` when the path has '%'. A decoded %2F stays in its segment.
     try:
@@ -410,6 +421,7 @@ cdef object _resolve_tree_n(
             else:
                 d = path_p + seg_start
                 dn = i - seg_start
+
             child = _match_exact(node, d, dn)
             if child is None:
                 if params is None:
@@ -433,11 +445,13 @@ cdef object _resolve_tree_n(
                     child = _take_param(node, d, dn, NULL, -1, params)
                 if child is None:
                     status[0] = 2
-                    custom[0] = custom_before
-                    return nf_before if nf_before is not None else _NF_HIT
+                    custom[0] = cust
+                    return nf_hit if nf_hit is not None else _NF_HIT
+
+            # Deepest matching node wins: carry its 404/405 overrides down.
             if child.not_found is not None:
                 nf_hit = child.nf_hit
-                cust = True
+                cust = child.not_found_custom
             if child.method_na is not None:
                 method_na = child.method_na
             if child is node.catchall:
@@ -493,6 +507,9 @@ cdef object _router_lookup_n(
             host_custom = False
         if host_status == 0:
             return host_hit
+
+        # Host tree missed or hit 404/405: the path tree still gets a say.
+        # An endpoint match or 405 outranks a generic 404.
         path_hit = _resolve_tree_n(
             self.path, path_p, path_n, decode, NULL, 0, method,
             &path_status, &path_custom,

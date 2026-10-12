@@ -6,6 +6,132 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Removed
+
+- **The CLI is gone.** `stario serve` and `stario watch` (and the
+  `[project.scripts]` entry point) are removed, along with the `watchfiles`
+  dependency. Run your app with `python -m …` — `serve()` is the only server
+  entry point — and use an external reloader such as
+  `uvx watchfiles 'uv run python -m app.main' app/` in development.
+- `STARIO_LOOP` and `ServerConfig.event_loop` are gone. Worker threads
+  (`STARIO_THREADS>1`) now create the same loop class as the loop running
+  `serve()`, so `uvloop.run(serve(bootstrap))` gives uvloop workers.
+- `Server.run()`, `Server.loop_runner()`, and the `serve(bootstrap, port=…)`
+  keyword form are gone: `serve(bootstrap, *, config=None, tracer=None)` is
+  the signature.
+
+### Changed
+
+- **Response helpers are `Writer` methods.** `w.text(body, status)`,
+  `w.json(value, status)`, `w.html(content, status)`, `w.redirect(url, status)`,
+  and `w.empty(status)` replace `responses.text(w, …)` and friends;
+  `stario.responses` is removed. `JsonValue` moved to `stario.json`. The root
+  package now exports `h` (`stario.markup.html`), `classes`, `ServerConfig`,
+  and `JsonValue` — the documented handler import is
+  `from stario import App, Context, Route, Span, Writer, h`.
+- **`serve()` reads `STARIO_*` when `config=` is omitted.** Pass
+  `config=ServerConfig(...)` to use an explicit config as-is — environment
+  variables are not merged in. `ServerConfig.from_env()` is the env reader.
+- `tracer_from_env()` moved to `stario.telemetry` (`stario.cli.env` is gone)
+  and raises `StarioError`. `serve(bootstrap)` with no `tracer=` uses it and
+  scopes the tracer to the call.
+- `run_app` (with `AppRun`) in `stario.http.bootstrap` is the single
+  app lifecycle: production `Server.serve` and the test `aload_app` both run
+  on it. `run_app` / `AppRun` are exported from `stario.http`.
+- `aload_app` is built on `run_app` — same `server.startup` →
+  `server.shutdown` span lifecycle as production.
+
+### Fixed
+
+- A `%00` (or a bare NUL) in the query string is answered **400** before the
+  handler runs, like one in the path. It used to raise `ValueError` from
+  `c.req.query` inside the handler and produce a 500 with a traceback. A
+  `ParsedQuery` built by hand now decodes `%00` the way
+  `urllib.parse.unquote_plus` does instead of raising.
+- `RequestHeaders.get()` / `getlist()` return the default (or `[]`) for a
+  name no request can carry (space, empty, non-Latin-1, over 255 bytes),
+  matching `in`. They used to raise `ValueError`.
+- Registering routes no longer recompiles the trie on every `app.add`.
+  The compiled router is built on the first lookup after a change; 3000
+  routes register in well under a second (was about 20 s).
+
+### Changed
+
+- **`TestClient` runs the production protocol.** Each request becomes
+  HTTP/1.1 bytes fed to the real `HttpProtocol` on an in-memory connection.
+  There is one dispatch path now: routing, 308 / 400 target answers,
+  response framing, compression, and the request span are the server's own.
+  What changes for a test:
+  - `compression=` configures the server; a response compresses only when
+    the request sends `Accept-Encoding`, and buffered calls decode it.
+  - New `requests=` (a `RequestPolicy`) sets the server limits.
+  - A buffered call returns once the handler has finished (as before). On
+    `timeout` the client hangs up, cancels that handler, and raises
+    `TimeoutError`; the client stays usable.
+  - Leaving `client.stream(...)` hangs up the connection, so the handler
+    sees `c.disconnected` / `c.alive()` ends, then waits for the handler.
+    `TestStreamResponse.disconnect()` hangs up early; `.disconnected` reads
+    the state.
+  - Protocol-answered spans are named by method (`"GET"`), a 308 by the
+    route it redirects to.
+  - Removed: `App.__call__`, `stario.testing.harness` (`TestWriter`,
+    `TestContext`), `stario.testing.dispatch`, `stario.testing.transport`,
+    `TestResponse.disconnect`. Unit-test a handler by calling it with your
+    own doubles, or run it through `TestClient`.
+- **`python -m stario_cython` is gone.** `stario serve` is the only server
+  entry point (`stario_cython.serve`, `stario_cython.run` removed).
+- `STARIO_CYTHON_TIMEOUTS` and `STARIO_CYTHON_TIMEOUT_SWEEP` are gone. The
+  timeout sweep is driven by the Server's Date tick through the new
+  `stario_cython.protocol.Connections` registry (one C loop per second, no
+  attributes on the event loop). Tests that build `HttpProtocol` directly
+  pass a `Connections(sweep_interval=...)`; `timeout_cleanup="off"` is a
+  constructor argument.
+- `ServerConfig.pin_threads` / `STARIO_PIN_THREADS=1` (opt-in): with
+  `STARIO_THREADS>1` each worker thread is pinned to one allowed CPU on
+  Linux (`sched_setaffinity`, cgroup aware). Elsewhere a no-op. Off by
+  default because threads a pinned worker spawns (`asyncio.to_thread`
+  executors, writer threads) inherit its one-CPU mask.
+- A loop with a task factory set (`loop.set_task_factory`) now sees the
+  handler tasks: the protocol calls `loop.create_task` in that case. The
+  default path still builds the `Task` directly.
+- `RedirectException` and `RequestBodyError` are answered by the server when
+  nothing was sent: the redirect (or 413/408 with `detail` as the body) goes
+  out instead of a 500, and the request span stays ok.
+  `catch_request_body_errors` / `respond_request_body_error` are removed —
+  no middleware is needed for either exception.
+- `Writer.write_headers` lost the `body=` keyword. HEAD is automatic: the
+  server sends the headers as declared (`Content-Length` keeps the GET
+  entity size) and drops the body.
+- Middleware composes at compile time instead of at `app.add`: `use` and
+  `add` work in any order (the "Middleware must be registered before
+  matching routes" error is gone), and scope middleware now also wraps the
+  404/405 answers under its prefix — including `not_found` and
+  `method_not_allowed` handlers. Apps that wrapped their `not_found`
+  handler in middleware by hand now run it twice and should drop the
+  manual wrap.
+
+### Performance
+
+- `Relay`: a cross-thread `publish` buffers under the inbox lock and hops to
+  the owning loop only while a `receive()` is blocked, once per burst. A
+  worker thread publishing 20,000 messages costs a handful of
+  `call_soon_threadsafe` calls instead of 20,000.
+- A complete Brotli body (`respond()`, `Assets`) uses the one-shot encoder
+  into a thread-local scratch buffer; no stream encoder is created and
+  destroyed per response. `write()` streams still use the stream encoder.
+- `app.tasks` is bound once per connection; the per-request
+  `threading.local` lookup is gone.
+- `c.alive()` no longer starts a `Task` per use; done-callbacks on the
+  disconnect and shutdown futures cancel the handler task directly.
+
+### Internal
+
+- `exchange.pyx` is split: `path.pxi` (target scan, host), `query.pxi`,
+  `cookies.pxi`, next to the existing `headers.pxi` and `router.pxi`.
+- CI runs the suite on `3.14t` (free-threaded) and asserts the GIL stays
+  off after importing the extensions. Benchmark history moved from
+  `CYTHON.md` to `benchmarks/HISTORY.md`.
+
 ## 5.0.0 - 2026-09-27
 
 ### Breaking changes

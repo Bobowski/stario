@@ -8,7 +8,6 @@ Commands: send_message, typing
 import time
 import uuid
 
-import stario.responses as responses
 from app.common.identity import identity_for_page
 from app.db import Database
 from app.features.lobby.urls import LOBBY
@@ -56,7 +55,7 @@ def show_room(db: Database):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.redirect(w, LOBBY.href())
+            w.redirect(LOBBY.href())
             return
 
         identity = identity_for_page(c)
@@ -68,8 +67,7 @@ def show_room(db: Database):
             }
         )
 
-        responses.html(
-            w,
+        w.html(
             room_view(
                 room,
                 identity.user_id,
@@ -94,12 +92,12 @@ def subscribe(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.redirect(w, LOBBY.href())
+            w.redirect(LOBBY.href())
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id:
-            responses.redirect(w, ROOM.href(room_id=room.id))
+            w.redirect(ROOM.href(room_id=room.id))
             return
 
         user = User(
@@ -164,20 +162,20 @@ def send_message(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.redirect(w, LOBBY.href(), 303)
+            w.redirect(LOBBY.href(), 303)
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id or not data.user_exists(db, signals.user_id, room.id):
-            responses.redirect(w, ROOM.href(room_id=room.id), 303)
+            w.redirect(ROOM.href(room_id=room.id), 303)
             return
 
         text = signals.message.strip()[:MAX_MESSAGE_LENGTH]
         if not text:
-            responses.empty(w)
+            w.empty()
             return
 
-        responses.empty(w)
+        w.empty()
 
         c.span.attrs({"user_id": signals.user_id, "room_id": room.id})
 
@@ -208,15 +206,15 @@ def typing(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            responses.empty(w)
+            w.empty()
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id or not data.user_exists(db, signals.user_id, room.id):
-            responses.empty(w)
+            w.empty()
             return
 
-        responses.empty(w)
+        w.empty()
 
         is_typing = bool(signals.message.strip())
         if data.set_user_typing(db, signals.user_id, room.id, is_typing):

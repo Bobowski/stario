@@ -42,6 +42,7 @@ cdef object _encode_name(str name)
 cdef bint host_value_ok(const char* value, size_t n) noexcept
 cdef object _host_without_port_n(const char* s, Py_ssize_t n)
 cdef int scan_request_path(const char* p, Py_ssize_t n, bint allow_raw_utf8) noexcept
+cdef bint query_has_nul(const char* s, Py_ssize_t n) noexcept
 cdef object decode_path_full(const char* p, Py_ssize_t n)
 cdef bytes canonical_path(const char* p, Py_ssize_t n)
 cdef void wake_waiters(list waiters) noexcept
@@ -343,7 +344,7 @@ cdef class RequestExchange:
     cdef object _h2_date_bare
     cdef object _handler_task
     cdef bint _head_request
-    # No body bytes follow the response headers (HEAD, or write_headers(body=False)).
+    # No body bytes follow the response headers (HEAD requests).
     cdef bint _skip_body
     cdef bint _expect_continue
     cdef bint _waiting
@@ -378,7 +379,7 @@ cdef class RequestExchange:
     cdef object host_from_arena(self)
     cpdef void respond(self, object body, object content_type, int status=*)
     cdef int _stream_encoding(self, Headers headers, bint allocate) except -1
-    cpdef object write_headers(self, int status_code, bint body=*)
+    cpdef object write_headers(self, int status_code)
     cpdef object write(self, object data)
     cpdef void end(self, object data=*)
     cpdef void abort(self)
@@ -431,7 +432,6 @@ cdef class RequestExchange:
     cdef void _apply_compression(self, object compression)
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1
     cdef int _buf_bytes(self, object data) except -1
-    cdef int _buf_body(self, object body) except -1
     cdef int _buf_uint(self, size_t n, int base) except -1
     cdef void _flush(self)
     cdef Py_ssize_t _body_nbytes(self, object body) except -2

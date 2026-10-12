@@ -20,6 +20,14 @@ cdef extern from "compression_buf.h":
         size_t* out_len,
     )
     void stario_brotli_release(StarioBrotli* brotli)
+    int stario_brotli_compress_borrowed(
+        int level,
+        int window_log,
+        const unsigned char* data,
+        size_t in_len,
+        const unsigned char** out,
+        size_t* out_len,
+    )
 
     ctypedef struct StarioGzip:
         pass

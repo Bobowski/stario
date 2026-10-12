@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioError
 from stario.http.config import RequestPolicy, ServerConfig
@@ -169,7 +168,7 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
             app.add(Route("GET /"), hello)
             yield
@@ -294,7 +293,7 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
             app.add(Route("GET /"), hello)
             yield
@@ -388,7 +387,7 @@ class TestServerRunLifecycle:
             apps.append(app)
 
             async def hello(c, w):
-                responses.text(w, "hello")
+                w.text("hello")
 
             app.add(Route("GET /"), hello)
             yield

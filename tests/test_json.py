@@ -1,15 +1,14 @@
 """Tests for the process-wide Stario JSON codec."""
 
 import json as json_module
-from typing import cast
 
 import pytest
 
 import stario.json as stario_json
-import stario.responses as responses
+from stario import App, Context, Route, Writer
 from stario.datastar import SSE, data, read_signals
-from stario.http.writer import Writer
 from stario.telemetry.formatters import dumps_json
+from stario.testing import TestClient
 from tests.helpers import make_request, make_writer_raw
 
 
@@ -98,23 +97,16 @@ async def test_framework_json_paths_use_configured_codec() -> None:
     codec = RecordingCodec()
     stario_json.set_codec(codec)
 
-    class ResponseWriter:
-        body = b""
-
-        def respond(self, body: bytes, _content_type: bytes, _status: int) -> None:
-            self.body = body
-
-    response_writer = ResponseWriter()
-    responses.json(cast(Writer, response_writer), {"response": True})
-    assert response_writer.body == b'{"response":true}'
-
-    data.signals({"attribute": True})
-
-    writer, _sink, loop = make_writer_raw()
+    json_writer, _sink, loop = make_writer_raw()
+    writer, _sink2, _loop2 = make_writer_raw()
     try:
+        json_writer.json({"response": True})
+        assert json_writer.body == b'{"response":true}'
         SSE(writer).patch_signals({"sse": True})
     finally:
         loop.close()
+
+    data.signals({"attribute": True})
 
     assert await read_signals(
         make_request(method="POST", body=b'{"request":true}')
@@ -128,3 +120,26 @@ async def test_framework_json_paths_use_configured_codec() -> None:
     assert {"attribute": True} in text_values
     assert codec.loaded == [b'{"request":true}']
     assert any(default is str for _value, default in codec.dumped)
+
+
+async def test_writer_json_uses_configured_codec_through_testclient() -> None:
+    """`w.json` on the real RequestHandle honour `set_codec`, not the stdlib."""
+    codec = RecordingCodec()
+    stario_json.set_codec(codec)
+
+    async def handler(_c: Context, w: Writer) -> None:
+        w.json({"response": True})
+
+    app = App()
+    app.add(Route("GET /"), handler)
+    async with TestClient(app) as client:
+        r = await client.get("/")
+
+    assert r.status_code == 200
+    assert [value for value, _default in codec.dumped_bytes] == [{"response": True}]
+    assert (
+        r.content
+        == json_module.dumps(
+            {"response": True}, ensure_ascii=False, separators=(",", ":")
+        ).encode()
+    )

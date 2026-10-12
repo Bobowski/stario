@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
-import stario.responses as responses
-from stario.exceptions import RequestBodyError, StarioError
+from stario.exceptions import StarioError
 from stario.http.context import Context, Handler, Middleware
 from stario.http.writer import Writer
 
@@ -39,19 +38,3 @@ def catch_errors(
         return wrapped
 
     return middleware
-
-
-async def respond_request_body_error(
-    _c: Context,
-    w: Writer,
-    exc: BaseException,
-) -> None:
-    """Write a plain-text 413/408 body for `RequestBodyError`."""
-    if not isinstance(exc, RequestBodyError):
-        raise TypeError(f"expected RequestBodyError, got {type(exc).__name__}")
-    responses.text(w, exc.detail, exc.status_code)
-
-
-def catch_request_body_errors() -> Middleware:
-    """Middleware preset: map uncaught `RequestBodyError` to 413/408."""
-    return catch_errors(RequestBodyError, respond=respond_request_body_error)

@@ -8,7 +8,7 @@ Collaborative painting board — the recommended **first Stario app**. Single-fi
 git clone https://github.com/bobowski/stario.git
 cd stario/examples/tiles
 uv sync
-uv run stario watch main:bootstrap
+uv run python -m main
 ```
 
 Open http://127.0.0.1:8000 — paint in two tabs to see live sync.

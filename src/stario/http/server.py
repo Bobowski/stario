@@ -8,7 +8,6 @@ Bootstrap startup completes before `start_serving`; exceptions there fail startu
 from __future__ import annotations
 
 import asyncio
-import importlib
 import os
 import signal
 import socket
@@ -16,28 +15,24 @@ import stat
 import sys
 import sysconfig
 import threading
-from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from types import FrameType
-from typing import Any, Unpack
+from typing import Any, Literal
 
 from stario._env import env_bool
 from stario.exceptions import StarioError
 from stario.telemetry.core import Span, Tracer
+from stario.telemetry.env import tracer_from_env
 from stario.telemetry.spans import ProxySpan
-from stario_cython.protocol import HttpProtocol
-from stario_cython.timeouts import DATE_TICK_SWEEP_ATTR
+from stario_cython.protocol import Connections, HttpProtocol
 
 from .app import App
-from .bootstrap import (
-    Bootstrap,
-    ShutdownTrigger,
-    bootstrap_run,
-)
+from .bootstrap import AppRun, Bootstrap, run_app
 from .compression import CompressionConfig
-from .config import EventLoopKind, RequestPolicy, ServerConfig, ServerOptions
+from .config import RequestPolicy, ServerConfig
 
 type Connection = Any
 type ProtocolMaker = Callable[
@@ -47,7 +42,7 @@ type ProtocolMaker = Callable[
         Tracer,
         list[bytes],
         CompressionConfig,
-        set[Connection],
+        Connections,
         RequestPolicy,
     ],
     asyncio.Protocol,
@@ -60,7 +55,7 @@ def _make_http_protocol(
     tracer: Tracer,
     date_box: list[bytes],
     compression: CompressionConfig,
-    connections: set[Connection],
+    connections: Connections,
     requests: RequestPolicy,
 ) -> asyncio.Protocol:
     return HttpProtocol(
@@ -83,7 +78,7 @@ def _make_http_protocol(
 type SignalHandler = Callable[[int, FrameType | None], object]
 type PreviousSignalHandler = signal.Handlers | int | SignalHandler | None
 
-type LoopRun[T] = Callable[[Coroutine[Any, Any, T]], T]
+type EventLoopKind = Literal["asyncio", "uvloop"]
 
 # Upper bound on the force-close loop after the graceful wait (see _drain_listener).
 _FORCE_CLOSE_CAP = 1.0
@@ -105,63 +100,11 @@ def loop_implementation(
     return "asyncio"
 
 
-def require_configured_loop(
-    event_loop: EventLoopKind,
-    *,
-    loop: asyncio.AbstractEventLoop | None = None,
-    where: str,
-) -> EventLoopKind:
-    """Refuse to continue when this thread's loop is not `STARIO_LOOP`."""
-    actual = loop_implementation(loop)
-    if actual != event_loop:
-        raise StarioError(
-            f"{where} is running {actual}, configured {event_loop}",
-            help_text=(
-                "Every worker uses Server.loop_runner() from STARIO_LOOP. "
-                "Do not install a different event loop policy in the process."
-            ),
-        )
-    return actual
-
-
 def _stdlib_loop_factory() -> asyncio.AbstractEventLoop:
     """Stdlib loop, ignoring a process-wide uvloop policy."""
     if sys.platform == "win32":
         return asyncio.ProactorEventLoop()
     return asyncio.SelectorEventLoop()
-
-
-def _asyncio_run[T](main: Coroutine[Any, Any, T]) -> T:
-    return asyncio.run(main, loop_factory=_stdlib_loop_factory)
-
-
-def resolve_loop_runner(event_loop: EventLoopKind) -> LoopRun[Any]:
-    """Return the runner that constructs `event_loop` on the calling thread.
-
-    `asyncio` always uses a stdlib loop factory so `uvloop.install()` cannot
-    leak into workers. `uvloop` is `uvloop.run`.
-    """
-    if event_loop == "asyncio":
-        return _asyncio_run
-    if sys.platform == "win32":
-        raise StarioError(
-            "uvloop is not supported on Windows",
-            help_text="Set event_loop='asyncio' in ServerConfig.",
-        )
-    try:
-        uvloop = importlib.import_module("uvloop")
-    except ImportError as exc:
-        raise StarioError(
-            "uvloop is not installed",
-            help_text="Install uvloop or set event_loop='asyncio' in ServerConfig.",
-        ) from exc
-    run = getattr(uvloop, "run", None)
-    if run is None:
-        raise StarioError(
-            "uvloop does not expose run()",
-            help_text="Set event_loop='asyncio' in ServerConfig.",
-        )
-    return run
 
 
 def gil_is_enabled() -> bool:
@@ -192,6 +135,38 @@ def require_thread_workers(threads: int) -> None:
         "STARIO_THREADS>1 requires free-threaded Python (3.14t)",
         help_text="Run a 3.14t interpreter or set STARIO_THREADS=1.",
     )
+
+
+def allowed_cpus() -> list[int]:
+    """CPUs this process may run on (cgroup / ``taskset`` aware). Empty if unknown."""
+    getter = getattr(os, "sched_getaffinity", None)
+    if getter is None:
+        return []
+    try:
+        return sorted(getter(0))
+    except OSError:
+        return []
+
+
+def pin_worker_cpu(index: int, allowed: list[int]) -> int | None:
+    """Pin the calling thread to one of ``allowed``; return the CPU, or None.
+
+    Worker ``index`` takes the ``index``-th allowed CPU, wrapping when there
+    are more workers than CPUs. Linux only; elsewhere a no-op. ``allowed``
+    is read once before any thread is pinned: a new thread inherits its
+    parent's mask, so a pinned leader must not be the source of truth.
+    A pinned loop keeps its caches and its ``SO_REUSEPORT`` connections on
+    one core instead of migrating between them.
+    """
+    setter = getattr(os, "sched_setaffinity", None)
+    if setter is None or not allowed:
+        return None
+    cpu = allowed[index % len(allowed)]
+    try:
+        setter(0, {cpu})
+    except OSError:
+        return None
+    return cpu
 
 
 _tcp_reuseport_ok: bool | None = None
@@ -273,17 +248,18 @@ class _LoopWorker:
         index: int,
         app: App,
         server: Server,
-        loop_run: LoopRun[Any],
+        loop_factory: Callable[[], asyncio.AbstractEventLoop],
     ) -> None:
         self.index = index
         self.app = app
         self.server = server
-        self.loop_run = loop_run
+        self.loop_factory = loop_factory
         self.loop: asyncio.AbstractEventLoop | None = None
         self.loop_kind: EventLoopKind | None = None
-        self.connections: set[Connection] = set()
+        self.connections = Connections(server_driven=True)
         self.date_box: list[bytes] = [b""]
         self.listen_sock: socket.socket | None = None
+        self.cpu: int | None = None
         self.ready = threading.Event()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
@@ -299,7 +275,10 @@ class _LoopWorker:
 
     def _run(self) -> None:
         try:
-            self.loop_run(self.server.run_reuseport_worker(self))
+            if self.server.config.pin_threads:
+                self.cpu = pin_worker_cpu(self.index, self.server.cpus)
+            with asyncio.Runner(loop_factory=self.loop_factory) as runner:
+                runner.run(self.server.run_reuseport_worker(self))
         except BaseException as exc:
             self.error = exc
             with suppress(Exception):
@@ -310,41 +289,29 @@ class _LoopWorker:
 
 async def serve(
     bootstrap: Bootstrap,
-    tracer: Tracer | None = None,
     *,
     config: ServerConfig | None = None,
-    **options: Unpack[ServerOptions],
+    tracer: Tracer | None = None,
 ) -> None:
     """Serve HTTP until shutdown on the running event loop.
 
     Start a loop with the implementation you want::
 
-        asyncio.run(serve(bootstrap, port=9000))
+        asyncio.run(serve(bootstrap))
         uvloop.run(serve(bootstrap))
 
-    Listen settings are `ServerConfig` fields (`host`, `port`, …). Pass a
-    prepared `config=` instead when you already have one. Do not mix the two.
+    When `config=` is omitted, listen settings come from the `STARIO_*`
+    environment variables (see `ServerConfig.from_env`). When it is passed,
+    it is used as-is — environment variables are not merged in.
 
     A tracer you pass in must already be entered and is not closed here.
-    When omitted, a TTY or JSON tracer is created and scoped to this call.
+    When omitted, `STARIO_TRACER` is read via `tracer_from_env()` and the
+    tracer is scoped to this call.
     """
-    if config is not None and options:
-        raise StarioError(
-            "Pass config= or listen fields, not both",
-            help_text="Use serve(bootstrap, config=cfg) or serve(bootstrap, port=9000).",
-        )
-    resolved = config if config is not None else ServerConfig(**options)
+    resolved = config if config is not None else ServerConfig.from_env()
     if tracer is None:
-        if sys.stdout.isatty():
-            from stario.telemetry.tty import TTYTracer
-
-            tracer = TTYTracer()
-        else:
-            from stario.telemetry.json import json_tracer_from_env
-
-            tracer = json_tracer_from_env()
-        with tracer:
-            await Server(bootstrap, tracer, config=resolved).serve()
+        with tracer_from_env() as env_tracer:
+            await Server(bootstrap, env_tracer, config=resolved).serve()
         return
     await Server(bootstrap, tracer, config=resolved).serve()
 
@@ -352,10 +319,10 @@ async def serve(
 class Server:
     """Binds a listener, runs bootstrap on a fresh app, serves until SIGINT/SIGTERM, then drains.
 
-    One instance, one `serve()` / `run()` — create a new `Server` to restart.
+    One instance, one `serve()` — create a new `Server` to restart.
 
-    Typical embedding is `await stario.serve(bootstrap, port=9000)` or
-    `Server(bootstrap, tracer, config=cfg).run()`.
+    Typical embedding is `await stario.serve(bootstrap)` or
+    `await Server(bootstrap, tracer, config=cfg).serve()` inside `asyncio.run`.
 
     `STARIO_THREADS>1` is N `SO_REUSEPORT` listeners (thread 0 included).
     Without kernel support the server stays single-threaded.
@@ -373,7 +340,7 @@ class Server:
 
         - `bootstrap`: Async generator `(app, span)` with a single `yield`.
         - `tracer`: Telemetry backend. Must already be entered; not closed here.
-        - `config`: Listen address, limits, compression, shutdown, and event loop.
+        - `config`: Listen address, limits, compression, and shutdown policy.
         - `make_protocol`: Optional factory; default is the Cython HTTP protocol.
         """
         self.bootstrap = bootstrap
@@ -384,30 +351,11 @@ class Server:
         self._used = False
         self._date_box = [b""]
         self._urgent_drain = False
-        self._live_connections: set[Connection] | None = None
-        self._loop_run: LoopRun[Any] | None = None
-        self._owns_loop = False
+        self._live_connections: Connections | None = None
         self._thread_count = 1
         self._leader_sock: socket.socket | None = None
-
-    def loop_runner(self) -> LoopRun[Any]:
-        """Event-loop runner for this process (`asyncio` stdlib or `uvloop.run`).
-
-        `run()` and every extra worker thread use this same callable so
-        `STARIO_LOOP` is forwarded, not re-detected per thread. asyncio
-        workers do not inherit a process-wide uvloop policy.
-        """
-        if self._loop_run is None:
-            self._loop_run = resolve_loop_runner(self.config.event_loop)
-        return self._loop_run
-
-    def run(self) -> None:
-        """Block until shutdown; picks the event loop from `config.event_loop`.
-
-        The tracer must already be entered by the caller (see `cli/runtime.py`).
-        """
-        self._owns_loop = True
-        self.loop_runner()(self.serve())
+        # Allowed CPUs, read before any thread is pinned (see pin_worker_cpu).
+        self.cpus: list[int] = []
 
     async def serve(self) -> None:
         """Run until SIGINT/SIGTERM (or fatal error); requires a running event loop.
@@ -421,65 +369,31 @@ class Server:
             )
         self._used = True
 
-        if self._owns_loop:
-            require_configured_loop(self.config.event_loop, where="Server.run")
-
         self._thread_count = self._effective_threads()
         if self._thread_count > 1:
             require_thread_workers(self._thread_count)
-            # Resolve once on this thread; extra workers call this same runner
-            # instead of re-detecting STARIO_LOOP.
-            self.loop_runner()
 
-        app = App()
-        span = self._open_startup_span()  # ProxySpan: startup → shutdown via replace()
-
-        # Signal handlers stay active through span.end(); see _signal_handlers.
-        with self._signal_handlers(app):
-            try:
+        async with run_app(self.bootstrap, self.tracer) as run:
+            app = run.app
+            self._record_startup_attrs(run.span)
+            # Signal handlers stay active through the shutdown span; see _signal_handlers.
+            with self._signal_handlers(app):
                 if self._thread_count > 1:
-                    async with bootstrap_run(self.bootstrap, app, span):
-                        await self._serve_reuseport(app, span)
+                    await self._serve_reuseport(run)
                 else:
                     with self._listen_socket() as listen_sock:
                         async with (
-                            bootstrap_run(self.bootstrap, app, span),
                             self._date_tick(),
-                            self._listener(listen_sock, app, span),
+                            self._listener(listen_sock, run),
                         ):
                             # Blocks until a signal (or test code) completes app.shutdown.
                             await app.shutdown
-            except BaseException as exc:
-                span.exception(exc)
-                span.fail(str(exc))
-                raise
-            finally:
-                # Safety net: unblock shutdown waiters when serve ends without a signal.
-                app.signal_shutdown()
-
-                # Ends whichever span ProxySpan currently points at (usually shutdown).
-                span.end()
-
-    def _open_startup_span(self) -> ProxySpan:
-        span = self.tracer.create("server.startup")
-        span.start()
-        self._record_startup_attrs(span)
-        return ProxySpan(span)
-
-    def _open_shutdown_span(self, span: ProxySpan, trigger: ShutdownTrigger) -> None:
-        # Swap startup → shutdown on the same handle so serve() can span.end() once.
-        startup_id = span.id
-        shutdown = self.tracer.create("server.shutdown")
-        shutdown.link("server.startup", startup_id)
-        shutdown.attr("server.shutdown.trigger", trigger)
-        shutdown.start()
-        span.replace(shutdown)
 
     async def _create_listener(
         self,
         listen_sock: socket.socket | None,
         app: App,
-        connections: set[Connection],
+        connections: Connections,
         *,
         date_box: list[bytes] | None = None,
         reuse_port: bool = False,
@@ -530,7 +444,7 @@ class Server:
         self,
         server: asyncio.Server,
         app: App,
-        connections: set[Connection],
+        connections: Connections,
         span: ProxySpan | None = None,
     ) -> None:
         """Stop accepting, drain in-flight work, then tear down transports and tasks.
@@ -599,7 +513,7 @@ class Server:
 
     async def _wait_for_managed_work_to_drain(
         self,
-        connections: set[Connection],
+        connections: Connections,
         tasks: set[asyncio.Task[Any]],
     ) -> None:
         # Wait until no open connections and no pending app.create_task work, or timeout.
@@ -625,7 +539,7 @@ class Server:
             else:
                 await asyncio.sleep(timeout)
 
-    async def _force_close_open_transports(self, connections: set[Connection]) -> int:
+    async def _force_close_open_transports(self, connections: Connections) -> int:
         transports = [
             protocol.transport
             for protocol in connections
@@ -855,52 +769,33 @@ class Server:
     async def _listener(
         self,
         listen_sock: socket.socket | None,
-        app: App,
-        span: ProxySpan,
+        run: AppRun,
     ) -> AsyncGenerator[asyncio.Server]:
         """Bind on enter; drain in-flight work on exit."""
-        connections: set[Connection] = set()
+        app = run.app
+        connections = Connections(server_driven=True)
         self._live_connections = connections
         listener = await self._create_listener(listen_sock, app, connections)
 
         # Startup span ends once we are listening; shutdown span opens on exit.
-        span.attr("server.listening", True)
-        span.end()
+        run.span.attr("server.listening", True)
+        run.end_startup()
         try:
             yield listener
         except BaseException:
-            self._open_shutdown_span(span, "runtime_failure")
+            run.begin_shutdown("runtime_failure")
             raise
         else:
-            self._open_shutdown_span(span, "expected_stop")  # signal or app.shutdown
+            run.begin_shutdown("expected_stop")  # signal or app.shutdown
         finally:
-            await self._drain_listener(listener, app, connections, span)
+            await self._drain_listener(listener, app, connections, run.span)
             self._live_connections = None
-
-    def _sweep_connection_timeouts(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        connections: set[Connection] | None = None,
-    ) -> None:
-        """Compare stored deadlines to one ``loop.time()`` (Date-tick cadence)."""
-        live = self._live_connections if connections is None else connections
-        if not live:
-            return
-        now = loop.time()
-        for proto in tuple(live):
-            check = getattr(proto, "check_timeouts", None)
-            if check is None:
-                continue
-            try:
-                check(now)
-            except Exception:
-                continue
 
     @asynccontextmanager
     async def _date_tick(
         self,
         date_box: list[bytes] | None = None,
-        connections: set[Connection] | None = None,
+        connections: Connections | None = None,
     ) -> AsyncGenerator[None]:
         """Refresh Date, then once per second also sweep connection timeouts.
 
@@ -915,20 +810,20 @@ class Server:
             box[0] = b"date: %s\r\n" % format_datetime(now, usegmt=True).encode("ascii")
 
         loop = asyncio.get_running_loop()
-        setattr(loop, DATE_TICK_SWEEP_ATTR, True)
 
         async def tick() -> None:
             while True:
                 await asyncio.sleep(1)
                 refresh()
-                self._sweep_connection_timeouts(loop, connections)
+                live = self._live_connections if connections is None else connections
+                if live is not None:
+                    live.sweep(loop.time())
 
         refresh()  # first value before any connection can read it
         task = asyncio.create_task(tick())
         try:
             yield
         finally:
-            setattr(loop, DATE_TICK_SWEEP_ATTR, False)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
@@ -936,11 +831,7 @@ class Server:
     async def run_reuseport_worker(self, worker: _LoopWorker) -> None:
         """Extra thread: bind SO_REUSEPORT, serve until shutdown, then drain."""
         loop = asyncio.get_running_loop()
-        kind = require_configured_loop(
-            self.config.event_loop,
-            loop=loop,
-            where=f"worker {worker.index}",
-        )
+        kind = loop_implementation(loop)
         worker.loop = loop
         worker.loop_kind = kind
         worker.app.attach_loop(loop)
@@ -966,20 +857,35 @@ class Server:
             if sock is not None:
                 sock.close()
 
-    async def _serve_reuseport(self, app: App, span: ProxySpan) -> None:
+    async def _serve_reuseport(self, run: AppRun) -> None:
         """Thread 0 listens and orchestrates; extras are the same kind of server."""
-        runner = self.loop_runner()
+        app = run.app
+        span = run.span
+        # Extra workers create the same loop class as the loop running serve().
+        kind = loop_implementation()
+        if kind == "uvloop":
+            import uvloop
+
+            loop_factory: Callable[[], asyncio.AbstractEventLoop] = (
+                uvloop.new_event_loop
+            )
+        else:
+            loop_factory = _stdlib_loop_factory
         extras = [
             _LoopWorker(
                 index=index,
                 app=app,
                 server=self,
-                loop_run=runner,
+                loop_factory=loop_factory,
             )
             for index in range(1, self._thread_count)
         ]
-        if self._owns_loop:
-            require_configured_loop(self.config.event_loop, where="Server.run")
+        if self.config.pin_threads:
+            # Thread 0 is a full worker too; it takes CPU slot 0. Read the
+            # mask first: the extra threads inherit whatever is set here.
+            self.cpus = allowed_cpus()
+            leader_cpu = pin_worker_cpu(0, self.cpus)
+            span.attr("server.pin_threads", leader_cpu is not None)
         unix_socket = self.config.unix_socket
         unix = unix_socket is not None
         sock = self._bind_reuseport(leader=True) if unix else None
@@ -987,7 +893,7 @@ class Server:
         if unix_socket is not None:
             bound = os.stat(unix_socket)
             unix_file_id = (bound.st_dev, bound.st_ino)
-        connections: set[Connection] = set()
+        connections = Connections(server_driven=True)
         join_timeout = (
             max(self.config.graceful_shutdown_timeout, 0.0) + _FORCE_CLOSE_CAP + 1.0
         )
@@ -1009,37 +915,23 @@ class Server:
                         if not started:
                             raise StarioError(
                                 f"worker {worker.index} failed to start",
-                                help_text=(
-                                    "Check worker thread logs; STARIO_LOOP must "
-                                    "match a usable runner."
-                                ),
+                                help_text="Check worker thread logs.",
                             )
                         if worker.error is not None:
                             raise worker.error
-                    kinds = {worker.loop_kind for worker in extras}
-                    if self._owns_loop:
-                        kinds.add(loop_implementation())
-                    if kinds and kinds != {self.config.event_loop}:
-                        raise StarioError(
-                            "worker event loops do not match STARIO_LOOP",
-                            help_text=(
-                                f"configured {self.config.event_loop}, workers running "
-                                f"{', '.join(sorted(k for k in kinds if k is not None)) or 'nothing'}."
-                            ),
-                        )
-                    span.attr("server.worker_event_loop", self.config.event_loop)
+                    span.attr("server.worker_event_loop", kind)
                     span.attr("server.listen_balance", "reuseport")
                     span.attr("server.listening", True)
-                    span.end()
+                    run.end_startup()
                     try:
                         await app.shutdown
                     except BaseException:
-                        self._open_shutdown_span(span, "runtime_failure")
+                        run.begin_shutdown("runtime_failure")
                         raise
                     else:
-                        self._open_shutdown_span(span, "expected_stop")
+                        run.begin_shutdown("expected_stop")
                     finally:
-                        await self._drain_listener(listener, app, connections, span)
+                        await self._drain_listener(listener, app, connections, run.span)
                 finally:
                     app.signal_shutdown()
                     for worker in extras:

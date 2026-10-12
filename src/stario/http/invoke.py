@@ -1,7 +1,8 @@
 """Handler-task finish: log failures, send 500 if nothing was sent, close the span.
 
-Does not map exception types to HTTP. A write-then-raise
-keeps the bytes already on the wire. Cancellation still aborts.
+The framework's own exceptions (`RedirectException`, `RequestBodyError`) map to
+HTTP when nothing was sent; everything else is logged and becomes a 500.
+A write-then-raise keeps the bytes already on the wire. Cancellation still aborts.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import asyncio
 import logging
 from typing import Any
 
+from stario.exceptions import RedirectException, RequestBodyError, StarioError
 from stario.http.context import Context
 from stario.http.writer import Writer
 from stario.telemetry.core import Span
@@ -31,6 +33,24 @@ def _finish_incomplete(w: Writer) -> None:
     w.headers.remove("transfer-encoding")
     w.headers.set("connection", "close")
     w.respond(_INTERNAL_ERROR, _PLAIN, 500)
+
+
+def _answer_framework_exception(w: Writer, exc: BaseException) -> bool:
+    """Map Stario's own exceptions to a response; ``False`` = log + 500 path."""
+    try:
+        if isinstance(exc, RedirectException):
+            w.redirect(exc.location, exc.status_code)
+            return True
+        if isinstance(exc, RequestBodyError):
+            if exc.status_code == 408:
+                # The upload stalled; the connection is not worth keeping
+                # (RFC 9110 15.5.9: a 408 carries the close option).
+                w.headers.set("connection", "close")
+            w.text(exc.detail, exc.status_code)
+            return True
+    except StarioError:
+        return False
+    return False
 
 
 def finish_request_span(
@@ -69,11 +89,12 @@ def on_handler_done(c: Context, w: Writer, task: asyncio.Task[Any]) -> None:
     else:
         exc = task.exception()
         if exc is not None:
-            _log.error("Handler failed", exc_info=exc)
-            if record:
-                span.fail(str(exc))
-                span.exception(exc)
-            _finish_incomplete(w)
+            if w.started or not _answer_framework_exception(w, exc):
+                _log.error("Handler failed", exc_info=exc)
+                if record:
+                    span.fail(str(exc))
+                    span.exception(exc)
+                _finish_incomplete(w)
         elif not w.completed:
             _log.error(
                 "Handler returned without sending a response (%s %s)",

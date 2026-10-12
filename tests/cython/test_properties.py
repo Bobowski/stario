@@ -15,7 +15,6 @@ from urllib.parse import quote, quote_plus
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-import stario.responses as responses
 from stario import App, Route
 from stario_cython.exchange import ParsedQuery
 from tests.cython.http import read_chunk, read_response, running_server
@@ -48,13 +47,8 @@ def test_query_wellformed_pairs_roundtrip(items):
 @settings(max_examples=200, deadline=None)
 def test_query_arbitrary_bytes_invariants(raw):
     q = ParsedQuery(raw)
-    try:
-        items = q.items()
-    except ValueError as exc:
-        # NUL bytes in a query are a deliberate rejection, not a crash.
-        if "NUL" not in str(exc) or (b"\x00" not in raw and b"%00" not in raw.lower()):
-            raise
-        return
+    # Any byte string indexes without raising; the protocol rejects NULs first.
+    items = q.items()
     assert len(q) == len({k for k, _v in items})
     assert bool(q) == bool(items)
     for key, _value in items:
@@ -263,7 +257,7 @@ def test_path_param_percent_decoding(seg):
         app = App()
 
         async def page(c, w):
-            responses.text(w, c.match.params["id"])
+            w.text(c.match.params["id"])
 
         app.add(Route("GET /u/{id}"), page)
         async with running_server(app) as port:

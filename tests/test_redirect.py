@@ -2,9 +2,8 @@
 
 import pytest
 
-import stario.responses as responses
 from stario.exceptions import StarioError
-from stario.responses import normalized_location
+from stario.http.redirect import normalized_location
 from tests.helpers import make_writer_raw
 
 SAFE_REDIRECT_TARGETS = [
@@ -47,6 +46,6 @@ def test_redirect_rejects_non_3xx_status() -> None:
     w, _sink, loop = make_writer_raw()
     try:
         with pytest.raises(StarioError, match="3xx"):
-            responses.redirect(w, "/ok", 200)
+            w.redirect("/ok", 200)
     finally:
         loop.close()

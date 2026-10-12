@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Protocol, Self
 
 if TYPE_CHECKING:
     from stario.http.headers import Headers
+    from stario.json import JsonValue
+    from stario.markup.types import HtmlElement
 
 
 class Writer(Protocol):
@@ -50,11 +52,11 @@ class Writer(Protocol):
         """Close without framing a failed started response as complete."""
         ...
 
-    def write_headers(self, status_code: int, *, body: bool = True) -> Self:
+    def write_headers(self, status_code: int) -> Self:
         """Send the status line and current ``headers`` (at most once).
 
-        ``body=False`` is for HEAD (and equivalent): keep ``Content-Length`` as
-        the entity size without requiring those bytes before ``end()``.
+        HEAD is handled by the server: the headers go out exactly as declared
+        (``Content-Length`` keeps the GET entity size) and the body is dropped.
         """
         ...
 
@@ -74,6 +76,26 @@ class Writer(Protocol):
 
     def end(self, data: bytes | None = None) -> None:
         """Finish the response. Optional final body bytes."""
+        ...
+
+    def text(self, body: str, status: int = 200) -> None:
+        """Send `body` as UTF-8 ``text/plain`` and finish the response."""
+        ...
+
+    def json(self, value: JsonValue, status: int = 200) -> None:
+        """Serialize `value` to compact UTF-8 JSON and finish the response."""
+        ...
+
+    def html(self, content: bytes | str | HtmlElement, status: int = 200) -> None:
+        """Send `bytes`, `str`, or markup nodes as ``text/html``."""
+        ...
+
+    def redirect(self, url: str, status: int = 307) -> None:
+        """Send a redirect with an empty body and a ``Location`` header."""
+        ...
+
+    def empty(self, status: int = 204) -> None:
+        """Finish with no message body (default ``204 No Content``)."""
         ...
 
 

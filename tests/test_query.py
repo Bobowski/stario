@@ -1,8 +1,7 @@
 """Unit tests for query string parsing."""
 
-import pytest
-
 from stario.http.query import ParsedQuery
+from stario_cython.exchange import request_query_ok
 
 
 def test_empty_query() -> None:
@@ -21,9 +20,14 @@ def test_percent_decoding() -> None:
     assert ParsedQuery(b"q=100%25").get("q") == "100%"
 
 
-def test_nul_in_query_value_is_rejected() -> None:
-    with pytest.raises(ValueError, match="NUL"):
-        ParsedQuery(b"file=foo%00.txt").get("file")
+def test_nul_in_query_decodes_like_urllib() -> None:
+    # The HTTP protocol answers 400 before a handler can see this. A query
+    # built by hand decodes the way ``urllib.parse.unquote_plus`` does.
+    assert ParsedQuery(b"file=foo%00.txt").get("file") == "foo\x00.txt"
+    assert ParsedQuery(b"a%00b=1").get("a\x00b") == "1"
+    assert not request_query_ok(b"file=foo%00.txt")
+    assert not request_query_ok(b"a\x00=1")
+    assert request_query_ok(b"a=%2500")
 
 
 def test_blank_and_bare_keys() -> None:

@@ -18,7 +18,7 @@ from dominate import tags as dt
 from tdom import html
 
 from stario.markup import baked, classes, data, render
-from stario.markup import html as h
+from stario import h
 
 ROW_COUNT = 50
 ROWS = [

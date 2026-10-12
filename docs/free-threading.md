@@ -4,9 +4,15 @@
 process. Thread 0 bootstraps, installs signals, and is also a server.
 Every thread binds the same TCP `host:port` with `SO_REUSEPORT` and runs
 its own `create_server` — accept, parse, and handlers stay on that loop.
-The kernel load-balances new connections. `Server.loop_runner()` resolves
-`STARIO_LOOP` once (stdlib asyncio with an explicit loop factory, or
-`uvloop.run`) and each thread refuses to start on the other library.
+The kernel load-balances new connections. Every worker thread creates the
+same loop class as the loop running `serve()` (stdlib asyncio or uvloop).
+
+`STARIO_PIN_THREADS=1` pins each worker thread to one allowed CPU on Linux
+(`sched_setaffinity`, cgroup aware). Thread 0 takes CPU slot 0; the allowed
+set is read before any pin because a new thread inherits its parent's mask.
+That inheritance is also why pinning is opt-in: `asyncio.to_thread`
+executors and writer threads started from a pinned worker share its one
+CPU. Measure before turning it on.
 
 If this kernel cannot share the listen address with `SO_REUSEPORT`
 (typical for Unix sockets; Windows has no flag), Stario stays at **one**
@@ -20,7 +26,7 @@ be locked or made thread-local, and how app state should cross workers.
 
 ## Why this is worth it
 
-Today `stario serve` is one OS thread and one event loop. Concurrent
+Today `serve()` is one OS thread and one event loop. Concurrent
 connections multiplex, but Python bytecode for handlers still runs serially.
 That is the gap versus Granian-on-several-workers and versus any native
 server that actually uses the other cores.
@@ -140,9 +146,9 @@ That cannot be shared as-is.
 | Stay on the shared `App` / `Router` | Move per worker loop |
 | --- | --- |
 | Compiled trie (read-only after bootstrap) | `shutdown` Future |
-| Registered handlers / middleware | `tasks` set (or drop it and use `asyncio.all_tasks()`) |
+| Registered handlers / middleware | `tasks` set (per thread via `threading.local`; each protocol binds its loop's set once) |
 | `host_routing` | `connections` set |
-| | Date-header box + 1s timeout sweep |
+| | Date-header box + `Connections` registry (1s C sweep) |
 | | `HttpProtocol.loop` |
 
 Concrete shutdown:
@@ -170,8 +176,10 @@ accept the cost.
 
 - `publish` is sync and lock-based; safe from any OS thread.
 - Each subscription binds to the loop that `async with`’d it.
-- Same-loop deliver is inline; other loops go through
-  `call_soon_threadsafe`.
+- Same-loop deliver is inline. A publish from another thread appends to
+  the inbox under its lock and schedules one `call_soon_threadsafe` wake
+  per burst, only while a `receive()` is blocked. A subscriber that keeps
+  up costs its publisher no loop hop at all.
 - Tests already cover worker-thread publish and two loops
   (`tests/test_relay.py`).
 
@@ -290,7 +298,7 @@ Native protocol talks to libbrotli / libzstd directly (`compression_buf.c`).
 Python `CompressionConfig` and `Files` / `Assets` use the same libs through
 `stario_cython.codecs` — no Python `brotli` / `zstandard` import, so those
 packages cannot re-enable the GIL. `xxhash` (Assets hashing at bootstrap)
-still can. `watchfiles` is the parent of `stario watch` only.
+still can.
 
 ### 2. Server / App — will not boot correctly on N loops
 

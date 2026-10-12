@@ -34,15 +34,10 @@ cdef extern from "llhttp.h":
         llhttp_cb on_reset
 
     enum llhttp_type:
-        HTTP_BOTH
         HTTP_REQUEST
-        HTTP_RESPONSE
 
     enum llhttp_errno:
         HPE_OK
-        HPE_PAUSED
-        HPE_PAUSED_UPGRADE
-        HPE_USER
 
     void llhttp_init(llhttp_t* parser, llhttp_type type, const llhttp_settings_t* settings)
     int llhttp_execute(llhttp_t* parser, const char* data, size_t len)
@@ -52,7 +47,6 @@ cdef extern from "llhttp.h":
     uint8_t llhttp_get_http_minor(llhttp_t* parser)
     uint8_t llhttp_get_upgrade(llhttp_t* parser)
     const char* llhttp_method_name(int method)
-    const char* llhttp_get_error_reason(const llhttp_t* parser)
 
 
 cdef extern from "stario_alloc.h":

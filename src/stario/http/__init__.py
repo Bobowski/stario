@@ -20,7 +20,7 @@ from stario.http.config import RequestPolicy, ServerConfig, server_config_from_e
 from stario.http.redirect import normalized_location
 from stario.http.server import Server
 
-asyncio.run(serve(bootstrap, port=9000))
+asyncio.run(serve(bootstrap))
 ```
 
 Filesystem serving lives in `stario.filesystem` (`Files`).
@@ -28,14 +28,11 @@ For tests, import `aload_app` from `stario.testing`.
 """
 
 from stario.http.app import App
+from stario.http.bootstrap import AppRun, run_app
 from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
 from stario.http.headers import Headers, RequestHeaders
-from stario.http.middleware import (
-    catch_errors,
-    catch_request_body_errors,
-    respond_request_body_error,
-)
+from stario.http.middleware import catch_errors
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
 from stario.http.request import ParsedCookies, Request
@@ -44,6 +41,7 @@ from stario.http.writer import Writer
 
 __all__ = [
     "App",
+    "AppRun",
     "Context",
     "Handler",
     "Headers",
@@ -57,9 +55,8 @@ __all__ = [
     "Router",
     "Writer",
     "catch_errors",
-    "catch_request_body_errors",
     "default_not_found",
     "method_not_allowed_handler",
     "normalized_location",
-    "respond_request_body_error",
+    "run_app",
 ]

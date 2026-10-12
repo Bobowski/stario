@@ -4,6 +4,7 @@ import pytest
 
 from stario.http.headers import (
     Headers,
+    RequestHeaders,
     encode_header_value,
 )
 
@@ -218,3 +219,21 @@ class TestHeadersEdgeCases:
         h.add("Set-Cookie", "b=2")
         assert h.setdefault("Set-Cookie", "c=3") == "a=1"
         assert h.getlist("Set-Cookie") == ["a=1", "b=2"]
+
+
+class TestRequestHeadersLookup:
+    """A name no request can carry is simply absent."""
+
+    @pytest.mark.parametrize("name", ["x y", "", "é", "x" * 300, "Bad@Name"])
+    def test_get_and_getlist_treat_invalid_names_as_absent(self, name):
+        h = RequestHeaders({"host": "a", "x-y": "1"})
+        assert h.get(name) is None
+        assert h.get(name, "default") == "default"
+        assert h.getlist(name) == []
+        assert name not in h
+
+    def test_valid_names_fold_case(self):
+        h = RequestHeaders({"host": "a", "x-y": ["1", "2"]})
+        assert h.get("X-Y") == "1"
+        assert h.getlist("X-Y") == ["1", "2"]
+        assert "HOST" in h

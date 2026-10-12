@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-import stario.responses as responses
 from stario import App, Route
 from stario.exceptions import StarioError
 from tests.cython import h2wire as h2
@@ -35,8 +34,7 @@ def _echo_app() -> App:
 
     async def show(c, w) -> None:
         params = ",".join(f"{k}={v}" for k, v in sorted(c.match.params.items()))
-        responses.text(
-            w,
+        w.text(
             f"{c.req.method} {c.req.path} {c.req.raw_path.decode()} [{params}] {c.req.host}",
         )
 
@@ -107,6 +105,8 @@ async def test_dot_segments_and_trailing_slash_redirect_to_canonical_path(
         b"/a/%0D%0Ax",
         b"/a/%7F",
         b"/a/%00",
+        b"/a?x=%00",
+        b"/a?%00=1",
         b"/a#frag",
         b"/a?x=1#frag",
         b"/a/%zz",
@@ -158,7 +158,7 @@ async def test_bad_target_in_a_pipeline_is_answered_in_order() -> None:
 
     async def slow(_c, w) -> None:
         await asyncio.sleep(0.05)
-        responses.text(w, "slow")
+        w.text("slow")
 
     app.add(Route("GET /slow"), slow)
     async with running_server(app) as port:
@@ -179,7 +179,7 @@ async def test_h2_bad_path_fails_only_its_stream() -> None:
 
     async def slow(_c, w) -> None:
         await asyncio.sleep(0.2)
-        responses.text(w, "slow ok")
+        w.text("slow ok")
 
     app.add(Route("GET /slow"), slow)
     app.add(Route("GET /a/{x}"), slow)
@@ -215,7 +215,7 @@ async def test_no_content_statuses_omit_content_length() -> None:
     app = App()
 
     async def empty(_c, w) -> None:
-        responses.empty(w)
+        w.empty()
 
     async def ended(_c, w) -> None:
         w.headers.set("x-kind", "end")
@@ -245,7 +245,7 @@ async def test_respond_rejects_non_final_status() -> None:
             w.respond(b"", b"text/plain", 101)
         except StarioError as exc:
             errors.append(str(exc))
-        responses.text(w, "ok")
+        w.text("ok")
 
     app.add(Route("GET /"), informational)
     async with running_server(app) as port:
