@@ -470,6 +470,26 @@ class TestServing:
         assert files.stats["cached_files"] == 1
         assert files.stats["compressed_files"] == 1
 
+    async def test_precompressed_files_prefer_br_over_zstd(
+        self, tmp_path: Path
+    ) -> None:
+        payload = ("body { color: red; }\n" * 100).encode()
+        (tmp_path / "app.css").write_bytes(payload)
+        files = Files(tmp_path)
+
+        async with TestClient(
+            await _loaded(
+                files,
+                precompress=("br", "zstd"),
+                compression=CompressionConfig(min_size=1),
+            )
+        ) as client:
+            response = await client.get(
+                "/data/app.css", headers={"Accept-Encoding": "br, zstd"}
+            )
+
+        assert response.headers.get("content-encoding") == "br"
+
     async def test_svg_is_precompressed(self, tmp_path: Path) -> None:
         payload = b'<svg xmlns="http://www.w3.org/2000/svg">' + b"<g/>" * 80 + b"</svg>"
         (tmp_path / "icon.svg").write_bytes(payload)

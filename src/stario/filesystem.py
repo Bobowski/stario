@@ -72,6 +72,8 @@ CONTENT_TYPES: Final = {
     ".webm": b"video/webm",
     ".wasm": b"application/wasm",
 }
+# Precompressed variants a static file can be served as, best first: br wins
+# ties because these bytes are encoded once at load, so only wire size counts.
 CODECS: Final = (b"br", b"zstd", b"gzip")
 PATH_ERRNOS: Final = frozenset((errno.EACCES, errno.ENOENT, errno.ENOTDIR, errno.ELOOP))
 OPEN_FLAGS: Final = (
@@ -888,6 +890,7 @@ class Assets(_Mount):
                 else negotiate_content_encoding(
                     request.unsafe_get(b"accept-encoding", b""),
                     encodings,
+                    CODECS,
                 )
             )
             etag = identity_etag if encoding is None else _etag(hashed.digest, encoding)
@@ -1033,6 +1036,7 @@ class Files(_Mount):
                 else negotiate_content_encoding(
                     request.unsafe_get(b"accept-encoding", b""),
                     encodings,
+                    CODECS,
                 )
             )
             etag = (

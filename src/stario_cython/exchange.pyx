@@ -801,6 +801,9 @@ cdef class RequestExchange:
         self._brotli_enabled = False
         self._zstd_enabled = False
         self._gzip_enabled = False
+        self._enc_order[0] = ENCODING_ZSTD
+        self._enc_order[1] = ENCODING_BR
+        self._enc_order[2] = ENCODING_GZIP
         self._compress_min_size = DEFAULT_MIN_SIZE
         self.in_pool = False
         self._body_active = False
@@ -841,6 +844,9 @@ cdef class RequestExchange:
             self._brotli_enabled = False
             self._zstd_enabled = False
             self._gzip_enabled = False
+            self._enc_order[0] = ENCODING_ZSTD
+            self._enc_order[1] = ENCODING_BR
+            self._enc_order[2] = ENCODING_GZIP
             self._compress_min_size = DEFAULT_MIN_SIZE
             return
         # Snapshot CompressionConfig so hot paths skip Python attribute access.
@@ -857,6 +863,15 @@ cdef class RequestExchange:
         self._brotli_enabled = self._brotli_level >= 0
         self._zstd_enabled = self._zstd_level >= 0
         self._gzip_enabled = self._gzip_level >= 0
+        preference = compression.preference
+        for i in range(3):
+            name = preference[i]
+            if name == b"br":
+                self._enc_order[i] = ENCODING_BR
+            elif name == b"gzip":
+                self._enc_order[i] = ENCODING_GZIP
+            else:
+                self._enc_order[i] = ENCODING_ZSTD
 
     cdef inline int _ensure_brotli(self) except -1:
         if self._brotli != NULL:
@@ -1377,6 +1392,10 @@ cdef class RequestExchange:
         cdef int zstd_q
         cdef int gzip_q
         cdef int best_q = 0
+        cdef int q_of[4]
+        cdef bint on[4]
+        cdef int enc
+        cdef int i
         if (
             not self._req_accept_present
             or not (self._brotli_enabled or self._zstd_enabled or self._gzip_enabled)
@@ -1397,17 +1416,23 @@ cdef class RequestExchange:
             else wildcard
         )
 
-        # Highest q wins (brotli > zstd > gzip on ties); identity beats all.
+        # Highest q wins; `CompressionConfig.preference` order breaks ties.
+        # The default leads with zstd on live responses: near-equal wire size
+        # at a fraction of brotli's encode cost. Precompressed static files
+        # negotiate in Python (br first — only wire size counts).
+        q_of[ENCODING_BR] = brotli_q
+        q_of[ENCODING_ZSTD] = zstd_q
+        q_of[ENCODING_GZIP] = gzip_q
+        on[ENCODING_BR] = self._brotli_enabled
+        on[ENCODING_ZSTD] = self._zstd_enabled
+        on[ENCODING_GZIP] = self._gzip_enabled
+
         self._req_encoding = ENCODING_NONE
-        if self._brotli_enabled and brotli_q > best_q:
-            best_q = brotli_q
-            self._req_encoding = ENCODING_BR
-        if self._zstd_enabled and zstd_q > best_q:
-            best_q = zstd_q
-            self._req_encoding = ENCODING_ZSTD
-        if self._gzip_enabled and gzip_q > best_q:
-            best_q = gzip_q
-            self._req_encoding = ENCODING_GZIP
+        for i in range(3):
+            enc = self._enc_order[i]
+            if on[enc] and q_of[enc] > best_q:
+                best_q = q_of[enc]
+                self._req_encoding = enc
         if self._req_identity_q >= best_q:
             self._req_encoding = ENCODING_NONE
 

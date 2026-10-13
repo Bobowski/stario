@@ -4,6 +4,20 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- Content negotiation now prefers `zstd` over `br` for dynamic and streamed
+  responses when the client weights both equally. zstd is within ~8% of brotli
+  on wire size at a fraction of the encode CPU, which matters per request and
+  per SSE event. Precompressed `Assets`/`Files` replies still prefer `br`:
+  those bytes are encoded once at load, so only wire size counts.
+  The tie-break order is configurable through `CompressionConfig(preference=…)`
+  or `STARIO_COMPRESS_PREFERENCE` (comma-separated names; unlisted encodings
+  fill in the default order). `negotiate_content_encoding` takes a
+  `preference` argument for the order.
+
 ## 5.0.3 - 2026-10-13
 
 ### Added

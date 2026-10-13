@@ -262,6 +262,7 @@ cdef class RequestExchange:
     cdef bint _brotli_enabled
     cdef bint _zstd_enabled
     cdef bint _gzip_enabled
+    cdef int _enc_order[3]
     cdef int _brotli_level
     cdef int _brotli_window
     cdef int _zstd_level

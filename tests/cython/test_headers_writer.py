@@ -203,7 +203,7 @@ async def test_one_shot_compression_writes_generated_headers_without_dict_roundt
         (b"BR;Q=1", b"br"),
         (b"gzip, zstd", b"zstd"),
         (b"zstd;q=0.5, gzip;q=0.5", b"zstd"),
-        (b"zstd, br", b"br"),
+        (b"zstd, br", b"zstd"),
         (b"ZSTD;Q=1", b"zstd"),
         (b"*;q=0.8, identity;q=1", None),
     ],
@@ -246,6 +246,37 @@ async def test_native_compression_qvalue_negotiation(
                 assert b"content-encoding:" not in header
             else:
                 assert b"content-encoding: " + expected + b"\r\n" in header
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_compression_preference_overrides_tie_break() -> None:
+    app = App()
+    body = b"compression preference " * 32
+
+    async def compressed(_c, w):
+        w.respond(body, b"text/plain")
+
+    app.add(Route("GET /"), compressed)
+    async with running_server(
+        app,
+        date=b"date: now\r\n",
+        compression=CompressionConfig(min_size=0, preference=("br",)),
+    ) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: zstd, br\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            payload = await read_response(reader)
+            header = payload.split(b"\r\n\r\n", 1)[0] + b"\r\n"
+            assert b"content-encoding: br\r\n" in header
         finally:
             writer.close()
             await writer.wait_closed()

@@ -6,7 +6,7 @@ import zlib
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from stario._env import env_int, env_optional_int
+from stario._env import env_int, env_optional_int, env_optional_str
 from stario.exceptions import StarioError
 
 from .wire import parse_accept_encoding
@@ -15,7 +15,12 @@ if TYPE_CHECKING:
     from .headers import Headers
 
 # `CompressionConfig.select` honors `Accept-Encoding` q-values, then prefers
-# br -> zstd -> gzip when the client weights supported encodings equally.
+# zstd -> br -> gzip when the client weights supported encodings equally.
+# Dynamic and streamed responses pay encode CPU per call, so zstd leads: it is
+# within ~8% of brotli on wire size at a fraction of the cost, and on a long
+# SSE stream the rolling history window makes them equal.
+# `filesystem` passes a brotli-first preference for precompressed assets,
+# where bytes are encoded once at load and only wire size matters.
 # Window bounds match libzstd / libbrotli (same libs the Cython writer uses).
 
 _ZSTD_WINDOW_LOG_MIN = 10
@@ -24,7 +29,34 @@ _BROTLI_WINDOW_LOG_MIN = 10
 _BROTLI_WINDOW_LOG_MAX = 24
 _GZIP_WINDOW_BITS_MIN = 9
 _GZIP_WINDOW_BITS_MAX = 15
-_ENCODING_PREFERENCE = (b"br", b"zstd", b"gzip")
+_ENCODING_PREFERENCE = (b"zstd", b"br", b"gzip")
+
+
+def _normalize_preference(
+    preference: Iterable[str | bytes] | None,
+) -> tuple[bytes, bytes, bytes]:
+    """Validate a codec order and append unlisted names in default order."""
+    if preference is None:
+        return _ENCODING_PREFERENCE
+    names = [name if isinstance(name, bytes) else name.encode() for name in preference]
+    seen: set[bytes] = set()
+    for name in names:
+        if name not in _ENCODING_PREFERENCE:
+            raise StarioError(
+                f"Unknown content encoding in preference: {name.decode('utf-8', 'replace')!r}",
+                help_text="Use 'zstd', 'br', and/or 'gzip'.",
+            )
+        if name in seen:
+            raise StarioError(
+                f"Duplicate content encoding in preference: {name.decode('utf-8', 'replace')!r}",
+                help_text="List each encoding at most once.",
+            )
+        seen.add(name)
+    if not names:
+        return _ENCODING_PREFERENCE
+    return tuple(names) + tuple(
+        name for name in _ENCODING_PREFERENCE if name not in seen
+    )
 
 
 def brotli_decompress(data: bytes) -> bytes:
@@ -42,8 +74,13 @@ def zstd_decompress(data: bytes) -> bytes:
 def negotiate_content_encoding(
     accept_encoding: str | bytes | None,
     available: Iterable[bytes],
+    preference: Iterable[bytes] = _ENCODING_PREFERENCE,
 ) -> bytes | None:
-    """Choose the best available content-coding from `Accept-Encoding`."""
+    """Choose the best available content-coding from `Accept-Encoding`.
+
+    `preference` lists the encodings this path serves, best first; it breaks
+    ties between encodings the client weights equally.
+    """
     if accept_encoding is None:
         return None
 
@@ -53,7 +90,7 @@ def negotiate_content_encoding(
     best_q = 0.0
     best_encoding: bytes | None = None
 
-    for encoding in _ENCODING_PREFERENCE:
+    for encoding in preference:
         if encoding not in available_set:
             continue
         q = accepted.get(encoding, wildcard_q)
@@ -273,6 +310,7 @@ class CompressionConfig:
         "gzip_level",
         "gzip_window_bits",
         "min_size",
+        "preference",
         "zstd_level",
         "zstd_window_log",
     )
@@ -287,6 +325,7 @@ class CompressionConfig:
         brotli_window_log: int | None = DEFAULT_BROTLI_WINDOW_LOG,
         gzip_level: int = DEFAULT_GZIP_LEVEL,
         gzip_window_bits: int | None = DEFAULT_GZIP_WINDOW_BITS,
+        preference: Iterable[str | bytes] | None = None,
     ) -> None:
         if min_size < 0:
             raise StarioError(
@@ -340,14 +379,8 @@ class CompressionConfig:
         self.brotli_window_log = brotli_window_log
         self.gzip_level = gzip_level
         self.gzip_window_bits = gzip_window_bits
-        enabled: list[bytes] = []
-        if brotli_level >= 0:
-            enabled.append(b"br")
-        if zstd_level >= 0:
-            enabled.append(b"zstd")
-        if gzip_level >= 0:
-            enabled.append(b"gzip")
-        self._enabled_encodings = tuple(enabled)
+        self.preference = _normalize_preference(preference)
+        self._enabled_encodings = self.enabled_encodings()
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CompressionConfig):
@@ -360,11 +393,17 @@ class CompressionConfig:
             and self.brotli_window_log == other.brotli_window_log
             and self.gzip_level == other.gzip_level
             and self.gzip_window_bits == other.gzip_window_bits
+            and self.preference == other.preference
         )
 
     def enabled_encodings(self) -> tuple[bytes, ...]:
-        """Supported encodings in framework preference order."""
-        return self._enabled_encodings
+        """Enabled encodings in `preference` order."""
+        enabled = {
+            b"br": self.brotli_level >= 0,
+            b"zstd": self.zstd_level >= 0,
+            b"gzip": self.gzip_level >= 0,
+        }
+        return tuple(name for name in self.preference if enabled[name])
 
     def make_compressor(self, encoding: bytes) -> Compressor:
         """Build a compressor for an encoding already selected by negotiation."""
@@ -414,7 +453,7 @@ class CompressionConfig:
             return None
 
         best_encoding = negotiate_content_encoding(
-            accept_encoding, self.enabled_encodings()
+            accept_encoding, self.enabled_encodings(), self.preference
         )
         if best_encoding is None:
             return None
@@ -423,8 +462,14 @@ class CompressionConfig:
 
 
 def compression_config_from_env() -> CompressionConfig:
-    """Read `STARIO_COMPRESS_*` codec levels and thresholds."""
+    """Read `STARIO_COMPRESS_*` codec levels, thresholds, and preference."""
     try:
+        raw_preference = env_optional_str("STARIO_COMPRESS_PREFERENCE")
+        preference = (
+            None
+            if raw_preference is None
+            else [name.strip() for name in raw_preference.split(",") if name.strip()]
+        )
         return CompressionConfig(
             min_size=env_int("STARIO_COMPRESS_MIN_SIZE", DEFAULT_MIN_SIZE),
             zstd_level=env_int("STARIO_COMPRESS_ZSTD_LEVEL", DEFAULT_ZSTD_LEVEL),
@@ -433,6 +478,7 @@ def compression_config_from_env() -> CompressionConfig:
             brotli_window_log=env_optional_int("STARIO_COMPRESS_BROTLI_WINDOW_LOG"),
             gzip_level=env_int("STARIO_COMPRESS_GZIP_LEVEL", DEFAULT_GZIP_LEVEL),
             gzip_window_bits=env_optional_int("STARIO_COMPRESS_GZIP_WINDOW_BITS"),
+            preference=preference,
         )
     except ValueError as exc:
         raise StarioError(str(exc)) from exc
