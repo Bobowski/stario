@@ -26,10 +26,9 @@ from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
 from os import stat_result
 from pathlib import Path
-from typing import Final, NamedTuple
+from typing import Final, NamedTuple, TypeGuard
 
 import xxhash
-from typing_extensions import TypeIs
 
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.app import App
@@ -133,7 +132,7 @@ def _identity(stat: stat_result) -> tuple[int, int, int, int]:
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
-def _is_relative(path: object) -> TypeIs[str]:
+def _is_relative(path: object) -> TypeGuard[str]:
     return (
         type(path) is str
         and bool(path)

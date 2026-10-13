@@ -25,7 +25,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "typing_extensions>=4.13.0,<5",
     "xxhash>=3.5.0,<4",
 ]
 

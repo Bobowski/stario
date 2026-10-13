@@ -6,6 +6,12 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Changed
+
+- `typing_extensions` is no longer a dependency. `_is_relative` uses
+  `typing.TypeGuard` (stdlib since 3.10) instead of `TypeIs` (3.13+).
+  The runtime depends only on `xxhash`.
+
 ### Fixed
 
 - A handler that streamed a body and returned without calling `end()` now
