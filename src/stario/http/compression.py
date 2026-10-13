@@ -54,9 +54,8 @@ def _normalize_preference(
         seen.add(name)
     if not names:
         return _ENCODING_PREFERENCE
-    return tuple(names) + tuple(
-        name for name in _ENCODING_PREFERENCE if name not in seen
-    )
+    ordered = names + [name for name in _ENCODING_PREFERENCE if name not in seen]
+    return ordered[0], ordered[1], ordered[2]
 
 
 def brotli_decompress(data: bytes) -> bytes:
