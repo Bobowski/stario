@@ -352,6 +352,48 @@ class DatastarActions:
             request_cancellation=request_cancellation,
         )
 
+    def query(
+        self,
+        url: str,
+        queries: Mapping[str, Any] | None = None,
+        *,
+        content_type: ContentType | str | None = None,
+        include: FilterValue | None = None,
+        exclude: FilterValue | None = None,
+        selector: str | None = None,
+        headers: dict[str, str] | None = None,
+        open_when_hidden: bool | None = None,
+        payload: dict[str, Any] | None = None,
+        retry: Retry | str | None = None,
+        retry_interval_ms: int | None = None,
+        retry_scaler: float | None = None,
+        retry_max_wait_ms: int | None = None,
+        retry_max_count: int | None = None,
+        request_cancellation: RequestCancellation | str | None = None,
+    ) -> str:
+        """Build `@query(...)` with the same option surface as `get`.
+
+        Sends a `QUERY` request with signals in the body, like `post`.
+        """
+        return self._fetch(
+            "query",
+            url,
+            queries,
+            content_type=content_type,
+            include=include,
+            exclude=exclude,
+            selector=selector,
+            headers=headers,
+            open_when_hidden=open_when_hidden,
+            payload=payload,
+            retry=retry,
+            retry_interval_ms=retry_interval_ms,
+            retry_scaler=retry_scaler,
+            retry_max_wait_ms=retry_max_wait_ms,
+            retry_max_count=retry_max_count,
+            request_cancellation=request_cancellation,
+        )
+
     def clipboard(self, text: str, is_base64: bool = False) -> str:
         """Build `@clipboard(...)`. **Datastar Pro only.**"""
         if is_base64:

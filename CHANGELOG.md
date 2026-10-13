@@ -4,6 +4,20 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `at.query(...)` builds `@query(...)`, the Datastar 1.0.4 action that sends a
+  `QUERY` request with signals in the body. `Route("QUERY", ...)` and
+  `read_signals` already cover it.
+
+### Changed
+
+- `ModuleScript()` now defaults to the Datastar 1.0.4 bundle
+  (`@v1.0.4/bundles/datastar.js`). Vendored copies in the examples and in
+  `stario-create` moved to 1.0.4 as well.
+
 ## 5.0.2 - 2026-10-13
 
 ### Changed

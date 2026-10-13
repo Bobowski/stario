@@ -55,7 +55,7 @@ class TestReadSignals:
         with pytest.raises(StarioError, match="Signals must decode to a JSON object"):
             await read_signals(req)
 
-    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "QUERY"])
     async def test_write_methods_use_body_not_query(self, method: str):
         req = make_request(
             method=method,

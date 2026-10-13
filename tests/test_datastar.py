@@ -581,6 +581,10 @@ class TestDatastarActions:
         action = at.delete("/api/item/123")
         assert action == "@delete('/api/item/123')"
 
+    def test_query(self):
+        action = at.query("/search", {"page": "2"}, include="q")
+        assert action == ("@query('/search?page=2', {filterSignals: {'include':'q'}})")
+
     def test_intl_basic(self):
         action = at.intl("number", "$price", {"style": "currency", "currency": "USD"})
         assert (
