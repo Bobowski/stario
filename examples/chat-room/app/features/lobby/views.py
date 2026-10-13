@@ -85,7 +85,18 @@ def _create_room_dialog() -> HtmlElement:
         {"id": "create-room-dialog", "class": "room-dialog"},
         h.Form(
             {"class": "room-dialog-form"},
-            data.on("submit", "evt.preventDefault()"),
+            data.on(
+                "submit",
+                f"""
+                if ($room_title.trim()) {{
+                    {at.post(CREATE.href())};
+                    $room_title = '';
+                    $room_description = '';
+                    el.closest('dialog').close();
+                }}
+                """,
+                prevent=True,
+            ),
             h.H2({"class": "room-dialog-title"}, "New room"),
             h.Label(
                 {"class": "room-dialog-label"},
@@ -120,19 +131,8 @@ def _create_room_dialog() -> HtmlElement:
                     "Cancel",
                 ),
                 h.Button(
-                    {"type": "button", "class": "room-dialog-create"},
+                    {"type": "submit", "class": "room-dialog-create"},
                     data.attrs({"disabled": "!$room_title.trim()"}),
-                    data.on(
-                        "click",
-                        f"""
-                        if ($room_title.trim()) {{
-                            {at.post(CREATE.href())};
-                            $room_title = '';
-                            $room_description = '';
-                            el.closest('dialog').close();
-                        }}
-                        """,
-                    ),
                     "Create",
                 ),
             ),

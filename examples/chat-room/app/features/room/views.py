@@ -109,7 +109,11 @@ def input_form_view(room_id: str) -> HtmlElement:
     send = at.post(SEND.href(room_id))
     return h.Form(
         {"id": "input-form", "class": "input-form"},
-        data.on("submit", "evt.preventDefault()"),
+        data.on(
+            "submit",
+            f"if ($message.trim()) {{ {send}; $message = ''; }}",
+            prevent=True,
+        ),
         h.Input(
             {
                 "id": "message-input",
@@ -120,16 +124,6 @@ def input_form_view(room_id: str) -> HtmlElement:
                 "autofocus": True,
             },
             data.bind("message"),
-            data.on(
-                "keydown",
-                f"""
-                if (evt.key === 'Enter' && !evt.shiftKey && $message.trim()) {{
-                    evt.preventDefault();
-                    {send};
-                    $message = '';
-                }}
-                """,
-            ),
             data.on("input", at.post(TYPING.href(room_id))),
         ),
         h.Button(

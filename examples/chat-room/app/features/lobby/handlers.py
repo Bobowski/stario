@@ -60,7 +60,8 @@ def subscribe(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         identity = await resolve_identity(c)
         if identity is None:
-            w.redirect(LOBBY.href())
+            # Reload the lobby page, which mints a fresh identity.
+            SSE(w).navigate(LOBBY.href())
             return
 
         async with relay.subscribe("room.*", "lobby.*") as live:
@@ -84,7 +85,7 @@ def create_room(db: Database, relay: Relay[str]):
         signals = await read_lobby_signals(c)
         title = signals.room_title.strip()[:MAX_TITLE_LENGTH]
         if not title:
-            w.redirect(LOBBY.href(), 303)
+            w.empty()
             return
 
         description = (signals.room_description.strip() or title)[
@@ -93,7 +94,7 @@ def create_room(db: Database, relay: Relay[str]):
         room = room_data.add_room(db, title=title, description=description)
         c.span.event("Room created", {"room_id": room.id, "title": room.title})
         relay.publish(lobby_subjects.rooms(), "created")
-        w.redirect(ROOM.href(room_id=room.id), 303)
+        SSE(w).navigate(ROOM.href(room_id=room.id))
 
     return handler
 
@@ -111,7 +112,7 @@ def delete_room(db: Database, relay: Relay[str]):
             c.span.event("Room deleted", {"room_id": room_id})
             relay.publish(room_subjects.deleted(room_id), "deleted")
             relay.publish(lobby_subjects.rooms(), "deleted")
-        w.redirect(LOBBY.href(), 303)
+        w.empty()
 
     return handler
 

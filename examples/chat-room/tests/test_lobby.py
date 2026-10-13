@@ -23,8 +23,9 @@ async def test_create_room(client):
         json={"room_title": "Design Chat", "room_description": "UI talk"},
         follow_redirects=False,
     )
-    assert r.status_code == 303
-    assert r.headers.get("location", "").endswith("/rooms/design-chat")
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers.get("content-type", "")
+    assert 'window.location = "/rooms/design-chat"' in r.text
     room = await client.get("/rooms/design-chat")
     assert room.status_code == 200
     assert "design chat" in room.text.lower()
@@ -37,7 +38,7 @@ async def test_delete_room(client):
         json={"room_title": "Temp", "room_description": "Gone soon"},
     )
     r = await client.delete("/rooms/temp", follow_redirects=False)
-    assert r.status_code == 303
+    assert r.status_code == 204
     lobby = await client.get("/")
     assert "temp" not in lobby.text.lower()
 

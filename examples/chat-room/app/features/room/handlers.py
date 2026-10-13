@@ -92,12 +92,13 @@ def subscribe(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            w.redirect(LOBBY.href())
+            SSE(w).navigate(LOBBY.href())
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id:
-            w.redirect(ROOM.href(room_id=room.id))
+            # Reload the room page, which mints a fresh identity.
+            SSE(w).navigate(ROOM.href(room_id=room.id))
             return
 
         user = User(
@@ -162,12 +163,12 @@ def send_message(db: Database, relay: Relay[str]):
     async def handler(c: Context, w: Writer) -> None:
         room = room_from_route(c, db)
         if room is None:
-            w.redirect(LOBBY.href(), 303)
+            SSE(w).navigate(LOBBY.href())
             return
 
         signals = await read_chat_signals(c)
         if not signals.user_id or not data.user_exists(db, signals.user_id, room.id):
-            w.redirect(ROOM.href(room_id=room.id), 303)
+            SSE(w).navigate(ROOM.href(room_id=room.id))
             return
 
         text = signals.message.strip()[:MAX_MESSAGE_LENGTH]
