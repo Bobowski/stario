@@ -126,7 +126,7 @@ cd my-app
 uv add stario
 ```
 
-For an app rather than a one-file experiment, start from the app guide in [bobowski/stario-skills](https://github.com/bobowski/stario-skills): copy its `AGENTS.md` into the repo root and install the skills with `npx skills add bobowski/stario-skills`.
+For an app rather than a one-file experiment, start from the app guide in [bobowski/stario-create](https://github.com/bobowski/stario-create): copy its `AGENTS.md` into the repo root and install the skills with `npx skills add bobowski/stario-create`.
 
 Put this in `main.py`:
 
