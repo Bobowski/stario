@@ -164,7 +164,7 @@ uv run python -m main
 For development, reload on file changes with watchfiles:
 
 ```bash
-uvx watchfiles 'uv run python -m main' .
+uv run --with watchfiles watchfiles 'python -m main' .
 ```
 
 Use `uvloop.run(serve(bootstrap))` when you want uvloop. When no

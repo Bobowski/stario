@@ -124,7 +124,10 @@ window.addEventListener('resize', () => el._clamp());
 
 @baked
 def debug_inspector() -> HtmlElement:
-    """Draggable overlay showing live Datastar signal JSON. Gate with STARIO_DEBUG."""
+    """Draggable overlay showing live Datastar signal JSON.
+
+    Opt-in: place the element inside the page body when you want it.
+    """
     return h.Div(
         {"id": "__stario_debug_inspector"},
         data.ignore_morph(),
