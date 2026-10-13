@@ -28,8 +28,6 @@ from os import stat_result
 from pathlib import Path
 from typing import Final, NamedTuple, TypeGuard
 
-import xxhash
-
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.app import App
 from stario.http.compression import (
@@ -42,6 +40,7 @@ from stario.http.context import Context
 from stario.http.headers import RequestHeaders, encode_header_value
 from stario.http.route import Route, append_query_fragment, public_prefix
 from stario.http.writer import Writer
+from stario_cython.xxh64 import xxh64
 
 DEFAULT_TYPE: Final = b"application/octet-stream"
 CONTENT_TYPES: Final = {
@@ -185,7 +184,7 @@ def _header(value: str | bytes, *, field: str) -> bytes:
 
 
 def _fingerprint(path: Path) -> str:
-    hasher = xxhash.xxh64()
+    hasher = xxh64()
     with path.open("rb") as handle:
         while chunk := handle.read(HASH_CHUNK):
             hasher.update(chunk)
@@ -827,7 +826,7 @@ class Assets(_Mount):
             try:
                 if file_stat.st_size <= self.max_file_size:
                     content = path.read_bytes()
-                    digest = xxhash.xxh64(content).hexdigest()
+                    digest = xxh64(content).hexdigest()
                     bodies[relative] = content
                 else:
                     digest = _fingerprint(path)

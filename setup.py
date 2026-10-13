@@ -111,6 +111,11 @@ extensions = [
         extra_compile_args=list(base_args),
     ),
     Extension(
+        "stario_cython.xxh64",
+        sources=["src/stario_cython/xxh64.pyx"],
+        extra_compile_args=list(base_args),
+    ),
+    Extension(
         "stario_cython.protocol",
         sources=[
             "src/stario_cython/protocol.pyx",

@@ -4,6 +4,14 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- `xxhash` is no longer a dependency. Asset fingerprints come from
+  `stario_cython.xxh64`, a small compiled xxHash64 module that keeps the same
+  digests. The runtime has no Python package dependencies.
+
 ## 5.0.1 - 2026-10-13
 
 ### Changed

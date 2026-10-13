@@ -297,8 +297,8 @@ and the cython lifetime tests cover recycle + two-loop accept.
 Native protocol talks to libbrotli / libzstd directly (`compression_buf.c`).
 Python `CompressionConfig` and `Files` / `Assets` use the same libs through
 `stario_cython.codecs` — no Python `brotli` / `zstandard` import, so those
-packages cannot re-enable the GIL. `xxhash` (Assets hashing at bootstrap)
-still can.
+packages cannot re-enable the GIL. Asset fingerprints use
+`stario_cython.xxh64`, which is also a compiled module.
 
 ### 2. Server / App — will not boot correctly on N loops
 
