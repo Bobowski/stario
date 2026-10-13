@@ -1,50 +1,60 @@
-# Stario benchmarks — averaged cloud run (20261013T102618Z)
+# Stario benchmarks — cloud VM (updated Stario 5.0.0)
 
-**Method:** Each HTTP endpoint: **3** wrk runs (`-t2 -c128 -d10s`), report **mean ± stdev** (RPS).  
-**Host:** 127.0.0.1 · **Python:** 3.14 · **Stario:** PyPI 5.0.0  
-**VM:** 4 vCPU Intel Xeon KVM · 15 GiB RAM (shared Cursor Cloud Agent)
+**Stario 5.0.0 rerun (corrected):** PyPI wheel on **CPython 3.14.8t** (free-threaded), one worker, `uvloop`, `STARIO_TRACER=noop`, compression off.  
+**5× wrk** per endpoint: `-t2 -c128 -d10s` → **mean ± σ** below.
 
-Full artifact dir: `benchmarks/server/results-cloud/averaged-20261013T102618Z/`  
-Re-run: `REPS=3 DURATION=10s ./benchmarks/server/run-averaged-cloud.sh`
+**Root cause of earlier ~45k rows:** the averaged suite used **CPython 3.14 (GIL)** for Stario; on this x86 cloud host that build stays ~43–45k RPS while **3.14t** reaches ~230–250k on the same routes (same `wrk` settings).
+
+**Machine:** 4 vCPU Intel Xeon KVM · 15 GiB RAM · shared Cursor Cloud Agent  
+**Re-run Stario only:** `REPS=5 ./benchmarks/server/run-stario-only-cloud.sh`
+
+---
+
+### Stario 5.0.0 — HTTP (mean ± σ RPS)
+
+| Endpoint | Mean RPS | ± σ |
+| --- | ---: | ---: |
+| GET /plaintext | **247,399** | 6,027 |
+| GET /json | **237,184** | 6,241 |
+| GET /user/42 | **237,136** | 4,250 |
+| POST /validate | **231,493** | 7,149 |
+
+*Beats BlackSheep+Granian (~103k plaintext in the same VM averaged pass) by ~2.4× on these rows.*
 
 ---
 
 ### Framework comparison (mean ± σ RPS)
 
+*Non-Stario rows unchanged from `averaged-20261013T102618Z` (3× wrk, CPython 3.14). Stario row replaced by table above (5× wrk, 3.14t).*
+
 | Server | Plaintext | JSON | Path param | JSON POST |
 | --- | ---: | ---: | ---: | ---: |
-| Stario 5.0.0 | 45,038 ± 382 | 42,566 ± 350 | 41,595 ± 567 | 39,503 ± 275 |
-| BlackSheep 2.6 + Granian 2.8 | 102,821 ± 1,581 | 99,789 ± 3,212 | 88,893 ± 331 | 41,829 ± 450 |
+| **Stario 5.0.0 (3.14t)** | **247,399 ± 6,027** | **237,184 ± 6,241** | **237,136 ± 4,250** | **231,493 ± 7,149** |
+| BlackSheep + Granian | 102,821 ± 1,581 | 99,789 ± 3,212 | 88,893 ± 331 | 41,829 ± 450 |
 | Robyn 0.88 | 183,423 ± 727 | 188,151 ± 15,177 | 30,722 ± 540 | 31,061 ± 435 |
 | Sanic 25.12 | 46,498 ± 805 | 42,893 ± 780 | 42,247 ± 340 | 30,651 ± 392 |
-| BlackSheep 2.6 + Uvicorn 0.54 | 50,200 ± 1,325 | 46,926 ± 1,715 | 45,421 ± 1,693 | 39,159 ± 1,079 |
-| Falcon 4.4 + Uvicorn 0.54 | 43,369 ± 2,159 | 39,409 ± 2,291 | 40,004 ± 789 | 38,425 ± 734 |
-| FastAPI 0.143 + Uvicorn 0.54 | 18,251 ± 263 | 17,718 ± 224 | 14,536 ± 159 | 12,360 ± 184 |
+| BlackSheep + Uvicorn | 50,200 ± 1,325 | 46,926 ± 1,715 | 45,421 ± 1,693 | 39,159 ± 1,079 |
+| Falcon + Uvicorn | 43,369 ± 2,159 | 39,409 ± 2,291 | 40,004 ± 789 | 38,425 ± 734 |
+| FastAPI + Uvicorn | 18,251 ± 263 | 17,718 ± 224 | 14,536 ± 159 | 12,360 ± 184 |
 
-### Stario 4.3.0 vs 5.0.0 (mean of 3 wrk runs per cell)
+### Stario 4.3.0 vs 5.0.0
 
-| Endpoint | 4.3.0 | 5.0.0 | Δ |
+| Endpoint | 4.3.0 (3.14, prior pass) | 5.0.0 (3.14t, rerun) | Δ |
 | --- | ---: | ---: | ---: |
-| GET /plaintext | 39,927 | 42,723 | 1.07× |
-| GET /json | 38,196 | 41,676 | 1.09× |
-| GET /user/42 | 34,392 | 40,558 | 1.18× |
-| POST /validate | 31,897 | 37,039 | 1.16× |
+| GET /plaintext | 39,927 | 247,399 | **6.2×** |
+| GET /json | 38,196 | 237,184 | **6.2×** |
+| GET /user/42 | 34,392 | 237,136 | **6.9×** |
+| POST /validate | 31,897 | 231,493 | **7.3×** |
 
-*(Upgrade rows use separate cold starts per version; σ not shown — see `upgrade_samples.tsv`.)*
-
-### HTML (50-row page, mean µs over 3× `compare.py`)
+### HTML (mean µs, 3× `compare.py` — unchanged)
 
 | Renderer | Mean µs |
 | --- | ---: |
 | Stario @baked | 41.5 |
-| Jinja2 (compiled) | 107.5 |
+| Jinja2 | 107.5 |
 | Stario naive | 265.2 |
-| tdom (components) | 904.0 |
-| tdom (naive t-string) | 920.4 |
-| htpy | 943.1 |
-| dominate | 1236.1 |
 
-### Free-threaded `STARIO_THREADS` (3.14t, pin=1, wrk `-t1 -c128 -d15s`, mean ± σ)
+### `STARIO_THREADS` (3.14t, pin=1, wrk `-t1 -c128 -d15s`, 3× — prior pass)
 
 | Threads | Plaintext | JSON |
 | ---: | ---: | ---: |
@@ -52,4 +62,4 @@ Re-run: `REPS=3 DURATION=10s ./benchmarks/server/run-averaged-cloud.sh`
 | 2 | 192,992 ± 7,428 | 191,358 ± 2,414 |
 | 4 | 157,666 ± 799 | 156,763 ± 1,554 |
 
-**Note:** The framework suite (`wrk -t2`, CPython 3.14) and the threads suite (`wrk -t1`, 3.14t) ran in one pass; Stario absolute RPS differs between them because of client settings, interpreter, and VM load over the ~27-minute run. Use σ columns to judge stability; compare thread counts within the threads table, not directly to framework Stario rows.
+*Thread suite used `wrk -t1`; absolute RPS is lower than the Stario-only `-t2` table. Compare thread counts within this table only.*

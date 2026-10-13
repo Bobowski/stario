@@ -60,7 +60,12 @@ path_for() {
 }
 
 ensure_all_envs() {
-  ensure_env stario stario==5.0.0 uvloop ujson
+  # Stario 5.0 PyPI on CPython 3.14 (GIL) was ~45k RPS on this host; 3.14t ~240k.
+  uv python install 3.14t >/dev/null 2>&1 || true
+  if [[ ! -x "$ENVS/stario/bin/python" ]]; then
+    uv venv "$ENVS/stario" --python 3.14t
+    uv pip install --python "$ENVS/stario/bin/python" stario==5.0.0 uvloop ujson
+  fi
   ensure_env stario43 stario==4.3.0 uvloop ujson
   ensure_env fastapi fastapi 'uvicorn[standard]' ujson
   ensure_env blacksheep-uvicorn blacksheep 'uvicorn[standard]' ujson
