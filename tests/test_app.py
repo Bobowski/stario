@@ -99,10 +99,14 @@ class TestAppErrorSurface:
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             async with TestClient(app) as client:
                 response = await client.get("/boom")
+                span = client.tracer.get_span(response.span_id)
 
         assert response.status_code == 500
         assert response.text == "Internal Server Error"
-        assert "Handler failed" in caplog.text
+        # The span carries the failure — no duplicate log line.
+        assert span is not None
+        assert span.error == "boom"
+        assert "Handler failed" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_unhandled_exception_is_500_on_test_client(self):
@@ -136,7 +140,7 @@ class TestAppErrorSurface:
         assert response.text == "Internal Server Error"
 
     @pytest.mark.asyncio
-    async def test_write_then_raise_keeps_response_and_is_logged(
+    async def test_write_then_raise_keeps_response_and_is_traced(
         self, caplog: pytest.LogCaptureFixture
     ):
         async def handler(_c: Context, w: Writer) -> None:
@@ -148,10 +152,13 @@ class TestAppErrorSurface:
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             async with TestClient(app) as client:
                 response = await client.get("/x")
+                span = client.tracer.get_span(response.span_id)
 
         assert response.status_code == 200
         assert response.text == "ok"
-        assert "Handler failed" in caplog.text
+        assert span is not None
+        assert span.error == "after write"
+        assert "Handler failed" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_uncaught_app_error_becomes_500_without_middleware(self):

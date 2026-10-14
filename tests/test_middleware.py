@@ -52,11 +52,15 @@ class TestCatchErrors:
                 response = await client.get("/x")
             assert response.status_code == 200
             assert response.text == "partial"
+            # Traced request: the failure lives on the span, not the logger.
+            span = client.tracer.get_span(response.span_id)
+            assert span is not None
+            assert span.error == "after write"
 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             asyncio.run(run())
 
-        assert "Handler failed" in caplog.text
+        assert "Handler failed" not in caplog.text
 
 
 class TestFrameworkExceptions:
@@ -108,8 +112,11 @@ class TestFrameworkExceptions:
                 response = await client.get("/old", follow_redirects=False)
             assert response.status_code == 200
             assert response.text == "kept"
+            span = client.tracer.get_span(response.span_id)
+            assert span is not None
+            assert span.error
 
         with caplog.at_level(logging.ERROR, logger="stario.http"):
             asyncio.run(run())
 
-        assert "Handler failed" in caplog.text
+        assert "Handler failed" not in caplog.text

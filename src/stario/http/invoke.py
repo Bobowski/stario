@@ -1,8 +1,10 @@
-"""Handler-task finish: log failures, send 500 if nothing was sent, close the span.
+"""Handler-task finish: record failures on the span, send 500, close the span.
 
 The framework's own exceptions (`RedirectException`, `RequestBodyError`) map to
-HTTP when nothing was sent; everything else is logged and becomes a 500.
+HTTP when nothing was sent; everything else is recorded and becomes a 500.
 A write-then-raise keeps the bytes already on the wire. Cancellation still aborts.
+Without a recording span the failure falls back to the `stario.http` logger —
+otherwise the crash would leave no trace at all.
 """
 
 from __future__ import annotations
@@ -90,22 +92,25 @@ def on_handler_done(c: Context, w: Writer, task: asyncio.Task[Any]) -> None:
         exc = task.exception()
         if exc is not None:
             if w.started or not _answer_framework_exception(w, exc):
-                _log.error("Handler failed", exc_info=exc)
                 if record:
+                    # The span carries status, message, and traceback.
                     span.fail(str(exc))
                     span.exception(exc)
+                else:
+                    _log.error("Handler failed", exc_info=exc)
                 _finish_incomplete(w)
         elif w.started and not w.completed:
             # Streamed body, clean return: finish the frame the handler left open.
             w.end()
         elif not w.completed:
-            _log.error(
-                "Handler returned without sending a response (%s %s)",
-                c.req.method,
-                c.req.path,
-            )
             if record:
                 span.fail("Handler returned without sending a response")
+            else:
+                _log.error(
+                    "Handler returned without sending a response (%s %s)",
+                    c.req.method,
+                    c.req.path,
+                )
             _finish_incomplete(w)
 
     if record:
