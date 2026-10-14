@@ -179,16 +179,6 @@ class TestSseWireFormat:
         finally:
             loop.close()
 
-    def test_keepalive_writes_comment_frame(self):
-        w, _sink, loop = _make_writer()
-        try:
-            SSE(w).keepalive()
-
-            assert w.headers.get("content-type") == "text/event-stream"
-            assert _sse_body(w) == b": ka\n\n"
-        finally:
-            loop.close()
-
     def test_first_event_opens_stream_lazily(self):
         w, _sink, loop = _make_writer()
         try:

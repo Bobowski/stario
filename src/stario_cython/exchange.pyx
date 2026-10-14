@@ -3456,8 +3456,8 @@ cdef class RequestHandle:
             return True
         return self.disconnected or self.shutting_down
 
-    def alive(self, source=None, *, on_idle=None, idle_after=25.0):
-        return _Alive(self, source, on_idle=on_idle, idle_after=idle_after)
+    def alive(self, source=None):
+        return _Alive(self, source)
 
     @property
     def headers(self):
