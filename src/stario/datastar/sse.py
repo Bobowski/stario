@@ -169,6 +169,18 @@ class SSE:
             script = b"<script>" + code_bytes + b"</script>"
         self.patch_elements(script, mode="append", selector="body")
 
+    def keepalive(self) -> None:
+        """Write an SSE comment — ignored by the client, exercises the socket.
+
+        Heartbeat quiet streams with it via ``c.alive(source, on_idle=sse.keepalive)``:
+        a stream that publishes nothing cannot otherwise notice a client that
+        vanished without closing the connection — the task and its
+        subscriptions linger forever. The write also holds NAT and proxy
+        mappings open between events.
+        """
+        self._prepare_headers()
+        self.w.write(b": ka\n\n")
+
     def remove(self, selector: str) -> None:
         """Remove nodes matching `selector`."""
         lines = [

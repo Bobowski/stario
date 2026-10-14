@@ -452,8 +452,16 @@ class TestContext:
     def closing(self) -> bool:
         return self.disconnected or self.shutting_down
 
-    def alive(self, source: Any = None) -> _Alive[Any]:
-        return _Alive(cast(Context, self), source)
+    def alive(
+        self,
+        source: Any = None,
+        *,
+        on_idle: Any = None,
+        idle_after: float = 25.0,
+    ) -> _Alive[Any]:
+        return _Alive(
+            cast(Context, self), source, on_idle=on_idle, idle_after=idle_after
+        )
 
 
 def make_writer() -> TestWriter:

@@ -91,16 +91,38 @@ class Context(Protocol):
         ...
 
     @overload
-    def alive(self, source: None = None) -> _Alive[None]: ...
+    def alive(
+        self,
+        source: None = None,
+        *,
+        on_idle: Callable[[], None] | None = None,
+        idle_after: float = 25.0,
+    ) -> _Alive[None]: ...
 
     @overload
-    def alive[T](self, source: AsyncIterable[T]) -> _Alive[T]: ...
+    def alive[T](
+        self,
+        source: AsyncIterable[T],
+        *,
+        on_idle: Callable[[], None] | None = None,
+        idle_after: float = 25.0,
+    ) -> _Alive[T]: ...
 
     def alive[T](
         self,
         source: AsyncIterable[T] | None = None,
+        *,
+        on_idle: Callable[[], None] | None = None,
+        idle_after: float = 25.0,
     ) -> _Alive[T] | _Alive[None]:
-        """Watch client disconnect and app shutdown; cancel this task when either happens."""
+        """Watch client disconnect and app shutdown; cancel this task when either happens.
+
+        While iterating a ``source``, ``on_idle`` runs whenever the source has
+        been silent for ``idle_after`` seconds. Heartbeat an SSE stream there
+        (``on_idle=sse.keepalive``): a stream that publishes nothing cannot
+        otherwise notice a client that vanished without closing the
+        connection — its task and subscriptions would linger forever.
+        """
         ...
 
 
@@ -110,6 +132,8 @@ class _Alive[T]:
 
     c: Context
     source: AsyncIterable[T] | None = None
+    on_idle: Callable[[], None] | None = None
+    idle_after: float = 25.0
     cancelled_current_task: bool = False
     _armed: bool = False
     _fire: Callable[[asyncio.Future[None]], None] | None = None
@@ -121,8 +145,30 @@ class _Alive[T]:
                 "Use `async with c.alive():` when not streaming a source."
             )
         async with self:
-            async for item in self.source:
-                yield item
+            if self.on_idle is None:
+                async for item in self.source:
+                    yield item
+                return
+            if self.idle_after <= 0:
+                raise ValueError("idle_after must be positive")
+            # A pending __anext__ waited with a timeout: the source iterator is
+            # never cancelled, so a heartbeat cannot lose a buffered message.
+            it = aiter(self.source)
+            pending = asyncio.ensure_future(it.__anext__())
+            try:
+                while True:
+                    done, _ = await asyncio.wait((pending,), timeout=self.idle_after)
+                    if not done:
+                        self.on_idle()
+                        continue
+                    try:
+                        item = pending.result()
+                    except StopAsyncIteration:
+                        return
+                    pending = asyncio.ensure_future(it.__anext__())
+                    yield item
+            finally:
+                pending.cancel()
 
     async def __aenter__(self) -> _Alive[T]:
         task = asyncio.current_task()
