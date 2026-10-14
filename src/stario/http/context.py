@@ -8,6 +8,7 @@ context. ``Match`` and ``_Alive`` stay as small Python helpers.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -100,7 +101,13 @@ class Context(Protocol):
         self,
         source: AsyncIterable[T] | None = None,
     ) -> _Alive[T] | _Alive[None]:
-        """Watch client disconnect and app shutdown; cancel this task when either happens."""
+        """Watch client disconnect and app shutdown; cancel this task when either happens.
+
+        Use `async with c.alive(): ...` for scoped work, or
+        `async for item in c.alive(source): ...` to stream from `source` until
+        disconnect or shutdown. Do not use `async for` without `source`; the
+        context-manager form is the supported no-source pattern.
+        """
         ...
 
 
@@ -110,10 +117,8 @@ class _Alive[T]:
 
     c: Context
     source: AsyncIterable[T] | None = None
+    watcher: asyncio.Task[None] | None = None
     cancelled_current_task: bool = False
-    _armed: bool = False
-    _fire: Callable[[asyncio.Future[None]], None] | None = None
-    _futures: tuple[asyncio.Future[None], ...] = ()
 
     async def __aiter__(self) -> AsyncIterator[T]:
         if self.source is None:
@@ -125,18 +130,20 @@ class _Alive[T]:
                 yield item
 
     async def __aenter__(self) -> _Alive[T]:
-        task = asyncio.current_task()
-        self._armed = True
+        current_task = asyncio.current_task()
+        disconnect = self.c.disconnect
+        shutdown = self.c.app.shutdown
 
-        def fire(_fut: asyncio.Future[None]) -> None:
-            if self._armed and task is not None and not task.done():
+        async def watcher() -> None:
+            await asyncio.wait(
+                {disconnect, shutdown},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if current_task and not current_task.done():
                 self.cancelled_current_task = True
-                task.cancel()
+                current_task.cancel()
 
-        self._fire = fire
-        self._futures = (self.c.disconnect, self.c.app.shutdown)
-        for fut in self._futures:
-            fut.add_done_callback(fire)
+        self.watcher = asyncio.create_task(watcher(), name="stario.context.alive")
         return self
 
     async def __aexit__(
@@ -145,11 +152,10 @@ class _Alive[T]:
         exc_val: BaseException | None,
         exc_tb: object | None,
     ) -> bool:
-        self._armed = False
-        fire = self._fire
-        if fire is not None:
-            for fut in self._futures:
-                fut.remove_done_callback(fire)
+        if self.watcher:
+            self.watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.watcher
 
         return (
             exc_type is not None
