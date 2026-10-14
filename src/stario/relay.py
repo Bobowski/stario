@@ -402,6 +402,20 @@ class Relay[T]:
                     raise
                 self.drop_subscription(subscription)
 
+    def has_subscribers(self, subject: str) -> bool:
+        """True if a publish on ``subject`` would reach a live inbox.
+
+        Same matching rules as publish: an exact or wildcard pattern both
+        count. The answer is a snapshot — a subscriber may still appear or
+        leave before the publish lands.
+        """
+        with self.lock:
+            for pattern in _matching_patterns(subject):
+                for subscription in self.subs.get(pattern, ()):
+                    if subscription.active:
+                        return True
+        return False
+
     def subscribe(
         self,
         *patterns: str,
