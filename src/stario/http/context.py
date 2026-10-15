@@ -113,12 +113,21 @@ class Context(Protocol):
 
 @dataclass(slots=True)
 class _Alive[T]:
-    """Connection lifecycle helper bound to a request context."""
+    """Connection lifecycle helper bound to a request context.
+
+    The watcher cancels the handler task on disconnect or shutdown, and
+    ``__aexit__`` swallows only that cancel — the bookkeeping mirrors
+    ``asyncio.timeout``: ``uncancel()`` below the count recorded at enter
+    means the cancel was ours. A foreign cancel raced with ours still
+    propagates, and a foreign cancel alone never sets ``expired``.
+    """
 
     c: Context
     source: AsyncIterable[T] | None = None
     watcher: asyncio.Task[None] | None = None
-    cancelled_current_task: bool = False
+    expired: bool = False
+    _task: asyncio.Task[Any] | None = None
+    _cancelling: int = 0
 
     async def __aiter__(self) -> AsyncIterator[T]:
         if self.source is None:
@@ -130,18 +139,24 @@ class _Alive[T]:
                 yield item
 
     async def __aenter__(self) -> _Alive[T]:
-        current_task = asyncio.current_task()
+        self._task = asyncio.current_task()
         disconnect = self.c.disconnect
         shutdown = self.c.app.shutdown
+        if self._task is not None:
+            self._cancelling = self._task.cancelling()
 
         async def watcher() -> None:
             await asyncio.wait(
                 {disconnect, shutdown},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if current_task and not current_task.done():
-                self.cancelled_current_task = True
-                current_task.cancel()
+            if (
+                self._task is not None
+                and not self._task.done()
+                and self._task.cancelling() == self._cancelling
+            ):
+                self.expired = True
+                self._task.cancel()
 
         self.watcher = asyncio.create_task(watcher(), name="stario.context.alive")
         return self
@@ -157,11 +172,16 @@ class _Alive[T]:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.watcher
 
-        return (
-            exc_type is not None
-            and issubclass(exc_type, asyncio.CancelledError)
-            and self.cancelled_current_task
-        )
+        if (
+            exc_type is None
+            or not issubclass(exc_type, asyncio.CancelledError)
+            or not self.expired
+        ):
+            return False
+        # Swallow only our own cancel: after uncancel(), anything left in the
+        # count is a request somebody else made — it must propagate.
+        task = asyncio.current_task()
+        return task is not None and task.uncancel() <= self._cancelling
 
 
 type Handler = Callable[[Context, "Writer"], Awaitable[None]]

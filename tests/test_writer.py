@@ -377,6 +377,30 @@ class TestWriterRaw:
         with pytest.raises(asyncio.CancelledError):
             await task
 
+    async def test_context_alive_raced_cancellation_still_propagates(self):
+        # A foreign cancel in flight when disconnect fires must propagate —
+        # the watcher does not stack a second cancel on an unwinding task.
+        loop = asyncio.get_running_loop()
+        disconnect = loop.create_future()
+        context = _make_context(loop=loop, disconnect=disconnect)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def worker() -> None:
+            async with context.alive():
+                started.set()
+                await never.wait()
+
+        task = asyncio.create_task(worker())
+        await started.wait()
+
+        task.cancel()
+        await asyncio.sleep(0)
+        disconnect.set_result(None)
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
     async def test_context_alive_without_source_raises(self):
         loop = asyncio.get_running_loop()
         context = _make_context(loop=loop)
