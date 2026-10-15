@@ -8,7 +8,6 @@ context. ``Match`` and ``_Alive`` stay as small Python helpers.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -115,18 +114,24 @@ class Context(Protocol):
 class _Alive[T]:
     """Connection lifecycle helper bound to a request context.
 
-    The watcher cancels the handler task on disconnect or shutdown, and
-    ``__aexit__`` swallows only that cancel — the bookkeeping mirrors
+    A done-callback on the disconnect/shutdown futures cancels the handler
+    task; ``__aexit__`` swallows only that cancel. The bookkeeping mirrors
     ``asyncio.timeout``: ``uncancel()`` below the count recorded at enter
-    means the cancel was ours. A foreign cancel raced with ours still
+    means the cancel was ours — a foreign cancel raced with ours still
     propagates, and a foreign cancel alone never sets ``expired``.
+
+    ``_armed`` guards the window between a queued ``_fire`` and
+    ``remove_done_callback``: callbacks already scheduled via ``call_soon``
+    cannot be removed, so a fire after ``__aexit__`` must no-op instead of
+    cancelling the task inside its post-scope cleanup.
     """
 
     c: Context
     source: AsyncIterable[T] | None = None
-    watcher: asyncio.Task[None] | None = None
     expired: bool = False
     _task: asyncio.Task[Any] | None = None
+    _futures: tuple[asyncio.Future[None], ...] = ()
+    _armed: bool = False
     _cancelling: int = 0
 
     async def __aiter__(self) -> AsyncIterator[T]:
@@ -138,27 +143,30 @@ class _Alive[T]:
             async for item in self.source:
                 yield item
 
+    def _fire(self, _fut: asyncio.Future[None]) -> None:
+        """One-shot: the first completion wins and disarms the rest."""
+        if not self._armed:
+            return
+        self._armed = False
+        for fut in self._futures:
+            fut.remove_done_callback(self._fire)
+        task = self._task
+        if (
+            task is not None
+            and not task.done()
+            and task.cancelling() == self._cancelling
+        ):
+            self.expired = True
+            task.cancel()
+
     async def __aenter__(self) -> _Alive[T]:
         self._task = asyncio.current_task()
-        disconnect = self.c.disconnect
-        shutdown = self.c.app.shutdown
+        self._futures = (self.c.disconnect, self.c.app.shutdown)
         if self._task is not None:
             self._cancelling = self._task.cancelling()
-
-        async def watcher() -> None:
-            await asyncio.wait(
-                {disconnect, shutdown},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if (
-                self._task is not None
-                and not self._task.done()
-                and self._task.cancelling() == self._cancelling
-            ):
-                self.expired = True
-                self._task.cancel()
-
-        self.watcher = asyncio.create_task(watcher(), name="stario.context.alive")
+        self._armed = True
+        for fut in self._futures:
+            fut.add_done_callback(self._fire)
         return self
 
     async def __aexit__(
@@ -167,10 +175,9 @@ class _Alive[T]:
         exc_val: BaseException | None,
         exc_tb: object | None,
     ) -> bool:
-        if self.watcher:
-            self.watcher.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.watcher
+        self._armed = False
+        for fut in self._futures:
+            fut.remove_done_callback(self._fire)
 
         if (
             exc_type is None
