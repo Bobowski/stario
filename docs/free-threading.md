@@ -337,13 +337,11 @@ from N request threads is the design they have.
 `end`) with no lock. That is fine if **only that thread** touches the
 span until `on_end`.
 
-**TTY tracer is not fine.** The refresh thread walks in-progress spans
-and reads `.attributes` / `.events` while the request thread appends.
-Today the GIL papers over memory unsafety; without it this is a dict
-mutation vs iteration crash and torn reads in the live footer. Fix:
-copy a snapshot under `TTYTracer._lock` at `attr`/`event` time, or stop
-live-updating fields and only render on `on_end`. For `STARIO_THREADS>1`,
-defaulting TTY off (JSON/noop) is a reasonable v1.
+**TTY tracer is now fine.** `TTYTracer.create()` sets `span.mutex` to its
+`_lock`, so every mutation (`attr`, `event`, `end`) serializes with the
+refresh thread that walks in-progress spans and reads `.attributes` /
+`.events` for the live footer. Without the GIL this would otherwise be a
+dict mutation vs iteration crash and torn reads.
 
 `create()` parent checks (`parent_id in _open_span_ids`) already take
 `_lock`. Keep that.
@@ -390,7 +388,9 @@ real sockets, recycle the thread-local exchange spare, hit compression.
 - Exchange pool reuse → two requests, one `RequestExchange` (mitigated: connection idle + thread-local spare; never share across loops).
 - Compression C pool → two encoders, one `StarioBrotli*` (mitigated: `_Thread_local` pools).
 - `connections` iterate vs add/discard (mitigated: per-loop set).
-- TTY live view vs `RecordingSpan.attributes.update`.
+- TTY live view vs `RecordingSpan.attributes.update` (mitigated: the TTY
+  tracer sets `span.mutex` to its `_lock`, so mutation and render
+  serialize).
 - `Game.board` / `user_colors` without a lock.
 - `app.shutdown` Future touched from the wrong loop.
 - Handler `w.write` from a non-owner thread (user error; must remain
@@ -418,7 +418,7 @@ real sockets, recycle the thread-local exchange spare, hit compression.
 | thread-local or `PyMutex` | C/Cython pools, URL cache init | acquire/release, not encode |
 | `threading.Event` + per-loop Future | shutdown | signal path |
 | `threading.RLock` | user `Game` / sqlite | mutation + snapshot, never across `await` |
-| TTY `_lock` | already; extend to span field copies | render snapshot |
+| TTY `_lock` | already; also assigned to `span.mutex` | span mutation + render snapshot |
 | **None** | frozen Router, baked plans, hashed assets | — |
 
 Avoid: one giant `Server` lock around dispatch (kills the point). Avoid

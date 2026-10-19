@@ -4,6 +4,21 @@ All notable changes to Stario are documented in this file.
 
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- The TTY tracer is rewritten. A finished request prints to scrollback as a
+  tree: method, path, and status in the header, child spans on rails, and
+  attributes under the span they belong to. Open requests repaint in a live
+  area at the bottom, where a span with an open child shows as waiting and
+  only the deepest open spans spin. The layout adapts to narrow and wide
+  terminals, uses only theme colors (readable on light and dark themes),
+  survives resizes, and keeps `print` and logging output from breaking the
+  live area. When stdout is not a TTY it writes plain history only. Spans
+  now take the tracer lock on mutation (`span.mutex`), which removes the
+  data race between the redraw thread and request threads.
+
 ## 5.0.4 - 2026-10-13
 
 ### Changed
