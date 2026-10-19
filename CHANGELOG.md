@@ -18,6 +18,17 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
   live area. When stdout is not a TTY it writes plain history only. Spans
   now take the tracer lock on mutation (`span.mutex`), which removes the
   data race between the redraw thread and request threads.
+- A handler failure is recorded once. With a recording span, the span carries
+  the status, message, and traceback; the `stario.http` logger is now only
+  the fallback for requests without a span. Before, the JSON tracer printed
+  each crash twice.
+
+### Fixed
+
+- `c.alive()` swallows only its own cancel. A cancel from other code that
+  races a disconnect or shutdown now propagates, and `alive()` no longer
+  cancels a task that is already unwinding, so `finally` blocks run to the
+  end.
 
 ## 5.0.4 - 2026-10-13
 
