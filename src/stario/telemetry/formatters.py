@@ -5,11 +5,13 @@ Span attributes are encoded with `dumps_json` (`default=str` for unknown
 types); event bodies are stricter — see `serialize_event_body`.
 """
 
+import json as json_module
+import math
 from functools import lru_cache
 from pathlib import Path
 from traceback import StackSummary, format_exception_only, format_list
 from types import TracebackType
-from typing import Any
+from typing import Any, cast
 
 from stario.json import dumps as json_dumps
 
@@ -68,9 +70,29 @@ def format_exception_for_telemetry(exc: BaseException) -> str:
     return "".join(parts)
 
 
+def _finite_safe(value: Any) -> Any:
+    """Stringify non-finite floats so `allow_nan=False` cannot raise."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _finite_safe(v) for k, v in cast(dict[Any, Any], value).items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_safe(v) for v in cast(list[Any] | tuple[Any, ...], value)]
+    return value
+
+
 def dumps_json(value: Any) -> str:
     """Compact JSON for span export; unknown value types become strings."""
-    return json_dumps(value, default=str)
+    try:
+        return json_dumps(value)
+    except (TypeError, ValueError):
+        return json_module.dumps(
+            _finite_safe(value),
+            allow_nan=False,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 def serialize_event_body(body: EventBody) -> str | None:

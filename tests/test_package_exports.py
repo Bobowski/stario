@@ -77,6 +77,8 @@ def test_core_modules_import() -> None:
             "stario.json",
             [
                 "JsonCodec",
+                "JsonDecode",
+                "JsonEncode",
                 "StdlibJsonCodec",
                 "dumps",
                 "dumps_bytes",

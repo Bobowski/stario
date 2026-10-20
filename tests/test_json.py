@@ -1,6 +1,7 @@
 """Tests for the process-wide Stario JSON codec."""
 
 import json as json_module
+import warnings
 
 import pytest
 
@@ -53,12 +54,30 @@ class RecordingCodec:
         return json_module.loads(value)
 
 
+def _recorders():
+    encoded: list[object] = []
+    loaded: list[object] = []
+
+    def encode(value: object) -> str:
+        encoded.append(value)
+        return json_module.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def decode(raw: str | bytes | bytearray) -> object:
+        loaded.append(raw)
+        return json_module.loads(raw)
+
+    return encoded, loaded, encode, decode
+
+
 @pytest.fixture(autouse=True)
 def _restore_codec():
-    previous = stario_json._codec
-    stario_json.set_codec(stario_json.StdlibJsonCodec())
+    encode = stario_json._encode
+    decode = stario_json._decode
+    legacy = stario_json._legacy
     yield
-    stario_json.set_codec(previous)
+    stario_json._encode = encode
+    stario_json._decode = decode
+    stario_json._legacy = legacy
 
 
 def test_default_codec_uses_compact_utf8_bytes_and_accepts_text() -> None:
@@ -80,22 +99,122 @@ def test_default_codec_rejects_non_json_floats(value: float) -> None:
         stario_json.dumps_bytes(value)
 
 
+def test_set_codec_accepts_an_encode_that_returns_bytes() -> None:
+    calls = 0
+
+    def encode(value: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return json_module.dumps(
+            value, ensure_ascii=False, separators=(",", ":")
+        ).encode()
+
+    stario_json.set_codec(encode, json_module.loads)
+    assert stario_json.dumps({"a": 1}) == '{"a":1}'
+    assert calls == 1
+    assert stario_json.dumps_bytes({"a": 1}) == b'{"a":1}'
+    assert calls == 2
+
+
+def test_set_codec_accepts_an_encode_that_returns_text() -> None:
+    calls = 0
+
+    def encode(value: object) -> str:
+        nonlocal calls
+        calls += 1
+        return json_module.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    stario_json.set_codec(encode, json_module.loads)
+    assert stario_json.dumps({"a": 1}) == '{"a":1}'
+    assert calls == 1
+    assert stario_json.dumps_bytes({"a": 1}) == b'{"a":1}'
+    assert calls == 2
+
+
+def test_loads_uses_decode_for_text_bytes_and_bytearray() -> None:
+    loaded: list[object] = []
+
+    def decode(raw: str | bytes | bytearray) -> object:
+        loaded.append(raw)
+        return json_module.loads(raw)
+
+    stario_json.set_codec(json_module.dumps, decode)
+    for raw in ('{"a":1}', b'{"a":1}', bytearray(b'{"a":1}')):
+        assert stario_json.loads(raw) == {"a": 1}
+    assert loaded == ['{"a":1}', b'{"a":1}', bytearray(b'{"a":1}')]
+
+
+def test_set_codec_accepts_a_deprecated_codec_object() -> None:
+    codec = RecordingCodec()
+    with pytest.warns(DeprecationWarning, match="two functions"):
+        stario_json.set_codec(codec)
+
+    assert stario_json.dumps({"a": 1}) == '{"a":1}'
+    assert stario_json.dumps_bytes({"a": 1}) == b'{"a":1}'
+    assert stario_json.loads('{"a":1}') == {"a": 1}
+    assert codec.dumped_bytes == [({"a": 1}, None), ({"a": 1}, None)]
+    assert codec.loaded == ['{"a":1}']
+
+    marker = object()
+    with pytest.warns(DeprecationWarning, match="default="):
+        out = stario_json.dumps(marker, default=str)
+    assert codec.dumped == [(marker, str)]
+    assert out.startswith('"<object object')
+
+
+def test_default_kwarg_warns_and_falls_back_to_stdlib() -> None:
+    stario_json.set_codec(lambda _v: "{}", json_module.loads)
+    marker = object()
+    with pytest.warns(DeprecationWarning, match="default="):
+        out = stario_json.dumps(marker, default=str)
+    assert out.startswith('"<object object')
+    with pytest.warns(DeprecationWarning, match="default="):
+        out_bytes = stario_json.dumps_bytes(marker, default=str)
+    assert out_bytes == out.encode()
+
+
+def test_stdlib_codec_construction_warns() -> None:
+    with pytest.warns(DeprecationWarning, match="StdlibJsonCodec"):
+        stario_json.StdlibJsonCodec()
+
+
+def test_set_codec_rejects_non_callables() -> None:
+    with pytest.raises(TypeError):
+        stario_json.set_codec(lambda _v: b"")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(TypeError):
+        stario_json.set_codec(1, 2)  # pyright: ignore[reportArgumentType]
+
+
+def test_dumps_json_falls_back_to_stdlib_without_a_warning() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert dumps_json({"a": object()}).startswith('{"a":"<object object')
+
+
 def test_set_codec_can_replace_a_codec_after_use() -> None:
-    first = RecordingCodec()
-    second = RecordingCodec()
+    seen_first: list[object] = []
+    seen_second: list[object] = []
 
-    stario_json.set_codec(first)
-    assert stario_json.dumps({"first": True}) == '{"first":true}'
-    stario_json.set_codec(second)
-    assert stario_json.dumps_bytes({"second": True}) == b'{"second":true}'
+    def encode_first(value: object) -> str:
+        seen_first.append(value)
+        return "{}"
 
-    assert first.dumped == [({"first": True}, None)]
-    assert second.dumped_bytes == [({"second": True}, None)]
+    def encode_second(value: object) -> str:
+        seen_second.append(value)
+        return "{}"
+
+    stario_json.set_codec(encode_first, json_module.loads)
+    stario_json.dumps({"first": True})
+    stario_json.set_codec(encode_second, json_module.loads)
+    stario_json.dumps_bytes({"second": True})
+
+    assert seen_first == [{"first": True}]
+    assert seen_second == [{"second": True}]
 
 
 async def test_framework_json_paths_use_configured_codec() -> None:
-    codec = RecordingCodec()
-    stario_json.set_codec(codec)
+    encoded, loaded, encode, decode = _recorders()
+    stario_json.set_codec(encode, decode)
 
     json_writer, _sink, loop = make_writer_raw()
     writer, _sink2, _loop2 = make_writer_raw()
@@ -113,19 +232,16 @@ async def test_framework_json_paths_use_configured_codec() -> None:
     ) == {"request": True}
     assert dumps_json({"unknown": object()}).startswith('{"unknown":"<object object')
 
-    byte_values = [value for value, _default in codec.dumped_bytes]
-    text_values = [value for value, _default in codec.dumped]
-    assert {"response": True} in byte_values
-    assert {"sse": True} in byte_values
-    assert {"attribute": True} in text_values
-    assert codec.loaded == [b'{"request":true}']
-    assert any(default is str for _value, default in codec.dumped)
+    assert {"response": True} in encoded
+    assert {"sse": True} in encoded
+    assert {"attribute": True} in encoded
+    assert loaded == [b'{"request":true}']
 
 
 async def test_writer_json_uses_configured_codec_through_testclient() -> None:
     """`w.json` on the real RequestHandle honour `set_codec`, not the stdlib."""
-    codec = RecordingCodec()
-    stario_json.set_codec(codec)
+    encoded, _loaded, encode, decode = _recorders()
+    stario_json.set_codec(encode, decode)
 
     async def handler(_c: Context, w: Writer) -> None:
         w.json({"response": True})
@@ -136,7 +252,7 @@ async def test_writer_json_uses_configured_codec_through_testclient() -> None:
         r = await client.get("/")
 
     assert r.status_code == 200
-    assert [value for value, _default in codec.dumped_bytes] == [{"response": True}]
+    assert {"response": True} in encoded
     assert (
         r.content
         == json_module.dumps(

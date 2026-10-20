@@ -45,26 +45,14 @@ uvloop is not supported on Windows. `STARIO_THREADS=N` is N full servers on one 
 Stario uses one process-wide JSON codec for responses, Datastar signals,
 telemetry, and the test client. The default codec uses the standard library and
 emits compact UTF-8 JSON. Replace it explicitly when the application uses
-another library:
+another library — its encode and decode functions plug in directly:
 
 ```python
 import msgspec
 
 import stario.json as stario_json
 
-
-class MsgspecCodec:
-    def dumps(self, value, *, default=None):
-        return self.dumps_bytes(value, default=default).decode()
-
-    def dumps_bytes(self, value, *, default=None):
-        return msgspec.json.encode(value, enc_hook=default)
-
-    def loads(self, data):
-        return msgspec.json.decode(data)
-
-
-stario_json.set_codec(MsgspecCodec())
+stario_json.set_codec(msgspec.json.encode, msgspec.json.decode)
 ```
 
 orjson has native byte output, so its byte path does not encode text first:
@@ -74,31 +62,20 @@ import orjson
 
 import stario.json as stario_json
 
-
-class OrjsonCodec:
-    def dumps(self, value, *, default=None):
-        return self.dumps_bytes(value, default=default).decode()
-
-    def dumps_bytes(self, value, *, default=None):
-        return orjson.dumps(value, default=default)
-
-    def loads(self, data):
-        return orjson.loads(data)
-
-
-stario_json.set_codec(OrjsonCodec())
+stario_json.set_codec(orjson.dumps, orjson.loads)
 ```
 
-`dumps()` returns text, `dumps_bytes()` returns UTF-8 bytes, and `loads()`
-accepts text, bytes, or a byte array. Stario uses bytes for HTTP and SSE and
-text for HTML attributes and telemetry storage. A byte-native codec only
-decodes when a text consumer asks for `dumps()`.
+`encode` returns one compact JSON value as text or UTF-8 bytes; Stario converts
+once where it needs the other form. `dumps()` returns text, `dumps_bytes()`
+returns UTF-8 bytes, and `loads()` accepts text, bytes, or a byte array. Stario
+uses bytes for HTTP and SSE and text for HTML attributes and telemetry storage.
+A byte-native encoder only decodes when a text consumer asks for `dumps()`.
 
 Calling `set_codec()` again replaces the codec for later operations. Stario
 does not synchronize replacement with active requests or telemetry writes.
 Configure during application setup unless changing live serialization is
-intentional. The `default` callback is backend-dependent: a codec may serialize
-its native datetime, UUID, Decimal, or model types before calling it.
+intentional. A codec may serialize its native datetime, UUID, Decimal, or model
+types itself.
 
 This is transport configuration only; validation and application models stay
 in application code.

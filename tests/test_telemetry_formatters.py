@@ -1,5 +1,6 @@
 """Tests for shared telemetry formatting helpers."""
 
+import json
 from decimal import Decimal
 from uuid import UUID
 
@@ -74,3 +75,21 @@ class TestJsonHelpers:
         uid = UUID("00000000-0000-0000-0000-000000000001")
         assert dumps_json({"id": uid}) == f'{{"id":"{uid}"}}'
         assert dumps_json({"d": Decimal("1.5")}) == '{"d":"1.5"}'
+
+    def test_dumps_json_stringifies_non_finite_floats_in_fallback(self):
+        # stdlib `allow_nan=False` would raise; fallback stringifies instead.
+        import math
+
+        nan_uuid = UUID("00000000-0000-0000-0000-000000000002")
+        out = dumps_json(
+            {
+                "id": nan_uuid,  # unserializable value forces the fallback path
+                "nan": math.nan,
+                "nested": [math.inf, {"v": -math.inf}, (math.nan,)],
+            }
+        )
+        assert json.loads(out) == {
+            "id": str(nan_uuid),
+            "nan": "nan",
+            "nested": ["inf", {"v": "-inf"}, ["nan"]],
+        }
