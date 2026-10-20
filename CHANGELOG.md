@@ -6,29 +6,68 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 5.1.0 - 2026-10-20
+
+### Added
+
+- `set_codec(encode, decode)` takes two functions, e.g.
+  `set_codec(orjson.dumps, orjson.loads)`.
+- `ServerConfig(max_connections=)` / `STARIO_MAX_CONNECTIONS`. Over the cap,
+  cleartext gets `503`, TLS is closed. The cap is split across worker loops.
+- `relay.subscribe(..., maxsize=, latest=)` bounds the inbox (drop oldest, or
+  newest per subject); drops count in `sub.dropped`. Default stays unbounded.
+- Middleware `same_origin()` (403 for cross-origin unsafe methods via
+  `Sec-Fetch-Site`/`Origin`) and `security_headers()` (nosniff, frame,
+  referrer, optional HSTS).
+- `SSE.ping()` heartbeat comment; `event_id=` and `retry=` on SSE events.
+- `Files(..., untrusted=True)`: `CSP: sandbox` on every response, and
+  `content-disposition: attachment` for HTML, XML, SVG, and JavaScript.
+- `CompressionConfig(stream_window_log=)` / `STARIO_COMPRESS_STREAM_WINDOW_LOG`:
+  a smaller encoder for streamed `write()` responses. Default `None` (as
+  before). `16` cuts an idle stream to ~110 KiB (zstd) from ~3.6 MiB, but
+  whole-document repaints larger than the window send far more bytes.
+
 ### Changed
 
-- The TTY tracer is rewritten. A finished request prints to scrollback as a
-  tree: method, path, and status in the header, child spans on rails, and
-  attributes under the span they belong to. Open requests repaint in a live
-  area at the bottom, where a span with an open child shows as waiting and
-  only the deepest open spans spin. The layout adapts to narrow and wide
-  terminals, uses only theme colors (readable on light and dark themes),
-  survives resizes, and keeps `print` and logging output from breaking the
-  live area. When stdout is not a TTY it writes plain history only. Spans
-  now take the tracer lock on mutation (`span.mutex`), which removes the
-  data race between the redraw thread and request threads.
-- A handler failure is recorded once. With a recording span, the span carries
-  the status, message, and traceback; the `stario.http` logger is now only
-  the fallback for requests without a span. Before, the JSON tracer printed
-  each crash twice.
+- Signal names pass to Datastar unchanged; the snake_case rule and the
+  `__case.snake` modifier are gone. `data.signal`/`computed`/`bind` render
+  Datastar's value form. Dotted keys in `data.signals()` and
+  `SSE.patch_signals()` are nested paths.
+- `set_cookie` / `delete_cookie` default to `httponly=True`.
+- Routes freeze after bootstrap: `app.add`/`use`/`not_found`/
+  `method_not_allowed` raise `StarioError`.
+- `read_signals` raises `RequestBodyError(400)` for invalid signals, so the
+  client gets `400`, not `500`. `RequestBodyError` accepts `400`.
+- A handler failure is recorded once: on the span, or in the `stario.http`
+  log when there is no span.
+- The TTY tracer is rewritten: finished requests print as trees, open
+  requests repaint in a live area.
+- `build-native-deps.sh` checks a pinned SHA-256 for each tarball.
+
+### Deprecated
+
+- A codec object in `set_codec`, `JsonCodec`, `StdlibJsonCodec`, and
+  `default=` on `dumps()`/`dumps_bytes()`. Removed in 6.0.
 
 ### Fixed
 
-- `c.alive()` swallows only its own cancel. A cancel from other code that
-  races a disconnect or shutdown now propagates, and `alive()` no longer
-  cancels a task that is already unwinding, so `finally` blocks run to the
-  end.
+- HTTP/2: a response stalled by flow control is reset after
+  `write_timeout`. It could pin the stream and handler forever.
+- HTTP/2: `c.disconnect`/`c.disconnected` follow the stream, so a reset
+  stream ends its own `alive()` only.
+- Shutdown no longer hangs on a client that stopped reading.
+- A small request body sent slowly uses `body_timeout`, not
+  `header_timeout`. A stalled one gets `408`.
+- A kept `c` no longer keeps the closed connection and its buffers alive.
+- `respond()` copies a mutable body when custom headers are set.
+- `c.alive()` swallows only its own cancel and does not cancel a task that
+  is already unwinding.
+- A handler that returns without a response after its client left aborts
+  quietly (`request.client_left` on the span), not with a `500`.
+- `Files`/`Assets` open files in a worker thread, not on the event loop.
+- A failed input-buffer resize closes the connection instead of dropping
+  bytes.
+- Telemetry no longer raises on NaN or infinite span attributes.
 
 ## 5.0.4 - 2026-10-13
 

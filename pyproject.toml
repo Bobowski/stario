@@ -1,6 +1,6 @@
 [project]
 name = "stario"
-version = "5.0.4"
+version = "5.1.0"
 description = "Craft realtime hypermedia apps that are a joy to write and ship."
 readme = "README.md"
 license = "MIT"
@@ -74,8 +74,10 @@ test = [
 ]
 dev = [
     { include-group = "test" },
+    "cython>=3.1,<4",
     "pyright>=1.1.403",
     "ruff>=0.12.8",
+    "setuptools>=77",
 ]
 
 [tool.uv]
