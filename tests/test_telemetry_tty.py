@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+from typing import TextIO
 from uuid import UUID, uuid4
 
 from stario.telemetry.noop import NoOpTracer
@@ -617,7 +618,7 @@ def _patch_terminal(monkeypatch, *, columns=80, lines=24, now=_NOW) -> _TermPatc
     return term
 
 
-def _manual_tracer(out: io.StringIO, *, live=True) -> TTYTracer:
+def _manual_tracer(out: TextIO, *, live=True) -> TTYTracer:
     tracer = TTYTracer(out=out, live=live)
     tracer._running = True
     return tracer
@@ -836,7 +837,9 @@ class TestPassthrough:
 
             tracer._render()
             assert tracer._region.has_content
-            assert "request" in tracer._region._text
+            text = tracer._region._text
+            assert text is not None
+            assert "request" in text
         finally:
             tracer._restore_streams()
 

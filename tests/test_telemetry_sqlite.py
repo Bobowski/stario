@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 from uuid import uuid4
 
 from stario.telemetry.sqlite import SqliteTracer
@@ -21,7 +22,8 @@ def test_sqlite_tracer_context_manager_persists_span_tree(tmp_path) -> None:
         span.link("related.request", target_id, {"kind": "related"})
         span.attr("response.status_code", 200)
 
-    with sqlite3.connect(db_path) as connection:
+    # `with sqlite3.connect()` commits but never closes; close explicitly.
+    with closing(sqlite3.connect(db_path)) as connection:
         rows = connection.execute(
             """
             SELECT
