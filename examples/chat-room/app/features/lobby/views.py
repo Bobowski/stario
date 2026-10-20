@@ -11,7 +11,7 @@ from stario.datastar import at, data
 from stario.debug import debug_inspector
 from stario.markup import HtmlElement
 
-from .urls import SUBSCRIBE
+from .urls import LIVE
 
 
 def lobby_live_view(
@@ -72,7 +72,7 @@ def lobby_view(
                     if_missing=True,
                 ),
                 data.init(
-                    f"{VISITOR_SESSION_INIT}\n{at.get(SUBSCRIBE.href(), retry='always')}"
+                    f"{VISITOR_SESSION_INIT}\n{at.get(LIVE.href(), retry='always')}"
                 ),
                 lobby_live_view(rooms=rooms, online_counts=online_counts),
             ),

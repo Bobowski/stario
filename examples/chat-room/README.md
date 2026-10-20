@@ -61,15 +61,15 @@ Each feature follows the same shape — every file optional:
 | Route | Job |
 |-------|-----|
 | `GET /` | Lobby — list rooms and online counts |
-| `GET /subscribe` | Long-lived SSE — patch lobby on presence and room list changes |
+| `GET /live` | Long-lived SSE — patch lobby on presence and room list changes |
 | `POST /rooms` | Create a room (dialog signals) |
 | `DELETE /rooms/{id}` | Delete a room and its messages/presence |
 | `GET /rooms/{id}` | First paint for a room (mint demo user) |
-| `GET /rooms/{id}/subscribe` | Long-lived SSE — patch HTML on relay events |
+| `GET /rooms/{id}/live` | Long-lived SSE — patch HTML on relay events |
 | `POST /rooms/{id}/send` | 204 first, then store and publish |
 | `POST /rooms/{id}/typing` | 204 first, then typing flag and publish |
 
-Relay subjects are per room (`room.{id}.presence`, `room.{id}.message`, …), built by `room/subjects.py` and subscribed with `room.{id}.*`. The lobby opens `GET /subscribe` and listens on `room.*` and `lobby.*` so online counts and the room list update when users join or leave, or when rooms are created or deleted. When a room is deleted mid-stream, the room subscribe handler calls `SSE(w).navigate(LOBBY.href())` so live tabs return to the lobby without a full page reload.
+Relay subjects are per room (`room.{id}.presence`, `room.{id}.message`, …), built by `room/subjects.py` and subscribed with `room.{id}.*`. The lobby opens `GET /live` and listens on `room.*` and `lobby.*` so online counts and the room list update when users join or leave, or when rooms are created or deleted. When a room is deleted mid-stream, the room live handler calls `SSE(w).navigate(LOBBY.href())` so live tabs return to the lobby without a full page reload.
 
 ## Configuration
 

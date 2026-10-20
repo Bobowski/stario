@@ -3,7 +3,7 @@
 import pytest
 
 from stario.datastar import read_signals
-from stario.exceptions import StarioError
+from stario.exceptions import RequestBodyError
 from tests.helpers import make_request
 
 
@@ -42,17 +42,28 @@ class TestReadSignals:
 
         assert result == {}
 
-    async def test_invalid_json_raises_stario_error(self):
+    async def test_invalid_json_raises_body_error_400(self):
         req = make_request(method="POST", body=b"{invalid")
 
-        with pytest.raises(StarioError, match="valid JSON"):
+        with pytest.raises(RequestBodyError, match="Invalid Datastar signals") as info:
             await read_signals(req)
+        assert info.value.status_code == 400
+        assert isinstance(info.value.__cause__, ValueError)
 
     @pytest.mark.parametrize("payload", [b"[1,2,3]", b"null", b'"text"', b"42"])
-    async def test_non_object_json_raises_stario_error(self, payload: bytes):
+    async def test_non_object_json_raises_body_error_400(self, payload: bytes):
         req = make_request(method="POST", body=payload)
 
-        with pytest.raises(StarioError, match="Signals must decode to a JSON object"):
+        with pytest.raises(RequestBodyError, match="Invalid Datastar signals") as info:
+            await read_signals(req)
+        assert info.value.status_code == 400
+
+    async def test_deep_nesting_raises_body_error_400(self):
+        # Past the decoder's depth cap stdlib json raises RecursionError, not
+        # ValueError; it must still map to a 400, not a 500.
+        req = make_request(method="POST", body=b"[" * 100_000 + b"]" * 100_000)
+
+        with pytest.raises(RequestBodyError, match="Invalid Datastar signals"):
             await read_signals(req)
 
     @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "QUERY"])

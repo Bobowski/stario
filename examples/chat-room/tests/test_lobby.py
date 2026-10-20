@@ -67,7 +67,7 @@ async def test_each_tab_gets_distinct_identity():
 
 
 @pytest.mark.asyncio
-async def test_lobby_subscribe(client):
+async def test_lobby_live(client):
     lobby = await client.get("/")
     user_id = _signal_value(lobby.text, "user_id")
     assert user_id
@@ -77,7 +77,7 @@ async def test_lobby_subscribe(client):
     saw_patch = False
     async with client.stream(
         "GET",
-        "/subscribe",
+        "/live",
         params={"datastar": signals},
         headers={"Accept-Encoding": "identity"},
     ) as r:

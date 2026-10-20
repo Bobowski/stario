@@ -15,8 +15,8 @@ async def test_shared_counter_updates_and_reconnect():
         assert "<strong>0</strong>" in page.text
 
         async with (
-            client.stream("GET", "/subscribe") as first,
-            client.stream("GET", "/subscribe") as second,
+            client.stream("GET", "/live") as first,
+            client.stream("GET", "/live") as second,
             asyncio.timeout(5),
         ):
             streams = [first.iter_events(), second.iter_events()]
@@ -38,7 +38,7 @@ async def test_shared_counter_updates_and_reconnect():
 
         # Changes while disconnected must appear on the next subscription.
         await client.post("/increment")
-        async with client.stream("GET", "/subscribe") as reconnected:
+        async with client.stream("GET", "/live") as reconnected:
             async with asyncio.timeout(5):
                 event = await anext(reconnected.iter_events())
                 assert "<strong>1</strong>" in event["data"]

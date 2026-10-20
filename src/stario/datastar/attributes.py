@@ -39,16 +39,17 @@ from .format import (
     SignalValue,
     Throttle,
     TimeValue,
+    check_signal_name,
     debounce_to_string,
+    expand_signal_paths,
     filter_js,
     js_object,
     require_mapping,
-    signal_key,
-    signal_path_key,
+    signal_attr_key,
+    signal_object,
     throttle_to_string,
     time_to_string,
     to_kebab_key,
-    validate_signal_path,
 )
 
 
@@ -61,6 +62,9 @@ class DatastarAttributes:
     but do not parse or sanitize the JavaScript itself. `signals()` wraps JSON
     in single-quoted attributes and escapes only `'`, `&`, and `<`/`>` —
     so JSON double quotes stay literal on the wire.
+
+    Signal names pass through to Datastar unchanged — a dot is a nested path
+    and a leading `_` marks a local signal the browser does not send.
 
     `prefix` defaults to `"data-"`. Pass an explicit Datastar alias prefix, such
     as `"data-star-"`, when loading a custom aliased Datastar bundle.
@@ -76,6 +80,9 @@ class DatastarAttributes:
     def attr(self, key: str, expression: str) -> Attrs:
         """Set one HTML attribute from a reactive expression.
 
+        `expression` is JavaScript evaluated in the browser — never pass
+        user-supplied text; use a signal reference or `string_literal()`.
+
         ```python
         data.attr("title", "$item.label")
         # Attrs(' data-attr:title="$item.label"')
@@ -86,6 +93,9 @@ class DatastarAttributes:
 
     def attrs(self, mapping: dict[str, str]) -> Attrs:
         """Set several HTML attributes from a mapping of expressions.
+
+        Values are JavaScript expressions evaluated in the browser — never
+        pass user-supplied text; use a signal reference or `string_literal()`.
 
         ```python
         data.attrs({"open": "sidebarOpen"})
@@ -107,24 +117,21 @@ class DatastarAttributes:
         data.bind("email")
         # Attrs(' data-bind="email"')
 
-        data.bind("is_checked", prop="checked", event="change")
-        # Attrs(' data-bind:is-checked__case.snake__prop.checked__event.change')
+        data.bind("isChecked", prop="checked", event="change")
+        # Attrs(' data-bind__prop.checked__event.change="isChecked"')
         ```
         """
-        validate_signal_path(signal_name)
+        check_signal_name(signal_name)
         if prop is not None:
             validate_attribute_key(prop)
         if event is not None:
             validate_attribute_key(event)
-        if prop is None and event is None:
-            return Attrs(f' {self.prefix}bind="{escape_attr(signal_name)}"')
-
-        key_suffix = signal_path_key(signal_name)
-        if prop is None:
-            return Attrs(f" {self.prefix}bind:{key_suffix}__event.{event}")
-        if event is None:
-            return Attrs(f" {self.prefix}bind:{key_suffix}__prop.{prop}")
-        return Attrs(f" {self.prefix}bind:{key_suffix}__prop.{prop}__event.{event}")
+        modifiers = ""
+        if prop is not None:
+            modifiers += f"__prop.{prop}"
+        if event is not None:
+            modifiers += f"__event.{event}"
+        return Attrs(f' {self.prefix}bind{modifiers}="{escape_attr(signal_name)}"')
 
     def class_(self, name: str, expression: str) -> Attrs:
         """Toggle one CSS class from a reactive expression.
@@ -150,30 +157,33 @@ class DatastarAttributes:
     def computed(self, key: str, expression: str) -> Attrs:
         """Create one computed signal from a reactive expression.
 
+        `expression` is JavaScript evaluated in the browser — never pass
+        user-supplied text; use a signal reference or `string_literal()`.
+
         ```python
-        data.computed("full_name", "$first + $last")
-        # Attrs(' data-computed:full-name__case.snake="$first + $last"')
+        data.computed("fullName", "$first + $last")
+        # Attrs(' data-computed="{'fullName':() =&gt; ($first + $last)}"')
         ```
         """
-        return Attrs(
-            f' {self.prefix}computed:{signal_key(key)}="{escape_attr(expression)}"'
-        )
+        return self.computeds({key: expression})
 
     def computeds(self, mapping: dict[str, str]) -> Attrs:
-        """Create several computed signals from expressions.
+        """Create several computed signals in one `data-computed` object.
+
+        Values are JavaScript expressions evaluated in the browser — never
+        pass user-supplied text; use a signal reference or `string_literal()`.
+        Dotted keys merge into one nested object; using a name both as a
+        signal and as a path prefix raises `StarioError`.
 
         ```python
-        data.computeds({"full_name": "$a", "initials": "$b"})
-        # Attrs(' data-computed:full-name__case.snake="$a" data-computed:initials__case.snake="$b"')
+        data.computeds({"fullName": "$a", "ui.label": "$b"})
+        # Attrs(' data-computed="{'fullName':() =&gt; ($a),'ui':{'label':() =&gt; ($b)}}"')
         ```
         """
-        prefix = self.prefix + "computed:"
-        return Attrs(
-            "".join(
-                f' {prefix}{signal_key(key)}="{escape_attr(value)}"'
-                for key, value in mapping.items()
-            )
+        tree = expand_signal_paths(
+            {name: f"() => ({expr})" for name, expr in mapping.items()}
         )
+        return Attrs(f' {self.prefix}computed="{escape_attr(js_object(tree))}"')
 
     def effect(self, expression: str) -> Attrs:
         """Run a side effect when the element initializes or updates.
@@ -218,7 +228,7 @@ class DatastarAttributes:
         # Attrs(' data-indicator="saving"')
         ```
         """
-        validate_signal_path(signal_name)
+        check_signal_name(signal_name)
         return Attrs(f' {self.prefix}indicator="{escape_attr(signal_name)}"')
 
     def init(
@@ -516,11 +526,11 @@ class DatastarAttributes:
         """Store the current element in a signal.
 
         ```python
-        data.ref("search_input")
-        # Attrs(' data-ref="search_input"')
+        data.ref("searchInput")
+        # Attrs(' data-ref="searchInput"')
         ```
         """
-        validate_signal_path(signal_name)
+        check_signal_name(signal_name)
         return Attrs(f' {self.prefix}ref="{escape_attr(signal_name)}"')
 
     def show(self, expression: str) -> Attrs:
@@ -542,19 +552,20 @@ class DatastarAttributes:
     ) -> Attrs:
         """Patch one signal from a Datastar expression.
 
+        `expression` is JavaScript evaluated in the browser — never pass
+        user-supplied text; use a signal reference or `string_literal()`.
+        The value is wrapped in parentheses, so a top-level comma in the
+        expression stays part of the signal's value.
+
         ```python
-        data.signal("my_count", "0", if_missing=True)
-        # Attrs(' data-signals:my-count__case.snake__ifmissing="0"')
+        data.signal("myCount", "0", if_missing=True)
+        # Attrs(' data-signals__ifmissing="{'myCount': (0)}"')
         ```
         """
+        obj = signal_object(name, expression)
         if if_missing:
-            return Attrs(
-                f' {self.prefix}signals:{signal_key(name)}__ifmissing="'
-                f'{escape_attr(expression)}"'
-            )
-        return Attrs(
-            f' {self.prefix}signals:{signal_key(name)}="{escape_attr(expression)}"'
-        )
+            return Attrs(f' {self.prefix}signals__ifmissing="{escape_attr(obj)}"')
+        return Attrs(f' {self.prefix}signals="{escape_attr(obj)}"')
 
     def signals(
         self,
@@ -564,13 +575,17 @@ class DatastarAttributes:
     ) -> Attrs:
         """Patch several signals.
 
+        Keys are sent as JSON object keys, so any signal name works. A
+        dotted key is a nested path — `{"ui.open": True}` sets the same
+        signal as `data.signal("ui.open", ...)`.
+
         ```python
         data.signals({"count": 0, "open": False})
         # Attrs(" data-signals='{\"count\":0,\"open\":false}'")
         ```
         """
         value = escape_sq_attribute_value(
-            json_dumps(dict(require_mapping("signals", payload)))
+            json_dumps(expand_signal_paths(require_mapping("signals", payload)))
         )
         if if_missing:
             return Attrs(f" {self.prefix}signals__ifmissing='{value}'")
@@ -630,13 +645,19 @@ class DatastarAttributes:
     def match_media(self, signal_name: str, expression: str) -> Attrs:
         """Sync a signal with `matchMedia`. **Datastar Pro only.**
 
+        `data-match-media` has no value form, so the key is spelled to
+        survive HTML lowercasing and Datastar's case conversion and still
+        yield `signal_name` exactly.
+
         ```python
+        data.match_media("isDark", "'prefers-color-scheme: dark'")
+        # Attrs(' data-match-media:is-dark="'prefers-color-scheme: dark'"')
         data.match_media("is_dark", "'prefers-color-scheme: dark'")
-        # Attrs(' data-match-media:is-dark__case.snake="'prefers-color-scheme: dark'"')
+        # Attrs(' data-match-media:is_dark__case.kebab="'prefers-color-scheme: dark'"')
         ```
         """
         return Attrs(
-            f' {self.prefix}match-media:{signal_key(signal_name)}="'
+            f' {self.prefix}match-media:{signal_attr_key(signal_name)}="'
             f'{escape_attr(expression)}"'
         )
 

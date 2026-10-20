@@ -15,7 +15,7 @@ from stario.datastar import SSE
 
 from . import subjects as lobby_subjects
 from .signals import read_lobby_signals
-from .urls import LOBBY, SUBSCRIBE
+from .urls import LIVE, LOBBY
 from .views import LOBBY_LIVE_SELECTOR, lobby_live_view, lobby_view
 
 MAX_TITLE_LENGTH = 60
@@ -54,8 +54,8 @@ def show_lobby(db: Database):
     return handler
 
 
-def subscribe(db: Database, relay: Relay[str]):
-    """GET /subscribe — SSE patches when rooms or presence change."""
+def live(db: Database, relay: Relay[str]):
+    """GET /live — SSE patches when rooms or presence change."""
 
     async def handler(c: Context, w: Writer) -> None:
         identity = await resolve_identity(c)
@@ -64,11 +64,11 @@ def subscribe(db: Database, relay: Relay[str]):
             SSE(w).navigate(LOBBY.href())
             return
 
-        async with relay.subscribe("room.*", "lobby.*") as live:
+        async with relay.subscribe("room.*", "lobby.*") as events:
             sse = SSE(w)
             patch_lobby(sse, db, identity)
 
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 if subject.startswith("lobby.") or any(
                     subject.endswith(s) for s in _LOBBY_REFRESH_SUFFIXES
@@ -119,6 +119,6 @@ def delete_room(db: Database, relay: Relay[str]):
 
 def register_lobby(app: App, db: Database, relay: Relay[str]) -> None:
     app.add(LOBBY, show_lobby(db))
-    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(LIVE, live(db, relay))
     app.add(CREATE, create_room(db, relay))
     app.add(DELETE, delete_room(db, relay))

@@ -2,7 +2,7 @@
 
 from typing import Any, TypedDict, cast
 
-from stario.exceptions import StarioError
+from stario.exceptions import RequestBodyError
 from stario.http.request import Request
 from stario.json import loads as json_loads
 
@@ -31,9 +31,10 @@ async def read_signals(req: Request) -> dict[str, Any]:
     request body.
 
     This is convenience parsing only. Incoming signals are untrusted; validate
-    types, sizes, and nested shapes before using them as application data. SSE
-    signal patches use snake_case top-level keys; nested client state should be
-    sent as nested JSON objects.
+    types, sizes, and nested shapes before using them as application data.
+    Signal names pass through unchanged; names starting with `_` are Datastar
+    local signals, so the browser does not send them by default and they are
+    missing here. Nested client state arrives as nested JSON objects.
 
     ```python
     from stario import Route
@@ -56,16 +57,10 @@ async def read_signals(req: Request) -> dict[str, Any]:
 
     try:
         value = json_loads(raw)
-    except ValueError as exc:
-        raise StarioError(
-            "Signals must be valid JSON",
-            context={"json_error": str(exc)},
-            help_text="Datastar signals must be encoded as one JSON object.",
-        ) from exc
+    except (ValueError, RecursionError) as exc:
+        # RecursionError: nesting deeper than the decoder's limit (stdlib
+        # json raises it unwrapped; orjson caps depth with a ValueError).
+        raise RequestBodyError(400, "Invalid Datastar signals") from exc
     if not isinstance(value, dict):
-        raise StarioError(
-            "Signals must decode to a JSON object",
-            context={"decoded_type": type(value).__name__},
-            help_text="Datastar signals must be encoded as one JSON object.",
-        )
+        raise RequestBodyError(400, "Invalid Datastar signals")
     return cast(dict[str, Any], value)

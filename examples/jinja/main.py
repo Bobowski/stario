@@ -12,7 +12,7 @@ from stario import App, Context, Relay, Route, Span, Writer
 from stario.datastar import DATASTAR_CDN_URL, SSE
 
 HOME = Route("GET", "/")
-SUBSCRIBE = Route("GET", "/subscribe")
+LIVE = Route("GET", "/live")
 INCREMENT = Route("POST", "/increment")
 RESET = Route("POST", "/reset")
 
@@ -46,7 +46,7 @@ def home(counter: Counter):
             title="Shared counter",
             count=counter.count,
             datastar_url=DATASTAR_CDN_URL,
-            subscribe_url=SUBSCRIBE.href(),
+            subscribe_url=LIVE.href(),
             increment_url=INCREMENT.href(),
             reset_url=RESET.href(),
         )
@@ -55,13 +55,13 @@ def home(counter: Counter):
     return handler
 
 
-def subscribe(counter: Counter, relay: Relay[None]):
+def live(counter: Counter, relay: Relay[None]):
     async def handler(c: Context, w: Writer) -> None:
         # Subscribe before the first render so updates cannot fall into a gap.
-        async with relay.subscribe("counter") as live:
+        async with relay.subscribe("counter") as events:
             sse = SSE(w)
             sse.patch_elements(counter_view(counter))
-            async for _ in c.alive(live):
+            async for _ in c.alive(events):
                 sse.patch_elements(counter_view(counter))
 
     return handler
@@ -91,7 +91,7 @@ async def bootstrap(app: App, span: Span):
     relay = Relay[None]()
 
     app.add(HOME, home(counter))
-    app.add(SUBSCRIBE, subscribe(counter, relay))
+    app.add(LIVE, live(counter, relay))
     app.add(INCREMENT, increment(counter, relay))
     app.add(RESET, reset(counter, relay))
     yield

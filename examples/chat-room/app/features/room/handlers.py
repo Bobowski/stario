@@ -1,7 +1,7 @@
 """
 Room feature handlers — one room URL, SSE stream, and POST commands.
 
-Queries: show_room, subscribe
+Queries: show_room, live
 Commands: send_message, typing
 """
 
@@ -17,7 +17,7 @@ from stario.datastar import SSE
 from . import data, subjects
 from .models import Message, Room, User
 from .signals import read_chat_signals
-from .urls import ROOM, SEND, SUBSCRIBE, TYPING
+from .urls import LIVE, ROOM, SEND, TYPING
 from .views import ROOM_LIVE_SELECTOR, room_live_view, room_view
 
 MAX_MESSAGE_LENGTH = 2000
@@ -81,8 +81,8 @@ def show_room(db: Database):
     return handler
 
 
-def subscribe(db: Database, relay: Relay[str]):
-    """GET /rooms/{room_id}/subscribe — SSE patches for this room.
+def live(db: Database, relay: Relay[str]):
+    """GET /rooms/{room_id}/live — SSE patches for this room.
 
     `c.alive` ends the loop on client disconnect or server shutdown, so the
     presence cleanup below always runs. If the room is deleted mid-stream we
@@ -110,7 +110,7 @@ def subscribe(db: Database, relay: Relay[str]):
 
         # Subscribe first so this connection's queue exists before we publish
         # presence (avoids a gap where join could be dropped for this client).
-        async with relay.subscribe(subjects.room_events(room.id)) as live:
+        async with relay.subscribe(subjects.room_events(room.id)) as events:
             sse = SSE(w)
             data.add_user(db, user)
             relay.publish(subjects.presence(room.id), "join")
@@ -132,7 +132,7 @@ def subscribe(db: Database, relay: Relay[str]):
                 db=db,
             )
 
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 if data.get_room(db, room.id) is None:
                     sse.navigate(LOBBY.href())
@@ -226,6 +226,6 @@ def typing(db: Database, relay: Relay[str]):
 
 def register_room(app: App, db: Database, relay: Relay[str]) -> None:
     app.add(ROOM, show_room(db))
-    app.add(SUBSCRIBE, subscribe(db, relay))
+    app.add(LIVE, live(db, relay))
     app.add(SEND, send_message(db, relay))
     app.add(TYPING, typing(db, relay))

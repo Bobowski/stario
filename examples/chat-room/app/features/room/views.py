@@ -11,7 +11,7 @@ from stario.debug import debug_inspector
 from stario.markup import HtmlElement, SafeString, classes, styles
 
 from .models import Message, Room, User
-from .urls import SEND, SUBSCRIBE, TYPING
+from .urls import LIVE, SEND, TYPING
 
 
 def message_view(msg: Message, current_user_id: str) -> HtmlElement:
@@ -204,7 +204,7 @@ def room_view(
                     },
                     if_missing=True,
                 ),
-                data.init(f"{VISITOR_SESSION_INIT}\n{at.get(SUBSCRIBE.href(room.id))}"),
+                data.init(f"{VISITOR_SESSION_INIT}\n{at.get(LIVE.href(room.id))}"),
                 room_live_view(
                     room,
                     user_id,

@@ -15,8 +15,12 @@ from stario.datastar import (
 )
 from stario.datastar.attributes import DatastarAttributes
 from stario.datastar.format import (
+    check_signal_name,
     debounce_to_string,
+    expand_signal_paths,
     js_object,
+    signal_attr_key,
+    signal_object,
     throttle_to_string,
     time_to_string,
 )
@@ -62,11 +66,12 @@ def _wire_attrs(mapping: dict[str, str | bool]) -> Attrs:
 class TestSseSignals:
     """Test writer-bound signal patching helpers."""
 
-    def test_patch_signals_rejects_non_snake_key(self):
+    def test_patch_signals_accepts_any_signal_key(self):
+        """The JSON payload carries any key verbatim — no name conversion."""
         w, _sink, loop = _make_writer()
         try:
-            with pytest.raises(StarioError, match="snake_case"):
-                SSE(w).patch_signals({"myCount": 42})
+            SSE(w).patch_signals({"myCount": 1, "my-name": 2, "_x": 3})
+            assert b'data: signals {"myCount":1,"my-name":2,"_x":3}' in _sse_body(w)
         finally:
             loop.close()
 
@@ -359,16 +364,95 @@ class TestSseRemove:
             loop.close()
 
 
+class TestSseEventMeta:
+    """`id:`/`retry:` fields and the `ping()` comment on the wire."""
+
+    def test_ping_writes_comment_and_opens_stream(self):
+        w, _sink, loop = _make_writer()
+        try:
+            SSE(w).ping("beat")
+            assert _sse_body(w) == b": beat\n\n"
+            assert w.headers.get("content-type") == "text/event-stream"
+        finally:
+            loop.close()
+
+    def test_ping_rejects_line_breaks(self):
+        w, _sink, loop = _make_writer()
+        try:
+            with pytest.raises(StarioError, match="line breaks"):
+                SSE(w).ping("a\nb")
+        finally:
+            loop.close()
+
+    def test_patch_elements_emits_id_and_retry_after_event_line(self):
+        w, _sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements(b"<p>x</p>", event_id="e7", retry=250)
+            body = _sse_body(w)
+            assert body.startswith(
+                b"event: datastar-patch-elements\nid: e7\nretry: 250\n"
+            )
+        finally:
+            loop.close()
+
+    def test_retry_default_1000_is_omitted(self):
+        w, _sink, loop = _make_writer()
+        try:
+            SSE(w).patch_elements(b"<p>x</p>", retry=1000)
+            assert b"retry:" not in _sse_body(w)
+        finally:
+            loop.close()
+
+    @pytest.mark.parametrize("retry", [0, -1, True, "500", 2.5])
+    def test_retry_must_be_positive_int(self, retry):
+        w, _sink, loop = _make_writer()
+        try:
+            with pytest.raises(StarioError, match="positive int"):
+                SSE(w).patch_elements(b"<p>x</p>", retry=cast(Any, retry))
+        finally:
+            loop.close()
+
+    @pytest.mark.parametrize("bad", ["a\nb", "a\rb", "a\x00b"])
+    def test_event_id_rejects_line_breaks_and_nul(self, bad):
+        w, _sink, loop = _make_writer()
+        try:
+            with pytest.raises(StarioError):
+                SSE(w).patch_elements(b"<p>x</p>", event_id=bad)
+        finally:
+            loop.close()
+
+    def test_patch_signals_and_remove_emit_meta(self):
+        w, _sink, loop = _make_writer()
+        try:
+            sse = SSE(w)
+            sse.patch_signals({"n": 1}, event_id="s1", retry=50)
+            sse.remove("#x", event_id="r1")
+            body = _sse_body(w)
+            assert b"event: datastar-patch-signals\nid: s1\nretry: 50\n" in body
+            assert b"event: datastar-patch-elements\nid: r1\n" in body
+        finally:
+            loop.close()
+
+    def test_navigate_and_execute_script_pass_meta_through(self):
+        w, _sink, loop = _make_writer()
+        try:
+            sse = SSE(w)
+            sse.execute_script("console.log(1)", event_id="js1")
+            sse.navigate("/next", retry=42)
+            body = _sse_body(w)
+            assert body.count(b"id: js1\n") == 1
+            assert body.count(b"retry: 42\n") == 1
+        finally:
+            loop.close()
+
+
 class TestDatastarAttributeValidation:
     """Validation rules not covered by the wire-format matrix."""
 
-    def test_bind_rejects_non_snake_signal_name(self):
-        with pytest.raises(StarioError, match="snake_case"):
-            data.bind("mySignal")
-
-    def test_bind_rejects_non_snake_signal_path_segment(self):
-        with pytest.raises(StarioError, match="snake_case"):
-            data.bind("crane.selectedCrane")
+    def test_signal_names_reject_only_empty_or_broken_paths(self):
+        for bad in ("", "a..b", ".a", "a.", 5, None):
+            with pytest.raises(StarioError, match="Invalid Datastar signal name"):
+                check_signal_name(bad)  # type: ignore[arg-type]
 
     def test_attr_rejects_quote_breakout_key(self):
         with pytest.raises(StarioError, match="Invalid attribute name"):
@@ -394,6 +478,214 @@ class TestDatastarAttributeValidation:
             throttle_to_string(("150ms", "leading"))  # type: ignore[arg-type]
 
 
+class TestSignalNames:
+    """Signal names pass through to Datastar unchanged; `_` means local."""
+
+    @pytest.mark.parametrize(
+        ("actual", "expected"),
+        [
+            # bind: the value form uses the name verbatim
+            (data.bind("myCount"), Attrs(' data-bind="myCount"')),
+            (data.bind("my_count"), Attrs(' data-bind="my_count"')),
+            (data.bind("my-count"), Attrs(' data-bind="my-count"')),
+            (data.bind("MyCount"), Attrs(' data-bind="MyCount"')),
+            (data.bind("_local"), Attrs(' data-bind="_local"')),
+            (data.bind("ui.open"), Attrs(' data-bind="ui.open"')),
+            (data.bind("ui._open"), Attrs(' data-bind="ui._open"')),
+            (
+                data.bind("myCount", prop="checked", event="change"),
+                Attrs(' data-bind__prop.checked__event.change="myCount"'),
+            ),
+            (
+                data.bind("ui._open", prop="checked"),
+                Attrs(' data-bind__prop.checked="ui._open"'),
+            ),
+            (
+                data.bind("query", event="input"),
+                Attrs(' data-bind__event.input="query"'),
+            ),
+            # indicator and ref: value form
+            (data.indicator("myCount"), Attrs(' data-indicator="myCount"')),
+            (data.indicator("_saving"), Attrs(' data-indicator="_saving"')),
+            (data.ref("searchInput"), Attrs(' data-ref="searchInput"')),
+            (data.ref("ui.el"), Attrs(' data-ref="ui.el"')),
+            # signal: value-form object; dotted names nest
+            (
+                data.signal("myCount", "0"),
+                Attrs(" data-signals=\"{'myCount': (0)}\""),
+            ),
+            (
+                data.signal("_local", "0"),
+                Attrs(" data-signals=\"{'_local': (0)}\""),
+            ),
+            (
+                data.signal("ui.open", "0"),
+                Attrs(" data-signals=\"{'ui': {'open': (0)}}\""),
+            ),
+            (
+                data.signal("myCount", "$a, $b"),
+                Attrs(" data-signals=\"{'myCount': ($a, $b)}\""),
+            ),
+            (
+                data.signal("myCount", "0", if_missing=True),
+                Attrs(" data-signals__ifmissing=\"{'myCount': (0)}\""),
+            ),
+            # signals(): JSON form, keys verbatim
+            (
+                data.signals({"_menu_open": False}),
+                Attrs(""" data-signals='{"_menu_open":false}'"""),
+            ),
+            # computed: value form, arrow function per entry (>&gt; escaped on the wire)
+            (
+                data.computed("fullName", "$first + $last"),
+                Attrs(" data-computed=\"{'fullName':() =&gt; ($first + $last)}\""),
+            ),
+            (
+                data.computed("ui.label", "$x"),
+                Attrs(" data-computed=\"{'ui':{'label':() =&gt; ($x)}}\""),
+            ),
+            (
+                data.computeds({"a": "$x", "b.c": "$y", "b.d": "$z"}),
+                Attrs(
+                    " data-computed=\"{'a':() =&gt; ($x),'b':{'c':() =&gt; ($y),'d':() =&gt; ($z)}}\""
+                ),
+            ),
+            # match_media: key form spelled to round-trip through case conversion
+            (
+                data.match_media("isDark", "$dark"),
+                Attrs(' data-match-media:is-dark="$dark"'),
+            ),
+            (
+                data.match_media("is_dark", "$dark"),
+                Attrs(' data-match-media:is_dark__case.kebab="$dark"'),
+            ),
+            (
+                data.match_media("IsDark", "$dark"),
+                Attrs(' data-match-media:is-dark__case.pascal="$dark"'),
+            ),
+            (
+                data.match_media("_menu_open", "$dark"),
+                Attrs(' data-match-media:_menu_open__case.kebab="$dark"'),
+            ),
+        ],
+    )
+    def test_signal_names_render_verbatim(self, actual, expected):
+        assert actual == expected
+
+    def test_computeds_rejects_leaf_and_prefix_conflict(self):
+        with pytest.raises(StarioError, match="Conflicting Datastar signal paths"):
+            data.computeds({"a.b": "$x", "a": "$y"})
+        with pytest.raises(StarioError, match="Conflicting Datastar signal paths"):
+            data.computeds({"a": "$y", "a.b": "$x"})
+
+    def test_signal_object_wraps_value_in_parentheses(self):
+        assert signal_object("ui._open", "0") == "{'ui': {'_open': (0)}}"
+        assert signal_object("myCount", "$a, $b") == "{'myCount': ($a, $b)}"
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("isDark", "is-dark"),
+            ("is_dark", "is_dark__case.kebab"),
+            ("IsDark", "is-dark__case.pascal"),
+            ("_x", "_x__case.kebab"),
+            ("my-count", "my-count__case.kebab"),
+            ("dark2", "dark2__case.kebab"),
+        ],
+    )
+    def test_signal_attr_key_round_trips(self, name, expected):
+        assert signal_attr_key(name) == expected
+
+    @pytest.mark.parametrize(
+        "name",
+        ["a__b", "a b", "aB-c", 'a"b', "a'b", "a>b", "a/b", "a=b"],
+    )
+    def test_signal_attr_key_rejects_unspellable_names(self, name):
+        with pytest.raises(StarioError, match="attribute key"):
+            signal_attr_key(name)
+
+    def test_patch_signals_accepts_local_signal_key(self):
+        w, _sink, loop = _make_writer()
+        try:
+            SSE(w).patch_signals({"_draft": ""})
+            assert b'data: signals {"_draft":""}' in _sse_body(w)
+        finally:
+            loop.close()
+
+
+class TestExpandSignalPaths:
+    """`{"ui.open": x}` becomes `{"ui": {"open": x}}` in every JSON payload."""
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"ui.open": True}, {"ui": {"open": True}}),
+            ({"a.b.c": 1}, {"a": {"b": {"c": 1}}}),
+            (
+                {"ui": {"a": 1}, "ui.b": 2},
+                {"ui": {"a": 1, "b": 2}},
+            ),
+            # a nested dict's own dotted keys expand the same way
+            ({"a": {"b.c": 1}}, {"a": {"b": {"c": 1}}}),
+            # a dict merges onto an existing dict path
+            ({"a.b": 1, "a": {"c": 2}}, {"a": {"b": 1, "c": 2}}),
+            # None is a leaf — Datastar uses it to remove a signal
+            ({"gone": None, "ui.open": None}, {"gone": None, "ui": {"open": None}}),
+            # lists and other values stay untouched leaves
+            (
+                {"list": [1, {"a.b": 2}], "ui.x": "y"},
+                {"list": [1, {"a.b": 2}], "ui": {"x": "y"}},
+            ),
+        ],
+    )
+    def test_dotted_keys_expand(self, payload, expected):
+        assert expand_signal_paths(payload) == expected
+
+    def test_no_dot_returns_an_equal_copy(self):
+        payload = {"count": 0, "ui": {"open": True, "deep": {"x": 1}}}
+        expanded = expand_signal_paths(payload)
+        assert expanded == payload
+        assert expanded is not payload
+        # the fast path does not rebuild nested values
+        assert expanded["ui"] is payload["ui"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            # a path runs through a non-dict leaf
+            {"a": 1, "a.b": 2},
+            {"a.b": 2, "a.b.c": 1},
+            # a leaf lands on a path (same leaf path set twice)
+            {"a.b": 2, "a": 1},
+            {"ui": {"open": 1}, "ui.open": 2},
+            {"a": {"b": 1}, "a.b": 2},
+            # a dict lands on an existing leaf
+            {"a": 1, "a.b": {"c": 2}},
+        ],
+    )
+    def test_conflicting_paths_raise(self, payload):
+        with pytest.raises(StarioError, match="Conflicting Datastar signal paths"):
+            expand_signal_paths(payload)
+
+    @pytest.mark.parametrize("key", ["", "a..b", ".a", "a.", 1, None])
+    def test_bad_names_raise(self, key):
+        with pytest.raises(StarioError, match="Invalid Datastar signal name"):
+            expand_signal_paths({key: 1})
+
+    def test_signals_attribute_expands_dotted_keys(self):
+        assert data.signals({"ui.open": True, "count": 0}) == Attrs(
+            ' data-signals=\'{"ui":{"open":true},"count":0}\''
+        )
+
+    def test_patch_signals_expands_dotted_keys(self):
+        w, _sink, loop = _make_writer()
+        try:
+            SSE(w).patch_signals({"ui.open": True})
+            assert b'data: signals {"ui":{"open":true}}' in _sse_body(w)
+        finally:
+            loop.close()
+
+
 class TestDatastarAttributeMatrix:
     """Table-driven contract for every attribute helper's wire format."""
 
@@ -403,21 +695,21 @@ class TestDatastarAttributeMatrix:
             (data.ignore_morph(), {"data-ignore-morph": True}),
             (
                 data.computed("full_name", "$a + $b"),
-                {"data-computed:full-name__case.snake": "$a + $b"},
+                {"data-computed": "{'full_name':() =&gt; ($a + $b)}"},
             ),
             (data.signals({"count": 0}), {"data-signals": '{"count":0}'}),
             (data.bind("email"), {"data-bind": "email"}),
             (
                 data.bind("is_checked", prop="checked"),
-                {"data-bind:is-checked__case.snake__prop.checked": True},
+                {"data-bind__prop.checked": "is_checked"},
             ),
             (
                 data.bind("query", event="input.change"),
-                {"data-bind:query__case.snake__event.input.change": True},
+                {"data-bind__event.input.change": "query"},
             ),
             (
                 data.bind("is_checked", prop="checked", event="change"),
-                {"data-bind:is-checked__case.snake__prop.checked__event.change": True},
+                {"data-bind__prop.checked__event.change": "is_checked"},
             ),
             (data.show("$visible"), {"data-show": "$visible"}),
             (

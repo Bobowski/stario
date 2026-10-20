@@ -6,15 +6,14 @@ Used by attribute and action builders; you rarely import this module directly.
 import math
 import re
 from collections.abc import Iterable, Mapping
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 
 from stario.exceptions import StarioError
 
-_SIGNAL_NAME_SEGMENT_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
-_SIGNAL_PATH_RE = re.compile(
-    r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:_[a-z0-9]+)*)*$"
-)
 _TIME_VALUE_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:ms|s)$")
+# Characters that cannot appear inside an attribute key (HTML or Datastar
+# parsing would break) — `__` starts a modifier, the rest break the tag.
+_SIGNAL_KEY_BAD_RE = re.compile(r"__|\s|[\"'>/=]")
 
 # Filter types for include/exclude parameters
 FilterValue = str | Iterable[str]
@@ -222,6 +221,10 @@ def js_object(__obj: dict[str, Any] | None = None, /, **kwargs: Any) -> str:
     String values are emitted as raw JavaScript expressions, not quoted text.
     Wrap text with `string_literal()` when you want a JavaScript string value.
 
+    Warning: a plain `str` is a JavaScript expression evaluated in the
+    browser. Never pass user-supplied text as a `str` value here — wrap it
+    with `string_literal()` or send it as a signal instead.
+
     ```python
     from stario.datastar import at, format
 
@@ -276,33 +279,175 @@ def filter_js(
 type Case = Literal["kebab", "snake", "pascal", "camel"]
 
 
-def validate_signal_name(name: str) -> None:
-    """Validate Stario's signal-name contract: Python-facing names are snake_case."""
-    if _SIGNAL_NAME_SEGMENT_RE.fullmatch(name):
-        return
+def check_signal_name(name: object) -> None:
+    """Reject only what cannot work as a Datastar signal name.
 
+    Names pass through to Datastar unchanged. A dot is a nested path, so
+    every segment must be non-empty. A leading `_` marks a Datastar local
+    signal the browser never sends — allowed, not blocked.
+    """
+    if (
+        not isinstance(name, str)
+        or not name
+        or any(part == "" for part in name.split("."))
+    ):
+        raise StarioError(
+            f"Invalid Datastar signal name: {name!r}",
+            context={"signal_name": repr(name)},
+            help_text=(
+                "Use a non-empty signal name. A dot is a nested path, so every "
+                "segment must be non-empty — for example `ui.open`."
+            ),
+        )
+
+
+def signal_object(name: str, value_js: str) -> str:
+    """Value-form JS object literal assigning `value_js` to a (dotted) signal.
+
+    ```python
+    signal_object("ui._open", "0")
+    # → "{'ui': {'_open': (0)}}"
+    signal_object("myCount", "$a, $b")
+    # → "{'myCount': ($a, $b)}"
+    ```
+    """
+    check_signal_name(name)
+    inner = f"({value_js})"
+    for part in reversed(name.split(".")):
+        inner = "{" + string_literal(part) + ": " + inner + "}"
+    return inner
+
+
+def expand_signal_paths(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Expand dotted signal keys into nested objects.
+
+    Datastar's JSON signal patches treat each object key literally, so a
+    wire `{"ui.open": true}` would create one signal named `ui.open` that
+    `$ui.open` and `data-bind="ui.open"` cannot reach. Stario expands a dot to a nested
+    path instead: `{"ui.open": True}` becomes `{"ui": {"open": True}}` —
+    the same signal `data.signal("ui.open", ...)` sets.
+
+    Mapping values merge into the path tree recursively; every other
+    value — including `None`, which removes a signal — is a leaf.
+    Conflicting paths raise `StarioError`.
+    """
+
+    def conflict(key: str) -> NoReturn:
+        raise StarioError(
+            f"Conflicting Datastar signal paths: {key!r}",
+            context={"signal_name": key},
+            help_text=(
+                "Do not set a signal both as a value and as the parent of "
+                "a dotted path, and do not set one signal twice."
+            ),
+        )
+
+    def check_keys(mapping: Mapping[str, Any]) -> bool:
+        dotted = False
+        for key, value in mapping.items():
+            check_signal_name(key)
+            if "." in key:
+                dotted = True
+            if isinstance(value, Mapping) and check_keys(
+                cast(Mapping[str, Any], value)
+            ):
+                dotted = True
+        return dotted
+
+    def merge_into(
+        node: dict[str, Any], parts: list[str], value: Any, key: str
+    ) -> None:
+        for part in parts[:-1]:
+            if part in node:
+                child: Any = node[part]
+                if not isinstance(child, dict):
+                    conflict(key)
+            else:
+                child = {}
+                node[part] = child
+            node = cast(dict[str, Any], child)
+        leaf = parts[-1]
+        if isinstance(value, Mapping):
+            if leaf in node:
+                child = node[leaf]
+                if not isinstance(child, dict):
+                    conflict(key)
+            else:
+                child = {}
+                node[leaf] = child
+            for sub_key, sub_value in cast(Mapping[str, Any], value).items():
+                merge_into(
+                    cast(dict[str, Any], child),
+                    sub_key.split("."),
+                    sub_value,
+                    sub_key,
+                )
+        else:
+            if leaf in node:
+                conflict(key)
+            node[leaf] = value
+
+    if not check_keys(payload):
+        # No dot anywhere — patch_signals runs per SSE event, so keep this cheap.
+        return dict(payload)
+    tree: dict[str, Any] = {}
+    for key, value in payload.items():
+        merge_into(tree, key.split("."), value, key)
+    return tree
+
+
+def _ds_camel(text: str) -> str:
+    """Port of Datastar `modifyCasing` camel: `-x` becomes `X`."""
+    return re.sub(r"-[a-z]", lambda m: m[0][1].upper(), text)
+
+
+def _ds_pascal(text: str) -> str:
+    """Port of Datastar `modifyCasing` pascal: capitalize, camel the rest."""
+    return text[:1].upper() + _ds_camel(text[1:])
+
+
+def signal_attr_key(name: str) -> str:
+    """Attribute-key suffix whose client-side case conversion yields `name`.
+
+    The key form lowercases in HTML before Datastar's `__case` conversion runs,
+    so this picks a spelling that round-trips: names without uppercase take
+    `__case.kebab` (a no-op), camelCase names get kebab-spelled (camel is the
+    default conversion), and PascalCase names take `__case.pascal`.
+
+    ```python
+    signal_attr_key("isDark")
+    # → "is-dark"
+    signal_attr_key("is_dark")
+    # → "is_dark__case.kebab"
+    signal_attr_key("IsDark")
+    # → "is-dark__case.pascal"
+    ```
+    """
+    check_signal_name(name)
+    if _SIGNAL_KEY_BAD_RE.search(name):
+        raise StarioError(
+            f"Signal name cannot be spelled as a Datastar attribute key: {name!r}",
+            context={"signal_name": name},
+            help_text=(
+                "Use a name Datastar can spell in an attribute key, for example "
+                "camelCase, snake_case, or kebab-case."
+            ),
+        )
+    if not any(c.isupper() for c in name):
+        return name + "__case.kebab"
+    kebabed = re.sub(r"[A-Z]", lambda m: "-" + m[0].lower(), name)
+    if name[0].isupper():
+        candidate = kebabed.lstrip("-")
+        if _ds_pascal(candidate) == name:
+            return candidate + "__case.pascal"
+    elif _ds_camel(kebabed) == name:
+        return kebabed
     raise StarioError(
-        f"Invalid Datastar signal name: {name!r}",
+        f"Signal name cannot be spelled as a Datastar attribute key: {name!r}",
         context={"signal_name": name},
         help_text=(
-            "Use snake_case signal names in Python, for example `user_id` or "
-            "`room_title`. Stario renders the Datastar `__case.snake` modifier "
-            "where the wire format needs it."
-        ),
-    )
-
-
-def validate_signal_path(path: str) -> None:
-    """Validate a snake_case Datastar signal name or dotted signal path."""
-    if _SIGNAL_PATH_RE.fullmatch(path):
-        return
-
-    raise StarioError(
-        f"Invalid Datastar signal path: {path!r}",
-        context={"signal_path": path},
-        help_text=(
-            "Use snake_case names in Python, including every segment of dotted "
-            "signal paths, for example `user_id` or `crane.selected_crane`."
+            "Use a name Datastar can spell in an attribute key, for example "
+            "camelCase, snake_case, or kebab-case."
         ),
     )
 
@@ -345,15 +490,3 @@ def to_kebab_key(key: str) -> str:
 def case_modifier(case: Case) -> str:
     """Return the explicit Datastar case modifier, omitting the camel default."""
     return "" if case == "camel" else "__case." + case
-
-
-def signal_key(name: str) -> str:
-    """Return a Datastar namespaced-attribute key suffix for a snake_case signal."""
-    validate_signal_name(name)
-    return to_kebab_key(name) + "__case.snake"
-
-
-def signal_path_key(path: str) -> str:
-    """Return a namespaced-attribute key suffix for a snake_case signal path."""
-    validate_signal_path(path)
-    return ".".join(to_kebab_key(part) for part in path.split(".")) + "__case.snake"

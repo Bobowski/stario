@@ -3,4 +3,4 @@
 from stario import Route
 
 LOBBY = Route("GET /")
-SUBSCRIBE = Route("GET /subscribe")
+LIVE = Route("GET /live")

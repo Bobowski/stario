@@ -5,7 +5,7 @@ from stario import Route
 ROOMS = "/rooms"
 ROOM_PATH = ROOMS + "/{room_id}"
 ROOM = Route("GET", ROOM_PATH)
-SUBSCRIBE = Route("GET", ROOM_PATH + "/subscribe")
+LIVE = Route("GET", ROOM_PATH + "/live")
 SEND = Route("POST", ROOM_PATH + "/send")
 TYPING = Route("POST", ROOM_PATH + "/typing")
 CREATE = Route("POST", ROOMS)

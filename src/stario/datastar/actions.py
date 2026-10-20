@@ -85,8 +85,10 @@ class DatastarActions:
     ) -> str:
         """Build a Datastar backend fetch action.
 
-        Values in `payload` are JavaScript expressions. Wrap literal text with
-        `string_literal()` so it is emitted as a JS string.
+        Values in `payload` are JavaScript expressions evaluated in the
+        browser. Never pass user-supplied text as a `payload` value — wrap
+        literal text with `string_literal()` or send it as a signal. Values in
+        `headers` are already string literals and are safe for literal text.
         """
         if selector is not None and content_type != "form":
             raise StarioError(
@@ -173,6 +175,10 @@ class DatastarActions:
     ) -> str:
         """Build `@get(...)`.
 
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+
         ```python
         h.Button(data.on("click", at.get("/items", {"q": "$query"})), "Search")
         ```
@@ -215,7 +221,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@post(...)` with the same option surface as `get`."""
+        """Build `@post(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "post",
             url,
@@ -254,7 +265,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@put(...)` with the same option surface as `get`."""
+        """Build `@put(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "put",
             url,
@@ -293,7 +309,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@patch(...)` with the same option surface as `get`."""
+        """Build `@patch(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "patch",
             url,
@@ -332,7 +353,12 @@ class DatastarActions:
         retry_max_count: int | None = None,
         request_cancellation: RequestCancellation | str | None = None,
     ) -> str:
-        """Build `@delete(...)` with the same option surface as `get`."""
+        """Build `@delete(...)` with the same option surface as `get`.
+
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
+        """
         return self._fetch(
             "delete",
             url,
@@ -374,6 +400,9 @@ class DatastarActions:
         """Build `@query(...)` with the same option surface as `get`.
 
         Sends a `QUERY` request with signals in the body, like `post`.
+        Warning: `payload` string values are JavaScript expressions evaluated
+        in the browser — never pass user-supplied text there; wrap it with
+        `string_literal()` or send it as a signal.
         """
         return self._fetch(
             "query",

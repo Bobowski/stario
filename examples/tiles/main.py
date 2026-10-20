@@ -17,7 +17,7 @@ Read top to bottom:
 Three routes, three jobs (CQRS-shaped, not a framework):
 
   GET  /           first paint — build HTML once
-  GET  /subscribe  stay open — patch HTML whenever Relay fires
+  GET  /live  stay open — patch HTML whenever Relay fires
   POST /click      change board — 204 immediately, updates arrive on SSE
 
 Handlers use c.span for request telemetry; bootstrap uses span.attrs at startup.
@@ -67,7 +67,7 @@ DATASTAR_JS = ASSETS.href("js/datastar.js")
 
 # One Route per endpoint — register with app.add, link with href() or at.get / at.post.
 HOME = Route("GET", "/")
-SUBSCRIBE = Route("GET", "/subscribe")
+LIVE = Route("GET", "/live")
 CLICK = Route("POST", "/click")
 
 # =============================================================================
@@ -111,7 +111,7 @@ class Game:
         self.grid_size = grid_size
         self.colors = palette
         self.board: dict[int, str] = {}  # cell index → paint color
-        self.user_colors: dict[str, str] = {}  # only tabs with an open /subscribe
+        self.user_colors: dict[str, str] = {}  # only tabs with an open /live
         self._lock = threading.Lock()
 
         total = grid_size * grid_size
@@ -223,7 +223,7 @@ def board_view(game: Game) -> HtmlElement:
 
 
 def info_view(user_id: str, game: Game) -> HtmlElement:
-    # Before /subscribe runs, this tab isn't in user_colors yet — show a neutral swatch.
+    # Before /live runs, this tab isn't in user_colors yet — show a neutral swatch.
     users = game.snapshot_users()
     my_color = users.get(user_id, "#ccc")
     colors = list(users.values())
@@ -262,8 +262,8 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
             # Signals: client-held JSON synced with the server; every Datastar @get/@post includes them.
             # if_missing=True: set defaults only when absent so reconnects don't clobber client state.
             data.signals({"user_id": user_id}, if_missing=True),
-            # Mount opens GET /subscribe; retry="always" survives brief network blips.
-            data.init(at.get(SUBSCRIBE.href(), retry="always")),
+            # Mount opens GET /live; retry="always" survives brief network blips.
+            data.init(at.get(LIVE.href(), retry="always")),
             # data.init runs once when the node mounts — here it opens the SSE stream (`@get`).
             h.H1("Tiles - Stario App"),
             h.P(
@@ -285,7 +285,7 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
 # Each route is a factory — home(game) returns the real handler so bootstrap can
 # inject shared state without globals. hello-world skips this; tiles needs it.
 #
-# Queries (read):  home, subscribe
+# Queries (read):  home, live
 # Commands (write): click
 
 
@@ -308,8 +308,8 @@ def home(game: Game):
     return handler
 
 
-def subscribe(game: Game, relay: Relay[str]):
-    """GET /subscribe — SSE stream; re-render home_view on every relay event."""
+def live(game: Game, relay: Relay[str]):
+    """GET /live — SSE stream; re-render home_view on every relay event."""
 
     async def handler(c: Context, w: Writer) -> None:
         user_id = await read_user_id(c)
@@ -321,11 +321,11 @@ def subscribe(game: Game, relay: Relay[str]):
         # Queue must exist before publish — otherwise this tab misses its own join.
         # Subscribe first so this connection's queue exists before we publish presence
         # (avoids a gap where "join" and other events could be dropped for this client).
-        async with relay.subscribe("*") as live:
+        async with relay.subscribe("*") as events:
             sse = SSE(w)
             game.join(user_id)
             # Same fan-out as clicks: all SSE clients patch so everyone sees the new player.
-            relay.publish("join", user_id)  # wakes every open subscribe loop
+            relay.publish("join", user_id)  # wakes every open live loop
             c.span.event("Player connected", {"user_id": user_id})
             c.span.attr("user_id", user_id)
 
@@ -336,7 +336,7 @@ def subscribe(game: Game, relay: Relay[str]):
             # First iteration (and every later one): relay fan-out — join included — drives patches.
             # No separate onload patch: `publish("join")` already queues for this subscriber.
             # `*` matches all topics; fine for demos — production often namespaces keys.
-            async for subject, _ in c.alive(live):
+            async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
                 sse.patch_elements(home_view(user_id, game))
 
@@ -353,7 +353,7 @@ def click(game: Game, relay: Relay[str]):
 
     async def handler(c: Context, w: Writer) -> None:
         user_id = await read_user_id(c)
-        # Membership in user_colors means /subscribe succeeded for this tab.
+        # Membership in user_colors means /live succeeded for this tab.
         if user_id not in game.user_colors:
             w.redirect(HOME.href())
             return
@@ -384,7 +384,7 @@ def click(game: Game, relay: Relay[str]):
         c.span.event("Cell toggled", {"cell_id": cell_id, "action": action})
 
         # Fan-out: every open SSE subscription receives this; each client's
-        # `subscribe` loop wakes up and calls `sse.patch_elements()`, so all users re-render.
+        # `live` loop wakes up and calls `sse.patch_elements()`, so all users re-render.
         # Real-time in this demo—and the same pub/sub + patch pattern scales to
         # larger apps with a broker instead of in-process `Relay`.
         relay.publish("click", user_id)  # SSE tabs re-read Game and patch
@@ -403,7 +403,7 @@ def click(game: Game, relay: Relay[str]):
 async def bootstrap(app: App, span: Span):
     # `span` is the root bootstrap tracer; attr() annotates startup for TTY/JSON/SQLite sinks.
     game = Game()
-    relay = Relay[str]()  # process-local fan-out between open /subscribe loops
+    relay = Relay[str]()  # process-local fan-out between open /live loops
 
     span.attrs(
         {
@@ -420,7 +420,7 @@ async def bootstrap(app: App, span: Span):
 
     # Queries — return or stream HTML
     app.add(HOME, home(game))
-    app.add(SUBSCRIBE, subscribe(game, relay))
+    app.add(LIVE, live(game, relay))
     # Commands — mutate Game, nudge relay; updates arrive on SSE
     app.add(CLICK, click(game, relay))
     yield

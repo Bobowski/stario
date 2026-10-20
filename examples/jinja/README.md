@@ -34,7 +34,7 @@ The counter lives in one server process and resets when it restarts.
 | Route | Purpose |
 |-------|---------|
 | `GET /` | Render the page and current counter |
-| `GET /subscribe` | Send the current counter, then stream Jinja fragments on Relay notifications |
+| `GET /live` | Send the current counter, then stream Jinja fragments on Relay notifications |
 | `POST /increment` | Increment the counter and notify subscribers; return 204 |
 | `POST /reset` | Reset the counter and notify subscribers; return 204 |
 
