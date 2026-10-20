@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator
 from functools import lru_cache
 from threading import Lock
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 from stario.exceptions import StarioError, StarioRuntime
 
@@ -115,10 +115,13 @@ class RelaySubscription[T]:
     __slots__ = (
         "_inbox_lock",
         "_items",
+        "_latest",
+        "_maxsize",
         "_relay",
         "_waiter",
         "_wake_pending",
         "active",
+        "dropped",
         "generation",
         "loop",
         "patterns",
@@ -128,17 +131,25 @@ class RelaySubscription[T]:
         self,
         relay: Relay[T],
         patterns: tuple[str, ...],
+        *,
+        maxsize: int | None = None,
+        latest: bool = False,
     ) -> None:
         self._relay = relay
         self.patterns = patterns
+        self._maxsize = maxsize
+        self._latest = latest
+        # Messages lost to bounded/latest inbox policy since registration.
+        self.dropped = 0
         # Guards the inbox below so a worker-thread publish can hand a message to a
         # handler awaiting on the owning loop.
         self._inbox_lock = Lock()
         self.active = False
         # Bumped on register/unregister so in-flight deliveries after teardown are ignored.
         self.generation = 0
-        # Messages delivered while no receive() is waiting. Unbounded by design.
-        self._items: deque[Msg[T]] = deque()
+        # Messages delivered while no receive() is waiting. A deque in normal
+        # mode; a subject-keyed dict in latest mode (insertion order = arrival).
+        self._items: deque[Msg[T]] | dict[str, Msg[T]] = {} if latest else deque()
         # The loop that registered us; every delivery must land there.
         self.loop: AbstractEventLoop | None = None
         # The future a blocked receive() is awaiting, if any (at most one).
@@ -196,7 +207,7 @@ class RelaySubscription[T]:
                 )
             # Drain buffered messages first; only block when the inbox is empty.
             if self._items:
-                return self._items.popleft()
+                return self._popleft_locked()
             # Single-consumer handle: a second concurrent receive() is a usage bug.
             if self._waiter is not None:
                 raise StarioRuntime("subscription already has a pending receive")
@@ -211,6 +222,34 @@ class RelaySubscription[T]:
                 if self._waiter is waiter:
                     self._waiter = None
 
+    def _append_locked(self, msg: Msg[T]) -> None:
+        # Inbox policy lives here so deliver() and enqueue() share it.
+        items = self._items
+        if self._latest:
+            latest_items = cast(dict[str, Msg[T]], items)
+            subject = msg[0]
+            if subject in latest_items:
+                # Newer value for a buffered subject replaces it, latest at end.
+                del latest_items[subject]
+                self.dropped += 1
+            elif self._maxsize is not None and len(latest_items) >= self._maxsize:
+                del latest_items[next(iter(latest_items))]
+                self.dropped += 1
+            latest_items[subject] = msg
+            return
+        queue = cast(deque[Msg[T]], items)
+        if self._maxsize is not None and len(queue) >= self._maxsize:
+            queue.popleft()
+            self.dropped += 1
+        queue.append(msg)
+
+    def _popleft_locked(self) -> Msg[T]:
+        items = self._items
+        if self._latest:
+            latest_items = cast(dict[str, Msg[T]], items)
+            return latest_items.pop(next(iter(latest_items)))
+        return cast(deque[Msg[T]], items).popleft()
+
     def deliver(self, msg: Msg[T], generation: int) -> None:
         # Runs on the subscription's own loop (same-loop publishers call it
         # inline), so it may complete the waiter Future directly.
@@ -218,7 +257,7 @@ class RelaySubscription[T]:
             # Stale delivery for a torn-down / re-registered subscription: drop it.
             if not self.active or self.generation != generation:
                 return
-            self._items.append(msg)
+            self._append_locked(msg)
             self._hand_off_locked()
 
     def enqueue(self, msg: Msg[T], generation: int) -> bool:
@@ -233,7 +272,7 @@ class RelaySubscription[T]:
         with self._inbox_lock:
             if not self.active or self.generation != generation:
                 return False
-            self._items.append(msg)
+            self._append_locked(msg)
             if self._waiter is None or self._wake_pending:
                 return False
             self._wake_pending = True
@@ -256,7 +295,7 @@ class RelaySubscription[T]:
             return
         self._waiter = None
         if not waiter.done():
-            waiter.set_result(self._items.popleft())
+            waiter.set_result(self._popleft_locked())
 
     async def __aenter__(self) -> Self:
         # Register on enter; unregister on exit — otherwise handles stay in
@@ -405,23 +444,41 @@ class Relay[T]:
     def subscribe(
         self,
         *patterns: str,
+        maxsize: int | None = None,
+        latest: bool = False,
     ) -> RelaySubscription[T]:
         """Subscribe to one or more patterns.
 
         Overlapping patterns are merged — each matching publish delivers at most once.
 
         The returned handle buffers nothing until entered with `async with`; do not
-        use `async for` on the bare return value. Its inbox is unbounded: a consumer
-        that falls behind a fast publisher grows memory without limit. Use a broker
-        (NATS, Redis) when you need backpressure.
+        use `async for` on the bare return value. Its inbox is unbounded by
+        default: a consumer that falls behind a fast publisher grows memory
+        without limit. Two opt-in bounds change that:
+
+        - `maxsize=N` caps buffered messages; when full, the oldest buffered
+          message is dropped for the new one.
+        - `latest=True` keeps only the newest message per subject; a new
+          message for a buffered subject replaces it (and moves it to the
+          end). With `maxsize` the cap counts distinct subjects.
+
+        Dropped and replaced messages count in `sub.dropped`. Use a broker
+        (NATS, Redis) when you need real backpressure.
         """
         if not patterns:
             raise StarioError(
                 "subscribe() requires at least one pattern",
                 example='relay.subscribe("room.*")',
             )
+        if maxsize is not None and maxsize < 1:
+            raise StarioError(
+                "subscribe(maxsize=) must be at least 1",
+                context={"maxsize": maxsize},
+            )
 
         return RelaySubscription(
             self,
             _deduplicate_patterns(tuple(patterns)),
+            maxsize=maxsize,
+            latest=latest,
         )

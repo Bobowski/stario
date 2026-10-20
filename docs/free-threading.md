@@ -189,9 +189,11 @@ handler. Do not add a second bus.
 ### What still bites
 
 **Unbounded inboxes.** A slow SSE subscriber on thread 1 plus a hot
-publisher on thread 0 grows `deque` without bound. That is today’s
-contract; threads make it easier to hit. Document it; do not silently
-drop. Apps that need backpressure still want NATS/Redis.
+publisher on thread 0 grows `deque` without bound. Unbounded is still the
+default contract; threads make it easier to hit. `subscribe(maxsize=N)`
+caps the buffer and drops the oldest message, `subscribe(latest=True)`
+keeps only the newest message per subject — drops count in `sub.dropped`.
+Apps that need real backpressure still want NATS/Redis.
 
 **Payload aliasing.** `publish` hands the same `data` object to every
 subscriber. If a handler mutates the dict, every other thread sees it.

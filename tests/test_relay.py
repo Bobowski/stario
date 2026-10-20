@@ -113,6 +113,93 @@ class TestRelayBasic:
         assert received == [1, 2]
 
 
+class TestRelayBoundedInbox:
+    def test_maxsize_must_be_at_least_one(self) -> None:
+        relay = Relay()
+        with pytest.raises(StarioError, match="at least 1"):
+            relay.subscribe("n", maxsize=0)
+
+    async def test_maxsize_keeps_newest_in_order(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", maxsize=3) as sub:
+            for i in range(5):
+                relay.publish("n", i)
+            received = [await sub.receive() for _ in range(3)]
+            assert received == [("n", 2), ("n", 3), ("n", 4)]
+            assert sub.dropped == 2
+
+    async def test_maxsize_still_hands_off_to_blocked_receive(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", maxsize=1) as sub:
+            waiter = asyncio.ensure_future(sub.receive())
+            await asyncio.sleep(0)
+            relay.publish("n", 1)
+            relay.publish("n", 2)
+            assert (await waiter) == ("n", 1)
+            # The second publish buffered; the first was already handed off.
+            assert await sub.receive() == ("n", 2)
+            assert sub.dropped == 0
+
+    async def test_latest_keeps_newest_per_subject(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("room.*", latest=True) as sub:
+            relay.publish("room.1", 1)
+            relay.publish("room.1", 2)
+            relay.publish("room.2", 3)
+            relay.publish("room.1", 4)
+            assert sub.dropped == 2  # two stale room.1 values replaced
+            # room.2 arrived before the last room.1 replacement moved to end.
+            assert await sub.receive() == ("room.2", 3)
+            assert await sub.receive() == ("room.1", 4)
+
+    async def test_latest_with_maxsize_caps_distinct_subjects(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("room.*", maxsize=2, latest=True) as sub:
+            relay.publish("room.1", 1)
+            relay.publish("room.2", 2)
+            relay.publish("room.3", 3)
+            assert sub.dropped == 1  # room.1 evicted, not replaced
+            assert await sub.receive() == ("room.2", 2)
+            assert await sub.receive() == ("room.3", 3)
+            # A re-publish of a dropped subject is a fresh buffer entry.
+            relay.publish("room.1", 4)
+            assert sub.dropped == 1
+            assert await sub.receive() == ("room.1", 4)
+
+    async def test_latest_hand_off_to_blocked_receive(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", latest=True) as sub:
+            waiter = asyncio.ensure_future(sub.receive())
+            await asyncio.sleep(0)
+            relay.publish("n", 9)
+            assert (await waiter) == ("n", 9)
+            assert sub.dropped == 0
+
+    async def test_maxsize_applies_to_cross_thread_enqueue(self) -> None:
+        relay = Relay[int]()
+
+        async with relay.subscribe("n", maxsize=3) as sub:
+            thread = threading.Thread(
+                target=lambda: [relay.publish("n", i) for i in range(8)]
+            )
+            thread.start()
+            thread.join(timeout=1.0)
+            assert sub.dropped == 5
+            received = [await sub.receive() for _ in range(3)]
+            assert received == [("n", 5), ("n", 6), ("n", 7)]
+
+    async def test_latest_applies_to_cross_thread_enqueue(self) -> None:
+        relay = Relay[int]()
+        async with relay.subscribe("n", latest=True) as sub:
+            thread = threading.Thread(
+                target=lambda: [relay.publish("n", i) for i in range(8)]
+            )
+            thread.start()
+            thread.join(timeout=1.0)
+            assert sub.dropped == 7
+            assert await sub.receive() == ("n", 7)
+
+
 class TestRelayPatterns:
     async def test_exact_match(self) -> None:
         relay = Relay()
