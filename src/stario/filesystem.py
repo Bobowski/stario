@@ -20,13 +20,13 @@ import asyncio
 import errno
 import os
 import stat as stat_module
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
 from os import stat_result
 from pathlib import Path
-from typing import Final, NamedTuple, TypeGuard
+from typing import Any, Final, NamedTuple, TypeGuard
 
 from stario.exceptions import StarioError, StarioRuntime
 from stario.http.app import App
@@ -210,6 +210,29 @@ def _open_regular(path: Path | str) -> tuple[int, stat_result] | None:
         os.close(fd)
         raise
     return fd, file_stat
+
+
+def _close_unclaimed(future: asyncio.Future[Any]) -> None:
+    """Close the fd a worker thread opened after its awaiting task was cancelled."""
+    try:
+        opened = future.result()
+    except BaseException:
+        return
+    if opened is not None:
+        os.close(opened[0])
+
+
+async def _to_thread_open[P](
+    open_in_thread: Callable[[P], tuple[Any, ...] | None], arg: P
+) -> tuple[Any, ...] | None:
+    """Resolve/open in a worker thread; a cancelled waiter still frees the fd."""
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, open_in_thread, arg)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        future.add_done_callback(_close_unclaimed)
+        raise
 
 
 def _parse_range(header: bytes, size: int) -> _Range | object | None:
@@ -921,7 +944,7 @@ class Assets(_Mount):
         self, context: Context, writer: Writer, entry: _Hashed
     ) -> None:
         """Stream a hashed file that is not in memory. 404 if the pin drifted."""
-        opened = _open_regular(entry.source)
+        opened = await _to_thread_open(_open_regular, entry.source)
         if opened is None:
             _not_found(writer)
             return
@@ -958,10 +981,57 @@ class Assets(_Mount):
             os.close(fd)
 
 
-class Files(_Mount):
-    """Live files. `href()` checks the path exists. GET uses ETag and Range."""
+# Media types that can execute or render active content in the browser.
+_ACTIVE_TYPES: Final = frozenset(
+    {
+        b"text/html",
+        b"application/xhtml+xml",
+        b"image/svg+xml",
+        b"text/xml",
+        b"application/xml",
+        b"text/javascript",
+        b"application/javascript",
+        b"application/ecmascript",
+    }
+)
 
-    __slots__ = ()
+
+class Files(_Mount):
+    """Live files. `href()` checks the path exists. GET uses ETag and Range.
+
+    Pass `untrusted=True` for directories holding user uploads or other
+    untrusted bytes: every served response then carries
+    `content-security-policy: sandbox`, and active media types (HTML, XML,
+    SVG, JavaScript) also get `content-disposition: attachment` so browsers
+    download them instead of executing them in the site's origin. The 404
+    for missing paths is left unchanged.
+    """
+
+    __slots__ = ("untrusted",)
+
+    def __init__(
+        self,
+        directory: Path | str,
+        url_prefix: str | None = None,
+        *,
+        include_hidden: bool = False,
+        follow_symlinks: bool = False,
+        content_types: Mapping[str, str | bytes] | None = None,
+        untrusted: bool = False,
+    ) -> None:
+        if type(untrusted) is not bool:
+            raise StarioError(
+                "untrusted must be bool",
+                help_text="Pass True or False, not 1 or 0.",
+            )
+        super().__init__(
+            directory,
+            url_prefix,
+            include_hidden=include_hidden,
+            follow_symlinks=follow_symlinks,
+            content_types=content_types,
+        )
+        self.untrusted = untrusted
 
     def href(
         self,
@@ -1001,21 +1071,28 @@ class Files(_Mount):
         stats["streamed_files"] = stats["files"] - stats["cached_files"]
         self.stats = stats
 
+    def _resolve_open(self, path: str) -> tuple[int, Path, stat_result] | None:
+        """Resolve then open in one worker-thread hop; fd first for cleanup."""
+        found = self.resolve(path)
+        if found is None:
+            return None
+        source, _ = found
+        opened = _open_regular(source)
+        if opened is None:
+            return None
+        fd, file_stat = opened
+        return fd, source, file_stat
+
     async def __call__(self, context: Context, writer: Writer) -> None:
         path = context.match.params.get("path", "")
         if not _is_relative(path):
             _not_found(writer)
             return
-        found = self.resolve(path)
-        if found is None:
-            _not_found(writer)
-            return
-        source, _ = found
-        opened = _open_regular(source)
+        opened = await _to_thread_open(self._resolve_open, path)
         if opened is None:
             _not_found(writer)
             return
-        fd, file_stat = opened
+        fd, source, file_stat = opened
         try:
             entry = self._cache.get(path)
             if entry is not None and entry.identity != _identity(file_stat):
@@ -1042,15 +1119,18 @@ class Files(_Mount):
             etag = (
                 identity_etag if encoding is None else _stat_etag(file_stat, encoding)
             )
-            self._headers(
-                writer,
+            content_type = (
                 entry.content_type
                 if entry is not None
-                else self._content_types.get(source.suffix.lower(), DEFAULT_TYPE),
-                etag,
-                modified,
-                encodings,
+                else self._content_types.get(source.suffix.lower(), DEFAULT_TYPE)
             )
+            self._headers(writer, content_type, etag, modified, encodings)
+            if self.untrusted:
+                headers = writer.headers
+                headers.unsafe_set(b"content-security-policy", b"sandbox")
+                media_type = content_type.split(b";", 1)[0].strip().lower()
+                if media_type in _ACTIVE_TYPES:
+                    headers.unsafe_set(b"content-disposition", b"attachment")
             if _fresh(request, etag, modified):
                 writer.write_headers(304).end()
                 return

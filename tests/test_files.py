@@ -1,6 +1,8 @@
 """Tests for live `Files` and fingerprinted `Assets` URLs."""
 
+import asyncio
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -985,3 +987,110 @@ class TestAssets:
         assert initial.status_code == 200
         assert initial.headers.get("x-content-type-options") == "nosniff"
         assert cached.status_code == 304
+
+
+class TestUntrustedFiles:
+    def test_untrusted_must_be_bool(self, tmp_path: Path) -> None:
+        with pytest.raises(StarioError, match="untrusted must be bool"):
+            Files(tmp_path, untrusted=1)  # type: ignore[arg-type]
+
+    async def test_untrusted_marks_active_types_for_download(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "page.html").write_text("<p>hi</p>")
+        (tmp_path / "note.txt").write_text("plain")
+        files = Files(tmp_path, untrusted=True)
+
+        async with TestClient(_app(files)) as client:
+            page = await client.get("/data/page.html")
+            note = await client.get("/data/note.txt")
+            missing = await client.get("/data/missing.txt")
+
+        assert page.status_code == 200
+        assert page.headers.get("content-security-policy") == "sandbox"
+        assert page.headers.get("content-disposition") == "attachment"
+        assert note.status_code == 200
+        assert note.headers.get("content-security-policy") == "sandbox"
+        assert note.headers.get("content-disposition") is None
+        # The 404 stays a plain not-found.
+        assert missing.status_code == 404
+        assert missing.headers.get("content-security-policy") is None
+        assert missing.headers.get("content-disposition") is None
+
+    async def test_untrusted_headers_on_304_206_and_416(self, tmp_path: Path) -> None:
+        (tmp_path / "page.html").write_text("<p>hi</p>")
+        files = Files(tmp_path, untrusted=True)
+
+        async with TestClient(_app(files)) as client:
+            stale = await client.get("/data/page.html", headers={"If-None-Match": "*"})
+            partial = await client.get(
+                "/data/page.html", headers={"Range": "bytes=0-2"}
+            )
+            unsatisfied = await client.get(
+                "/data/page.html", headers={"Range": "bytes=99-100"}
+            )
+
+        for response in (stale, partial, unsatisfied):
+            assert response.headers.get("content-security-policy") == "sandbox"
+            assert response.headers.get("content-disposition") == "attachment"
+        assert [stale.status_code, partial.status_code, unsatisfied.status_code] == [
+            304,
+            206,
+            416,
+        ]
+
+    async def test_trusted_mount_has_no_sandbox_headers(self, tmp_path: Path) -> None:
+        (tmp_path / "page.html").write_text("<p>hi</p>")
+        files = Files(tmp_path)
+
+        async with TestClient(_app(files)) as client:
+            response = await client.get("/data/page.html")
+
+        assert response.status_code == 200
+        assert response.headers.get("content-security-policy") is None
+        assert response.headers.get("content-disposition") is None
+
+
+@pytest.mark.asyncio
+class TestOpenOffLoop:
+    async def test_cancelled_open_does_not_leak_fd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A handler cancelled while the worker thread opens the file still
+        closes the fd once the thread returns."""
+        target = tmp_path / "file.txt"
+        target.write_bytes(b"content")
+        files = Files(tmp_path)
+        app = _app(files)
+        gate = threading.Event()
+        descriptors: list[int] = []
+        real = Files._resolve_open
+
+        def gated(self: Files, path: str):
+            assert gate.wait(5)
+            opened = real(self, path)
+            if opened is not None:
+                descriptors.append(opened[0])
+            return opened
+
+        monkeypatch.setattr(Files, "_resolve_open", gated)
+
+        async with TestClient(app) as client:
+            request = asyncio.ensure_future(client.get("/data/file.txt"))
+            for _ in range(100):
+                if app.tasks:
+                    break
+                await asyncio.sleep(0.01)
+            handler_task = next(iter(app.tasks))
+            handler_task.cancel()
+            gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await handler_task
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            await asyncio.sleep(0.1)  # let the thread finish + callback run
+
+        assert descriptors, "the gated open never ran"
+        for fd in descriptors:
+            with pytest.raises(OSError, match="Bad file descriptor"):
+                os.fstat(fd)

@@ -4,6 +4,7 @@ import pytest
 
 import stario.testing as stio_testing
 from stario import App, Route
+from stario.exceptions import StarioError
 from stario.telemetry.core import Span
 from stario.testing import TestClient, aload_app
 
@@ -175,3 +176,54 @@ async def test_test_client_query_sends_body() -> None:
 
     assert response.status_code == 200
     assert response.text == "q=foo"
+
+
+@pytest.mark.asyncio
+async def test_routes_freeze_after_startup() -> None:
+    """Registration after bootstrap's yield raises; lookup keeps working."""
+    captured: list[App] = []
+
+    async def bootstrap(app: App, span):
+        async def ping(c, w):
+            w.text("pong")
+
+        app.add(Route("GET", "/ping"), ping)
+        yield
+
+    async with aload_app(bootstrap) as app, TestClient(app) as client:
+        captured.append(app)
+
+        async def late(c, w):
+            w.text("late")
+
+        for register in (
+            lambda: app.add(Route("GET", "/late"), late),
+            lambda: app.use("/api", lambda h: h),
+            lambda: app.not_found("/api", late),
+            lambda: app.method_not_allowed("/api", lambda a: late),
+        ):
+            with pytest.raises(StarioError, match="Routes are frozen"):
+                register()
+        assert (await client.get("/ping")).text == "pong"
+
+
+@pytest.mark.asyncio
+async def test_handler_adding_route_at_request_time_fails() -> None:
+    """A handler that calls app.add gets the frozen-route error -> 500."""
+
+    async def bootstrap(app: App, span):
+        async def ping(c, w):
+            w.text("pong")
+
+        async def sneaky(c, w):
+            app.add(Route("GET", "/sneaky"), ping)
+            w.text("never")
+
+        app.add(Route("GET", "/ping"), ping)
+        app.add(Route("GET", "/sneaky-add"), sneaky)
+        yield
+
+    async with TestClient(bootstrap) as client:
+        response = await client.get("/sneaky-add")
+        assert response.status_code == 500
+        assert (await client.get("/ping")).status_code == 200

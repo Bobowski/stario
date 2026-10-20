@@ -89,6 +89,7 @@ async def run_app(
     try:
         async with bootstrap_run(bootstrap, app, span):
             app.compiled()
+            app.freeze()
             try:
                 yield run
             except BaseException as exc:

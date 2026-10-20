@@ -54,10 +54,13 @@ def set_cookie(
     path: str = "/",
     domain: str | None = None,
     secure: bool = False,
-    httponly: bool = False,
+    httponly: bool = True,
     samesite: Literal["lax", "strict", "none"] | None = "lax",
 ) -> Writer:
     """Append `Set-Cookie` (returns `w` for chaining).
+
+    `httponly` defaults to `True` so `document.cookie` cannot read the value;
+    pass `httponly=False` only for cookies client-side JavaScript must read.
 
     `expires` may be:
 
@@ -134,7 +137,7 @@ def delete_cookie(
     path: str = "/",
     domain: str | None = None,
     secure: bool = False,
-    httponly: bool = False,
+    httponly: bool = True,
     samesite: Literal["lax", "strict", "none"] | None = "lax",
 ) -> Writer:
     """Expire a cookie by sending a clearing `Set-Cookie` that matches how it was set.

@@ -32,7 +32,7 @@ from stario.http.bootstrap import AppRun, run_app
 from stario.http.context import Context, Handler, Match, Middleware
 from stario.http.dispatch import Router, default_not_found, method_not_allowed_handler
 from stario.http.headers import Headers, RequestHeaders
-from stario.http.middleware import catch_errors
+from stario.http.middleware import catch_errors, same_origin, security_headers
 from stario.http.query import ParsedQuery
 from stario.http.redirect import normalized_location
 from stario.http.request import ParsedCookies, Request
@@ -59,4 +59,6 @@ __all__ = [
     "method_not_allowed_handler",
     "normalized_location",
     "run_app",
+    "same_origin",
+    "security_headers",
 ]

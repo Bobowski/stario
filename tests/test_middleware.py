@@ -6,7 +6,7 @@ import logging
 from stario import App, Route
 from stario.exceptions import RedirectException, RequestBodyError
 from stario.http.context import Context
-from stario.http.middleware import catch_errors
+from stario.http.middleware import catch_errors, same_origin, security_headers
 from stario.http.writer import Writer
 from stario.testing import TestClient
 from tests.helpers import run_with_app
@@ -120,3 +120,136 @@ class TestFrameworkExceptions:
             asyncio.run(run())
 
         assert "Handler failed" not in caplog.text
+
+
+class TestSameOrigin:
+    """`same_origin` blocks cross-origin state-changing requests (403)."""
+
+    def _app(self, **kwargs) -> App:
+        app = App()
+
+        async def handler(_c: Context, w: Writer) -> None:
+            w.text("ok")
+
+        app.use("/", same_origin(**kwargs))
+        app.add(Route("POST /x"), handler)
+        app.add(Route("GET /x"), handler)
+        return app
+
+    async def _post(self, app: App, **headers: str):
+        async with TestClient(app) as client:
+            return await client.post("/x", headers=headers)
+
+    async def test_same_origin_fetch_site_allowed(self):
+        response = await self._post(self._app(), **{"sec-fetch-site": "same-origin"})
+        assert response.status_code == 200
+
+    async def test_none_fetch_site_allowed(self):
+        response = await self._post(self._app(), **{"sec-fetch-site": "none"})
+        assert response.status_code == 200
+
+    async def test_cross_site_fetch_site_blocked(self):
+        response = await self._post(self._app(), **{"sec-fetch-site": "cross-site"})
+        assert response.status_code == 403
+        assert response.text == "Cross-origin request blocked"
+
+    async def test_same_site_blocked_by_default_allowed_when_opted_in(self):
+        response = await self._post(self._app(), **{"sec-fetch-site": "same-site"})
+        assert response.status_code == 403
+        response = await self._post(
+            self._app(allow_same_site=True), **{"sec-fetch-site": "same-site"}
+        )
+        assert response.status_code == 200
+
+    async def test_safe_method_skips_fetch_site_check(self):
+        app = self._app()
+        async with TestClient(app) as client:
+            response = await client.get("/x", headers={"sec-fetch-site": "cross-site"})
+        assert response.status_code == 200
+
+    async def test_origin_matching_host_allowed(self):
+        response = await self._post(
+            self._app(),
+            **{"origin": "https://example.com", "host": "example.com"},
+        )
+        assert response.status_code == 200
+
+    async def test_origin_default_port_normalised(self):
+        response = await self._post(
+            self._app(),
+            **{"origin": "https://example.com:443", "host": "example.com"},
+        )
+        assert response.status_code == 200
+
+    async def test_origin_mismatched_host_blocked(self):
+        response = await self._post(
+            self._app(),
+            **{"origin": "https://evil.example.com", "host": "example.com"},
+        )
+        assert response.status_code == 403
+
+    async def test_origin_null_blocked(self):
+        response = await self._post(
+            self._app(), **{"origin": "null", "host": "example.com"}
+        )
+        assert response.status_code == 403
+
+    async def test_no_headers_allowed(self):
+        # Non-browser clients send neither Sec-Fetch-Site nor Origin.
+        response = await self._post(self._app())
+        assert response.status_code == 200
+
+
+class TestSecurityHeaders:
+    def _app(self, **kwargs) -> App:
+        app = App()
+
+        async def handler(_c: Context, w: Writer) -> None:
+            w.text("ok")
+
+        app.use("/", security_headers(**kwargs))
+        app.add(Route("GET /x"), handler)
+        return app
+
+    async def test_defaults(self):
+        async with TestClient(self._app()) as client:
+            response = await client.get("/x")
+        assert response.headers.get("x-content-type-options") == "nosniff"
+        assert response.headers.get("x-frame-options") == "DENY"
+        assert (
+            response.headers.get("referrer-policy") == "strict-origin-when-cross-origin"
+        )
+        assert response.headers.get("strict-transport-security") is None
+
+    async def test_hsts_and_sameorigin(self):
+        app = self._app(frame="SAMEORIGIN", referrer="no-referrer", hsts=31536000)
+        async with TestClient(app) as client:
+            response = await client.get("/x")
+        assert response.headers.get("x-frame-options") == "SAMEORIGIN"
+        assert response.headers.get("referrer-policy") == "no-referrer"
+        assert (
+            response.headers.get("strict-transport-security")
+            == "max-age=31536000; includeSubDomains"
+        )
+
+    async def test_none_disables_optional_headers(self):
+        app = self._app(frame=None, referrer=None)
+        async with TestClient(app) as client:
+            response = await client.get("/x")
+        assert response.headers.get("x-frame-options") is None
+        assert response.headers.get("referrer-policy") is None
+        # nosniff stays on.
+        assert response.headers.get("x-content-type-options") == "nosniff"
+
+    async def test_handler_may_override(self):
+        app = App()
+
+        async def handler(_c: Context, w: Writer) -> None:
+            w.headers.set("x-frame-options", "SAMEORIGIN")
+            w.text("ok")
+
+        app.use("/", security_headers(frame="DENY"))
+        app.add(Route("GET /x"), handler)
+        async with TestClient(app) as client:
+            response = await client.get("/x")
+        assert response.headers.get("x-frame-options") == "SAMEORIGIN"

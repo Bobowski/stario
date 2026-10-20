@@ -240,6 +240,7 @@ class Router:
 
     __slots__ = (
         "_cy_router",
+        "_frozen",
         "_has_param_hosts",
         "_host_routing",
         "_hosts_exact",
@@ -253,6 +254,7 @@ class Router:
         self._hosts_param = Node()
         self._has_param_hosts = False
         self._host_routing = False
+        self._frozen = False
         # Compiled on the first lookup after a change. Registering N routes
         # is then N tree inserts and one compile, not N compiles.
         self._cy_router: CRouter | None = None
@@ -283,6 +285,21 @@ class Router:
                 state.host_routing = self._host_routing
                 state.router = compiled
         return compiled
+
+    def freeze(self) -> None:
+        """Seal the table: `add`/`use`/`not_found`/`method_not_allowed` raise.
+
+        Called once startup completes so a request-time registration bug fails
+        loudly instead of silently replacing the compiled trie under traffic.
+        """
+        self._frozen = True
+
+    def _check_frozen(self) -> None:
+        if self._frozen:
+            raise StarioError(
+                "Routes are frozen after startup",
+                help_text="Register routes in bootstrap before yield.",
+            )
 
     def _invalidate_lookup(self) -> None:
         self._cy_router = None
@@ -461,6 +478,7 @@ class Router:
         return self._descend(tree, route)
 
     def use(self, pattern: str, *middleware: Middleware) -> None:
+        self._check_frozen()
         current = self._policy_node(pattern)
         if not middleware:
             return
@@ -468,6 +486,7 @@ class Router:
         self._invalidate_lookup()
 
     def not_found(self, pattern: str, handler: Handler) -> None:
+        self._check_frozen()
         require_async_handler(handler, what="Not-found handler")
         node = self._policy_node(pattern)
         node.not_found_handler = handler
@@ -479,6 +498,8 @@ class Router:
         pattern: str,
         handler: MethodNotAllowedHandler,
     ) -> None:
+        self._check_frozen()
+
         def checked(allowed: frozenset[str]) -> Handler:
             resolved = handler(allowed)
             require_async_handler(resolved, what="Method-not-allowed handler")
@@ -494,6 +515,7 @@ class Router:
         *,
         middleware: Sequence[Middleware] = (),
     ) -> None:
+        self._check_frozen()
         require_async_handler(handler)
         if route is EMPTY_ROUTE:
             raise StarioError("Cannot register the unmatched route")
