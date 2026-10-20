@@ -209,6 +209,12 @@ cdef object _span_path(const char* url, Py_ssize_t n):
     return out
 
 
+def _cancel_unless_cancelling(task):
+    """Cancel ``task`` unless an ``alive()`` cancel is already in flight."""
+    if not task.done() and task.cancelling() == 0:
+        task.cancel()
+
+
 cdef Py_ssize_t _h2_unsent(RequestExchange ex) noexcept:
     """DATA bytes a stream has queued but nghttp2 has not sent yet."""
     cdef object pending = ex._h2_pending
@@ -295,6 +301,16 @@ cdef int PARSER_QUANTUM = 512 * 1024
 cdef int TIMEOUT_NONE = 0
 cdef int TIMEOUT_HEADER = 1
 cdef int TIMEOUT_IDLE = 2
+# Deferred small request bodies: body_timeout with progress resets.
+cdef int TIMEOUT_BODY = 3
+
+cdef bytes H1_OVERLOADED = (
+    b"HTTP/1.1 503 Service Unavailable\r\n"
+    b"connection: close\r\n"
+    b"content-length: 0\r\n"
+    b"retry-after: 1\r\n"
+    b"\r\n"
+)
 cdef int CLEANUP_OFF = 0
 cdef int CLEANUP_SWEEP = 1
 
@@ -609,19 +625,25 @@ cdef class Connections:
     cdef object _sweep_task
     cdef double _interval
     cdef public bint server_driven
+    # 0 means unlimited; `rejected` counts connections refused at the cap.
+    cdef public Py_ssize_t max_connections
+    cdef public Py_ssize_t rejected
 
     def __cinit__(self):
         self._protocols = set()
         self._sweep_task = None
         self._interval = 1.0
         self.server_driven = False
+        self.max_connections = 0
+        self.rejected = 0
 
-    def __init__(self, *, sweep_interval=1.0, server_driven=False):
+    def __init__(self, *, sweep_interval=1.0, server_driven=False, max_connections=0):
         interval = float(sweep_interval)
         if interval < 0.001:
             interval = 0.001
         self._interval = interval
         self.server_driven = server_driven
+        self.max_connections = max(int(max_connections), 0)
 
     def add(self, proto):
         self._protocols.add(proto)
@@ -897,6 +919,18 @@ cdef class CHttpProtocol(HttpConnection):
     def connection_made(self, transport):
         cdef object ssl_object
         cdef object selected
+        cdef Connections conns = self.connections
+        if (
+            conns.max_connections > 0
+            and len(conns._protocols) >= conns.max_connections
+        ):
+            # Refuse before registering: nothing tracks this socket.
+            conns.rejected += 1
+            self.rejected = True
+            if transport.get_extra_info("ssl_object") is None:
+                transport.write(H1_OVERLOADED)
+            transport.close()
+            return
         self.transport = transport
         self._t_is_closing = transport.is_closing
         self.closed = False
@@ -939,6 +973,15 @@ cdef class CHttpProtocol(HttpConnection):
             if self.closed and not self.disconnect.done():
                 self.disconnect.set_result(None)
         return self.disconnect
+
+    cdef object ensure_stream_disconnect(self, RequestExchange ex):
+        # Stream-scoped disconnect: resolves on stream reset or connection
+        # loss (both route through RequestExchange.c_abort).
+        if ex._stream_disc is None:
+            ex._stream_disc = self.loop.create_future()
+            if self.closed and not ex._stream_disc.done():
+                ex._stream_disc.set_result(None)
+        return ex._stream_disc
 
     def connection_lost(self, exc):
         cdef RequestExchange exchange
@@ -985,6 +1028,12 @@ cdef class CHttpProtocol(HttpConnection):
         self.pump_scheduled = False
         self.transport = None
         self._t_is_closing = None
+        # Dead connection: a retained ``c`` must not keep the buffers alive.
+        self._in_view = None
+        self._in_buf = None
+        self.h2_out = bytearray()
+        self.preface_hold = bytearray()
+        self.last_task = None
 
     cdef void release_exchange(self, RequestExchange exchange):
         """Detach, then keep one idle on this connection or recycle on this thread."""
@@ -1074,7 +1123,9 @@ cdef class CHttpProtocol(HttpConnection):
                 self.held_offset = 0
             new_n = keep + add_n
             if PyByteArray_Resize(held, new_n) < 0:
+                # OOM mid-append: held input is unrecoverable, so close.
                 PyErr_Clear()
+                self._protocol_error(500, "Internal Server Error")
                 return
             if add_n:
                 memcpy(PyByteArray_AS_STRING(held) + keep, src, <size_t>add_n)
@@ -1141,6 +1192,7 @@ cdef class CHttpProtocol(HttpConnection):
         cdef RequestExchange active
         cdef RequestExchange exchange
         cdef double seconds
+        cdef int kind
         if self._check_write_stall(now) or self.rejected:
             return
 
@@ -1148,6 +1200,8 @@ cdef class CHttpProtocol(HttpConnection):
             if self.timeout_deadline <= 0.0:
                 if self.timeout_kind == TIMEOUT_HEADER:
                     seconds = self.header_timeout
+                elif self.timeout_kind == TIMEOUT_BODY:
+                    seconds = self.body_timeout
                 else:
                     seconds = self.keep_alive_timeout
                 if seconds <= 0.0:
@@ -1156,9 +1210,14 @@ cdef class CHttpProtocol(HttpConnection):
                 else:
                     self.timeout_deadline = now + seconds
             elif now >= self.timeout_deadline:
+                kind = self.timeout_kind
                 self.timeout_kind = TIMEOUT_NONE
                 self.timeout_deadline = 0.0
-                self._close_on_timeout()
+                if kind == TIMEOUT_BODY:
+                    # Deferred small upload stalled: answer 408 and close.
+                    self._protocol_error(408, "Request timeout")
+                else:
+                    self._close_on_timeout()
                 return
 
         reading = self.reading_exchange
@@ -1174,6 +1233,7 @@ cdef class CHttpProtocol(HttpConnection):
                 self._check_h2_header_timeout(exchange, now)
                 if not exchange.in_pool:
                     self._check_body_stall(exchange, now)
+                    self._check_h2_send_stall(exchange, now)
 
     cdef bint _check_write_stall(self, double now):
         """Abort a connection whose peer stopped reading its output.
@@ -1219,19 +1279,69 @@ cdef class CHttpProtocol(HttpConnection):
         transport.close()
 
     cdef void _check_h2_header_timeout(self, RequestExchange ex, double now) noexcept:
-        """Reset a stream that has not dispatched within the header timeout."""
+        """Reset a stream that stalls on headers or a deferred body.
+
+        Small bodies defer dispatch to message-complete, so ``headers_done``
+        means the stream graduated to a body deadline that resets on DATA
+        progress. Pre-headers it is the plain header deadline.
+        """
         if (
             ex is None
             or ex._h2_dispatched
-            or self.header_timeout <= 0.0
             or self.timeout_cleanup == CLEANUP_OFF
         ):
+            return
+        if ex._h2_headers_done:
+            if self.body_timeout <= 0.0:
+                return
+            if ex._h2_body_mark < 0 or ex._total_read != ex._h2_body_mark:
+                ex._h2_body_mark = ex._total_read
+                ex._h2_header_deadline = now + self.body_timeout
+                return
+            if ex._h2_header_deadline <= 0.0:
+                ex._h2_header_deadline = now + self.body_timeout
+                return
+            if now >= ex._h2_header_deadline:
+                ex._h2_header_deadline = 0.0
+                self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_CANCEL)
+                self._h2_send()
+            return
+        if self.header_timeout <= 0.0:
             return
         if ex._h2_header_deadline <= 0.0:
             ex._h2_header_deadline = now + self.header_timeout
             return
         if now >= ex._h2_header_deadline:
             ex._h2_awaiting_headers = False
+            self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_CANCEL)
+            self._h2_send()
+
+    cdef void _check_h2_send_stall(self, RequestExchange ex, double now) noexcept:
+        """Reset a stream whose unsent DATA has made no progress.
+
+        Flow-control-blocked bytes live on the exchange, not the transport
+        buffer, so ``_check_write_stall`` cannot see them. Sent progress
+        re-arms the deadline; a window that never opens gets CANCEL.
+        """
+        if ex is None:
+            return
+        if (
+            ex._h2_end_sent
+            or self.write_timeout <= 0.0
+            or self.timeout_cleanup == CLEANUP_OFF
+            or _h2_unsent(ex) <= 0
+        ):
+            ex._h2_send_deadline = 0.0
+            return
+        if ex._h2_sent_total != ex._h2_send_mark:
+            ex._h2_send_mark = ex._h2_sent_total
+            ex._h2_send_deadline = now + self.write_timeout
+            return
+        if ex._h2_send_deadline <= 0.0:
+            ex._h2_send_deadline = now + self.write_timeout
+            return
+        if now >= ex._h2_send_deadline:
+            ex._h2_send_deadline = 0.0
             self._h2_reject_stream(ex._h2_stream_id, NGHTTP2_CANCEL)
             self._h2_send()
 
@@ -1248,6 +1358,7 @@ cdef class CHttpProtocol(HttpConnection):
             self.header_timeout_reset = False
             if (
                 not self.rejected
+                and self.timeout_kind != TIMEOUT_BODY
                 and self.reading_exchange is not None
                 and (
                     not self.request_dispatched
@@ -1685,6 +1796,11 @@ cdef class CHttpProtocol(HttpConnection):
                     and (flags & F_CONTENT_LENGTH)
                     and content_length <= <uint64_t>SMALL_BODY
                 ):
+                    # The request is not dispatched, so the header deadline
+                    # cannot keep running: a dribbled body would die at
+                    # header_timeout. BODY gets body_timeout with progress
+                    # resets in _on_body.
+                    self._arm_timeout(TIMEOUT_BODY, self.body_timeout)
                     return
             else:
                 exchange.mark_nobody()
@@ -1697,6 +1813,9 @@ cdef class CHttpProtocol(HttpConnection):
     cdef void _on_body(self, const char* at, size_t length) noexcept:
         if self.rejected or self.reading_exchange is None:
             return
+        if self.timeout_kind == TIMEOUT_BODY:
+            # Deferred-body progress: re-arm on the next sweep, no loop.time().
+            self.timeout_deadline = 0.0
         if self.reading_exchange.c_feed(at, length) != 0:
             self._protocol_error(400, "Invalid HTTP request")
 
@@ -1867,7 +1986,10 @@ cdef class CHttpProtocol(HttpConnection):
     cdef void _dispatch(self, RequestExchange exchange):
         cdef object span
         self.request_dispatched = True
-        if self.timeout_kind == TIMEOUT_HEADER:
+        if (
+            self.timeout_kind == TIMEOUT_HEADER
+            or self.timeout_kind == TIMEOUT_BODY
+        ):
             self.timeout_kind = TIMEOUT_NONE
             self.timeout_deadline = 0.0
 
@@ -2209,8 +2331,12 @@ cdef class CHttpProtocol(HttpConnection):
 
         self._set_pause_reason(PAUSE_PIPELINE, False)
         # Headers of the next request may already be trickling in: their
-        # deadline keeps running, or slow headers never time out.
-        if self.timeout_kind != TIMEOUT_HEADER:
+        # deadline keeps running, or slow headers never time out. A pipelined
+        # deferred body has its own BODY deadline; idle must not clobber it.
+        if (
+            self.timeout_kind != TIMEOUT_HEADER
+            and self.timeout_kind != TIMEOUT_BODY
+        ):
             self._arm_timeout(TIMEOUT_IDLE, self.keep_alive_timeout)
 
     cdef void _finish_protocol_span(
@@ -2908,9 +3034,15 @@ cdef class CHttpProtocol(HttpConnection):
             task = ex._handler_task
             ex.c_abort()
             if task is not None and not task.done():
-                # Recycle from on_handler_done after CancelledError so
-                # the handler cannot touch a pooled exchange.
-                task.cancel()
+                # alive() already cancelled through the stream disconnect
+                # future; a second bare cancel here would escape __aexit__
+                # as a foreign CancelledError, so defer it one tick.
+                if ex._stream_disc is not None:
+                    self.loop.call_soon(_cancel_unless_cancelling, task)
+                else:
+                    # Recycle from on_handler_done after CancelledError so
+                    # the handler cannot touch a pooled exchange.
+                    task.cancel()
             elif not ex.handler_started:
                 ex.cancel_before_start()
             else:
@@ -3068,6 +3200,7 @@ cdef class CHttpProtocol(HttpConnection):
             ))
 
         ex._h2_pending_off = off + <Py_ssize_t>length
+        ex._h2_sent_total += <Py_ssize_t>length
         if ex._drain_waiters and n - ex._h2_pending_off <= H2_DRAIN_LOW:
             wake_waiters(ex._drain_waiters)
         if ex._h2_pending_off >= n:

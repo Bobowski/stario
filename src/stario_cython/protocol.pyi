@@ -6,8 +6,14 @@ class Connections:
     """One event loop's live connections plus their timeout sweep."""
 
     server_driven: bool
+    max_connections: int
+    rejected: int
     def __init__(
-        self, *, sweep_interval: float = 1.0, server_driven: bool = False
+        self,
+        *,
+        sweep_interval: float = 1.0,
+        server_driven: bool = False,
+        max_connections: int = 0,
     ) -> None: ...
     def add(self, proto: Any) -> None: ...
     def discard(self, proto: Any) -> None: ...

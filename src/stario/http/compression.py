@@ -29,6 +29,8 @@ _BROTLI_WINDOW_LOG_MIN = 10
 _BROTLI_WINDOW_LOG_MAX = 24
 _GZIP_WINDOW_BITS_MIN = 9
 _GZIP_WINDOW_BITS_MAX = 15
+_STREAM_WINDOW_LOG_MIN = 10
+_STREAM_WINDOW_LOG_MAX = 24
 _ENCODING_PREFERENCE = (b"zstd", b"br", b"gzip")
 
 
@@ -294,12 +296,22 @@ DEFAULT_BROTLI_LEVEL = 4
 DEFAULT_BROTLI_WINDOW_LOG: int | None = None
 DEFAULT_GZIP_LEVEL = 1
 DEFAULT_GZIP_WINDOW_BITS: int | None = None
+DEFAULT_STREAM_WINDOW_LOG: int | None = None
 
 
 class CompressionConfig:
     """Policy for picking `br` / `zstd` / `gzip` from `Accept-Encoding` and for streaming vs whole-body responses.
 
     Configure only via the constructor; fields are not meant for post-init mutation.
+
+    `stream_window_log` is the window bound for streamed (`write()`)
+    responses only — a live stream's encoder then holds a small window and
+    capped match tables (brotli also drops to quality 3) instead of the
+    one-shot memory footprint. `None` (the default) gives streams the
+    one-shot settings exactly; `respond()` output never depends on it.
+    A small window saves memory per idle stream but loses the previous
+    repaint once a document outgrows it, so whole-document SSE repaints
+    send far more bytes and cost more encode CPU.
     """
 
     __slots__ = (
@@ -310,6 +322,7 @@ class CompressionConfig:
         "gzip_window_bits",
         "min_size",
         "preference",
+        "stream_window_log",
         "zstd_level",
         "zstd_window_log",
     )
@@ -324,6 +337,7 @@ class CompressionConfig:
         brotli_window_log: int | None = DEFAULT_BROTLI_WINDOW_LOG,
         gzip_level: int = DEFAULT_GZIP_LEVEL,
         gzip_window_bits: int | None = DEFAULT_GZIP_WINDOW_BITS,
+        stream_window_log: int | None = DEFAULT_STREAM_WINDOW_LOG,
         preference: Iterable[str | bytes] | None = None,
     ) -> None:
         if min_size < 0:
@@ -370,6 +384,17 @@ class CompressionConfig:
                 f"{_GZIP_WINDOW_BITS_MIN} and {_GZIP_WINDOW_BITS_MAX}",
                 help_text="Omit the setting to use the framework default.",
             )
+        if stream_window_log is not None and not (
+            _STREAM_WINDOW_LOG_MIN <= stream_window_log <= _STREAM_WINDOW_LOG_MAX
+        ):
+            raise StarioError(
+                "stream_window_log must be between "
+                f"{_STREAM_WINDOW_LOG_MIN} and {_STREAM_WINDOW_LOG_MAX}",
+                help_text=(
+                    "Pass None to use the one-shot codec settings for "
+                    "streamed responses too."
+                ),
+            )
 
         self.min_size = min_size
         self.zstd_level = zstd_level
@@ -378,6 +403,7 @@ class CompressionConfig:
         self.brotli_window_log = brotli_window_log
         self.gzip_level = gzip_level
         self.gzip_window_bits = gzip_window_bits
+        self.stream_window_log = stream_window_log
         self.preference = _normalize_preference(preference)
         self._enabled_encodings = self.enabled_encodings()
 
@@ -392,6 +418,7 @@ class CompressionConfig:
             and self.brotli_window_log == other.brotli_window_log
             and self.gzip_level == other.gzip_level
             and self.gzip_window_bits == other.gzip_window_bits
+            and self.stream_window_log == other.stream_window_log
             and self.preference == other.preference
         )
 
@@ -469,6 +496,20 @@ def compression_config_from_env() -> CompressionConfig:
             if raw_preference is None
             else [name.strip() for name in raw_preference.split(",") if name.strip()]
         )
+        raw_stream_window = env_optional_str("STARIO_COMPRESS_STREAM_WINDOW_LOG")
+        stream_window_log: int | None
+        if raw_stream_window is None:
+            stream_window_log = DEFAULT_STREAM_WINDOW_LOG
+        elif raw_stream_window.strip().lower() == "none":
+            stream_window_log = None
+        else:
+            try:
+                stream_window_log = int(raw_stream_window)
+            except ValueError as exc:
+                raise ValueError(
+                    "STARIO_COMPRESS_STREAM_WINDOW_LOG must be an integer "
+                    f"or 'none' (got {raw_stream_window!r})."
+                ) from exc
         return CompressionConfig(
             min_size=env_int("STARIO_COMPRESS_MIN_SIZE", DEFAULT_MIN_SIZE),
             zstd_level=env_int("STARIO_COMPRESS_ZSTD_LEVEL", DEFAULT_ZSTD_LEVEL),
@@ -477,6 +518,7 @@ def compression_config_from_env() -> CompressionConfig:
             brotli_window_log=env_optional_int("STARIO_COMPRESS_BROTLI_WINDOW_LOG"),
             gzip_level=env_int("STARIO_COMPRESS_GZIP_LEVEL", DEFAULT_GZIP_LEVEL),
             gzip_window_bits=env_optional_int("STARIO_COMPRESS_GZIP_WINDOW_BITS"),
+            stream_window_log=stream_window_log,
             preference=preference,
         )
     except ValueError as exc:

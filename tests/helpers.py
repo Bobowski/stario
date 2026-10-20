@@ -114,6 +114,7 @@ class DummyWriter:
         self.headers = Headers()
         self.started = False
         self.ended = False
+        self.gone = False
         self._status_code: int | None = None
         self._completed = False
 
@@ -161,7 +162,7 @@ class DummyWriter:
 
     @property
     def closing(self) -> bool:
-        return self._completed
+        return self.gone or self._completed
 
     def text(self, body: str, status: int = 200) -> None:
         _w_text(self, body, status)

@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import random
 
 import pytest
 
 from stario import App, Relay, Route
-from stario.datastar import SSE
+from stario.datastar import SSE, read_signals
 from stario.testing.tracer import TestTracer
 from stario_cython.exchange import Request
-from stario_cython.protocol import Connections
+from stario_cython.protocol import Connections, HttpProtocol
 from tests.cython.http import (
     RecordingTransport,
     connection_set,
+    free_port,
     make_protocol,
     response_status,
     response_statuses,
@@ -922,7 +924,7 @@ async def test_trickle_headers_do_not_reset_header_timeout() -> None:
 @pytest.mark.asyncio
 async def test_stalled_deferred_small_body_times_out() -> None:
     """Small Content-Length bodies dispatch at message-complete. Incomplete
-    bodies must not hang: the header deadline stays armed until dispatch."""
+    bodies must not hang: the body deadline answers 408 and closes."""
     app = App()
     hits = 0
 
@@ -933,10 +935,11 @@ async def test_stalled_deferred_small_body_times_out() -> None:
         w.text("ok")
 
     app.add(Route("POST /"), handler)
-    proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT)
+    proto, app, transport = _attach(app=app, header_timeout=5.0, body_timeout=_TIMEOUT)
     try:
         proto.data_received(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n\r\n")
         await asyncio.sleep(_WAIT)
+        assert response_status(transport.writes) == 408
         assert transport.is_closing()
         assert hits == 0
     finally:
@@ -1213,6 +1216,44 @@ async def test_protocol_400_finishes_span_without_fail() -> None:
             await _drain(app)
             assert response_status(transport.writes) == 400
             assert_status_span(tracer, 400)
+        finally:
+            if not transport.is_closing():
+                transport.close()
+            await _drain(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{bad json",
+        b"[1,2]",
+        b"[" * 100_000 + b"]" * 100_000,  # decoder depth cap -> RecursionError
+    ],
+    ids=["bad-json", "non-object", "deep-nesting"],
+)
+async def test_bad_datastar_signals_answer_400_without_span_fail(body) -> None:
+    """Malformed signals are client errors: 400, and the span stays ok."""
+    app = App()
+
+    async def handler(c, w) -> None:
+        await read_signals(c.req)
+        w.text("ok")
+
+    app.add(Route("POST /"), handler)
+    with TestTracer() as tracer:
+        proto, app, transport = _attach(app=app, tracer=tracer)
+        try:
+            proto.data_received(
+                b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+            await _drain(app)
+            assert response_status(transport.writes) == 400
+            assert b"Invalid Datastar signals" in b"".join(transport.writes)
+            assert_status_span(tracer, 400, method="POST", path="/")
         finally:
             if not transport.is_closing():
                 transport.close()
@@ -1568,3 +1609,205 @@ async def test_handler_task_goes_through_a_loop_task_factory() -> None:
             await _drain(app)
     finally:
         loop.set_task_factory(previous)
+
+
+@pytest.mark.asyncio
+async def test_sse_after_the_client_closes_is_not_a_missing_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """close() sets is_closing before connection_lost. That is not a 500."""
+    app = App()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def flip(_c, w) -> None:
+        started.set()
+        await release.wait()
+        SSE(w).execute_script("void 0")
+
+    app.add(Route("POST /ls/x/flip-item"), flip)
+    proto, _, transport = _attach(app)
+    try:
+        proto.data_received(
+            b"POST /ls/x/flip-item HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        # The asyncio window: the socket is closing, connection_lost has not run.
+        transport._closing = True
+        release.set()
+        with caplog.at_level(logging.ERROR, logger="stario.http"):
+            await _drain(app)
+        raw = b"".join(bytes(chunk) for chunk in transport.writes)
+        assert b"Internal Server Error" not in raw
+        assert "without sending a response" not in caplog.text
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_deferred_small_body_progress_outlives_header_timeout() -> None:
+    """A dribbled small body dispatches at message-complete: while bytes keep
+    arriving the body deadline, not the header deadline, applies."""
+    app = App()
+    got: list[int] = []
+
+    async def handler(c, w) -> None:
+        body = await c.req.body()
+        got.append(len(body))
+        w.text("ok")
+
+    app.add(Route("POST /"), handler)
+    proto, app, transport = _attach(app=app, header_timeout=_TIMEOUT, body_timeout=5.0)
+    try:
+        proto.data_received(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 64\r\n\r\n")
+        # Past the header deadline the connection must still accept body bytes.
+        for chunk in (b"d" * 24, b"d" * 24, b"d" * 16):
+            await asyncio.sleep(_WAIT)
+            assert not transport.is_closing()
+            proto.data_received(chunk)
+        await _drain(app)
+        assert got == [64]
+        assert response_status(transport.writes) == 200
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_respond_snapshots_mutable_body_with_custom_headers() -> None:
+    """With user headers set, respond() must not hand the caller's buffer to
+    the transport by reference: a later mutation stays off the wire."""
+    app = App()
+
+    async def mutable(_c, w) -> None:
+        w.headers.set("x-a", "1")
+        buf = bytearray(b"A" * 64)
+        w.respond(buf, b"text/plain")
+        buf[:] = b"B" * 64
+
+    app.add(Route("GET /"), mutable)
+    proto = make_protocol(asyncio.get_running_loop(), app)
+    transport = HoldingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        raw = b"".join(bytes(chunk) for chunk in transport.writes)
+        assert raw.split(b"\r\n\r\n", 1)[1] == b"A" * 64
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_respond_snapshots_mutable_body_parts_with_custom_headers() -> None:
+    """Same snapshot rule for a list/tuple body in the non-fast path."""
+    app = App()
+
+    async def mutable(_c, w) -> None:
+        w.headers.set("x-a", "1")
+        part = bytearray(b"A" * 64)
+        w.respond([part, b"tail"], b"text/plain")
+        part[:] = b"B" * 64
+
+    app.add(Route("GET /"), mutable)
+    proto = make_protocol(asyncio.get_running_loop(), app)
+    transport = HoldingTransport(proto)
+    proto.connection_made(transport)
+    try:
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        raw = b"".join(bytes(chunk) for chunk in transport.writes)
+        assert raw.split(b"\r\n\r\n", 1)[1] == b"A" * 64 + b"tail"
+    finally:
+        if not transport.is_closing():
+            transport.close()
+        await _drain(app)
+
+
+@pytest.mark.asyncio
+async def test_retained_handle_does_not_pin_protocol() -> None:
+    """A stored ``c`` keeps req/match/span but must not pin the protocol."""
+    retained = []
+    app = App()
+
+    async def handler(c, w) -> None:
+        retained.append(c)
+        w.text("ok")
+
+    app.add(Route("GET /"), handler)
+    loop = asyncio.get_running_loop()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        for _ in range(20):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            await reader.read()
+            writer.close()
+            await writer.wait_closed()
+        gc.collect()
+        await asyncio.sleep(0.1)
+        gc.collect()
+        live = [obj for obj in gc.get_objects() if isinstance(obj, HttpProtocol)]
+        assert live == []
+        assert len(retained) == 20
+        assert all(h.disconnected for h in retained)
+    finally:
+        server.close()
+        await server.wait_closed()
+        retained.clear()
+        gc.collect()
+
+
+@pytest.mark.asyncio
+async def test_max_connections_rejects_over_cap_with_503() -> None:
+    """At the cap a cleartext socket gets a minimal 503, is never registered,
+    and a slot frees up as soon as an accepted connection closes."""
+    connections = Connections(sweep_interval=0.05, max_connections=2)
+    loop = asyncio.get_running_loop()
+    app = App()
+
+    async def ok(_c, w) -> None:
+        w.text("ok")
+
+    app.add(Route("GET /"), ok)
+    transports: list[RecordingTransport] = []
+    for _ in range(3):
+        proto = make_protocol(loop, app, connections=connections)
+        transport = RecordingTransport(proto)
+        transports.append(transport)
+        proto.connection_made(transport)
+    try:
+        assert len(connections) == 2
+        assert connections.rejected == 1
+        raw = b"".join(transports[2].writes)
+        assert raw.startswith(b"HTTP/1.1 503 Service Unavailable")
+        assert b"connection: close" in raw.lower()
+        assert b"retry-after: 1" in raw.lower()
+        assert transports[2].is_closing()
+
+        # Closing an accepted connection frees a slot for the next one.
+        transports[0].close()
+        proto = make_protocol(loop, app, connections=connections)
+        transport = RecordingTransport(proto)
+        transports.append(transport)
+        proto.connection_made(transport)
+        assert len(connections) == 2
+        proto.data_received(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        await _drain(app)
+        assert response_status(transport.writes) == 200
+    finally:
+        for transport in transports:
+            if not transport.is_closing():
+                transport.close()
+        await _drain(app)

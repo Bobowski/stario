@@ -138,6 +138,7 @@ cdef class HttpConnection:
     cdef void response_completed(self, RequestExchange exchange)
     cdef void set_body_paused(self, RequestExchange exchange, bint paused)
     cdef object ensure_disconnect(self)
+    cdef object ensure_stream_disconnect(self, RequestExchange ex)
     cdef object drain_waiter(self, RequestExchange exchange)
     cdef void h2_respond(
         self,
@@ -252,6 +253,8 @@ cdef class RequestExchange:
     cdef StarioBrotli* _brotli
     cdef StarioZstd* _zstd
     cdef StarioGzip* _gzip
+    cdef StarioZstd* _zstd_1s
+    cdef StarioGzip* _gzip_1s
     cdef object _out_buf
     cdef Py_ssize_t _out_len
     cdef int _status_code
@@ -269,6 +272,14 @@ cdef class RequestExchange:
     cdef int _zstd_window
     cdef int _gzip_level
     cdef int _gzip_window
+    cdef int _s_brotli_level
+    cdef int _s_brotli_window
+    cdef int _s_brotli_lgblock
+    cdef int _s_zstd_window
+    cdef int _s_zstd_hash
+    cdef int _s_zstd_chain
+    cdef int _s_gzip_window
+    cdef int _s_gzip_mem
     cdef Py_ssize_t _compress_min_size
     cdef bint _completed
 
@@ -341,6 +352,14 @@ cdef class RequestExchange:
     cdef bint _h2_flow_paused
     # ``w.drain()`` waiters for this stream's unsent DATA (HTTP/2).
     cdef list _drain_waiters
+    # Per-stream response send progress for the flow-control stall sweep.
+    cdef Py_ssize_t _h2_sent_total
+    cdef Py_ssize_t _h2_send_mark
+    cdef double _h2_send_deadline
+    # Deferred request bodies: bytes counted at the last body sweep (HTTP/2).
+    cdef Py_ssize_t _h2_body_mark
+    # Stream-scoped disconnect future, resolved when this stream dies (HTTP/2).
+    cdef object _stream_disc
     cdef object _h2_date_line
     cdef object _h2_date_bare
     cdef object _handler_task
@@ -452,6 +471,8 @@ cdef class RequestExchange:
     cdef int _ensure_brotli(self) except -1
     cdef int _ensure_zstd(self) except -1
     cdef int _ensure_gzip(self) except -1
+    cdef int _ensure_zstd_1s(self) except -1
+    cdef int _ensure_gzip_1s(self) except -1
     cdef void _free_compressors(self)
     cdef void _raise_abort(self)
     cdef void _wake(self)
@@ -495,6 +516,8 @@ cdef class RequestHandle:
     # Per-request ``c`` / ``w``. ``_ex`` is None once the exchange is recycled.
     cdef RequestExchange _ex
     cdef HttpConnection _conn
+    # Disconnect future snapshotted at detach; `_conn` is None by then.
+    cdef object _disc
     cdef public object app
     cdef public object span
     cdef public object match

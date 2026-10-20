@@ -106,6 +106,17 @@ class Context(Protocol):
         `async for item in c.alive(source): ...` to stream from `source` until
         disconnect or shutdown. Do not use `async for` without `source`; the
         context-manager form is the supported no-source pattern.
+
+        The `async for` form swallows the disconnect/shutdown cancel only
+        while it waits on `source`. If the loop body itself awaits, that
+        cancel lands inside the body and propagates. To have it swallowed
+        anywhere in the block, wrap the iteration instead:
+
+        ```python
+        async with c.alive():
+            async for item in source:
+                await send(item)
+        ```
         """
         ...
 
@@ -124,6 +135,10 @@ class _Alive[T]:
     ``remove_done_callback``: callbacks already scheduled via ``call_soon``
     cannot be removed, so a fire after ``__aexit__`` must no-op instead of
     cancelling the task inside its post-scope cleanup.
+
+    With ``source`` set, ``__aiter__`` scopes the cancel to its own ``async
+    for`` on the source; a cancel landing in the caller's loop body is not
+    ours to swallow. ``async with`` around the source loop covers the body.
     """
 
     c: Context

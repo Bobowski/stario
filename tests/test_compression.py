@@ -148,3 +148,29 @@ def test_native_compressors_round_trip() -> None:
             )
             == b"onetwo"
         )
+
+
+def test_stream_window_log_default_and_bounds() -> None:
+    assert CompressionConfig().stream_window_log is None
+    assert CompressionConfig(stream_window_log=16).stream_window_log == 16
+    assert CompressionConfig(stream_window_log=24).stream_window_log == 24
+    for bad in (9, 25):
+        with pytest.raises(StarioError, match="stream_window_log"):
+            CompressionConfig(stream_window_log=bad)
+    assert CompressionConfig() == CompressionConfig()
+    assert CompressionConfig() == CompressionConfig(stream_window_log=None)
+    assert CompressionConfig() != CompressionConfig(stream_window_log=20)
+
+
+def test_compression_config_from_env_stream_window_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STARIO_COMPRESS_STREAM_WINDOW_LOG", "18")
+    assert compression_config_from_env().stream_window_log == 18
+    monkeypatch.setenv("STARIO_COMPRESS_STREAM_WINDOW_LOG", "none")
+    assert compression_config_from_env().stream_window_log is None
+    monkeypatch.delenv("STARIO_COMPRESS_STREAM_WINDOW_LOG")
+    assert compression_config_from_env().stream_window_log is None
+    monkeypatch.setenv("STARIO_COMPRESS_STREAM_WINDOW_LOG", "bogus")
+    with pytest.raises(StarioError, match="STREAM_WINDOW_LOG"):
+        compression_config_from_env()

@@ -4,7 +4,7 @@ cdef extern from "compression_buf.h":
     ctypedef struct StarioBrotli:
         pass
 
-    StarioBrotli* stario_brotli_acquire(int level, int window_log)
+    StarioBrotli* stario_brotli_acquire(int level, int window_log, int lgblock)
     int stario_brotli_block_borrowed(
         StarioBrotli* brotli,
         const unsigned char* data,
@@ -32,7 +32,7 @@ cdef extern from "compression_buf.h":
     ctypedef struct StarioGzip:
         pass
 
-    StarioGzip* stario_gzip_acquire(int level, int window_bits)
+    StarioGzip* stario_gzip_acquire(int level, int window_bits, int mem_level)
     int stario_gzip_block_borrowed(
         StarioGzip* gzip,
         const unsigned char* data,
@@ -52,7 +52,9 @@ cdef extern from "compression_buf.h":
     ctypedef struct StarioZstd:
         pass
 
-    StarioZstd* stario_zstd_acquire(int level, int window_log)
+    StarioZstd* stario_zstd_acquire(
+        int level, int window_log, int hash_log, int chain_log
+    )
     int stario_zstd_block_borrowed(
         StarioZstd* zstd,
         const unsigned char* data,

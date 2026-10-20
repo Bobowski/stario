@@ -71,7 +71,7 @@ def brotli_decompress(bytes data) -> bytes:
 
 
 def zstd_compress(bytes data, int level=3, int window=0) -> bytes:
-    cdef StarioZstd* enc = stario_zstd_acquire(level, window)
+    cdef StarioZstd* enc = stario_zstd_acquire(level, window, 0, 0)
     cdef const unsigned char* out = NULL
     cdef size_t out_len = 0
     cdef const unsigned char* ptr
@@ -102,7 +102,7 @@ cdef class BrotliEncoder:
     cdef StarioBrotli* _enc
 
     def __cinit__(self, int level, int window=0):
-        self._enc = stario_brotli_acquire(level, window)
+        self._enc = stario_brotli_acquire(level, window, 0)
         if self._enc == NULL:
             raise StarioError("brotli stream init failed")
 
@@ -144,7 +144,7 @@ cdef class ZstdEncoder:
     cdef StarioZstd* _enc
 
     def __cinit__(self, int level, int window=0):
-        self._enc = stario_zstd_acquire(level, window)
+        self._enc = stario_zstd_acquire(level, window, 0, 0)
         if self._enc == NULL:
             raise StarioError("zstd stream init failed")
 

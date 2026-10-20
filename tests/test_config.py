@@ -51,3 +51,23 @@ def test_server_config_ssl_keyfile_requires_certfile() -> None:
 def test_server_config_missing_certfile_raises() -> None:
     with pytest.raises(StarioError, match="TLS certificate not found"):
         ServerConfig(ssl_certfile="/no/such/cert.pem")
+
+
+def test_server_config_rejects_zero_max_connections() -> None:
+    with pytest.raises(StarioError, match="max_connections must be at least 1"):
+        ServerConfig(max_connections=0)
+
+
+def test_server_config_accepts_max_connections() -> None:
+    assert ServerConfig(max_connections=100).max_connections == 100
+
+
+def test_server_config_reads_max_connections_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("STARIO_MAX_CONNECTIONS", "42")
+    assert ServerConfig.from_env().max_connections == 42
+
+
+def test_server_config_rejects_bad_max_connections_env(monkeypatch) -> None:
+    monkeypatch.setenv("STARIO_MAX_CONNECTIONS", "-3")
+    with pytest.raises(StarioError, match="max_connections must be at least 1"):
+        ServerConfig.from_env()

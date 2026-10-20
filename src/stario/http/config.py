@@ -13,6 +13,7 @@ from stario._env import (
     env_float,
     env_int,
     env_octal_mode,
+    env_optional_int,
     env_optional_str,
     env_str,
 )
@@ -166,6 +167,7 @@ class ServerConfig:
         "compression",
         "graceful_shutdown_timeout",
         "host",
+        "max_connections",
         "pin_threads",
         "port",
         "requests",
@@ -190,6 +192,7 @@ class ServerConfig:
         reuse_addr: bool = DEFAULT_REUSE_ADDR,
         threads: int = DEFAULT_THREADS,
         pin_threads: bool = DEFAULT_PIN_THREADS,
+        max_connections: int | None = None,
         ssl: SSLContext | None = None,
         ssl_certfile: str | Path | None = None,
         ssl_keyfile: str | Path | None = None,
@@ -234,6 +237,11 @@ class ServerConfig:
                 "threads must be at most 256",
                 help_text="Set STARIO_THREADS to a smaller worker count.",
             )
+        if max_connections is not None and max_connections < 1:
+            raise StarioError(
+                "max_connections must be at least 1",
+                help_text="Set STARIO_MAX_CONNECTIONS to a positive cap.",
+            )
         if ssl is not None and (ssl_certfile is not None or ssl_keyfile is not None):
             raise StarioError(
                 "pass either ssl= or ssl_certfile=, not both",
@@ -262,6 +270,8 @@ class ServerConfig:
         # (asyncio.to_thread executors, writer threads) inherit that one-CPU
         # mask. Off: the kernel migrates threads freely.
         self.pin_threads = pin_threads
+        # Process-wide live-connection cap, split evenly across worker loops.
+        self.max_connections = max_connections
         if ssl is not None:
             self.ssl = ssl
         elif ssl_certfile is not None:
@@ -297,6 +307,7 @@ def server_config_from_env() -> ServerConfig:
             reuse_addr=env_bool("STARIO_REUSE_ADDR", DEFAULT_REUSE_ADDR),
             threads=env_int("STARIO_THREADS", DEFAULT_THREADS),
             pin_threads=env_bool("STARIO_PIN_THREADS", DEFAULT_PIN_THREADS),
+            max_connections=env_optional_int("STARIO_MAX_CONNECTIONS"),
             ssl_certfile=env_optional_str("STARIO_SSL_CERTFILE"),
             ssl_keyfile=env_optional_str("STARIO_SSL_KEYFILE"),
         )

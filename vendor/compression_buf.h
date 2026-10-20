@@ -9,8 +9,8 @@ typedef struct StarioZstd StarioZstd;
 
 /* Borrowed output is valid until the next call on the same encoder, or free. */
 
-StarioBrotli* stario_brotli_new(int level, int window_log);
-StarioBrotli* stario_brotli_acquire(int level, int window_log);
+StarioBrotli* stario_brotli_new(int level, int window_log, int lgblock);
+StarioBrotli* stario_brotli_acquire(int level, int window_log, int lgblock);
 int stario_brotli_block_borrowed(
     StarioBrotli* brotli,
     const unsigned char* in,
@@ -38,8 +38,8 @@ int stario_brotli_compress_borrowed(
     size_t* out_len
 );
 
-StarioGzip* stario_gzip_new(int level, int window_bits);
-StarioGzip* stario_gzip_acquire(int level, int window_bits);
+StarioGzip* stario_gzip_new(int level, int window_bits, int mem_level);
+StarioGzip* stario_gzip_acquire(int level, int window_bits, int mem_level);
 int stario_gzip_block_borrowed(
     StarioGzip* gzip,
     const unsigned char* in,
@@ -57,8 +57,8 @@ int stario_gzip_finish_borrowed(
 void stario_gzip_free(StarioGzip* gzip);
 void stario_gzip_release(StarioGzip* gzip);
 
-StarioZstd* stario_zstd_new(int level, int window_log);
-StarioZstd* stario_zstd_acquire(int level, int window_log);
+StarioZstd* stario_zstd_new(int level, int window_log, int hash_log, int chain_log);
+StarioZstd* stario_zstd_acquire(int level, int window_log, int hash_log, int chain_log);
 int stario_zstd_block_borrowed(
     StarioZstd* zstd,
     const unsigned char* in,

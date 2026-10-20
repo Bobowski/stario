@@ -6,14 +6,17 @@ import asyncio
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from stario import App, Route
 from stario.http.tls import load_tls_context
 from tests.cython.h2wire import (
+    FLAG_ACK,
     FLAG_END_HEADERS,
     FLAG_END_STREAM,
     H2_PREFACE,
@@ -25,7 +28,9 @@ from tests.cython.h2wire import (
     TYPE_CONTINUATION,
     TYPE_DATA,
     TYPE_HEADERS,
+    TYPE_RST_STREAM,
     TYPE_SETTINGS,
+    TYPE_WINDOW_UPDATE,
     collected_settings,
     encode_request,
     h2_handshake,
@@ -1389,4 +1394,445 @@ async def test_h2_authority_with_question_mark_is_rejected() -> None:
         assert stream_data(frames, 1) != b"nope"
     finally:
         proto.connection_lost(None)
+        await app.drain_tasks()
+
+
+SETTINGS_INITIAL_WINDOW_SIZE = 0x4
+
+
+async def _h2_handshake_window(
+    host: str, port: int, stream_window: int
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes]:
+    """Handshake advertising ``stream_window`` as the initial stream window."""
+    reader, writer = await asyncio.open_connection(host, port)
+    settings = SETTINGS_INITIAL_WINDOW_SIZE.to_bytes(2, "big") + stream_window.to_bytes(
+        4, "big"
+    )
+    writer.write(H2_PREFACE + pack_frame(TYPE_SETTINGS, 0, 0, settings))
+    await writer.drain()
+    buf = b""
+    async with asyncio.timeout(2):
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                raise ConnectionError("closed during HTTP/2 handshake")
+            buf += chunk
+            frames, buf = parse_frames(buf)
+            if any(
+                frame.type == TYPE_SETTINGS and not (frame.flags & FLAG_ACK)
+                for frame in frames
+            ):
+                writer.write(pack_frame(TYPE_SETTINGS, FLAG_ACK, 0))
+                await writer.drain()
+                return reader, writer, buf
+
+
+async def _collect(reader, buf, seconds):
+    """Read raw bytes for ``seconds``; return (frames, buf, eof)."""
+    frames = []
+    eof = False
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        parsed, buf = parse_frames(buf)
+        frames.extend(parsed)
+        try:
+            async with asyncio.timeout(max(0.01, deadline - time.monotonic())):
+                chunk = await reader.read(65536)
+        except TimeoutError:
+            break
+        if not chunk:
+            eof = True
+            break
+        buf += chunk
+    parsed, buf = parse_frames(buf)
+    frames.extend(parsed)
+    return frames, buf, eof
+
+
+@pytest.mark.asyncio
+async def test_h2_stalled_response_resets_stream() -> None:
+    """A zero-window client that never opens the stream window gets
+    RST_STREAM(CANCEL) at write_timeout; the connection stays usable."""
+    app = App()
+
+    async def big(_c, w) -> None:
+        w.respond(b"x" * (2 * 1024 * 1024), b"application/octet-stream", 200)
+
+    async def ok(_c, w) -> None:
+        w.text("ok")
+
+    app.add(Route("GET /big"), big)
+    app.add(Route("GET /ok"), ok)
+    loop = asyncio.get_running_loop()
+    connections = connection_set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, connections=connections, write_timeout=0.15),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await _h2_handshake_window("127.0.0.1", port, 0)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(method="GET", path="/big"),
+                )
+            )
+            await writer.drain()
+            frames, buf, _eof = await _collect(reader, buf, 0.8)
+            assert has_rst(frames, 1)
+            assert rst_code(frames, 1) == NGHTTP2_CANCEL
+            assert not has_goaway(frames)
+            assert not stream_data(frames, 1)
+
+            # The connection survives: raise the initial window (a fresh
+            # SETTINGS applies to streams opened after it) and ask again.
+            settings = SETTINGS_INITIAL_WINDOW_SIZE.to_bytes(2, "big") + (
+                65535
+            ).to_bytes(4, "big")
+            writer.write(
+                pack_frame(TYPE_SETTINGS, 0, 0, settings)
+                + pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    3,
+                    encode_request(method="GET", path="/ok"),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 3)
+            assert not has_rst(frames, 3)
+            assert stream_data(frames, 3) == b"ok"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_stalled_drain_handler_resets_stream() -> None:
+    """write+drain under a zero window: the drain wait ends via the reset,
+    the handler task unwinds, and the stream does not pin forever."""
+    app = App()
+    finished = asyncio.Event()
+
+    async def dribble(c, w) -> None:
+        w.write_headers(200)
+        try:
+            for _ in range(32):
+                w.write(b"y" * 65536)
+                await w.drain()
+            w.end()
+        finally:
+            finished.set()
+
+    app.add(Route("GET /stream"), dribble)
+    loop = asyncio.get_running_loop()
+    connections = connection_set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, connections=connections, write_timeout=0.15),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await _h2_handshake_window("127.0.0.1", port, 0)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(method="GET", path="/stream"),
+                )
+            )
+            await writer.drain()
+            frames, buf, _eof = await _collect(reader, buf, 0.8)
+            assert has_rst(frames, 1)
+            assert rst_code(frames, 1) == NGHTTP2_CANCEL
+            await asyncio.wait_for(finished.wait(), timeout=2)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_send_progress_keeps_stalled_stream_alive() -> None:
+    """A slow but progressing reader is not cut: WINDOW_UPDATE credit every
+    ~0.1s keeps the stream below the write deadline."""
+    app = App()
+
+    async def big(_c, w) -> None:
+        w.respond(b"x" * (512 * 1024), b"application/octet-stream", 200)
+
+    app.add(Route("GET /big"), big)
+    loop = asyncio.get_running_loop()
+    connections = connection_set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, connections=connections, write_timeout=0.5),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await _h2_handshake_window("127.0.0.1", port, 8192)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(method="GET", path="/big"),
+                )
+            )
+            await writer.drain()
+            # Trickling credit past several write deadlines must not reset.
+            # The connection window needs the same trickle as the stream's.
+            sent = 0
+            for _ in range(8):
+                await asyncio.sleep(0.1)
+                writer.write(
+                    pack_frame(TYPE_WINDOW_UPDATE, 0, 0, (8192).to_bytes(4, "big"))
+                    + pack_frame(TYPE_WINDOW_UPDATE, 0, 1, (8192).to_bytes(4, "big"))
+                )
+                await writer.drain()
+                parsed, buf = parse_frames(buf)
+                sent += sum(
+                    len(f.payload)
+                    for f in parsed
+                    if f.type == TYPE_DATA and f.stream_id == 1
+                )
+                assert not has_rst(parsed, 1)
+            # Open both windows fully and read the rest of the body.
+            writer.write(
+                pack_frame(
+                    TYPE_WINDOW_UPDATE, 0, 0, (4 * 1024 * 1024).to_bytes(4, "big")
+                )
+                + pack_frame(
+                    TYPE_WINDOW_UPDATE, 0, 1, (4 * 1024 * 1024).to_bytes(4, "big")
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1, timeout=3)
+            # What the credit trickle withheld now arrives.
+            assert len(stream_data(frames, 1)) + sent == 512 * 1024
+            assert not has_rst(frames, 1)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_deferred_small_body_progress_outlives_header_timeout() -> None:
+    """Small bodies defer dispatch until END_STREAM; incoming DATA resets the
+    deadline so a slow upload does not die at the header timeout."""
+    app = App()
+    got: list[int] = []
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        got.append(len(body))
+        w.respond(body, b"application/octet-stream")
+
+    app.add(Route("POST /echo"), echo)
+    loop = asyncio.get_running_loop()
+    connections = connection_set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(
+            loop, app, connections=connections, header_timeout=0.15, body_timeout=5.0
+        ),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    encode_request(
+                        method="POST",
+                        path="/echo",
+                        extra=[(b"content-length", b"64")],
+                    ),
+                )
+            )
+            await writer.drain()
+            # Past the header deadline, a dribbled body must still land.
+            for chunk in (b"d" * 24, b"d" * 24):
+                await asyncio.sleep(0.35)
+                writer.write(pack_frame(TYPE_DATA, 0, 1, chunk))
+                await writer.drain()
+            writer.write(pack_frame(TYPE_DATA, FLAG_END_STREAM, 1, b"d" * 16))
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 1)
+            assert not has_rst(frames, 1)
+            assert stream_data(frames, 1) == b"d" * 64
+            assert got == [64]
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_stalled_deferred_body_resets_stream() -> None:
+    """A stream whose deferred body never arrives gets RST_STREAM(CANCEL) at
+    body_timeout; a sibling stream on the same connection still answers."""
+    app = App()
+
+    async def echo(c, w) -> None:
+        body = await c.req.body()
+        w.respond(body, b"application/octet-stream")
+
+    async def ok(_c, w) -> None:
+        w.text("ok")
+
+    app.add(Route("POST /echo"), echo)
+    app.add(Route("GET /ok"), ok)
+    loop = asyncio.get_running_loop()
+    connections = connection_set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(
+            loop, app, connections=connections, header_timeout=5.0, body_timeout=0.15
+        ),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        reader, writer, buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS,
+                    1,
+                    encode_request(
+                        method="POST",
+                        path="/echo",
+                        extra=[(b"content-length", b"64")],
+                    ),
+                )
+            )
+            await writer.drain()
+            frames, buf, _eof = await _collect(reader, buf, 0.8)
+            assert has_rst(frames, 1)
+            assert rst_code(frames, 1) == NGHTTP2_CANCEL
+            assert not has_goaway(frames)
+
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    3,
+                    encode_request(method="GET", path="/ok"),
+                )
+            )
+            await writer.drain()
+            frames, _buf = await read_stream(reader, buf, 3)
+            assert stream_data(frames, 3) == b"ok"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+        await app.drain_tasks()
+
+
+@pytest.mark.asyncio
+async def test_h2_stream_reset_disconnects_only_that_stream() -> None:
+    """c.disconnect follows the stream, not the connection: resetting one
+    SSE stream ends its alive() loop cleanly while a sibling keeps running."""
+    app = App()
+    after: dict[int, str] = {}
+    ready = [asyncio.Event(), asyncio.Event()]
+    disconn: dict[int, Any] = {}
+
+    def make_handler(idx: int):
+        async def handler(c, w) -> None:
+            disconn[idx] = c
+            w.write_headers(200)
+            ready[idx].set()
+            async with c.alive():
+                await asyncio.Event().wait()
+            after[idx] = "clean"
+
+        return handler
+
+    app.add(Route("GET /a"), make_handler(0))
+    app.add(Route("GET /b"), make_handler(1))
+    loop = asyncio.get_running_loop()
+    connections = connection_set()
+    port = free_port()
+    server = await loop.create_server(
+        lambda: make_protocol(loop, app, connections=connections),
+        "127.0.0.1",
+        port,
+    )
+    try:
+        _reader, writer, _buf = await h2_handshake("127.0.0.1", port)
+        try:
+            writer.write(
+                pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    encode_request(method="GET", path="/a"),
+                )
+                + pack_frame(
+                    TYPE_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    3,
+                    encode_request(method="GET", path="/b"),
+                )
+            )
+            await writer.drain()
+            await asyncio.wait_for(asyncio.gather(ready[0].wait(), ready[1].wait()), 2)
+
+            # Reset stream 1 only; stream 3 must keep running.
+            writer.write(
+                pack_frame(TYPE_RST_STREAM, 0, 1, NGHTTP2_CANCEL.to_bytes(4, "big"))
+            )
+            await writer.drain()
+            async with asyncio.timeout(2):
+                while 0 not in after:
+                    await asyncio.sleep(0.01)
+            assert after == {0: "clean"}
+            assert disconn[0].disconnected
+            assert not disconn[1].disconnected
+        finally:
+            # Close the socket; stream 3's alive() must also unwind cleanly.
+            writer.close()
+            await writer.wait_closed()
+        async with asyncio.timeout(2):
+            while 1 not in after:
+                await asyncio.sleep(0.01)
+        assert after[1] == "clean"
+        assert disconn[1].disconnected
+    finally:
+        server.close()
+        await server.wait_closed()
         await app.drain_tasks()

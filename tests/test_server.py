@@ -7,6 +7,7 @@ import signal
 import socket
 import stat
 import tempfile
+import time
 from io import StringIO
 from typing import Any
 
@@ -369,6 +370,120 @@ class TestServerRunLifecycle:
         assert shutdown_span["status"] == "ok"
         assert shutdown_span["attributes"]["server.shutdown.urgent"] is True
         assert shutdown_span["attributes"]["server.shutdown.cancelled_tasks"] == 1
+
+    async def test_shutdown_aborts_write_blocked_transport(
+        self, short_socket_path
+    ) -> None:
+        """A client that never reads must not stall wait_closed(): the drain
+        aborts transports that close() would flush forever."""
+        socket_path = short_socket_path
+        output = StringIO()
+        tracer = JsonTracer(output)
+        apps: list[App] = []
+
+        async def serve_bootstrap(app: App, span: Any):
+            apps.append(app)
+
+            async def big(_c, w) -> None:
+                w.write_headers(200)
+                for _ in range(160):  # ~10 MiB, no drain
+                    w.write(b"z" * 65536)
+                w.end()
+
+            app.add(Route("GET /big"), big)
+            yield
+
+        server = Server(
+            serve_bootstrap,
+            tracer,
+            config=ServerConfig(
+                unix_socket=socket_path,
+                requests=RequestPolicy(write_timeout=60.0),
+                graceful_shutdown_timeout=0.1,
+            ),
+        )
+
+        run_task = asyncio.create_task(_serve(server))
+        reader, writer = await _connect_with_retry(socket_path)
+        try:
+            writer.write(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+            await writer.drain()
+            await asyncio.sleep(0.1)  # let the write buffer fill
+            await reader.read(1)  # response bytes are flowing
+
+            t0 = time.monotonic()
+            apps[0].signal_shutdown()
+            # graceful(0.1) + force cap(0.1) + abort — never write_timeout.
+            async with asyncio.timeout(4.0):
+                await run_task
+            assert time.monotonic() - t0 < 3.0
+        finally:
+            writer.close()
+
+        spans = [json.loads(line) for line in output.getvalue().splitlines()]
+        shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
+        assert shutdown_span["attributes"]["server.shutdown.aborted"] >= 1
+
+    async def test_shutdown_delivers_response_to_steady_reader(
+        self, short_socket_path
+    ) -> None:
+        """A close()d transport gets the whole force-close budget to flush;
+        a client that keeps reading must see the complete body, not an abort."""
+        socket_path = short_socket_path
+        output = StringIO()
+        tracer = JsonTracer(output)
+        apps: list[App] = []
+        body_len = 4 * 1024 * 1024
+
+        async def serve_bootstrap(app: App, span: Any):
+            apps.append(app)
+
+            async def big(_c, w) -> None:
+                w.write_headers(200)
+                for _ in range(body_len // 65536):
+                    w.write(b"z" * 65536)
+                w.end()
+
+            app.add(Route("GET /big"), big)
+            yield
+
+        server = Server(
+            serve_bootstrap,
+            tracer,
+            config=ServerConfig(
+                unix_socket=socket_path,
+                requests=RequestPolicy(write_timeout=60.0),
+                graceful_shutdown_timeout=0.5,
+            ),
+        )
+
+        run_task = asyncio.create_task(_serve(server))
+        reader, writer = await _connect_with_retry(socket_path)
+        try:
+            writer.write(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+            await writer.drain()
+            head = await reader.readuntil(b"\r\n\r\n")
+            assert b" 200 " in head
+
+            # The client pauses so bytes are still buffered when drain begins.
+            await asyncio.sleep(0.05)
+            apps[0].signal_shutdown()
+
+            received = bytearray()
+            async with asyncio.timeout(4.0):
+                # Steady reads: the transport flush completes inside the budget.
+                while chunk := await reader.read(65536):
+                    received += chunk
+                await run_task
+            # Chunked framing: the terminator and every payload byte arrived.
+            assert received.endswith(b"0\r\n\r\n")
+            assert received.count(b"z") == body_len
+        finally:
+            writer.close()
+
+        spans = [json.loads(line) for line in output.getvalue().splitlines()]
+        shutdown_span = next(s for s in spans if s["name"] == "server.shutdown")
+        assert shutdown_span["attributes"]["server.shutdown.aborted"] == 0
 
     async def test_shutdown_span_survives_second_sigint_after_stop_requested(
         self, short_socket_path

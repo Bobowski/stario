@@ -249,6 +249,7 @@ class _LoopWorker:
         app: App,
         server: Server,
         loop_factory: Callable[[], asyncio.AbstractEventLoop],
+        connections: Connections,
     ) -> None:
         self.index = index
         self.app = app
@@ -256,7 +257,7 @@ class _LoopWorker:
         self.loop_factory = loop_factory
         self.loop: asyncio.AbstractEventLoop | None = None
         self.loop_kind: EventLoopKind | None = None
-        self.connections = Connections(server_driven=True)
+        self.connections = connections
         self.date_box: list[bytes] = [b""]
         self.listen_sock: socket.socket | None = None
         self.cpu: int | None = None
@@ -356,6 +357,16 @@ class Server:
         self._leader_sock: socket.socket | None = None
         # Allowed CPUs, read before any thread is pinned (see pin_worker_cpu).
         self.cpus: list[int] = []
+
+    def _new_connections(self) -> Connections:
+        """One loop's registry; the process cap is split evenly across loops."""
+        limit = self.config.max_connections
+        if limit is None:
+            return Connections(server_driven=True)
+        return Connections(
+            server_driven=True,
+            max_connections=-(-limit // max(self._thread_count, 1)),
+        )
 
     async def serve(self) -> None:
         """Run until SIGINT/SIGTERM (or fatal error); requires a running event loop.
@@ -490,6 +501,17 @@ class Server:
             force_closed += await self._force_close_open_transports(connections)
             await asyncio.sleep(0)
 
+        # A close()d transport flushes forever against a peer that stopped
+        # reading; wait_closed() would hang on it. abort() drops the socket.
+        aborted = 0
+        for protocol in list(connections):
+            transport = protocol.transport
+            if transport is not None:
+                transport.abort()
+                aborted += 1
+        if aborted:
+            await asyncio.sleep(0)
+
         # --- phase 3: cancel orphaned app.create_task work ------------------
         cancelled_tasks = await self._cancel_pending_tasks(app.tasks)
 
@@ -503,6 +525,7 @@ class Server:
                     "server.shutdown.urgent": self._urgent_drain,
                     "server.shutdown.idle_closed": idle_closed,
                     "server.shutdown.force_closed": force_closed,
+                    "server.shutdown.aborted": aborted,
                     "server.shutdown.stale_connections": stale_connections,
                     "server.shutdown.cancelled_tasks": cancelled_tasks,
                 }
@@ -773,7 +796,7 @@ class Server:
     ) -> AsyncGenerator[asyncio.Server]:
         """Bind on enter; drain in-flight work on exit."""
         app = run.app
-        connections = Connections(server_driven=True)
+        connections = self._new_connections()
         self._live_connections = connections
         listener = await self._create_listener(listen_sock, app, connections)
 
@@ -877,6 +900,7 @@ class Server:
                 app=app,
                 server=self,
                 loop_factory=loop_factory,
+                connections=self._new_connections(),
             )
             for index in range(1, self._thread_count)
         ]
@@ -893,7 +917,7 @@ class Server:
         if unix_socket is not None:
             bound = os.stat(unix_socket)
             unix_file_id = (bound.st_dev, bound.st_ino)
-        connections = Connections(server_driven=True)
+        connections = self._new_connections()
         join_timeout = (
             max(self.config.graceful_shutdown_timeout, 0.0) + _FORCE_CLOSE_CAP + 1.0
         )
@@ -983,6 +1007,10 @@ class Server:
             attrs["server.compression.gzip_window_bits"] = (
                 self.config.compression.gzip_window_bits
             )
+        if self.config.compression.stream_window_log is not None:
+            attrs["server.compression.stream_window_log"] = (
+                self.config.compression.stream_window_log
+            )
         if self.config.unix_socket:
             attrs["server.listen_mode"] = "unix_socket"
             attrs["server.unix_socket"] = self.config.unix_socket
@@ -998,4 +1026,6 @@ class Server:
         attrs["server.limits.max_request_body_bytes"] = (
             self.config.requests.max_body_bytes
         )
+        if self.config.max_connections is not None:
+            attrs["server.limits.max_connections"] = self.config.max_connections
         span.attrs(attrs)

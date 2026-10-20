@@ -1,6 +1,7 @@
 """Handler-task finish: log and write 500 if nothing was sent."""
 
 import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -159,6 +160,139 @@ def test_on_handler_done_logs_exception_after_completed_response(
         assert w.body == "ok"
         assert w.completed
         assert "Handler failed" in caplog.text
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_records_a_missing_response_on_the_span(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        with TestTracer() as tracer:
+            ctx = make_context(
+                "/ls/s9dk-f26u-6uuw/flip-item",
+                method="POST",
+                app=app,
+                loop=asyncio.get_running_loop(),
+            )
+            span = tracer.create("request")
+            span.start()
+            ctx.span = span
+            w = DummyWriter()
+
+            async def silent() -> None:
+                return None
+
+            task = app.create_task(silent(), eager_start=True)
+            with caplog.at_level(logging.ERROR, logger="stario.http"):
+                on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+            assert w.status == 500
+            assert "without sending a response" not in caplog.text
+            finished = tracer.get_span(span.id)
+            assert finished is not None
+            assert finished.error == (
+                "Handler returned without sending a response "
+                "(POST /ls/s9dk-f26u-6uuw/flip-item)"
+            )
+            assert "request.client_left" not in finished.attributes
+            assert not tracer.has_open_spans()
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_does_not_fail_when_the_client_left(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        with TestTracer() as tracer:
+            ctx = make_context("/ls/stream", app=app, loop=asyncio.get_running_loop())
+            span = tracer.create("request")
+            span.start()
+            ctx.span = span
+            w = DummyWriter()
+            w.gone = True
+
+            async def silent() -> None:
+                return None
+
+            task = app.create_task(silent(), eager_start=True)
+            with caplog.at_level(logging.ERROR, logger="stario.http"):
+                on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+            assert w.completed
+            assert w.status is None
+            assert "without sending a response" not in caplog.text
+            assert "Handler failed" not in caplog.text
+            finished = tracer.get_span(span.id)
+            assert finished is not None
+            assert finished.ok
+            assert finished.attributes["request.client_left"] is True
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_marks_client_left_when_the_task_was_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        with TestTracer() as tracer:
+            ctx = make_context("/ls/stream", app=app, loop=asyncio.get_running_loop())
+            span = tracer.create("request")
+            span.start()
+            ctx.span = span
+            w = DummyWriter()
+            w.gone = True
+
+            async def hang() -> None:
+                await asyncio.sleep(60)
+
+            task = app.create_task(hang(), eager_start=True)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+
+            with caplog.at_level(logging.ERROR, logger="stario.http"):
+                on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+            assert w.completed
+            assert "Handler failed" not in caplog.text
+            finished = tracer.get_span(span.id)
+            assert finished is not None
+            assert finished.ok
+            assert finished.attributes["request.client_left"] is True
+
+    asyncio.run(run())
+
+
+def test_on_handler_done_cancelled_while_connected_records_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        app = App()
+        with TestTracer() as tracer:
+            ctx = make_context("/ls/stream", app=app, loop=asyncio.get_running_loop())
+            span = tracer.create("request")
+            span.start()
+            ctx.span = span
+            w = DummyWriter()  # client still connected
+
+            async def hang() -> None:
+                await asyncio.sleep(60)
+
+            task = app.create_task(hang(), eager_start=True)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+
+            with caplog.at_level(logging.ERROR, logger="stario.http"):
+                on_handler_done(ctx, w, task)  # type: ignore[arg-type]
+            assert w.completed
+            finished = tracer.get_span(span.id)
+            assert finished is not None
+            assert "request.client_left" not in finished.attributes
 
     asyncio.run(run())
 

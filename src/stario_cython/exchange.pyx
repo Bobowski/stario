@@ -106,6 +106,9 @@ cdef class HttpConnection:
     cdef object ensure_disconnect(self):
         raise NotImplementedError("ensure_disconnect")
 
+    cdef object ensure_stream_disconnect(self, RequestExchange ex):
+        raise NotImplementedError("ensure_stream_disconnect")
+
     cdef object drain_waiter(self, RequestExchange exchange):
         return None
 
@@ -150,6 +153,13 @@ cdef int STREAM_CHUNK_LIMIT = 1024 * 1024
 cdef int STREAM_CHUNK_CL = 256 * 1024
 cdef int OUTPUT_BUFFER_RETAIN_MAX = 64 * 1024
 cdef int DEFAULT_STREAM_CHUNK = 64 * 1024
+# zlib memLevel for streamed gzip responses; a stream holds far less input
+# history than a one-shot body, so the default 8 wastes ~50 KiB per stream.
+cdef int STREAM_GZIP_MEM_LEVEL = 4
+# Stream encoders cap brotli at quality 3: q4+ holds ~0.7 MiB of fixed
+# tables per live stream for no wire-size gain on chunked writes.
+cdef int STREAM_BROTLI_LEVEL_MAX = 3
+cdef int ZSTD_WINDOW_LOG_MIN = 10
 # Same-OS-thread spare. Keep-alive reuse is the connection idle slot.
 cdef int POOL_MAX = 16
 cdef int REQUEST_NAME_MAX = 256
@@ -753,6 +763,8 @@ cdef class RequestExchange:
         self._brotli = NULL
         self._zstd = NULL
         self._gzip = NULL
+        self._zstd_1s = NULL
+        self._gzip_1s = NULL
         self._out_buf = None
         self._out_len = 0
         self._status_code = -1
@@ -780,6 +792,11 @@ cdef class RequestExchange:
         self._h2_head_bytes = 0
         self._h2_awaiting_headers = False
         self._h2_header_deadline = 0.0
+        self._h2_sent_total = 0
+        self._h2_send_mark = 0
+        self._h2_send_deadline = 0.0
+        self._h2_body_mark = -1
+        self._stream_disc = None
         self._h2_date_line = None
         self._h2_date_bare = None
         self._req_content_length = -1
@@ -801,6 +818,14 @@ cdef class RequestExchange:
         self._brotli_enabled = False
         self._zstd_enabled = False
         self._gzip_enabled = False
+        self._s_brotli_level = DEFAULT_BROTLI_LEVEL
+        self._s_brotli_window = 0
+        self._s_brotli_lgblock = 0
+        self._s_zstd_window = 0
+        self._s_zstd_hash = 0
+        self._s_zstd_chain = 0
+        self._s_gzip_window = 15
+        self._s_gzip_mem = 0
         self._enc_order[0] = ENCODING_ZSTD
         self._enc_order[1] = ENCODING_BR
         self._enc_order[2] = ENCODING_GZIP
@@ -859,6 +884,49 @@ cdef class RequestExchange:
         self._gzip_level = compression.gzip_level
         window = compression.gzip_window_bits
         self._gzip_window = 15 if window is None else window
+        # Streamed responses get their own encoder profile: a smaller rolling
+        # window keeps a live compressed write() from pinning codec tables.
+        # None means streams reuse the one-shot parameters exactly.
+        window = compression.stream_window_log
+        if window is None:
+            self._s_brotli_level = self._brotli_level
+            self._s_brotli_window = self._brotli_window
+            self._s_brotli_lgblock = 0
+            self._s_zstd_window = self._zstd_window
+            self._s_zstd_hash = 0
+            self._s_zstd_chain = 0
+            self._s_gzip_window = self._gzip_window
+            self._s_gzip_mem = 0
+        else:
+            stream_window = window
+            # Brotli quality 4+ allocates ~0.7 MiB of fixed tables per
+            # encoder; quality 3 keeps the same wire size on streamed events.
+            self._s_brotli_level = (
+                self._brotli_level
+                if self._brotli_level < STREAM_BROTLI_LEVEL_MAX
+                else STREAM_BROTLI_LEVEL_MAX
+            )
+            self._s_brotli_window = stream_window
+            self._s_brotli_lgblock = 0
+            # The zstd stream buffers dwarf its window, so the window sits
+            # below stream_window_log to keep a stream near 150 KiB.
+            self._s_zstd_window = (
+                stream_window - 3
+                if stream_window - 3 > ZSTD_WINDOW_LOG_MIN
+                else ZSTD_WINDOW_LOG_MIN
+            )
+            self._s_zstd_hash = (
+                self._s_zstd_window - 3
+                if self._s_zstd_window - 3 > 6
+                else 6
+            )
+            self._s_zstd_chain = self._s_zstd_hash
+            self._s_gzip_window = (
+                stream_window - 2
+                if 9 <= stream_window - 2 <= 15
+                else (15 if stream_window - 2 > 15 else 9)
+            )
+            self._s_gzip_mem = STREAM_GZIP_MEM_LEVEL
         self._compress_min_size = compression.min_size
         self._brotli_enabled = self._brotli_level >= 0
         self._zstd_enabled = self._zstd_level >= 0
@@ -877,8 +945,9 @@ cdef class RequestExchange:
         if self._brotli != NULL:
             return 0
         self._brotli = stario_brotli_acquire(
-            self._brotli_level,
-            self._brotli_window,
+            self._s_brotli_level,
+            self._s_brotli_window,
+            self._s_brotli_lgblock,
         )
         if self._brotli == NULL:
             raise StarioError("brotli stream init failed")
@@ -889,7 +958,9 @@ cdef class RequestExchange:
             return 0
         self._zstd = stario_zstd_acquire(
             self._zstd_level,
-            self._zstd_window,
+            self._s_zstd_window,
+            self._s_zstd_hash,
+            self._s_zstd_chain,
         )
         if self._zstd == NULL:
             raise StarioError("zstd stream init failed")
@@ -900,9 +971,36 @@ cdef class RequestExchange:
             return 0
         self._gzip = stario_gzip_acquire(
             self._gzip_level,
-            self._gzip_window,
+            self._s_gzip_window,
+            self._s_gzip_mem,
         )
         if self._gzip == NULL:
+            raise StarioError("gzip stream init failed")
+        return 0
+
+    cdef inline int _ensure_zstd_1s(self) except -1:
+        """One-shot profile: respond() output must not change with stream_window_log."""
+        if self._zstd_1s != NULL:
+            return 0
+        self._zstd_1s = stario_zstd_acquire(
+            self._zstd_level,
+            self._zstd_window,
+            0,
+            0,
+        )
+        if self._zstd_1s == NULL:
+            raise StarioError("zstd stream init failed")
+        return 0
+
+    cdef inline int _ensure_gzip_1s(self) except -1:
+        if self._gzip_1s != NULL:
+            return 0
+        self._gzip_1s = stario_gzip_acquire(
+            self._gzip_level,
+            self._gzip_window,
+            0,
+        )
+        if self._gzip_1s == NULL:
             raise StarioError("gzip stream init failed")
         return 0
 
@@ -916,6 +1014,12 @@ cdef class RequestExchange:
         if self._gzip != NULL:
             stario_gzip_release(self._gzip)
             self._gzip = NULL
+        if self._zstd_1s != NULL:
+            stario_zstd_release(self._zstd_1s)
+            self._zstd_1s = NULL
+        if self._gzip_1s != NULL:
+            stario_gzip_release(self._gzip_1s)
+            self._gzip_1s = NULL
 
     cdef int _buf_add(self, const char* src, Py_ssize_t n) except -1:
         cdef bytearray buf
@@ -1354,6 +1458,11 @@ cdef class RequestExchange:
             self._h2_outbound = False
             self._h2_end_sent = False
             self._h2_flow_paused = False
+            self._h2_sent_total = 0
+            self._h2_send_mark = 0
+            self._h2_send_deadline = 0.0
+            self._h2_body_mark = -1
+            self._stream_disc = None
         self._handler_task = None
         self._head_request = False
 
@@ -1370,6 +1479,11 @@ cdef class RequestExchange:
         self._h2_outbound = False
         self._h2_end_sent = False
         self._h2_flow_paused = False
+        self._h2_sent_total = 0
+        self._h2_send_mark = 0
+        self._h2_send_deadline = 0.0
+        self._h2_body_mark = -1
+        self._stream_disc = None
         self._handler_task = None
         self._head_request = False
 
@@ -1543,6 +1657,7 @@ cdef class RequestExchange:
             self._spare_handle = None
         handle._ex = self
         handle._conn = self._connection
+        handle._disc = None
         handle.app = self.app
         handle.span = self.span
         handle.match = self.match
@@ -1569,6 +1684,12 @@ cdef class RequestExchange:
                 handle._req = self.ensure_request()
                 handle._final_status = self._status_code
                 handle._ex = None
+                # Snapshot the right future (stream for H2, conn otherwise)
+                # so a retained ``c`` stops pinning the protocol.
+                handle._disc = self._stream_disc
+                if handle._disc is None:
+                    handle._disc = self._connection.ensure_disconnect()
+                handle._conn = None
             else:
                 # Only this local refers to it. start_handle() rebinds every field.
                 handle._ex = None
@@ -1654,6 +1775,11 @@ cdef class RequestExchange:
         self._generation += 1
         wake_waiters(self._drain_waiters)
         self._detach_views()
+        if self._stream_disc is not None:
+            # This stream's channel is over; wake anyone still watching it.
+            if not self._stream_disc.done():
+                self._stream_disc.set_result(None)
+            self._stream_disc = None
         self._clear_request_binding()
         self._cached = None
         self._wake()
@@ -1791,15 +1917,15 @@ cdef class RequestExchange:
                 raise StarioError("brotli compression failed")
             return 0
         if encoding == b"zstd":
-            self._ensure_zstd()
+            self._ensure_zstd_1s()
             if stario_zstd_finish_borrowed(
-                self._zstd, <const unsigned char*>ptr, n, out, out_len
+                self._zstd_1s, <const unsigned char*>ptr, n, out, out_len
             ) != 0:
                 raise StarioError("zstd compression failed")
             return 0
-        self._ensure_gzip()
+        self._ensure_gzip_1s()
         if stario_gzip_finish_borrowed(
-            self._gzip, <const unsigned char*>ptr, n, out, out_len
+            self._gzip_1s, <const unsigned char*>ptr, n, out, out_len
         ) != 0:
             raise StarioError("gzip compression failed")
         return 0
@@ -2177,10 +2303,12 @@ cdef class RequestExchange:
             self._status_code = status
 
             if nbytes and not self._head_request:
+                # Snapshot like the fast path: the transport may hold the
+                # object past return, so mutation must not reach the wire.
                 if isinstance(body, (list, tuple)):
-                    self._t_writelines(body)
+                    self._t_writelines([_wire_part(p) for p in body])
                 else:
-                    self._transport.write(body)
+                    self._transport.write(_wire_part(body))
         self._status_code = status
         self._bytes_written = self._declared_length if self._declared_length > 0 else 0
         self._completed = True
@@ -2870,6 +2998,8 @@ cdef class RequestExchange:
 
     cdef void c_abort(self):
         wake_waiters(self._drain_waiters)
+        if self._stream_disc is not None and not self._stream_disc.done():
+            self._stream_disc.set_result(None)
         if self._abort_reason != ABORT_NONE:
             return
         self._free_compressors()
@@ -3417,6 +3547,7 @@ cdef class RequestHandle:
     def __cinit__(self):
         self._ex = None
         self._conn = None
+        self._disc = None
         self._state = None
         self._req = None
         self._final_status = -1
@@ -3440,11 +3571,30 @@ cdef class RequestHandle:
 
     @property
     def disconnect(self):
-        return self._conn.ensure_disconnect()
+        cdef RequestExchange ex = self._ex
+        if ex is not None and ex._http2:
+            # Stream-scoped: a reset stream goes away without the connection.
+            return self._conn.ensure_stream_disconnect(ex)
+        if self._conn is not None:
+            return self._conn.ensure_disconnect()
+        # Detached handle: _detach_views snapshotted the right future.
+        return self._disc
 
     @property
     def disconnected(self):
-        return _connection_gone(self._conn)
+        cdef RequestExchange ex = self._ex
+        cdef object fut
+        if ex is not None and ex._http2:
+            fut = ex._stream_disc
+            if fut is not None and fut.done():
+                return True
+            if ex._abort_reason == ABORT_DISCONNECTED:
+                return True
+            return _connection_gone(self._conn)
+        if self._conn is not None:
+            return _connection_gone(self._conn)
+        fut = self._disc
+        return fut is None or fut.done()
 
     @property
     def shutting_down(self):
@@ -3452,7 +3602,16 @@ cdef class RequestHandle:
 
     @property
     def closing(self):
-        if self._ex is None:
+        cdef RequestExchange ex = self._ex
+        cdef object transport
+        if ex is None:
+            return True
+        # A reset stream sets this before the connection itself closes.
+        if ex._abort_reason == ABORT_DISCONNECTED:
+            return True
+        # close() flips is_closing before connection_lost runs.
+        transport = ex._transport
+        if transport is not None and transport.is_closing():
             return True
         return self.disconnected or self.shutting_down
 
