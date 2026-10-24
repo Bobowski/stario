@@ -17,6 +17,7 @@ from stario_cython.compression_buf cimport (
     stario_brotli_decoder_free,
     stario_brotli_decoder_new,
     stario_brotli_decoder_push_borrowed,
+    stario_brotli_decoder_version,
     stario_brotli_decompress_borrowed,
     stario_brotli_finish_borrowed,
     stario_brotli_release,
@@ -57,6 +58,19 @@ def brotli_compress(bytes data, int level=4, int window=0) -> bytes:
     if stario_brotli_compress_borrowed(level, window, ptr, n, &out, &out_len) != 0:
         raise StarioError("brotli compression failed")
     return _owned_bytes(out, out_len)
+
+
+def brotli_decoder_version() -> tuple:
+    """Linked ``libbrotlidec`` as ``(major, minor, patch)``.
+
+    Packed with ``BROTLI_MAKE_HEX_VERSION`` (minor and patch are 12 bits).
+    """
+    cdef unsigned int packed = stario_brotli_decoder_version()
+    return (
+        int(packed >> 24),
+        int((packed >> 12) & 0xFFF),
+        int(packed & 0xFFF),
+    )
 
 
 def brotli_decompress(bytes data) -> bytes:

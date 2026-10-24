@@ -8,11 +8,14 @@ optional (`uvloop.run(serve(bootstrap))`). The free-threaded runtime
 [`docs/free-threading.md`](docs/free-threading.md).
 
 Building needs `pkg-config`, nghttp2 1.66+ (older distro builds that carry
-the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), Brotli, and zstd
+the security backports: set `STARIO_ALLOW_OLD_NGHTTP2=1`), Brotli with the
+CVE-2026-111497 fix (1.0.10+, 1.1.1+, or 1.2.1+; `STARIO_ALLOW_OLD_BROTLI=1`
+only when the distro backports that fix without a version bump), and zstd
 development packages (`libnghttp2-dev libbrotli-dev libzstd-dev` on
 Debian/Ubuntu, `brew install pkg-config nghttp2 brotli zstd` on macOS).
-Gzip links system zlib (`-lz`). Published wheels bundle nghttp2, Brotli,
-and zstd (`scripts/build-native-deps.sh`). Python `CompressionConfig` /
+`scripts/build-native-deps.sh` installs Brotli 1.2.1 when the distro package
+is still in the affected range. Gzip links system zlib (`-lz`). Published
+wheels bundle nghttp2, Brotli 1.2.1, and zstd. Python `CompressionConfig` /
 `Files` use the same libs through `stario_cython.codecs`.
 
 ```bash

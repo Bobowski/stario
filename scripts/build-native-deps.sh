@@ -3,18 +3,54 @@
 # Used by cibuildwheel: manylinux ships an nghttp2 without
 # nghttp2_option_set_max_continuations, and Homebrew bottles target the
 # runner's macOS rather than MACOSX_DEPLOYMENT_TARGET.
+#
+# Usage: build-native-deps.sh [PREFIX] [all|nghttp2,brotli,zstd]
+# Brotli is 1.2.1 (CVE-2026-111497). CI builds only brotli so the distro
+# nghttp2 stays the one under test.
 set -euo pipefail
 
 PREFIX="${1:-/usr/local}"
+COMPONENTS="${2:-all}"
 NGHTTP2_VERSION="1.70.0"
-BROTLI_VERSION="1.2.0"
+BROTLI_VERSION="1.2.1"
 ZSTD_VERSION="1.5.7"
 # nghttp2: GitHub release asset digest. zstd: published .sha256 next to the
-# tarball. brotli publishes no hash for tag archives — pinned on first use.
+# tarball. brotli publishes no hash for tag archives — pinned for v1.2.1.
 NGHTTP2_SHA256="e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2"
-BROTLI_SHA256="816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec"
+BROTLI_SHA256="98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f"
 ZSTD_SHA256="eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+
+want() {
+  local name="$1" part
+  if [[ "$COMPONENTS" == "all" ]]; then
+    return 0
+  fi
+  local IFS=','
+  for part in $COMPONENTS; do
+    if [[ "$part" == "$name" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ "$COMPONENTS" != "all" ]]; then
+  IFS=',' read -ra _requested <<< "$COMPONENTS"
+  if [[ ${#_requested[@]} -eq 0 ]]; then
+    echo "build-native-deps.sh: no components named" >&2
+    exit 1
+  fi
+  for part in "${_requested[@]}"; do
+    case "$part" in
+      nghttp2|brotli|zstd) ;;
+      *)
+        echo "build-native-deps.sh: unknown component '$part' (nghttp2, brotli, zstd, or all)" >&2
+        exit 1
+        ;;
+    esac
+  done
+fi
 
 verify_sha256() {
   local file="$1" expected="$2" actual
@@ -43,43 +79,68 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cd "$work"
 
-curl -fsSL -o nghttp2.tar.xz \
-  "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.xz"
-verify_sha256 nghttp2.tar.xz "$NGHTTP2_SHA256"
-tar xf nghttp2.tar.xz
-(
-  cd "nghttp2-${NGHTTP2_VERSION}"
-  ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --enable-lib-only \
-    --disable-static --disable-dependency-tracking >/dev/null
-  make -j"$JOBS" >/dev/null
-  make install >/dev/null
-)
+if want nghttp2; then
+  curl -fsSL -o nghttp2.tar.xz \
+    "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.xz"
+  verify_sha256 nghttp2.tar.xz "$NGHTTP2_SHA256"
+  tar xf nghttp2.tar.xz
+  (
+    cd "nghttp2-${NGHTTP2_VERSION}"
+    ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --enable-lib-only \
+      --disable-static --disable-dependency-tracking >/dev/null
+    make -j"$JOBS" >/dev/null
+    $SUDO make install >/dev/null
+  )
+fi
 
-curl -fsSL -o brotli.tar.gz \
-  "https://github.com/google/brotli/archive/refs/tags/v${BROTLI_VERSION}.tar.gz"
-verify_sha256 brotli.tar.gz "$BROTLI_SHA256"
-tar xf brotli.tar.gz
-cmake -S "brotli-${BROTLI_VERSION}" -B brotli-build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-  -DCMAKE_INSTALL_LIBDIR=lib \
-  -DBROTLI_DISABLE_TESTS=ON >/dev/null
-cmake --build brotli-build -j"$JOBS" >/dev/null
-cmake --install brotli-build >/dev/null
+if want brotli; then
+  curl -fsSL -o brotli.tar.gz \
+    "https://github.com/google/brotli/archive/refs/tags/v${BROTLI_VERSION}.tar.gz"
+  verify_sha256 brotli.tar.gz "$BROTLI_SHA256"
+  tar xf brotli.tar.gz
+  cmake -S "brotli-${BROTLI_VERSION}" -B brotli-build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DBROTLI_DISABLE_TESTS=ON >/dev/null
+  cmake --build brotli-build -j"$JOBS" >/dev/null
+  $SUDO cmake --install brotli-build >/dev/null
+fi
 
-curl -fsSL -o zstd.tar.gz \
-  "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz"
-verify_sha256 zstd.tar.gz "$ZSTD_SHA256"
-tar xf zstd.tar.gz
-cmake -S "zstd-${ZSTD_VERSION}/build/cmake" -B zstd-build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-  -DCMAKE_INSTALL_LIBDIR=lib \
-  -DZSTD_BUILD_PROGRAMS=OFF \
-  -DZSTD_BUILD_TESTS=OFF \
-  -DZSTD_BUILD_STATIC=OFF \
-  -DZSTD_BUILD_SHARED=ON >/dev/null
-cmake --build zstd-build -j"$JOBS" >/dev/null
-cmake --install zstd-build >/dev/null
+if want zstd; then
+  curl -fsSL -o zstd.tar.gz \
+    "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz"
+  verify_sha256 zstd.tar.gz "$ZSTD_SHA256"
+  tar xf zstd.tar.gz
+  cmake -S "zstd-${ZSTD_VERSION}/build/cmake" -B zstd-build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DZSTD_BUILD_PROGRAMS=OFF \
+    -DZSTD_BUILD_TESTS=OFF \
+    -DZSTD_BUILD_STATIC=OFF \
+    -DZSTD_BUILD_SHARED=ON >/dev/null
+  cmake --build zstd-build -j"$JOBS" >/dev/null
+  $SUDO cmake --install zstd-build >/dev/null
+fi
 
-PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion libnghttp2 libbrotlienc libzstd
+# A newly installed libbrotlidec.so.1 shares its soname with distro 1.1.0.
+# Refresh the loader cache so the PREFIX build is the one that resolves.
+if [[ "$(id -u)" == 0 ]]; then
+  ldconfig
+elif [[ -n "$SUDO" ]]; then
+  $SUDO ldconfig
+fi
+
+pc_modules=()
+if want nghttp2; then
+  pc_modules+=(libnghttp2)
+fi
+if want brotli; then
+  pc_modules+=(libbrotlienc libbrotlidec)
+fi
+if want zstd; then
+  pc_modules+=(libzstd)
+fi
+PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+  pkg-config --modversion "${pc_modules[@]}"

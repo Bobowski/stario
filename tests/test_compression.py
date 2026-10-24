@@ -1,5 +1,9 @@
 """Unit tests for compression negotiation helpers."""
 
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
+
 import pytest
 
 from stario.exceptions import StarioError
@@ -133,6 +137,89 @@ def test_select_prefers_zstd_over_gzip() -> None:
     )
     assert compressor is not None
     assert compressor.encoding == b"zstd"
+
+
+def _brotli_has_cve_2026_111497_fix(version: tuple[int, ...]) -> bool:
+    # Same policy as setup.py: 1.0.10+, 1.1.1+, 1.2.1+, and later minors.
+    if len(version) < 2:
+        return False
+    major, minor = version[0], version[1]
+    patch = version[2] if len(version) > 2 else 0
+    if major > 1 or (major == 1 and minor > 2):
+        return True
+    if (major, minor) == (1, 0):
+        return patch >= 10
+    if (major, minor) == (1, 1):
+        return patch >= 1
+    if (major, minor) == (1, 2):
+        return patch >= 1
+    return False
+
+
+@pytest.mark.parametrize(
+    ("version", "fixed"),
+    [
+        ((1, 0, 2), False),
+        ((1, 0, 9), False),
+        ((1, 0, 10), True),
+        ((1, 1, 0), False),
+        ((1, 1, 1), True),
+        ((1, 2, 0), False),
+        ((1, 2, 1), True),
+        ((1, 3, 0), True),
+        ((2, 0, 0), True),
+    ],
+)
+def test_brotli_cve_2026_111497_version_policy(
+    version: tuple[int, ...], fixed: bool
+) -> None:
+    assert _brotli_has_cve_2026_111497_fix(version) is fixed
+
+
+def test_setup_py_brotli_policy_matches() -> None:
+    source = Path("setup.py").read_text()
+    start = source.index("def _version_tuple")
+    end = source.index("def _require_brotli_version")
+    namespace: dict[str, object] = {}
+    exec(source[start:end], namespace)
+    policy = cast(
+        Callable[[tuple[int, ...]], bool],
+        namespace["_brotli_has_cve_2026_111497_fix"],
+    )
+    for version, fixed in (
+        ((1, 0, 9), False),
+        ((1, 0, 10), True),
+        ((1, 1, 0), False),
+        ((1, 1, 1), True),
+        ((1, 2, 0), False),
+        ((1, 2, 1), True),
+    ):
+        assert policy(version) is fixed
+        assert policy(version) is _brotli_has_cve_2026_111497_fix(version)
+
+
+def test_linked_brotli_decoder_rejects_invalid_block_switch() -> None:
+    # CVE-2026-111497. Node's regression input from
+    # test/parallel/test-zlib-invalid-input.js: a block switch in a stream
+    # that declared a single block type. A fixed decoder reports a format
+    # error instead of continuing.
+    from stario_cython.codecs import BrotliDecoder, brotli_decoder_version
+
+    version = brotli_decoder_version()
+    assert _brotli_has_cve_2026_111497_fix(version), version
+
+    invalid = bytes.fromhex("200010414141fcffff07002228f00b60f7f41f000000")
+    with pytest.raises(StarioError, match="brotli decompression failed"):
+        brotli_decompress(invalid)
+
+    decoder = BrotliDecoder()
+
+    def decode_each_byte() -> None:
+        for offset in range(len(invalid)):
+            decoder.decompress(invalid[offset : offset + 1])
+
+    with pytest.raises(StarioError, match="brotli decompression failed"):
+        decode_each_byte()
 
 
 def test_native_compressors_round_trip() -> None:

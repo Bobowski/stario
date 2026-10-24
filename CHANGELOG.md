@@ -6,6 +6,20 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+### Added
+
+- `stario_cython.codecs.brotli_decoder_version()` reports the linked
+  libbrotlidec as `(major, minor, patch)`.
+
+### Fixed
+
+- Wheels bundle Brotli 1.2.1. The decoder in 1.0.3 through 1.2.0 writes
+  out of bounds on a crafted stream (CVE-2026-111497). Source builds reject
+  a `libbrotlidec` in that range. `STARIO_ALLOW_OLD_BROTLI=1` is only for a
+  distro package that backports the fix without changing its version.
+  Request bodies stay as the client sent them. `brotli_decompress`,
+  `BrotliDecoder`, and `TestClient` are the paths that decode Brotli.
+
 ## 5.1.0 - 2026-10-20
 
 ### Added
