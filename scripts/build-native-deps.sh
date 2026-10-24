@@ -73,7 +73,6 @@ if [[ ! -w "$(dirname "$PREFIX")" && "$(id -u)" != 0 ]]; then
   SUDO="sudo"
 fi
 $SUDO mkdir -p "$PREFIX"
-$SUDO chown "$(id -u)" "$PREFIX" 2>/dev/null || true
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

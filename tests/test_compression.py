@@ -139,21 +139,20 @@ def test_select_prefers_zstd_over_gzip() -> None:
     assert compressor.encoding == b"zstd"
 
 
-def _brotli_has_cve_2026_111497_fix(version: tuple[int, ...]) -> bool:
-    # Same policy as setup.py: 1.0.10+, 1.1.1+, 1.2.1+, and later minors.
-    if len(version) < 2:
-        return False
-    major, minor = version[0], version[1]
-    patch = version[2] if len(version) > 2 else 0
-    if major > 1 or (major == 1 and minor > 2):
-        return True
-    if (major, minor) == (1, 0):
-        return patch >= 10
-    if (major, minor) == (1, 1):
-        return patch >= 1
-    if (major, minor) == (1, 2):
-        return patch >= 1
-    return False
+def _load_brotli_policy() -> Callable[[tuple[int, ...]], bool]:
+    # Importing setup.py runs setuptools, so exec only the policy function.
+    source = Path("setup.py").read_text()
+    start = source.index("def _brotli_has_cve_2026_111497_fix")
+    end = source.index("def _require_brotli_version")
+    namespace: dict[str, object] = {}
+    exec(source[start:end], namespace)
+    return cast(
+        Callable[[tuple[int, ...]], bool],
+        namespace["_brotli_has_cve_2026_111497_fix"],
+    )
+
+
+_brotli_has_cve_2026_111497_fix = _load_brotli_policy()
 
 
 @pytest.mark.parametrize(
@@ -174,28 +173,6 @@ def test_brotli_cve_2026_111497_version_policy(
     version: tuple[int, ...], fixed: bool
 ) -> None:
     assert _brotli_has_cve_2026_111497_fix(version) is fixed
-
-
-def test_setup_py_brotli_policy_matches() -> None:
-    source = Path("setup.py").read_text()
-    start = source.index("def _version_tuple")
-    end = source.index("def _require_brotli_version")
-    namespace: dict[str, object] = {}
-    exec(source[start:end], namespace)
-    policy = cast(
-        Callable[[tuple[int, ...]], bool],
-        namespace["_brotli_has_cve_2026_111497_fix"],
-    )
-    for version, fixed in (
-        ((1, 0, 9), False),
-        ((1, 0, 10), True),
-        ((1, 1, 0), False),
-        ((1, 1, 1), True),
-        ((1, 2, 0), False),
-        ((1, 2, 1), True),
-    ):
-        assert policy(version) is fixed
-        assert policy(version) is _brotli_has_cve_2026_111497_fix(version)
 
 
 def test_linked_brotli_decoder_rejects_invalid_block_switch() -> None:

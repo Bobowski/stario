@@ -13,8 +13,8 @@ CVE-2026-111497 fix (1.0.10+, 1.1.1+, or 1.2.1+; `STARIO_ALLOW_OLD_BROTLI=1`
 only when the distro backports that fix without a version bump), and zstd
 development packages (`libnghttp2-dev libbrotli-dev libzstd-dev` on
 Debian/Ubuntu, `brew install pkg-config nghttp2 brotli zstd` on macOS).
-`scripts/build-native-deps.sh` installs Brotli 1.2.1 when the distro package
-is still in the affected range. Gzip links system zlib (`-lz`). Published
+`scripts/build-native-deps.sh` always builds Brotli 1.2.1 (pass `brotli`
+to build only that library). Gzip links system zlib (`-lz`). Published
 wheels bundle nghttp2, Brotli 1.2.1, and zstd. Python `CompressionConfig` /
 `Files` use the same libs through `stario_cython.codecs`.
 
