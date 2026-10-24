@@ -6,6 +6,8 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 5.1.1 - 2026-10-24
+
 ### Added
 
 - `stario_cython.codecs.brotli_decoder_version()` reports the linked
