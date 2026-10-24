@@ -1,4 +1,5 @@
 from libc.stddef cimport size_t
+from libc.stdint cimport uint32_t
 
 cdef extern from "compression_buf.h":
     ctypedef struct StarioBrotli:
@@ -71,6 +72,7 @@ cdef extern from "compression_buf.h":
     )
     void stario_zstd_release(StarioZstd* zstd)
 
+    uint32_t stario_brotli_decoder_version()
     int stario_brotli_decompress_borrowed(
         const unsigned char* data,
         size_t in_len,

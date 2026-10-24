@@ -2,6 +2,7 @@
 #define STARIO_COMPRESSION_BUF_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct StarioBrotli StarioBrotli;
 typedef struct StarioGzip StarioGzip;
@@ -78,6 +79,9 @@ void stario_zstd_release(StarioZstd* zstd);
 
 typedef struct StarioBrotliDecoder StarioBrotliDecoder;
 typedef struct StarioZstdDecoder StarioZstdDecoder;
+
+/* Linked libbrotlidec, packed as BROTLI_MAKE_HEX_VERSION. */
+uint32_t stario_brotli_decoder_version(void);
 
 int stario_brotli_decompress_borrowed(
     const unsigned char* in,

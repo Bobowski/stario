@@ -19,10 +19,18 @@ jobs:
     env:
       # Ubuntu's 1.59 is new enough to test against; release wheels bundle 1.70.
       STARIO_ALLOW_OLD_NGHTTP2: "1"
+      # Distro libbrotli is still in the CVE-2026-111497 range. The script
+      # installs 1.2.1 under /usr/local; pkg-config and the loader must see
+      # that copy before the distro one (same soname, libbrotlidec.so.1).
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+      LD_LIBRARY_PATH: /usr/local/lib
     steps:
       - uses: actions/checkout@v4
       - name: Native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libnghttp2-dev libbrotli-dev libzstd-dev nghttp2-client
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            pkg-config cmake libnghttp2-dev libbrotli-dev libzstd-dev nghttp2-client
+          bash scripts/build-native-deps.sh /usr/local brotli
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}

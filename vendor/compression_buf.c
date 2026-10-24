@@ -818,6 +818,10 @@ static int zstd_decode_into(
     }
 }
 
+uint32_t stario_brotli_decoder_version(void) {
+    return BrotliDecoderVersion();
+}
+
 int stario_brotli_decompress_borrowed(
     const unsigned char* in,
     size_t in_len,

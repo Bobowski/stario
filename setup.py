@@ -1,9 +1,12 @@
 """Build the Cython HTTP runtime (``stario_cython``).
 
 Native libraries come from pkg-config: nghttp2 1.66+ (MadeYouReset,
-CVE-2025-8671), Brotli, and zstd. Gzip links system zlib. llhttp is vendored.
+CVE-2025-8671), Brotli with the CVE-2026-111497 fix (1.0.10+, 1.1.1+, or
+1.2.1+), and zstd. Gzip links system zlib. llhttp is vendored.
 A distro nghttp2 older than 1.66 that carries the security backports can be
-used with ``STARIO_ALLOW_OLD_NGHTTP2=1``.
+used with ``STARIO_ALLOW_OLD_NGHTTP2=1``. ``STARIO_ALLOW_OLD_BROTLI=1`` is
+the same escape for a Brotli package that backports CVE-2026-111497 without
+a version bump.
 
 Development build: ``uv pip install -e .`` or ``python setup.py build_ext --inplace``.
 """
@@ -47,6 +50,61 @@ def _pkg_config(option: str) -> list[str]:
     return shlex.split(result.stdout)
 
 
+def _version_tuple(raw: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for part in raw.strip().split("."):
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _brotli_has_cve_2026_111497_fix(version: tuple[int, ...]) -> bool:
+    """True for a libbrotli release outside the CVE-2026-111497 range.
+
+    Fixed lines are 1.0.10+, 1.1.1+, and 1.2.1+. Later majors and minors
+    count as fixed. 1.0.3 through 1.0.9, 1.1.0, and 1.2.0 do not.
+    """
+    if len(version) < 2:
+        return False
+    major, minor = version[0], version[1]
+    patch = version[2] if len(version) > 2 else 0
+    if major > 1 or (major == 1 and minor > 2):
+        return True
+    if (major, minor) == (1, 0):
+        return patch >= 10
+    if (major, minor) == (1, 1):
+        return patch >= 1
+    if (major, minor) == (1, 2):
+        return patch >= 1
+    return False
+
+
+def _require_brotli_version() -> None:
+    if os.environ.get("STARIO_ALLOW_OLD_BROTLI") == "1":
+        return
+    raw = subprocess.run(
+        ["pkg-config", "--modversion", "libbrotlidec"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if _brotli_has_cve_2026_111497_fix(_version_tuple(raw)):
+        return
+    raise RuntimeError(
+        f"stario needs a Brotli decoder with the CVE-2026-111497 fix "
+        f"(found {raw}). Affected releases are 1.0.3-1.0.9, 1.1.0, and "
+        "1.2.0. Install 1.0.10+, 1.1.1+, or 1.2.1+ "
+        "(scripts/build-native-deps.sh), or set STARIO_ALLOW_OLD_BROTLI=1 "
+        "only if your distro backports that fix."
+    )
+
+
 def _require_nghttp2_version() -> None:
     if os.environ.get("STARIO_ALLOW_OLD_NGHTTP2") == "1":
         return
@@ -73,6 +131,7 @@ class native_build_ext(build_ext):
     def build_extensions(self) -> None:
         _pkg_config("--exists")
         _require_nghttp2_version()
+        _require_brotli_version()
         include_dirs = [
             f[2:] for f in _pkg_config("--cflags-only-I") if f.startswith("-I")
         ]
