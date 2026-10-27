@@ -22,7 +22,7 @@ Per feature the pattern is the same:
   subjects.py  relay subject helpers (room.{id}.message, .presence, …)
   signals.py   Datastar signal shape for this page
   views.py     pure HTML (common.shell.page wraps body content)
-  handlers.py  handler factories + register_* at the bottom
+  handlers.py  the page class: register(app) + one method per route
 
 Files are optional per feature — the lobby is UI over the room domain, so
 it has no models.py or data.py of its own.
@@ -34,9 +34,9 @@ https://stario.dev/docs/how-tos/structuring-apps
 from app.assets import ASSETS
 from app.config import Config
 from app.db import Database
-from app.features.lobby.handlers import register_lobby
+from app.features.lobby.handlers import LobbyPage
 from app.features.room import data as room_data
-from app.features.room.handlers import register_room
+from app.features.room.handlers import RoomPage
 from stario import App, Relay, Span
 
 
@@ -46,7 +46,7 @@ async def bootstrap(app: App, span: Span):
     db = Database(config.db_path)
     db.apply_schema(room_data.SCHEMA)
 
-    relay = Relay()
+    relay: Relay[dict] = Relay()
 
     span.attrs(
         {
@@ -59,8 +59,8 @@ async def bootstrap(app: App, span: Span):
     with span.step("static_assets") as s:
         s.attrs(await ASSETS.attach(app))
 
-    register_lobby(app, db, relay)
-    register_room(app, db, relay)
+    LobbyPage(db, relay).register(app)
+    RoomPage(db, relay).register(app)
     yield
 
 

@@ -79,7 +79,7 @@ async def test_lobby_live(client):
         "GET",
         "/live",
         params={"datastar": signals},
-        headers={"Accept-Encoding": "identity"},
+        timeout=2,
     ) as r:
         assert r.status_code == 200
         assert "text/event-stream" in r.headers.get("content-type", "")

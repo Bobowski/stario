@@ -154,6 +154,9 @@ def throttle_to_string(throttle: Throttle) -> str:
 def string_literal(value: str) -> str:
     """Single-quoted JS string literal for Datastar action/object expressions.
 
+    `<` is escaped as `\\x3c`, so the result is safe inside a `<script>`
+    element and an HTML attribute — user text cannot close either early.
+
     ```python
     from stario.datastar.format import js_object, string_literal
 
@@ -163,6 +166,7 @@ def string_literal(value: str) -> str:
     """
     escaped = (
         value.replace("\\", "\\\\")
+        .replace("<", "\\x3c")
         .replace("'", "\\'")
         .replace("\b", "\\b")
         .replace("\f", "\\f")

@@ -50,9 +50,9 @@ Each feature follows the same shape — every file optional:
 | `subjects.py` | relay subject helpers — no typo-prone f-strings at call sites |
 | `signals.py` | Datastar signal dataclass + `read_*_signals` for this page |
 | `views.py` | HTML trees (`common.shell.page` wraps body content) |
-| `handlers.py` | handler factories + `register_*` at the bottom |
+| `handlers.py` | the page class — `register(app)` plus one method per route |
 
-`app/main.py` reads `Config.from_env()`, builds shared deps once (`db`, `relay`), applies each feature's `SCHEMA`, registers static assets, then calls each `register_*`.
+`app/main.py` reads `Config.from_env()`, builds shared deps once (`db`, `relay`), applies each feature's `SCHEMA`, registers static assets, then calls each page's `register(app)`.
 
 **Who owns the data:** the room feature owns the whole room domain (tables, models, queries). The lobby is UI over that domain — it imports `room.data` and `room.urls` rather than duplicating them. Domain imports flow one way (lobby consumes room's `data`/`models`, never the reverse); `urls.py` modules are leaves, so any feature may import another's URLs for links and redirects (room redirects to `LOBBY`). `app/db.py` never grows when you add a feature.
 

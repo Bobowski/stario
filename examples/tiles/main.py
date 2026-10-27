@@ -28,6 +28,7 @@ For a multi-file layout, clone examples/chat-room from the stario repo
 import random
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from stario import (
@@ -87,7 +88,7 @@ CLICK = Route("POST", "/click")
 # `Span` from `stario` (the tracing handle, not the HTML element).
 #
 # Game is the source of truth. Commands mutate it; queries read it and pass it
-# into views. Handler factories close over one Game instance from bootstrap.
+# into views. The page class below holds one Game instance from bootstrap.
 
 
 class Game:
@@ -279,14 +280,19 @@ def home_view(user_id: str, game: Game) -> HtmlElement:
 
 
 # =============================================================================
-# 4. Handlers
+# 4. Handlers — one page class
 # =============================================================================
 #
-# Each route is a factory — home(game) returns the real handler so bootstrap can
-# inject shared state without globals. hello-world skips this; tiles needs it.
+# A page is one class: its fields are its dependencies, `register` wires each
+# route to a method, and each method is the handler. hello-world needs no
+# state, so it registers a plain function instead.
 #
 # Queries (read):  home, live
 # Commands (write): click
+
+# Shared changes publish {} on this subject; the payload carries nothing
+# because every live loop re-reads Game and repaints.
+CHANGED = "board.changed"
 
 
 async def read_user_id(c: Context) -> str:
@@ -296,22 +302,25 @@ async def read_user_id(c: Context) -> str:
     return str(signals.get("user_id", ""))
 
 
-def home(game: Game):
-    """GET / — mint a user_id and render the page."""
+@dataclass(frozen=True, slots=True)
+class TilesPage:
+    game: Game
+    relay: Relay[dict]
 
-    async def handler(c: Context, w: Writer) -> None:
+    def register(self, app: App) -> None:
+        app.add(HOME, self.home)
+        app.add(LIVE, self.live)
+        app.add(CLICK, self.click)
+
+    async def home(self, c: Context, w: Writer) -> None:
+        """GET / — mint a user_id and render the page."""
         # Fresh id per tab — becomes a Datastar signal for later POSTs and SSE.
         user_id = str(uuid.uuid4())[:8]
         c.span.attr("user_id", user_id)
-        w.html(home_view(user_id, game))
+        w.html(home_view(user_id, self.game))
 
-    return handler
-
-
-def live(game: Game, relay: Relay[str]):
-    """GET /live — SSE stream; re-render home_view on every relay event."""
-
-    async def handler(c: Context, w: Writer) -> None:
+    async def live(self, c: Context, w: Writer) -> None:
+        """GET /live — SSE stream; re-render home_view on every relay event."""
         user_id = await read_user_id(c)
         if not user_id:
             c.span.event("Missing user id", {})
@@ -321,40 +330,34 @@ def live(game: Game, relay: Relay[str]):
         # Queue must exist before publish — otherwise this tab misses its own join.
         # Subscribe first so this connection's queue exists before we publish presence
         # (avoids a gap where "join" and other events could be dropped for this client).
-        async with relay.subscribe("*") as events:
+        async with self.relay.subscribe(CHANGED, latest=True) as events:
             sse = SSE(w)
-            game.join(user_id)
+            self.game.join(user_id)
             # Same fan-out as clicks: all SSE clients patch so everyone sees the new player.
-            relay.publish("join", user_id)  # wakes every open live loop
+            self.relay.publish(CHANGED, {})  # wakes every open live loop
             c.span.event("Player connected", {"user_id": user_id})
             c.span.attr("user_id", user_id)
 
             # Full tree patch — don't wait for relay; ship truth as soon as SSE opens.
-            sse.patch_elements(home_view(user_id, game))
+            sse.patch_elements(home_view(user_id, self.game))
 
             # c.alive stops when the tab disconnects or the process shuts down.
             # First iteration (and every later one): relay fan-out — join included — drives patches.
-            # No separate onload patch: `publish("join")` already queues for this subscriber.
-            # `*` matches all topics; fine for demos — production often namespaces keys.
+            # No separate onload patch: `publish(CHANGED)` already queues for this subscriber.
             async for subject, _ in c.alive(events):
                 c.span.event("relay", {"subject": subject})
-                sse.patch_elements(home_view(user_id, game))
+                sse.patch_elements(home_view(user_id, self.game))
 
         # Unsubscribed — then drop presence so leave is not delivered to this (dead) SSE queue.
-        game.leave(user_id)
-        relay.publish("leave", user_id)  # still subscribed — others get the update
+        self.game.leave(user_id)
+        self.relay.publish(CHANGED, {})  # still subscribed — others get the update
         c.span.event("Player disconnected", {"user_id": user_id})
 
-    return handler
-
-
-def click(game: Game, relay: Relay[str]):
-    """POST /click — toggle a cell; clients learn about it on SSE, not here."""
-
-    async def handler(c: Context, w: Writer) -> None:
+    async def click(self, c: Context, w: Writer) -> None:
+        """POST /click — toggle a cell; clients learn about it on SSE, not here."""
         user_id = await read_user_id(c)
         # Membership in user_colors means /live succeeded for this tab.
-        if user_id not in game.user_colors:
+        if user_id not in self.game.user_colors:
             w.redirect(HOME.href())
             return
 
@@ -368,7 +371,7 @@ def click(game: Game, relay: Relay[str]):
         except ValueError:
             w.redirect(HOME.href())
             return
-        if not 0 <= cell_id < game.total_cells:
+        if not 0 <= cell_id < self.game.total_cells:
             w.redirect(HOME.href())
             return
 
@@ -380,16 +383,14 @@ def click(game: Game, relay: Relay[str]):
         # broadcast (here: update shared state and notify other tabs).
         w.empty(204)  # ack before fan-out — browser isn't waiting for HTML
 
-        action = game.paint_cell(user_id, cell_id)
+        action = self.game.paint_cell(user_id, cell_id)
         c.span.event("Cell toggled", {"cell_id": cell_id, "action": action})
 
         # Fan-out: every open SSE subscription receives this; each client's
         # `live` loop wakes up and calls `sse.patch_elements()`, so all users re-render.
         # Real-time in this demo—and the same pub/sub + patch pattern scales to
         # larger apps with a broker instead of in-process `Relay`.
-        relay.publish("click", user_id)  # SSE tabs re-read Game and patch
-
-    return handler
+        self.relay.publish(CHANGED, {})  # SSE tabs re-read Game and patch
 
 
 # =============================================================================
@@ -403,7 +404,7 @@ def click(game: Game, relay: Relay[str]):
 async def bootstrap(app: App, span: Span):
     # `span` is the root bootstrap tracer; attr() annotates startup for TTY/JSON/SQLite sinks.
     game = Game()
-    relay = Relay[str]()  # process-local fan-out between open /live loops
+    relay: Relay[dict] = Relay()  # process-local fan-out between open /live loops
 
     span.attrs(
         {
@@ -418,11 +419,9 @@ async def bootstrap(app: App, span: Span):
     with span.step("static_assets") as s:
         s.attrs(await ASSETS.attach(app))
 
-    # Queries — return or stream HTML
-    app.add(HOME, home(game))
-    app.add(LIVE, live(game, relay))
-    # Commands — mutate Game, nudge relay; updates arrive on SSE
-    app.add(CLICK, click(game, relay))
+    # One page registers queries (return or stream HTML) and commands
+    # (mutate Game, nudge relay; updates arrive on SSE).
+    TilesPage(game, relay).register(app)
     yield
 
 
