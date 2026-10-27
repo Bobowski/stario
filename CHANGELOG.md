@@ -6,6 +6,24 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 5.2.0 - 2026-10-25
+
+### Changed
+
+- `string_literal` escapes `<` as `\x3c`, so its result is safe inside a
+  `<script>` element and an HTML attribute — user text passed to
+  `SSE.execute_script` or an action expression can no longer close either
+  early.
+- `TestClient` exit now matches the server's graceful shutdown: it signals
+  `app.signal_shutdown()` before draining, so `while not app.shutting_down`
+  work loops stop, and cancels tasks still pending after `shutdown_timeout`
+  (default 5 s, like `STARIO_GRACEFUL_SHUTDOWN_TIMEOUT`; `None` restores the
+  old wait-forever behavior). `drain_tasks(timeout=)` takes the same value.
+- The examples use page classes — one `@dataclass(frozen=True, slots=True)`
+  page per screen whose fields are its dependencies, `register(app)` wires
+  each route to a method, and commands reply before they change state and
+  publish on a `Relay[dict]`.
+
 ## 5.1.1 - 2026-10-24
 
 ### Added

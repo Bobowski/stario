@@ -138,6 +138,51 @@ async def test_timeout_hangs_up_and_cancels_the_handler() -> None:
         assert (await client.get("/missing")).status_code == 404
 
 
+async def test_exit_signals_shutdown_so_work_loops_stop() -> None:
+    """A `while not app.shutting_down` job exits like under the real Server."""
+
+    async def page(c: Context, w: Writer) -> None:
+        async def job() -> None:
+            while not c.app.shutting_down:
+                await asyncio.sleep(0.01)
+
+        c.app.create_task(job())
+        w.text("ok")
+
+    async def bootstrap(app: App, span):
+        app.add(Route("GET /"), page)
+        yield
+
+    async with asyncio.timeout(1):
+        async with TestClient(bootstrap) as client:
+            assert (await client.get("/")).status_code == 200
+
+
+async def test_exit_cancels_tasks_past_shutdown_timeout() -> None:
+    """A job that never wakes on its own is cancelled at the deadline."""
+    cancelled = asyncio.Event()
+
+    async def page(c: Context, w: Writer) -> None:
+        async def job() -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        c.app.create_task(job())
+        w.text("ok")
+
+    async def bootstrap(app: App, span):
+        app.add(Route("GET /"), page)
+        yield
+
+    async with asyncio.timeout(5):
+        async with TestClient(bootstrap, shutdown_timeout=0.1) as client:
+            assert (await client.get("/")).status_code == 200
+    assert cancelled.is_set()
+
+
 async def test_buffered_call_returns_after_the_handler_finished() -> None:
     """Post-response work in the handler is done; app.create_task work is not."""
     order: list[str] = []

@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 from stario.http.app import App
 from stario.http.bootstrap import Bootstrap
 from stario.http.compression import CompressionConfig
-from stario.http.config import RequestPolicy
+from stario.http.config import DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT, RequestPolicy
 from stario.http.headers import Headers
 from stario.testing.cookies import merge_cookie_jar
 from stario.testing.encode import decode_content_encoding, parse_response_cookies
@@ -66,8 +66,11 @@ class TestClient:
     `timeout` / `request_timeout` cap one exchange. Past it the client hangs
     up, cancels that handler, and raises `TimeoutError`.
 
-    Exit — open connections close, `drain_tasks` runs, then bootstrap
-    teardown (if any) matches normal app shutdown.
+    Exit — open connections close, the app's shutdown is signaled (so
+    `app.shutting_down` work loops wake), and `drain_tasks` runs up to
+    `shutdown_timeout`; tasks still pending past it are cancelled, like the
+    server's graceful shutdown. Then bootstrap teardown (if any) matches
+    normal app shutdown.
     """
 
     __test__ = False
@@ -86,6 +89,7 @@ class TestClient:
         compression: CompressionConfig | None = None,
         requests: RequestPolicy | None = None,
         request_timeout: float | None = 30.0,
+        shutdown_timeout: float | None = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
     ) -> None:
         """Wire the client.
 
@@ -103,6 +107,11 @@ class TestClient:
           Responses compress only when the request sends `Accept-Encoding`.
         - `requests`: Server request limits (default `RequestPolicy()`).
         - `request_timeout`: Default seconds per request; `None` means no timeout.
+        - `shutdown_timeout`: Seconds exit waits for `app.create_task` work
+          after signaling shutdown (default matches the server's
+          `STARIO_GRACEFUL_SHUTDOWN_TIMEOUT`, 5 s). Past it, pending tasks are
+          cancelled. `None` waits forever — a job that ignores
+          `app.shutting_down` then hangs the exit.
         """
         if isinstance(app_or_bootstrap, App):
             self._app = app_or_bootstrap
@@ -129,6 +138,7 @@ class TestClient:
         )
         self.requests = requests if requests is not None else RequestPolicy()
         self.request_timeout = request_timeout
+        self._shutdown_timeout = shutdown_timeout
         # One registry for every connection this client opens. The Server's
         # Date tick would sweep it; here timeouts are off, so it only counts.
         self._connections = Connections(server_driven=True)
@@ -166,9 +176,12 @@ class TestClient:
                 if transport is not None and not transport.is_closing():
                     transport.close()
             if self._app is not None:
-                if self._async_app_cm is None and self._owns_shutdown:
+                # Signal before draining so `while not app.shutting_down`
+                # loops exit on their own. Bootstrap teardown signals again —
+                # signal_shutdown() is idempotent.
+                if self._async_app_cm is not None or self._owns_shutdown:
                     self._app.signal_shutdown()
-                await self.drain_tasks()
+                await self.drain_tasks(timeout=self._shutdown_timeout)
             if self._async_app_cm is not None:
                 await self._async_app_cm.__aexit__(exc_type, exc_val, exc_tb)
                 self._async_app_cm = None
@@ -177,23 +190,45 @@ class TestClient:
             self._entered = False
             self.tracer.__exit__(exc_type, exc_val, exc_tb)
 
-    async def drain_tasks(self) -> None:
-        """Wait until `App.drain_tasks` is quiet and `tracer` has no open spans.
+    async def drain_tasks(self, timeout: float | None = None) -> None:
+        """Wait until `app.tasks` is quiet and `tracer` has no open spans.
 
         Called automatically after hanging up every connection when exiting
-        the client context. Unsafe to call from work scheduled via
+        the client context — the client's `shutdown_timeout` applies there.
+        `timeout` caps the wait on `app.create_task` work; tasks still
+        pending past it are cancelled, like the server's graceful shutdown.
+        `None` waits forever. Unsafe to call from work scheduled via
         `app.create_task` (can deadlock).
         """
         if not self._entered:
             raise RuntimeError(
                 "TestClient must be entered before drain_tasks(). Use `async with TestClient(...)`."
             )
-        if self._app is None:
+        app = self._app
+        if app is None:
             raise RuntimeError(
                 "TestClient has no wired app (enter `async with TestClient(...)` before drain_tasks)."
             )
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(timeout, 0.0)
         while True:
-            await self._app.drain_tasks()
+            # Poll the set so tasks scheduled while draining still count.
+            while True:
+                pending = [task for task in app.tasks if not task.done()]
+                if not pending:
+                    break
+                remaining = None if deadline is None else deadline - loop.time()
+                if remaining is not None and remaining <= 0:
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    break
+                wait_timeout = 0.05 if remaining is None else min(0.05, remaining)
+                await asyncio.wait(
+                    pending,
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             if not self.tracer.has_open_spans():
                 return
             await asyncio.sleep(0)

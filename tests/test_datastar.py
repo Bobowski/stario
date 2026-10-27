@@ -21,6 +21,7 @@ from stario.datastar.format import (
     js_object,
     signal_attr_key,
     signal_object,
+    string_literal,
     throttle_to_string,
     time_to_string,
 )
@@ -476,6 +477,17 @@ class TestDatastarAttributeValidation:
 
         with pytest.raises(StarioError, match="Invalid throttle modifier"):
             throttle_to_string(("150ms", "leading"))  # type: ignore[arg-type]
+
+
+class TestStringLiteral:
+    """`<` escapes as `\\x3c` so user text cannot close a script or attribute."""
+
+    def test_escapes_script_close(self):
+        assert string_literal("</script>") == "'\\x3c/script>'"
+
+    def test_output_contains_no_raw_lt(self):
+        out = string_literal("</script><script>alert(1)</script>")
+        assert "<" not in out
 
 
 class TestSignalNames:
