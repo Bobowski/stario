@@ -944,7 +944,6 @@ class Server:
                         if worker.error is not None:
                             raise worker.error
                     span.attr("server.worker_event_loop", kind)
-                    span.attr("server.listen_balance", "reuseport")
                     span.attr("server.listening", True)
                     run.end_startup()
                     try:
@@ -989,12 +988,12 @@ class Server:
             "server.timeout.response_write": self.config.requests.write_timeout,
             "server.event_loop": loop_implementation(),
             "server.threads": self._thread_count,
-            "server.threads_requested": self.config.threads,
-            "server.listen_balance": (
-                "reuseport" if self._thread_count > 1 else "single"
-            ),
             "server.tls": self.config.ssl is not None,
         }
+        # More than one thread always means SO_REUSEPORT balancing, so the
+        # thread count says it all; the request only matters when it was cut.
+        if self.config.threads != self._thread_count:
+            attrs["server.threads_requested"] = self.config.threads
         if self.config.compression.zstd_window_log is not None:
             attrs["server.compression.zstd_window_log"] = (
                 self.config.compression.zstd_window_log

@@ -73,6 +73,28 @@ def test_tracer_from_env_explicit_builtins(monkeypatch) -> None:
         assert isinstance(tracer_from_env(), cls)
 
 
+def test_tracer_from_env_tty_ascii(monkeypatch) -> None:
+    monkeypatch.setenv("STARIO_TRACER", "tty")
+    monkeypatch.delenv("STARIO_TRACERS_TTY_ASCII", raising=False)
+    tracer = tracer_from_env()
+    assert isinstance(tracer, TTYTracer)
+    assert tracer._ascii is (tracer._write_enc is not None)
+
+    monkeypatch.setenv("STARIO_TRACERS_TTY_ASCII", "1")
+    tracer = tracer_from_env()
+    assert isinstance(tracer, TTYTracer)
+    assert tracer._ascii is True
+
+    monkeypatch.setenv("STARIO_TRACERS_TTY_ASCII", "0")
+    tracer = tracer_from_env()
+    assert isinstance(tracer, TTYTracer)
+    assert tracer._ascii is False
+
+    monkeypatch.setenv("STARIO_TRACERS_TTY_ASCII", "maybe")
+    with pytest.raises(StarioError, match="STARIO_TRACERS_TTY_ASCII"):
+        tracer_from_env()
+
+
 def test_tracer_from_env_invalid_sqlite_env_raises(monkeypatch) -> None:
     monkeypatch.setenv("STARIO_TRACER", "sqlite")
     monkeypatch.setenv("STARIO_TRACERS_SQLITE_FLUSH_INTERVAL", "not-a-number")

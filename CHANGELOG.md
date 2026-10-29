@@ -6,6 +6,36 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 5.2.1 - 2026-10-28
+
+### Changed
+
+- The TTY tracer has a calmer layout. Attributes print as `key=value`.
+  Keys with the same dotted prefix share one row under a dim label
+  (`compression  zstd_level=3 gzip_level=1`). A `*_bytes` value prints as
+  `10MiB`, a boolean as `true`/`false`, and a path in the home directory
+  starts with `~`. Each span line has one right-hand column, the duration
+  (`7.3ms`, `28.26s`). The start offsets and the trace id tail are gone.
+  The status code follows the request name. A child connector shows the
+  child's status (`├─` done, `├×` failed, `├⠋` running). A child that took
+  half of its root or more has a bold duration. Lines stop at 100 cells on
+  a wide terminal. Below 50 columns, a root has no time prefix and a group
+  label goes on its own row. A tree gets a blank line before and after it;
+  one-line requests stack like an access log. `http.route` is hidden when
+  it repeats the path.
+- The TTY tracer works on every terminal theme and font. It uses only the
+  eight base colors plus bold and dim. Dim marks structure (time, keys,
+  rails) and never names, values, durations, or tracebacks. The glyphs come
+  from the WGL4 set that every common monospace font has (`×` for a failure,
+  `○` for waiting, `!` for an orphan), except the braille spinner. A stream
+  that cannot encode UTF-8 gets an ASCII set (`*`, `x`, `|-`, `` `- ``).
+  `STARIO_TRACERS_TTY_ASCII=1` forces the ASCII set and `0` forbids it;
+  `TTYTracer(ascii=...)` does the same in code. `TERM=dumb` turns off color
+  and the live footer.
+- `server.startup` no longer records `server.listen_balance`; more than one
+  `server.threads` always means `SO_REUSEPORT`. `server.threads_requested`
+  is recorded only when it differs from `server.threads`.
+
 ## 5.2.0 - 2026-10-25
 
 ### Changed

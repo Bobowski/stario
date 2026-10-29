@@ -6,6 +6,20 @@ of the terminal. Each frame is a single write wrapped in the terminal's
 synchronized-output markers (``\\x1b[?2026h`` / ``\\x1b[?2026l``): erase the
 previous live block, print newly finished roots, redraw the live block.
 
+Layout: one header line per span (status glyph, name, status code, and the
+duration in one right-hand column), then its attributes as ``key=value``
+pairs. Keys that share a dotted prefix share one row under a dim label.
+Lines never exceed ``min(columns - 1, 100)`` cells, so the duration column
+stays near the text on a wide terminal.
+
+Accessibility: only the eight base ANSI colors plus bold and dim, so light
+and dark themes both work. Dim marks structure (time, keys, rails) and never
+names, values, durations, or tracebacks. ``NO_COLOR`` turns color off,
+``TERM=dumb`` turns color and the live footer off, and an ASCII glyph set
+replaces the Unicode one when the stream cannot encode UTF-8 or when
+``STARIO_TRACERS_TTY_ASCII=1``. The Unicode set uses glyphs from the WGL4
+repertoire (every common monospace font has them) except the braille spinner.
+
 The erase is reflow-aware: it counts screen rows from the stored visible width
 of every previous live line against the *current* raw terminal columns, so it
 still reaches the first live row after a shrink and cannot touch scrollback.
@@ -27,16 +41,20 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import functools
 import logging
+import os
 import shutil
 import sys
 import threading
 import time
 import unicodedata
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
+from pathlib import Path
 from types import TracebackType
 from typing import Any, TextIO, cast
 from unicodedata import combining, east_asian_width
@@ -50,10 +68,14 @@ from .spans import RecordedEvent, RecordedLink, RecordingSpan
 
 _REFRESH_INTERVAL_S = 0.125
 _ELLIPSIS = "…"
-_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _FRAME_NS = 125_000_000
 _NAME_MIN = 8
-_GUTTER = 10
+_MAX_WIDTH = 100
+_STAMP_MIN = 50
+_DUR_W = 6
+_LABEL_MAX = 20
+_SIDE_MIN = 24
+_SIDE_PAIR = 40
 _MAX_BODY_LINES = 12
 _MAX_VALUE_CHARS = 4000
 _MAX_NESTED = 60
@@ -63,6 +85,70 @@ _PROMOTED_KEYS = (
     "request.path",
     "response.status_code",
     "status_code",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _Glyphs:
+    done: str
+    failed: str
+    waiting: str
+    orphan: str
+    spinner: str
+    event: str
+    tee: str
+    elbow: str
+    pipe: str
+    dash: str
+    frame_top: str
+    frame_mid: str
+    frame_bot: str
+    link: str
+    sep: str
+    ellipsis: str
+    newline: str
+    micro: str
+
+
+_UNICODE = _Glyphs(
+    done="●",
+    failed="×",
+    waiting="○",
+    orphan="!",
+    spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
+    event="◦",
+    tee="├",
+    elbow="└",
+    pipe="│",
+    dash="─",
+    frame_top="┌",
+    frame_mid="│",
+    frame_bot="└",
+    link="→",
+    sep=" · ",
+    ellipsis=_ELLIPSIS,
+    newline="↵",
+    micro="µs",
+)
+_ASCII = _Glyphs(
+    done="*",
+    failed="x",
+    waiting="o",
+    orphan="!",
+    spinner="|/-\\",
+    event="+",
+    tee="|",
+    elbow="`",
+    pipe="|",
+    dash="-",
+    frame_top="|",
+    frame_mid="|",
+    frame_bot="|",
+    link="->",
+    sep=", ",
+    ellipsis="...",
+    newline="\\n",
+    micro="us",
 )
 
 
@@ -94,6 +180,15 @@ def _isatty(stream: object) -> bool:
         return False
 
 
+@functools.cache
+def _home_dir() -> str | None:
+    try:
+        home = str(Path.home())
+    except (RuntimeError, KeyError, OSError):
+        return None
+    return home if len(home) > 1 else None
+
+
 def _ansi_sequence_end(text: str, index: int) -> int | None:
     if text[index : index + 2] != "\033[":
         return None
@@ -123,15 +218,15 @@ def _visible_width(text: str) -> int:
     return width
 
 
-def _clip_visible(text: str, max_width: int) -> str:
+def _clip_visible(text: str, max_width: int, ellipsis: str = _ELLIPSIS) -> str:
     if max_width <= 0:
         return ""
     if _visible_width(text) <= max_width:
         return text
 
-    ellipsis_width = _cell_width(_ELLIPSIS)
+    ellipsis_width = _visible_width(ellipsis)
     if max_width <= ellipsis_width:
-        return _ELLIPSIS[:max_width]
+        return ellipsis[:max_width]
 
     budget = max_width - ellipsis_width
     width = 0
@@ -152,33 +247,103 @@ def _clip_visible(text: str, max_width: int) -> str:
         width += ch_width
         i += 1
 
-    pieces.append(_ELLIPSIS)
+    pieces.append(ellipsis)
     if saw_ansi:
         pieces.append(_RESET)
     return "".join(pieces)
 
 
-def _fmt_duration(ns: int) -> str:
+def _cut(text: str, width: int) -> tuple[str, str]:
+    """Split plain ``text`` after at most ``width`` cells, at a space when possible."""
+    w = 0
+    i = 0
+    while i < len(text):
+        cw = _cell_width(text[i])
+        if w + cw > width:
+            break
+        w += cw
+        i += 1
+    if i == 0:
+        i = 1
+    cut = text.rfind(" ", 1, i + 1)
+    if cut > 0:
+        return text[:cut], text[cut + 1 :]
+    # No space: break after a path or query separator before mid-word.
+    soft = max(text.rfind(ch, 1, i) for ch in "/&?,")
+    if soft > 0:
+        return text[: soft + 1], text[soft + 1 :]
+    return text[:i], text[i:]
+
+
+def _wrap(text: str, width: int, rest: int | None = None) -> list[str]:
+    """Wrap plain text; the first row gets ``width`` cells, later rows ``rest``."""
+    first = max(1, width)
+    later = max(1, rest if rest is not None else width)
+    out: list[str] = []
+    for para in text.split("\n"):
+        s = para
+        budget = first
+        while _visible_width(s) > budget:
+            head, s = _cut(s, budget)
+            out.append(head)
+            budget = later
+        out.append(s)
+        first = later
+    return out
+
+
+def _fmt_duration(ns: int, micro: str = "µs") -> str:
     if ns < 0:
         ns = 0
     if ns < 1_000_000:
         us = ns / 1e3
-        if us < 10:
-            return f"{us:.1f} us"
-        return f"{us:.0f} us"
+        return f"{us:.1f}{micro}" if us < 10 else f"{us:.0f}{micro}"
 
     ms = ns / 1e6
     if ms < 10:
-        return f"{ms:.1f} ms"
+        return f"{ms:.1f}ms"
     if ms < 1000:
-        return f"{ms:.0f} ms"
+        return f"{ms:.0f}ms"
     if ms < 60_000:
-        return f"{ms / 1000:.2f} s"
+        return f"{ms / 1000:.2f}s"
     minutes, seconds = divmod(int(ms / 1000), 60)
     if minutes < 60:
-        return f"{minutes}:{seconds:02d} min"
+        return f"{minutes}m{seconds:02d}s"
     hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{hours}h{minutes:02d}m"
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    size = float(n)
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        size /= 1024
+        if size < 1024 or unit == "TiB":
+            break
+    return f"{size:.1f}".removesuffix(".0") + unit
+
+
+def _fmt_value(key: str, value: object, home: str | None) -> str:
+    """Display text of one attribute value (before sanitizing)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if (
+        isinstance(value, int)
+        and value >= 0
+        and (key == "bytes" or key.endswith("_bytes"))
+    ):
+        return _fmt_bytes(value)
+    text = str(value)
+    if (
+        home
+        and isinstance(value, str)
+        and (text == home or text.startswith(home + os.sep))
+    ):
+        return "~" + text[len(home) :]
+    return text
 
 
 def _uuid_tail(uid: UUID) -> str:
@@ -186,40 +351,24 @@ def _uuid_tail(uid: UUID) -> str:
     return s[-8:] if len(s) >= 8 else s
 
 
-def _sanitize(text: object, *, multiline: bool) -> str:
+def _sanitize(text: object, *, multiline: bool, newline: str = "↵") -> str:
     """Make a user-supplied string terminal-safe.
 
     Tabs become four spaces, ``\\r`` variants become ``\\n``, newlines are kept
-    only where multi-line is allowed (else ``↵``), and every remaining control
-    character becomes a literal ``\\xNN`` escape so user text can never emit
-    terminal escapes or break width accounting.
+    only where multi-line is allowed (else ``newline``), and every remaining
+    control character becomes a literal ``\\xNN`` escape so user text can never
+    emit terminal escapes or break width accounting.
     """
     s = str(text).replace("\t", "    ").replace("\r\n", "\n").replace("\r", "\n")
     out: list[str] = []
     for ch in s:
         if ch == "\n":
-            out.append("\n" if multiline else "↵")
+            out.append("\n" if multiline else newline)
         elif unicodedata.category(ch) == "Cc":
             out.append(f"\\x{ord(ch):02x}")
         else:
             out.append(ch)
     return "".join(out)
-
-
-def _span_status_style(span: RecordingSpan) -> str:
-    if span.in_progress:
-        return "cyan"
-    if span.failed:
-        return "red"
-    for key in ("response.status_code", "status_code"):
-        if not span.attributes or key not in span.attributes:
-            continue
-        try:
-            code = int(span.attributes[key])
-        except (ValueError, TypeError):
-            continue
-        return _status_color(code)
-    return "green"
 
 
 def _status_color(code: int) -> str:
@@ -230,6 +379,11 @@ def _status_color(code: int) -> str:
     return "red"
 
 
+def _status_styles(color: str) -> tuple[str, ...]:
+    # Yellow is pale on light themes; bold keeps it readable.
+    return (color, "bold") if color == "yellow" else (color,)
+
+
 def _promoted(span: RecordingSpan) -> tuple[str, dict[str, Any]]:
     """Display name and renderable attributes after request-name promotion."""
     attrs = dict(span.attributes or {})
@@ -238,6 +392,8 @@ def _promoted(span: RecordingSpan) -> tuple[str, dict[str, Any]]:
     if method is not None and path is not None:
         for key in _PROMOTED_KEYS:
             attrs.pop(key, None)
+        if attrs.get("http.route") == path:
+            del attrs["http.route"]
         return f"{method} {path}", attrs
     return span.name, attrs
 
@@ -327,22 +483,19 @@ class _LiveEntry:
         self.content = content
 
 
-# (flow_text, flow_width, is_block, key, value_multiline, value_flat)
-_FlowItem = tuple[str, int, bool, str, str, str]
-
-
 class TTYRenderer:
     """Pure string rendering for span trees; no I/O, locks, or threads.
 
     Pass terminal width, a ``parent_id → children`` map, a fixed ``now_ns``
     (all open-span durations in one frame come from the same instant so a
-    parent is never shorter than a child), and whether ANSI color is on.
+    parent is never shorter than a child), whether ANSI color is on, and
+    whether to draw with the ASCII glyph set.
 
     `history_block` renders one root as a ledger entry for scrollback;
     `live_text` renders the active path of open roots for the live footer.
     """
 
-    __slots__ = ("_children", "_color", "_now", "_width")
+    __slots__ = ("_children", "_color", "_g", "_home", "_now", "_width")
 
     def __init__(
         self,
@@ -351,11 +504,14 @@ class TTYRenderer:
         *,
         now_ns: int,
         color: bool,
+        ascii: bool = False,
     ) -> None:
-        self._width = max(1, width)
+        self._width = max(1, min(width, _MAX_WIDTH))
         self._children = children
         self._now = now_ns
         self._color = color
+        self._g = _ASCII if ascii else _UNICODE
+        self._home = _home_dir()
 
     # --------------------------------------------------------------
     # shared primitives
@@ -368,8 +524,15 @@ class TTYRenderer:
             return text
         return f"{codes}{text}{_RESET}"
 
-    def _fit(self, line: str, width: int) -> str:
-        return _clip_visible(line, width)
+    def _clip(self, text: str, width: int) -> str:
+        return _clip_visible(text, width, self._g.ellipsis)
+
+    def _fit(self, line: str) -> str:
+        """Final form of an output line: clipped to the width, no trailing blanks."""
+        return self._clip(line, self._width).rstrip(" ")
+
+    def _flat(self, text: object) -> str:
+        return _sanitize(text, multiline=False, newline=self._g.newline)
 
     def _duration_ns(self, span: RecordingSpan) -> int | None:
         if span.start_ns is None:
@@ -387,117 +550,136 @@ class TTYRenderer:
         kids.sort(key=lambda c: c.start_ns or 0)
         return kids
 
-    def _glyph(self, span: RecordingSpan, *, orphan: bool, waiting: bool) -> str:
+    def _marker(
+        self, span: RecordingSpan, *, is_root: bool, orphan: bool, waiting: bool
+    ) -> str:
+        """Status glyph: the root's bullet, or the second cell of a child connector."""
+        g = self._g
         if orphan:
-            return self._styled("⚠", "yellow")
+            return self._styled(g.orphan, "yellow", "bold")
         if span.failed:
-            return self._styled("✗", "red")
-        if not span.in_progress:
-            return self._styled("●", _span_status_style(span))
-        if waiting:
-            return self._styled("◌", "cyan", "dim")
-        frame = (self._now // _FRAME_NS) % len(_SPINNER)
-        return self._styled(_SPINNER[frame], "cyan")
+            return self._styled(g.failed, "red", "bold")
+        if span.in_progress:
+            if waiting:
+                return self._styled(g.waiting, "cyan")
+            frame = (self._now // _FRAME_NS) % len(g.spinner)
+            return self._styled(g.spinner[frame], "cyan")
+        if not is_root:
+            return self._styled(g.dash, "dim")
+        code = _status_code(span)
+        return self._styled(g.done, *_status_styles(_status_color(code or 200)))
 
-    def _col_a(self, span: RecordingSpan, *, is_root: bool, root_start: int) -> str:
-        if is_root:
-            code = _status_code(span)
-            if code is None:
-                return " " * 9
-            style = _status_color(code)
-            # Yellow is pale on light themes; bold keeps 3xx/4xx readable.
-            styles = ("yellow", "bold") if style == "yellow" else (style,)
-            return self._styled(str(code).rjust(9), *styles)
-        start = span.start_ns if span.start_ns is not None else root_start
-        return self._styled(f"+{_fmt_duration(start - root_start)}".rjust(9), "dim")
+    def _is_hot(self, span: RecordingSpan, root: RecordingSpan) -> bool:
+        """A finished child that took at least half of a root of 1 ms or more."""
+        if not span.finished:
+            return False
+        total = self._duration_ns(root) or 0
+        took = self._duration_ns(span) or 0
+        return total >= 1_000_000 and took * 2 >= total
 
-    def _header_line(
+    def _header(
         self,
         span: RecordingSpan,
         *,
-        rail: str,
-        width: int,
+        lead: str,
+        marker: str,
         is_root: bool,
-        orphan: bool,
-        waiting: bool,
-        root_start: int,
+        hot: bool = False,
         meta: str = "",
     ) -> str:
+        """``{lead}{marker} {name}  {status}{meta} … {duration}`` in one line.
+
+        The status code stays next to the name it belongs to; the duration is
+        right-aligned so durations line up down a tree.
+        """
         if span.start_ns is None:
             raise RuntimeError("TTYRenderer can only render started spans")
+        width = self._width
         name, _ = _promoted(span)
-        name_text = _sanitize(name, multiline=False)
+        name_text = self._flat(name)
         if is_root:
             name_text = self._styled(name_text, "bold")
-        glyph = self._glyph(span, orphan=orphan, waiting=waiting)
-        head_w = _visible_width(rail) + _visible_width(glyph) + 1
-        id_tail = f" {_uuid_tail(span.id)}" if is_root and self._width >= 100 else ""
-
-        col_a = self._col_a(span, is_root=is_root, root_start=root_start)
+        head = lead + marker + " "
+        code = _status_code(span)
+        code_s = "" if code is None else str(code)
         dur = self._duration_ns(span)
-        col_b = _fmt_duration(dur).rjust(9) if dur is not None else "—".rjust(9)
-        open_m = self._styled(" ⋯", "dim") if span.in_progress else "  "
+        dur_s = "" if dur is None else _fmt_duration(dur, self._g.micro)
 
-        # Narrowing: name needs >= 8 cells; drop colA first, then colB+open.
-        id_w = _visible_width(id_tail)
-        mode = 0
-        name_w = width - head_w - (9 + 1 + 9 + 2 + id_w)
-        if name_w < _NAME_MIN:
-            mode = 1
-            name_w = width - head_w - (9 + 2 + id_w)
-        if name_w < _NAME_MIN:
-            mode = 2
-            name_w = width - head_w - id_w
-        name_w = max(0, name_w)
+        # Narrowing: the name keeps >= 8 cells; drop the duration, then the status.
+        budget = width - _visible_width(head)
+        status_w = 2 + len(code_s) if code_s else 0
+        dur_w = 2 + max(_DUR_W, len(dur_s)) if dur_s else 0
+        if budget - status_w - dur_w < _NAME_MIN:
+            dur_w = 0
+        if budget - status_w - dur_w < _NAME_MIN:
+            status_w = 0
+        name_w = max(0, budget - status_w - dur_w)
 
+        line = head + self._clip(name_text, name_w)
+        if status_w and code is not None:
+            line += "  " + self._styled(code_s, *_status_styles(_status_color(code)))
         # The meta suffix is appended whole or not at all — never mid-token.
         meta_w = _visible_width(meta)
-        if meta_w and _visible_width(name_text) + meta_w <= name_w:
-            name_c = name_text + meta
-        else:
-            name_c = _clip_visible(name_text, name_w)
-        gap = " " * max(0, name_w - _visible_width(name_c))
-        line = self._styled(rail, "dim") + glyph + " " + name_c + gap
-        if mode == 0:
-            line += col_a + " " + col_b + open_m + self._styled(id_tail, "dim")
-        elif mode == 1:
-            line += col_b + open_m + self._styled(id_tail, "dim")
-        else:
-            line += self._styled(id_tail, "dim")
-        return self._fit(line, width)
+        if meta_w and _visible_width(line) + meta_w <= width - dur_w:
+            line += meta
+        if dur_w:
+            right = self._styled(dur_s.rjust(_DUR_W), "bold" if hot else "")
+            line += " " * max(2, width - _visible_width(line) - _DUR_W) + right
+        return self._clip(line, width)
 
     # --------------------------------------------------------------
-    # attribute flow layout
+    # attributes: key=value pairs, grouped by dotted prefix
 
-    def _flow_items(
-        self,
-        span: RecordingSpan,
-        attrs: dict[str, Any],
-        first_item: str | None,
-    ) -> list[_FlowItem]:
-        items: list[_FlowItem] = []
-        if first_item is not None:
-            text = self._styled(first_item, "dim")
-            items.append((text, _visible_width(text), False, "", "", ""))
-        fold = f"{span.name.split('.', 1)[0]}." if "." in span.name else None
-        for raw_key in sorted(attrs):
-            key = raw_key
-            if fold and key.startswith(fold) and len(key) > len(fold):
-                key = key[len(fold) :]
-            key = _sanitize(key, multiline=False)
-            raw = str(attrs[raw_key])[:_MAX_VALUE_CHARS]
-            value_ml = _sanitize(raw, multiline=True)
-            value_flat = _sanitize(raw, multiline=False)
-            block = "\n" in value_ml
-            text = self._styled(key, "dim") + " " + value_flat
-            items.append((text, _visible_width(text), block, key, value_ml, value_flat))
-        return items
+    def _pair(self, key: str, value: object) -> tuple[str, str]:
+        """Sanitized ``(key, value)``; the value keeps newlines for block layout."""
+        text = _fmt_value(key, value, self._home)[:_MAX_VALUE_CHARS]
+        return self._flat(key), _sanitize(text, multiline=True)
 
-    def _flow_lines(
-        self, items: list[_FlowItem], avail: int, *, live: bool
+    def _quote(self, value: str) -> str:
+        if value and " " not in value and '"' not in value:
+            return value
+        return '"' + value.replace('"', '\\"') + '"'
+
+    def _token(self, key: str, value: str) -> str:
+        return self._styled(key + "=", "dim") + value
+
+    def _inline(self, attrs: dict[str, Any] | None) -> str:
+        if not attrs:
+            return ""
+        tokens: list[str] = []
+        for raw_key, raw_value in attrs.items():
+            key, value = self._pair(raw_key, raw_value)
+            tokens.append(
+                self._token(key, self._quote(value.replace("\n", self._g.newline)))
+            )
+        return " ".join(tokens)
+
+    def _capped(self, rows: list[str]) -> list[str]:
+        if len(rows) <= _MAX_BODY_LINES:
+            return rows
+        more = len(rows) - _MAX_BODY_LINES
+        note = self._styled(f"{self._g.ellipsis} {more} more lines", "dim")
+        return [*rows[:_MAX_BODY_LINES], "  " + note]
+
+    def _hanging(self, key: str, value: str, avail: int) -> list[str]:
+        """One pair wider than the row: wrap it with a 2-cell hanging indent."""
+        rows = _wrap(f"{key}={value}", avail, avail - 2)
+        out = [rows[0], *("  " + row for row in rows[1:])]
+        head = key + "="
+        if out[0].startswith(head):
+            out[0] = self._token(key, out[0][len(head) :])
+        return self._capped(out)
+
+    def _flow(
+        self, pairs: list[tuple[str, str]], avail: int, *, live: bool
     ) -> list[str]:
+        """Pack pairs into rows of ``avail`` cells.
+
+        History wraps a long value (no information is lost) and shows a
+        multi-line value as an indented block. The live footer clips both to
+        one row so its row budget holds.
+        """
         avail = max(1, avail)
-        sep = self._styled(" · ", "dim")
         lines: list[str] = []
         cur: list[str] = []
         cur_w = 0
@@ -505,129 +687,133 @@ class TTYRenderer:
         def flush() -> None:
             nonlocal cur, cur_w
             if cur:
-                lines.append(sep.join(cur))
+                lines.append(" ".join(cur))
                 cur = []
                 cur_w = 0
 
-        for text, vw, block, key, value_ml, value_flat in items:
-            if block or vw > avail:
+        for key, value in pairs:
+            block = "\n" in value
+            flat = self._quote(value.replace("\n", self._g.newline))
+            width = _visible_width(key) + 1 + _visible_width(flat)
+            if block and not live:
+                flush()
+                lines.append(self._styled(key + "=", "dim"))
+                lines.extend(
+                    self._capped(["  " + row for row in _wrap(value, avail - 2)])
+                )
+                continue
+            if width > avail:
                 flush()
                 if live:
-                    item_text = (
-                        text
-                        if not block
-                        else (self._styled(key, "dim") + " " + value_flat)
-                    )
-                    lines.append(_clip_visible(item_text, avail))
+                    lines.append(self._clip(self._token(key, flat), avail))
                 else:
-                    lines.append(self._styled(key, "dim"))
-                    wrapped = self._wrap_value(value_ml, max(1, avail - 2))
-                    lines.extend("  " + w for w in wrapped[:_MAX_BODY_LINES])
-                    if len(wrapped) > _MAX_BODY_LINES:
-                        more = len(wrapped) - _MAX_BODY_LINES
-                        lines.append("  " + self._styled(f"… {more} more lines", "dim"))
+                    lines.extend(self._hanging(key, flat, avail))
                 continue
-            if cur and cur_w + 3 + vw <= avail:
-                cur.append(text)
-                cur_w += 3 + vw
+            if cur and cur_w + 1 + width <= avail:
+                cur.append(self._token(key, flat))
+                cur_w += 1 + width
             else:
                 flush()
-                cur = [text]
-                cur_w = vw
+                cur = [self._token(key, flat)]
+                cur_w = width
         flush()
         return lines
 
-    def _wrap_value(self, value: str, width: int) -> list[str]:
-        out: list[str] = []
-        for para in value.split("\n"):
-            s = para
-            while _visible_width(s) > width:
-                w = 0
-                i = 0
-                while i < len(s):
-                    cw = _cell_width(s[i])
-                    if w + cw > width:
-                        break
-                    w += cw
-                    i += 1
-                if i == 0:
-                    i = 1
-                cut = s.rfind(" ", 1, i + 1)
-                if cut > 0:
-                    out.append(s[:cut])
-                    s = s[cut + 1 :]
-                else:
-                    out.append(s[:i])
-                    s = s[i:]
-            out.append(s)
-        return out
+    def _attr_lines(self, span: RecordingSpan, avail: int, *, live: bool) -> list[str]:
+        """Attribute rows: ungrouped pairs first, then one row group per prefix.
 
-    def _attr_lines(
-        self,
-        span: RecordingSpan,
-        prefix: str,
-        width: int,
-        first_item: str | None,
-    ) -> list[str]:
+        The first segment of a dotted span name folds away (``server.host`` on
+        ``server.startup`` shows as ``host``). Two or more keys that share the
+        text before their last dot become a group: ``compression  gzip_level=1
+        zstd_level=3``. A label sits beside its pairs when every pair (up to
+        40 cells) fits there, else on its own row above them.
+        """
         _, attrs = _promoted(span)
-        if not attrs and first_item is None:
-            return []
-        items = self._flow_items(span, attrs, first_item)
-        avail = width - _visible_width(prefix)
-        return [prefix + line for line in self._flow_lines(items, avail, live=False)]
-
-    def _inline_attrs(self, attrs: dict[str, Any] | None) -> str:
         if not attrs:
-            return ""
-        parts = [
-            self._styled(_sanitize(k, multiline=False), "dim")
-            + " "
-            + _sanitize(v, multiline=False)
-            for k, v in sorted(attrs.items())
-        ]
-        return "  " + self._styled(" · ", "dim").join(parts)
+            return []
+        fold = f"{span.name.split('.', 1)[0]}." if "." in span.name else None
+        keyed: list[tuple[str, Any]] = []
+        for raw_key, value in attrs.items():
+            key = raw_key
+            if fold and key.startswith(fold) and len(key) > len(fold):
+                key = key[len(fold) :]
+            keyed.append((key, value))
+        counts = Counter(key.rpartition(".")[0] for key, _ in keyed)
+        flat: list[tuple[str, str]] = []
+        groups: dict[str, list[tuple[str, str]]] = {}
+        for key, value in keyed:
+            label, _, leaf = key.rpartition(".")
+            if label and leaf and counts[label] >= 2:
+                groups.setdefault(label, []).append(self._pair(leaf, value))
+            else:
+                flat.append(self._pair(key, value))
+
+        lines = self._flow(flat, avail, live=live) if flat else []
+        if not groups:
+            return lines
+        labels = {label: self._flat(label) for label in groups}
+        label_w = min(_LABEL_MAX, max(_visible_width(t) for t in labels.values()))
+        widest = max(
+            _visible_width(k) + 1 + _visible_width(self._quote(v))
+            for pairs in groups.values()
+            for k, v in pairs
+        )
+        side = avail - label_w - 2 >= max(_SIDE_MIN, min(widest, _SIDE_PAIR))
+        for label, pairs in groups.items():
+            if side:
+                rows = self._flow(pairs, avail - label_w - 2, live=live)
+                text = self._clip(labels[label], label_w)
+                pad = " " * (label_w - _visible_width(text) + 2)
+                lines.append(self._styled(text, "dim") + pad + rows[0])
+                lines.extend(" " * (label_w + 2) + row for row in rows[1:])
+            else:
+                lines.append(self._styled(self._clip(labels[label], avail), "dim"))
+                lines.extend(
+                    "  " + row for row in self._flow(pairs, avail - 2, live=live)
+                )
+        return lines
 
     def _link_line(self, link: RecordedLink, prefix: str) -> str:
-        text = f"↗ {_sanitize(link.name, multiline=False)} {_uuid_tail(link.span_id)}"
+        text = f"{self._g.link} {self._flat(link.name)} {_uuid_tail(link.span_id)}"
+        line = prefix + self._styled(text, "dim")
         if link.attributes:
-            parts = [
-                f"{_sanitize(k, multiline=False)} {_sanitize(v, multiline=False)}"
-                for k, v in sorted(link.attributes.items())
-            ]
-            text += "  " + " · ".join(parts)
-        return prefix + self._styled(text, "dim")
+            line += "  " + self._inline(link.attributes)
+        return line
 
     # --------------------------------------------------------------
     # body blocks (errors, frames, event bodies)
 
-    def _frame_lines(self, body: str, prefix: str, width: int) -> list[str]:
+    def _frame_lines(self, body: str, prefix: str) -> list[str]:
         """Framed traceback; long rows wrap (2-cell continuation indent), never clip."""
         text = _sanitize(body, multiline=True).rstrip("\n")
         # Budget after "{prefix}{edge} " minus the continuation indent.
-        avail = max(1, width - _visible_width(prefix) - 4)
+        avail = max(1, self._width - _visible_width(prefix) - 4)
         rows: list[str] = []
         for line in text.split("\n"):
-            wrapped = self._wrap_value(line, avail)
+            wrapped = _wrap(line, avail)
             rows.append(wrapped[0])
             rows.extend("  " + piece for piece in wrapped[1:])
+        g = self._g
         n = len(rows)
         out: list[str] = []
         for i, row in enumerate(rows):
-            edge = "╭" if i == 0 else ("╰" if i == n - 1 else "│")
-            out.append(prefix + self._styled(f"{edge} {row}", "dim"))
+            edge = (
+                g.frame_top if i == 0 else (g.frame_bot if i == n - 1 else g.frame_mid)
+            )
+            out.append(prefix + self._styled(edge, "dim") + " " + row)
         return out
 
-    def _body_lines(self, body: str, prefix: str, width: int) -> list[str]:
+    def _body_lines(self, body: str, prefix: str) -> list[str]:
         """Event body; wraps instead of clipping, capped at _MAX_BODY_LINES wrapped rows."""
         text = _sanitize(body, multiline=True).rstrip("\n")
-        avail = max(1, width - _visible_width(prefix))
-        rows: list[str] = []
-        for line in text.split("\n"):
-            rows.extend(self._wrap_value(line, avail))
-        out = [prefix + self._styled(row, "dim") for row in rows[:_MAX_BODY_LINES]]
+        avail = max(1, self._width - _visible_width(prefix))
+        rows = _wrap(text, avail)
+        out = [prefix + row for row in rows[:_MAX_BODY_LINES]]
         if len(rows) > _MAX_BODY_LINES:
             more = len(rows) - _MAX_BODY_LINES
-            out.append(prefix + self._styled(f"… {more} more lines", "dim"))
+            out.append(
+                prefix + self._styled(f"{self._g.ellipsis} {more} more lines", "dim")
+            )
         return out
 
     # --------------------------------------------------------------
@@ -637,38 +823,20 @@ class TTYRenderer:
         """Render one root (and its whole subtree) for scrollback."""
         if root.start_ns is None:
             raise RuntimeError("TTYRenderer can only render started spans")
-        gutter = self._width >= 60
-        inner = max(1, self._width - _GUTTER) if gutter else self._width
-        first_item: str | None = None
-        if not gutter:
-            _, attrs = _promoted(root)
-            if attrs:
-                first_item = datetime.fromtimestamp(root.start_ns / 1e9).strftime(
-                    "%H:%M:%S"
-                )
+        stamp = ""
+        if self._width >= _STAMP_MIN:
+            clock = datetime.fromtimestamp(root.start_ns / 1e9).strftime("%H:%M:%S")
+            stamp = self._styled(clock, "dim") + " "
         lines: list[str] = []
         self._emit_span(
             lines,
             root,
-            anc="",
-            connector="",
-            is_last=True,
+            lead=stamp,
+            rail=" " * _visible_width(stamp),
             is_root=True,
-            inner=inner,
             root=root,
-            first_item=first_item,
         )
-        out: list[str] = []
-        for i, line in enumerate(lines):
-            line = self._fit(line, inner)
-            if not gutter:
-                out.append(line)
-            elif i == 0:
-                stamp = datetime.fromtimestamp(root.start_ns / 1e9).strftime("%H:%M:%S")
-                out.append(self._styled(stamp, "dim") + "  " + line)
-            else:
-                out.append(" " * _GUTTER + line)
-        return "\n".join(out)
+        return "\n".join(self._fit(line) for line in lines)
 
     def _consumed_exception(self, span: RecordingSpan) -> RecordedEvent | None:
         """The exception event folded into the error line of a failed span."""
@@ -703,33 +871,28 @@ class TTYRenderer:
         lines: list[str],
         span: RecordingSpan,
         *,
-        anc: str,
-        connector: str,
-        is_last: bool,
+        lead: str,
+        rail: str,
         is_root: bool,
-        inner: int,
         root: RecordingSpan,
-        first_item: str | None = None,
     ) -> None:
-        rail = "" if is_root else anc + connector
-        cont = "" if is_root else anc + ("  " if is_last else "│ ")
-        root_start = root.start_ns or 0
-        orphan = bool(root.end_ns) and span.in_progress
+        """Header, body, and nested items of one span.
+
+        ``lead`` is the styled text before the status glyph; ``rail`` is the
+        plain prefix of this span's nested connectors (the root's sits under
+        its glyph, a child's under its name).
+        """
+        orphan = root.end_ns is not None and span.in_progress
         waiting = any(c.in_progress for c in self._children.get(span.id, []))
         consumed = self._consumed_exception(span)
         nested = self._nested_items(span, consumed)
+        marker = self._marker(span, is_root=is_root, orphan=orphan, waiting=waiting)
+        hot = not is_root and self._is_hot(span, root)
         lines.append(
-            self._header_line(
-                span,
-                rail=rail,
-                width=inner,
-                is_root=is_root,
-                orphan=orphan,
-                waiting=waiting,
-                root_start=root_start,
-            )
+            self._header(span, lead=lead, marker=marker, is_root=is_root, hot=hot)
         )
-        body = cont + ("│" if nested else " ") + "  "
+        body = self._styled(rail + (self._g.pipe if nested else " "), "dim") + " "
+        avail = self._width - _visible_width(body)
         if span.failed:
             error = span.error or "failed"
             exc_type = (
@@ -738,26 +901,27 @@ class TTYRenderer:
                 else None
             )
             text = f"{exc_type}: {error}" if exc_type else error
-            lines.append(body + self._styled(_sanitize(text, multiline=False), "red"))
+            lines.append(body + self._styled(self._flat(text), "red"))
             if consumed is not None and consumed.body:
-                lines.extend(self._frame_lines(consumed.body, body, inner))
+                lines.extend(self._frame_lines(consumed.body, body))
         if orphan:
             lines.append(
-                body + self._styled("still open when the parent ended", "yellow")
+                body
+                + self._styled("still open when the parent ended", "yellow", "bold")
             )
-        lines.extend(self._attr_lines(span, body, inner, first_item))
+        lines.extend(body + line for line in self._attr_lines(span, avail, live=False))
         for link in span.links or []:
             lines.append(self._link_line(link, body))
-        self._emit_nested(lines, nested, cont, inner, root)
+        self._emit_nested(lines, nested, rail, root)
 
     def _emit_nested(
         self,
         lines: list[str],
         items: list[tuple[int, RecordedEvent | RecordingSpan]],
-        cont: str,
-        inner: int,
+        rail: str,
         root: RecordingSpan,
     ) -> None:
+        g = self._g
         n = len(items)
         marker: str | None = None
         shown: list[tuple[int, RecordedEvent | RecordingSpan] | None]
@@ -765,38 +929,26 @@ class TTYRenderer:
             mid = items[_NESTED_EDGE : n - _NESTED_EDGE]
             spans_n = sum(1 for _, it in mid if isinstance(it, RecordingSpan))
             events_n = len(mid) - spans_n
-            marker = f"⋯ {len(mid)} more ({spans_n} spans, {events_n} events)"
+            marker = (
+                f"{g.ellipsis} {len(mid)} more ({spans_n} spans, {events_n} events)"
+            )
             shown = [*items[:_NESTED_EDGE], None, *items[n - _NESTED_EDGE :]]
         else:
             shown = list(items)
         last = len(shown) - 1
         for i, entry in enumerate(shown):
             is_last = i == last
-            connector = "└─" if is_last else "├─"
+            lead = self._styled(rail + (g.elbow if is_last else g.tee), "dim")
+            inner = rail + ("   " if is_last else g.pipe + "  ")
             if entry is None:
-                lines.append(cont + "  " + self._styled(marker or "", "dim"))
+                lines.append(self._styled(rail + g.pipe + "  " + (marker or ""), "dim"))
                 continue
             _, item = entry
             if isinstance(item, RecordedEvent):
-                self._emit_event(
-                    lines,
-                    item,
-                    cont=cont,
-                    connector=connector,
-                    is_last=is_last,
-                    inner=inner,
-                    root_start=root.start_ns or 0,
-                )
+                self._emit_event(lines, item, lead=lead, rail=inner, root=root)
             else:
                 self._emit_span(
-                    lines,
-                    item,
-                    anc=cont,
-                    connector=connector,
-                    is_last=is_last,
-                    is_root=False,
-                    inner=inner,
-                    root=root,
+                    lines, item, lead=lead, rail=inner, is_root=False, root=root
                 )
 
     def _emit_event(
@@ -804,64 +956,50 @@ class TTYRenderer:
         lines: list[str],
         event: RecordedEvent,
         *,
-        cont: str,
-        connector: str,
-        is_last: bool,
-        inner: int,
-        root_start: int,
+        lead: str,
+        rail: str,
+        root: RecordingSpan,
     ) -> None:
-        rail = cont + connector
-        body = cont + ("  " if is_last else "│ ") + "  "
-        name = _sanitize(event.name, multiline=False)
-        text = name
+        text = self._flat(event.name)
+        attrs = event.attributes
         if event.name == "exception":
-            attrs = event.attributes or {}
-            exc_type = attrs.get("exc.type")
-            exc_msg = attrs.get("exc.message")
-            if exc_type and exc_msg:
-                label = f"{exc_type}: {exc_msg}"
-            else:
-                label = str(exc_msg or exc_type or "")
+            attrs = dict(event.attributes or {})
+            exc_type = attrs.pop("exc.type", None)
+            exc_msg = attrs.pop("exc.message", None)
+            label = (
+                f"{exc_type}: {exc_msg}"
+                if exc_type and exc_msg
+                else str(exc_msg or exc_type or "")
+            )
             if label:
-                text += "  " + self._styled(_sanitize(label, multiline=False), "red")
-            other = {
-                k: v for k, v in attrs.items() if k not in ("exc.type", "exc.message")
-            }
-            text += self._inline_attrs(other)
-        else:
-            text += self._inline_attrs(event.attributes)
-        offset = f"+{_fmt_duration(event.time_ns - root_start)}"
-        lines.append(self._event_line(rail, text, offset, inner))
+                text += "  " + self._styled(self._flat(label), "red")
+        if inline := self._inline(attrs):
+            text += "  " + inline
+        offset = (
+            f"+{_fmt_duration(event.time_ns - (root.start_ns or 0), self._g.micro)}"
+        )
+        lines.append(
+            self._event_line(
+                lead + self._styled(self._g.event, "dim") + " ", text, offset
+            )
+        )
         if event.body:
+            body = self._styled(rail, "dim") + "  "
             if event.name == "exception":
-                lines.extend(self._frame_lines(event.body, body, inner))
+                lines.extend(self._frame_lines(event.body, body))
             else:
-                lines.extend(self._body_lines(event.body, body, inner))
+                lines.extend(self._body_lines(event.body, body))
 
-    def _event_line(self, rail: str, text: str, offset: str, width: int) -> str:
-        """`{rail}◇ {text}{gap}{offset}` with the offset parked in the colA column."""
-        rail_w = _visible_width(rail)
-        target = width - 12  # end column of the span colA field
-        budget = target - 9 - rail_w - 2
-        if budget >= 4:
-            clipped = _clip_visible(text, budget)
-            gap = " " * max(0, budget - _visible_width(clipped))
-            line = (
-                self._styled(rail, "dim")
-                + self._styled("◇", "dim")
-                + " "
-                + clipped
-                + gap
-                + self._styled(offset.rjust(9), "dim")
-            )
-        else:
-            line = (
-                self._styled(rail, "dim")
-                + self._styled("◇", "dim")
-                + " "
-                + _clip_visible(text, max(0, width - rail_w - 2))
-            )
-        return self._fit(line, width)
+    def _event_line(self, head: str, text: str, offset: str) -> str:
+        """``{head}{text} … {offset}``, the offset right-aligned in the duration column."""
+        width = self._width
+        budget = width - _visible_width(head) - 2 - _DUR_W
+        if budget < _NAME_MIN:
+            return self._clip(head + text, width)
+        line = head + self._clip(text, budget)
+        right = self._styled(offset.rjust(_DUR_W), "dim")
+        gap = width - _visible_width(line) - _visible_width(right)
+        return self._clip(line + " " * max(2, gap) + right, width)
 
     # --------------------------------------------------------------
     # live area
@@ -873,10 +1011,10 @@ class TTYRenderer:
         newest_first = list(reversed(roots))
         if max_rows == 1:
             entries = [_LiveEntry(0, 0, "header", newest_first[0], -1, 0)]
-            rendered = self._render_live_root(entries, {0}, newest_first[0])
-            return rendered[0] if rendered else ""
+            rendered = self._render_live_root(entries, {0})
+            return self._fit(rendered[0]) if rendered else ""
 
-        budget = max_rows - 1  # first row is the "─ N open" line
+        budget = max_rows - 1  # first row is the "── N open" line
         shown: list[RecordingSpan] = []
         for span in newest_first:
             if len(shown) >= budget:
@@ -903,15 +1041,16 @@ class TTYRenderer:
             entries = per_root[id(span)]
             ordered = sorted(entries, key=lambda e: (e.pri, e.seq))
             kept = {e.seq for e in ordered[: grants[id(span)]]}
-            lines.extend(self._render_live_root(entries, kept, span))
-        return "\n".join(self._fit(line, self._width) for line in lines)
+            lines.extend(self._render_live_root(entries, kept))
+        return "\n".join(self._fit(line) for line in lines)
 
     def _open_line(self, n_open: int, not_shown: int) -> str:
-        text = f"─ {n_open} open"
+        g = self._g
+        text = f"{g.dash * 2} {n_open} open"
         if not_shown:
-            text += f" · {not_shown} not shown"
+            text += f"{g.sep}{not_shown} not shown"
         pad = max(0, self._width - _visible_width(text) - 1)
-        return self._fit(self._styled(text + " " + "─" * pad, "dim"), self._width)
+        return self._clip(self._styled(text + " " + g.dash * pad, "dim"), self._width)
 
     def _live_meta(self, span: RecordingSpan) -> str:
         done = failed = 0
@@ -922,13 +1061,14 @@ class TTYRenderer:
                 failed += 1
             else:
                 done += 1
+        sep = self._g.sep
         meta = ""
         if done:
-            meta += self._styled(f" · {done} done", "dim")
+            meta += self._styled(f"{sep}{done} done", "dim")
         if failed:
-            meta += self._styled(f" · {failed} failed", "red")
+            meta += self._styled(f"{sep}{failed} failed", "red")
         if span.events:
-            meta += self._styled(f" · {len(span.events)} events", "dim")
+            meta += self._styled(f"{sep}{len(span.events)} events", "dim")
         return meta
 
     def _live_root_entries(self, root: RecordingSpan) -> list[_LiveEntry]:
@@ -952,14 +1092,10 @@ class TTYRenderer:
             return len(entries) - 1
 
         def attr_entries(span: RecordingSpan, owner: int, depth: int, pri: int) -> None:
-            _, attrs = _promoted(span)
-            if not attrs:
-                return
-            items = self._flow_items(span, attrs, None)
-            # Prefix is owner.cont (2 cells/level) + 3 cells; content packs
+            # Prefix is the owner's rail (3 cells/level) + 2 cells; content packs
             # against that width whichever rail survives the row budget.
-            avail = self._width - 2 * depth - 3
-            for line in self._flow_lines(items, avail, live=True):
+            avail = self._width - 3 * depth - 2
+            for line in self._attr_lines(span, avail, live=True):
                 add(pri, "attr", span, owner, 0, content=line)
 
         root_idx = add(
@@ -981,12 +1117,7 @@ class TTYRenderer:
         walk(root, root_idx, 1)
         return entries
 
-    def _render_live_root(
-        self,
-        entries: list[_LiveEntry],
-        kept: set[int],
-        root: RecordingSpan,
-    ) -> list[str]:
+    def _render_live_root(self, entries: list[_LiveEntry], kept: set[int]) -> list[str]:
         """Emit kept entries in DFS order, rails recomputed over the kept set."""
         present: set[int] = set()
         for i in kept:
@@ -1004,29 +1135,29 @@ class TTYRenderer:
             has_present_child.add(e.parent)
 
         lines: list[str] = []
-        root_start = root.start_ns or 0
         for e in entries:
             if e.seq not in kept:
                 continue
             if e.kind == "header":
                 rail, _ = self._live_rail(e, entries, last_present)
+                is_root = e.parent < 0
+                marker = self._marker(
+                    e.span, is_root=is_root, orphan=False, waiting=e.waiting
+                )
                 lines.append(
-                    self._header_line(
+                    self._header(
                         e.span,
-                        rail=rail,
-                        width=self._width,
-                        is_root=e.parent < 0,
-                        orphan=False,
-                        waiting=e.waiting,
-                        root_start=root_start,
+                        lead=self._styled(rail, "dim"),
+                        marker=marker,
+                        is_root=is_root,
                         meta=self._live_meta(e.span),
                     )
                 )
             else:
                 owner = entries[e.parent]
                 _, cont = self._live_rail(owner, entries, last_present)
-                prefix = cont + ("│" if owner.seq in has_present_child else " ") + "  "
-                lines.append(prefix + e.content)
+                pipe = self._g.pipe if owner.seq in has_present_child else " "
+                lines.append(self._styled(cont + pipe, "dim") + " " + e.content)
         return lines
 
     def _live_rail(
@@ -1038,19 +1169,20 @@ class TTYRenderer:
         """(rail, continuation) for an entry, recomputed over present siblings."""
         if entry.parent < 0:
             return "", ""
+        g = self._g
         chain_: list[_LiveEntry] = []
         node = entry
         while node.parent >= 0:
             chain_.append(node)
             node = entries[node.parent]
         parts = [
-            "  " if a.order == last_present.get(a.parent, -2) else "│ "
+            "   " if a.order == last_present.get(a.parent, -2) else g.pipe + "  "
             for a in reversed(chain_[1:])
         ]
         ancestor = "".join(parts)
         is_last = entry.order == last_present.get(entry.parent, -2)
-        rail = ancestor + ("└─" if is_last else "├─")
-        cont = ancestor + ("  " if is_last else "│ ")
+        rail = ancestor + (g.elbow if is_last else g.tee)
+        cont = ancestor + ("   " if is_last else g.pipe + "  ")
         return rail, cont
 
 
@@ -1135,13 +1267,18 @@ class TTYTracer:
     `flush`) formats history off the request thread. Spans get
     ``span.mutex = self._lock`` so mutations serialize with rendering.
     `stats()` is always zero (dev-only sink).
+
+    ``live`` defaults to "the stream is a TTY and ``TERM`` is not ``dumb``".
+    ``ascii`` defaults to "the stream cannot encode UTF-8".
     """
 
     __slots__ = (
+        "_ascii",
         "_children",
         "_color",
         "_deferred",
         "_err_proxy",
+        "_last_multiline",
         "_live_enabled",
         "_lock",
         "_open_span_ids",
@@ -1159,11 +1296,20 @@ class TTYTracer:
         "_write_lock",
     )
 
-    def __init__(self, *, out: TextIO | None = None, live: bool | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        out: TextIO | None = None,
+        live: bool | None = None,
+        ascii: bool | None = None,
+    ) -> None:
         self._out = out if out is not None else sys.stdout
-        is_tty = _isatty(self._out)
+        # A dumb terminal (Emacs shell, some CI consoles) has no cursor moves
+        # and no color; it gets plain history lines.
+        is_tty = _isatty(self._out) and os.environ.get("TERM") != "dumb"
         self._live_enabled = is_tty if live is None else bool(live)
         self._color = color_enabled() and is_tty
+        self._last_multiline: bool | None = None
         self._lock = threading.RLock()
         self._write_lock = threading.Lock()
         self._roots: dict[UUID, RecordingSpan] = {}
@@ -1190,6 +1336,14 @@ class TTYTracer:
         except (LookupError, TypeError):
             resolved = "utf-8"
         self._write_enc = None if resolved.startswith("utf") else resolved
+        self._ascii = self._write_enc is not None if ascii is None else bool(ascii)
+
+    def _renderer(
+        self, width: int, children: dict[UUID, list[RecordingSpan]], now: int
+    ) -> TTYRenderer:
+        return TTYRenderer(
+            width, children, now_ns=now, color=self._color, ascii=self._ascii
+        )
 
     def __enter__(self) -> TTYTracer:
         self._start()
@@ -1294,18 +1448,14 @@ class TTYTracer:
             while self._pending:
                 root, kids = self._pending.popleft()
                 try:
-                    blocks.append(
-                        TTYRenderer(
-                            width, kids, now_ns=now, color=self._color
-                        ).history_block(root)
-                    )
+                    blocks.append(self._renderer(width, kids, now).history_block(root))
                 except Exception as exc:
                     blocks.append(self._fallback_block(root, width, exc))
             remaining = sorted(
                 (s for s in self._roots.values() if s.started),
                 key=lambda s: s.start_ns or 0,
             )
-            renderer = TTYRenderer(width, self._children, now_ns=now, color=self._color)
+            renderer = self._renderer(width, self._children, now)
             for span in remaining:
                 try:
                     blocks.append(renderer.history_block(span))
@@ -1356,11 +1506,7 @@ class TTYTracer:
         while self._pending:
             root, kids = self._pending.popleft()
             try:
-                blocks.append(
-                    TTYRenderer(
-                        width, kids, now_ns=now, color=self._color
-                    ).history_block(root)
-                )
+                blocks.append(self._renderer(width, kids, now).history_block(root))
             except Exception as exc:
                 blocks.append(self._fallback_block(root, width, exc))
         live_text: str | None = None
@@ -1371,9 +1517,9 @@ class TTYTracer:
             )
             if open_roots:
                 try:
-                    live_text = TTYRenderer(
-                        width, self._children, now_ns=now, color=self._color
-                    ).live_text(open_roots, max_rows=max(1, rows // 2))
+                    live_text = self._renderer(width, self._children, now).live_text(
+                        open_roots, max_rows=max(1, rows // 2)
+                    )
                 except Exception as exc:
                     live_text = _clip_visible(
                         f"live view failed: {type(exc).__name__}", width
@@ -1382,14 +1528,15 @@ class TTYTracer:
 
     def _fallback_block(self, span: RecordingSpan, width: int, exc: Exception) -> str:
         """One-line substitute for a root whose render raised — never drop a trace."""
-        line = _sanitize(span.name, multiline=False)
+        glyphs = _ASCII if self._ascii else _UNICODE
+        line = _sanitize(span.name, multiline=False, newline=glyphs.newline)
         line += f"  (render failed: {type(exc).__name__})"
-        if width >= 60 and span.start_ns is not None:
+        if width >= _STAMP_MIN and span.start_ns is not None:
             stamp = datetime.fromtimestamp(span.start_ns / 1e9).strftime("%H:%M:%S")
             if self._color:
                 stamp = f"{SGR['dim']}{stamp}{_RESET}"
-            line = stamp + "  " + line
-        return _clip_visible(line, width)
+            line = stamp + " " + line
+        return _clip_visible(line, min(width, _MAX_WIDTH), glyphs.ellipsis)
 
     # --------------------------------------------------------------
     # writes (under _write_lock only; never takes _lock)
@@ -1411,6 +1558,7 @@ class TTYTracer:
             if self._deferred:
                 blocks = self._deferred + blocks
                 self._deferred = []
+            blocks = self._spaced(blocks)
             if not self._live_enabled:
                 if blocks:
                     self._out.write(self._to_out("\n".join(blocks) + "\n"))
@@ -1439,6 +1587,21 @@ class TTYTracer:
             self._out.flush()
             if live_text:
                 self._region.store(live_text, width)
+
+    def _spaced(self, blocks: list[str]) -> list[str]:
+        """Put a blank line before and after every block of several lines.
+
+        One-line roots (plain requests) stack like an access log; a tree
+        stands apart from its neighbors.
+        """
+        out: list[str] = []
+        for block in blocks:
+            multiline = "\n" in block
+            if self._last_multiline is not None and (multiline or self._last_multiline):
+                out.append("")
+            out.append(block)
+            self._last_multiline = multiline
+        return out
 
     def _to_out(self, text: str) -> str:
         """Round-trip through the output encoding when it cannot hold text."""

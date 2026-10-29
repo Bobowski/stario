@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import TextIO
 from uuid import UUID, uuid4
 
@@ -22,6 +23,9 @@ from stario.telemetry.tty import (
     TTYRenderer,
     TTYTracer,
     _clip_visible,
+    _cut,
+    _fmt_bytes,
+    _fmt_duration,
     _LiveRegion,
     _visible_width,
 )
@@ -34,6 +38,8 @@ _NOW = _T0 + 10_000_000
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _FORBIDDEN_SGR = re.compile(r"\x1b\[(?:[34]0|37|9\d|4\d|10\d|38;)")
 _SGR = re.compile(r"\x1b\[([0-9;]*)m")
+_DIM_RUN = re.compile(r"\x1b\[2m(.*?)\x1b\[0m")
+_STAMP = re.compile(r"\d{2}:\d{2}:\d{2}")
 
 
 def make_span(
@@ -70,10 +76,11 @@ def render(
     width: int = 120,
     now: int = _NOW,
     color: bool = False,
+    ascii: bool = False,
 ) -> str:
-    return TTYRenderer(width, children or {}, now_ns=now, color=color).history_block(
-        span
-    )
+    return TTYRenderer(
+        width, children or {}, now_ns=now, color=color, ascii=ascii
+    ).history_block(span)
 
 
 def _complex_tree() -> tuple[RecordingSpan, dict[UUID, list[RecordingSpan]]]:
@@ -122,6 +129,22 @@ def _complex_tree() -> tuple[RecordingSpan, dict[UUID, list[RecordingSpan]]]:
     return root, {root.id: [db, render_span], render_span.id: [fetch]}
 
 
+def _startup() -> RecordingSpan:
+    return make_span(
+        "server.startup",
+        attributes={
+            "server.host": "127.0.0.1",
+            "server.port": 8080,
+            "server.tls": False,
+            "server.compression.zstd_level": 3,
+            "server.compression.brotli_level": 4,
+            "server.compression.gzip_level": 1,
+            "server.limits.max_request_header_bytes": 65536,
+            "server.limits.max_request_body_bytes": 10_485_760,
+        },
+    )
+
+
 class TestSpanStates:
     def test_running_leaf_shows_spinner_glyph(self):
         span = make_span("request", end_ns=None)
@@ -145,14 +168,23 @@ class TestSpanStates:
         text = render(root, children={root.id: [child]}, width=90)
 
         root_line, child_line = text.splitlines()
-        assert "◌" in root_line
+        assert "○" in root_line
         assert any(g in child_line for g in _SPINNER)
 
     def test_done_and_failed_glyphs(self):
-        done = make_span("request")
-        failed = make_span("request", error="boom")
-        assert "●" in render(done, width=90)
-        assert "✗" in render(failed, width=90)
+        assert "●" in render(make_span("request"), width=90)
+        assert "×" in render(make_span("request", error="boom"), width=90)
+
+    def test_child_connector_carries_the_status(self):
+        root = make_span("request", end_ns=_T0 + 9_000_000)
+        done = make_span("a", parent=root, start_ns=_T0 + 1, end_ns=_T0 + 2)
+        failed = make_span(
+            "b", parent=root, start_ns=_T0 + 3, end_ns=_T0 + 4, error="x"
+        )
+        text = render(root, children={root.id: [done, failed]}, width=90)
+
+        assert "├─ a" in text
+        assert "└× b" in text
 
     def test_open_parent_duration_covers_child(self):
         root = make_span("request", end_ns=None)
@@ -162,8 +194,8 @@ class TestSpanStates:
         text = render(root, children={root.id: [child]}, width=90, now=_T0 + 10_000_000)
 
         lines = text.splitlines()
-        assert "10 ms" in lines[0]
-        assert "8.0 ms" in lines[1]
+        assert lines[0].endswith("10ms")
+        assert lines[1].endswith("8.0ms")
 
     def test_orphan_when_root_ends_before_child(self):
         root = make_span("request", end_ns=_T0 + 10_000_000)
@@ -172,7 +204,7 @@ class TestSpanStates:
         )
         text = render(root, children={root.id: [child]}, width=90)
 
-        assert "⚠" in text
+        assert "└! db.query" in text
         assert "still open when the parent ended" in text
 
 
@@ -189,31 +221,58 @@ class TestHeaders:
         )
         text = render(root, width=90)
 
-        assert "GET /projects/42" in text
-        assert "200" in text
+        assert "GET /projects/42  200" in text
         assert "request.method" not in text
         assert "request.path" not in text
         assert "response.status_code" not in text
-        assert "user.id" in text
+        assert "user.id=17" in text
 
-    def test_status_code_in_col_a_and_offsets_from_root(self):
+    def test_route_hidden_only_when_it_repeats_the_path(self):
+        same = make_span(
+            "request",
+            attributes={
+                "request.method": "GET",
+                "request.path": "/",
+                "http.route": "/",
+            },
+        )
+        assert "http.route" not in render(same, width=90)
+        other = make_span(
+            "request",
+            attributes={
+                "request.method": "GET",
+                "request.path": "/notes/4",
+                "http.route": "/notes/{id}",
+            },
+        )
+        assert "http.route=/notes/{id}" in render(other, width=90)
+
+    def test_one_right_column_holds_durations(self):
         root, children = _complex_tree()
         text = render(root, children=children, width=90)
 
-        root_line = text.splitlines()[0]
-        assert "200" in root_line
-        db_line = next(ln for ln in text.splitlines() if "db.query" in ln)
-        assert "+1.2 ms" in db_line
-        fetch_line = next(ln for ln in text.splitlines() if "fetch avatar" in ln)
-        # Offset is from the ROOT start, not the parent.
-        assert "+20 ms" in fetch_line
+        # Four span durations and one event offset (+9.8ms) end at the edge.
+        timed = [ln for ln in text.splitlines() if re.search(r"\d(ms|s|µs)$", ln)]
+        assert len(timed) == 5
+        for line in timed:
+            assert _visible_width(line) == 90
+        # Neither the start offsets nor the trace id tail are shown any more.
+        assert "+1.2" not in text
+        assert str(root.id)[-8:] not in text
 
-    def test_root_id_tail_at_width_100(self):
-        span = make_span("request")
-        wide = render(span, width=110)
-        assert str(span.id)[-8:] in wide
-        narrow = render(span, width=90)
-        assert str(span.id)[-8:] not in narrow
+    def test_line_width_caps_at_100(self):
+        root, children = _complex_tree()
+        for line in render(root, children=children, width=200).splitlines():
+            assert _visible_width(line) <= 100
+
+    def test_hot_child_duration_is_bold(self):
+        root, children = _complex_tree()
+        text = render(root, children=children, width=90, color=True)
+        render_line = next(ln for ln in text.splitlines() if "render" in ln)
+        db_line = next(ln for ln in text.splitlines() if "db.query" in ln)
+        # render took 33 of 48 ms; db.query 12 ms.
+        assert "\x1b[1m" in render_line
+        assert "\x1b[1m" not in db_line
 
     def test_bare_root_is_one_line(self):
         span = make_span("request")
@@ -221,68 +280,80 @@ class TestHeaders:
         assert "\n" not in render(span, width=40)
 
 
-class TestHistoryGutter:
-    def test_gutter_time_at_wide_widths(self):
+class TestHistoryStamp:
+    def test_time_prefix_and_body_indent_at_wide_widths(self):
         root, children = _complex_tree()
         lines = render(root, children=children, width=90).splitlines()
 
-        assert re.match(r"^\d{2}:\d{2}:\d{2}  ", lines[0])
+        assert re.match(r"^\d{2}:\d{2}:\d{2} ● ", lines[0])
         for line in lines[1:]:
-            assert line.startswith(" " * 10)
+            assert line.startswith(" " * 9)
 
-    def test_no_gutter_below_60_and_time_joins_flow(self):
+    def test_no_time_below_50(self):
         root = make_span(
             "request",
             attributes={"request.method": "GET", "request.path": "/x", "user.id": 3},
         )
-        text = render(root, width=50)
-
-        first = text.splitlines()[0]
-        assert not re.match(r"^\d{2}:\d{2}:\d{2}", first)
-        # The time lands in the attribute flow when the root has attributes.
-        assert re.search(r"\d{2}:\d{2}:\d{2} ·", text)
-
-    def test_no_gutter_and_no_attrs_stays_one_line(self):
-        root = make_span("request")
-        text = render(root, width=50)
-        assert "\n" not in text
-        assert not re.search(r"\d{2}:\d{2}:\d{2}", text)
+        text = render(root, width=49)
+        assert text.startswith("● GET /x")
+        assert not _STAMP.search(text)
 
 
-class TestAttributeFlow:
-    def test_short_items_pack_on_one_line(self):
+class TestAttributes:
+    def test_pairs_are_key_equals_value(self):
+        root = make_span("request", attributes={"aa": "1", "bb": "2", "cc": "3"})
+        assert "aa=1 bb=2 cc=3" in render(root, width=90)
+
+    def test_values_read_like_logfmt(self):
         root = make_span(
-            "request",
-            attributes={"aa": "1", "bb": "2", "cc": "3"},
+            "job",
+            attributes={
+                "done": True,
+                "failed": False,
+                "owner": None,
+                "title": 'say "hi" now',
+                "empty": "",
+                "retained_bytes": 1_305_229,
+                "body_bytes": 512,
+                "count": 65536,
+            },
         )
-        text = render(root, width=90)
-        assert "aa 1 · bb 2 · cc 3" in text
+        text = render(root, width=120)
+        assert "done=true failed=false owner=null" in text
+        assert 'title="say \\"hi\\" now"' in text
+        assert 'empty=""' in text
+        assert "retained_bytes=1.2MiB" in text
+        assert "body_bytes=512B count=65536" in text
 
-    def test_long_value_wraps_without_losing_info(self):
-        value = " ".join(f"word{i:02d}" for i in range(40))
-        root = make_span("request", attributes={"payload": value})
-        text = render(root, width=50)
+    def test_home_directory_becomes_tilde(self):
+        home = str(Path.home())
+        root = make_span("job", attributes={"dir": f"{home}/data", "other": "/srv/x"})
+        text = render(root, width=120)
+        assert "dir=~/data" in text
+        assert "other=/srv/x" in text
 
-        assert "payload" in text
-        assert "more lines" not in text
-        joined = " ".join(text.split())
-        for i in range(40):
-            assert f"word{i:02d}" in joined
+    def test_dotted_keys_group_under_a_label(self):
+        text = render(_startup(), width=100)
+        lines = text.splitlines()
 
-    def test_very_long_value_caps_at_twelve_lines(self):
-        value = " ".join(f"word{i:02d}" for i in range(400))
-        root = make_span("request", attributes={"payload": value})
-        text = render(root, width=40)
-        assert "more lines" in text
+        assert "host=127.0.0.1 port=8080 tls=false" in lines[1]
+        compression = next(ln for ln in lines if "compression" in ln)
+        assert compression.endswith(
+            "compression  zstd_level=3 brotli_level=4 gzip_level=1"
+        )
+        limits = next(ln for ln in lines if "limits" in ln)
+        assert (
+            "limits       max_request_header_bytes=64KiB max_request_body_bytes=10MiB"
+            in limits
+        )
 
-    def test_multiline_value_becomes_block(self):
-        root = make_span("request", attributes={"payload": "first\nsecond\nthird"})
-        text = render(root, width=90)
-        assert "first" in text
-        assert "second" in text
-        assert "third" in text
+    def test_narrow_width_stacks_the_label(self):
+        lines = render(_startup(), width=44).splitlines()
+        i = next(i for i, ln in enumerate(lines) if ln.endswith("limits"))
+        assert lines[i + 1].endswith("  max_request_header_bytes=64KiB")
+        assert lines[i + 2].endswith("  max_request_body_bytes=10MiB")
 
-    def test_key_folding_uses_name_prefix(self):
+    def test_single_key_prefix_stays_flat(self):
         root = make_span(
             "server.startup",
             attributes={
@@ -292,9 +363,42 @@ class TestAttributeFlow:
             },
         )
         text = render(root, width=90)
-        assert "host 0.0.0.0" in text
-        assert "port 8000" in text
-        assert "limits.max_request_header_bytes 65536" in text
+        assert "host=0.0.0.0 port=8000" in text
+        assert "limits.max_request_header_bytes=64KiB" in text
+
+    def test_insertion_order_is_kept(self):
+        root = make_span("job", attributes={"zeta": 1, "alpha": 2})
+        assert "zeta=1 alpha=2" in render(root, width=90)
+
+    def test_long_value_wraps_without_losing_info(self):
+        value = " ".join(f"word{i:02d}" for i in range(40))
+        root = make_span("request", attributes={"payload": value})
+        text = render(root, width=50)
+
+        assert 'payload="word00' in text
+        assert "more lines" not in text
+        joined = " ".join(text.split())
+        for i in range(40):
+            assert f"word{i:02d}" in joined
+
+    def test_long_path_breaks_after_a_slash(self):
+        root = make_span(
+            "job", attributes={"dir": "/srv/yard/apps/querymarks/data/uploads/2026"}
+        )
+        lines = render(root, width=40).splitlines()
+        assert lines[1].rstrip().endswith("/")
+
+    def test_very_long_value_caps_at_twelve_lines(self):
+        value = " ".join(f"word{i:02d}" for i in range(400))
+        root = make_span("request", attributes={"payload": value})
+        assert "more lines" in render(root, width=40)
+
+    def test_multiline_value_becomes_block(self):
+        root = make_span("request", attributes={"payload": "first\nsecond\nthird"})
+        lines = render(root, width=90).splitlines()
+        assert lines[1].endswith("payload=")
+        assert lines[2].endswith("  first")
+        assert lines[4].endswith("  third")
 
 
 class TestEventsErrorsLinks:
@@ -311,9 +415,9 @@ class TestEventsErrorsLinks:
             ],
         )
         text = render(root, width=90)
-        assert "◇" in text
-        assert "cache.miss" in text
-        assert "key p:42" in text
+        event_line = text.splitlines()[1]
+        assert "└◦ cache.miss  key=p:42" in event_line
+        assert event_line.endswith("+1.0ms")
         assert "lookup failed" in text
 
     def test_failed_span_shows_exc_type_and_frame(self):
@@ -334,11 +438,11 @@ class TestEventsErrorsLinks:
         )
         text = render(root, width=90)
 
-        assert "✗" in text
+        assert "×" in text
         assert "ValueError: bad password hash" in text
-        assert "╭ " in text
-        assert "╰ " in text
-        assert "◇ exception" not in text
+        assert "┌ Traceback" in text
+        assert "└ ValueError" in text
+        assert "◦ exception" not in text
 
     def test_frames_and_bodies_wrap_instead_of_clipping(self):
         body = "Traceback (most recent call last):\n" + "x" * 200 + "\nValueError: boom"
@@ -376,18 +480,17 @@ class TestEventsErrorsLinks:
             ],
         )
         text = render(root, width=90)
-        assert "◇ exception" in text
-        assert "ValueError: hmm" in text
-        assert "╭ " in text
+        assert "◦ exception  ValueError: hmm" in text
+        assert "┌ Traceback:" in text
 
-    def test_links_render_dim_arrow_lines(self):
+    def test_links_render_arrow_lines(self):
         root = make_span(
             "request",
             links=[RecordedLink("parent.trace", uuid4(), {"kind": "retry"})],
         )
         text = render(root, width=90)
-        assert "↗ parent.trace" in text
-        assert "kind retry" in text
+        assert "→ parent.trace" in text
+        assert "kind=retry" in text
 
     def test_nested_collapse_marker_over_60_items(self):
         root = make_span(
@@ -397,7 +500,7 @@ class TestEventsErrorsLinks:
             ],
         )
         text = render(root, width=90)
-        assert "⋯ 10 more (0 spans, 10 events)" in text
+        assert "… 10 more (0 spans, 10 events)" in text
 
     def test_sanitizing_blocks_escapes_and_controls(self):
         root = make_span(
@@ -413,19 +516,35 @@ class TestEventsErrorsLinks:
 
 
 class TestColorRules:
-    def test_no_forbidden_sgr_and_styles_closed(self):
+    def _samples(self, width: int = 90) -> list[str]:
         root, children = _complex_tree()
         open_root = make_span(
             "request",
             end_ns=None,
             attributes={"request.method": "GET", "request.path": "/x"},
         )
-        for text in (
-            render(root, children=children, width=90, color=True),
-            TTYRenderer(90, children, now_ns=_NOW, color=True).live_text(
+        failed = make_span(
+            "request",
+            error="boom",
+            events=[
+                RecordedEvent(
+                    time_ns=_T0 + 1,
+                    name="exception",
+                    attributes={"exc.type": "ValueError", "exc.message": "boom"},
+                    body='Traceback (most recent call last):\n  File "a.py"',
+                )
+            ],
+        )
+        return [
+            render(root, children=children, width=width, color=True),
+            render(failed, width=width, color=True),
+            TTYRenderer(width, children, now_ns=_NOW, color=True).live_text(
                 [open_root], max_rows=12
             ),
-        ):
+        ]
+
+    def test_no_forbidden_sgr_and_styles_closed(self):
+        for text in self._samples():
             assert not _FORBIDDEN_SGR.search(text)
             for line in text.splitlines():
                 assert _visible_width(line) <= 90
@@ -434,13 +553,73 @@ class TestColorRules:
                     open_style = match.group(1) != "0"
                 assert not open_style, line
 
+    def test_dim_never_hides_names_values_durations_or_tracebacks(self):
+        dim = " ".join(m for text in self._samples() for m in _DIM_RUN.findall(text))
+        for essential in (
+            "GET",
+            "db.query",
+            "render",
+            "a81f09c2",
+            "project.html",
+            "48ms",
+            "12ms",
+            "33ms",
+            "Traceback",
+            "a.py",
+        ):
+            assert essential not in dim, essential
+        # Structure is dim: keys, rails, and the time prefix.
+        assert "session=" in dim
+        assert "├" in dim
+        assert _STAMP.search(dim)
+
     def test_yellow_status_is_bolded(self):
-        root = make_span(
-            "request",
-            attributes={"response.status_code": 302},
-        )
+        root = make_span("request", attributes={"response.status_code": 302})
         text = render(root, width=90, color=True)
-        assert "\x1b[33m\x1b[1m      302" in text
+        assert "\x1b[33m\x1b[1m302\x1b[0m" in text
+        assert "\x1b[33m\x1b[1m●" in text
+
+
+class TestAsciiGlyphs:
+    def test_ascii_set_has_no_non_ascii_output(self):
+        root, children = _complex_tree()
+        failed = make_span(
+            "request",
+            error="boom",
+            events=[
+                RecordedEvent(
+                    time_ns=_T0 + 1,
+                    name="exception",
+                    attributes={"exc.type": "ValueError", "exc.message": "boom"},
+                    body="Traceback:\nline",
+                )
+            ],
+            links=[RecordedLink("parent.trace", uuid4())],
+        )
+        root.attributes = {**(root.attributes or {}), "note": "東京", "multi": "a\nb"}
+        texts = [
+            render(root, children=children, width=90, ascii=True),
+            render(failed, width=90, ascii=True),
+            TTYRenderer(90, children, now_ns=_NOW, color=False, ascii=True).live_text(
+                [make_span("request", end_ns=None)], max_rows=4
+            ),
+        ]
+        for text in texts:
+            # User text (東京) passes through; every glyph Stario adds is ASCII.
+            assert text.replace("東京", "").isascii(), text
+
+        tree = texts[0]
+        assert "* GET /projects/42  200" in tree
+        assert "|- db.query" in tree
+        assert "`- render" in tree
+        assert "+ cache.miss" in tree
+        assert "x GET" not in tree
+        assert "x request" in texts[1]
+        assert "-> parent.trace" in texts[1]
+
+    def test_ascii_ellipsis_and_micro(self):
+        assert _fmt_duration(400_000, "us") == "400us"
+        assert _clip_visible("abcdefghij", 6, "...") == "abc..."
 
 
 class TestWidthSweep:
@@ -448,18 +627,25 @@ class TestWidthSweep:
         root, children = _complex_tree()
         open_root, open_children = _complex_tree()
         open_root.end_ns = None
+        startup = _startup()
         for width in range(1, 131):
             for color in (False, True):
-                history = TTYRenderer(
-                    width, children, now_ns=_NOW, color=color
-                ).history_block(root)
-                for line in history.splitlines():
-                    assert _visible_width(line) <= width
-                live = TTYRenderer(
-                    width, open_children, now_ns=_NOW, color=color
-                ).live_text([open_root], max_rows=12)
-                for line in live.splitlines():
-                    assert _visible_width(line) <= width
+                for ascii in (False, True):
+                    texts = [
+                        TTYRenderer(
+                            width, children, now_ns=_NOW, color=color, ascii=ascii
+                        ).history_block(root),
+                        TTYRenderer(
+                            width, {}, now_ns=_NOW, color=color, ascii=ascii
+                        ).history_block(startup),
+                        TTYRenderer(
+                            width, open_children, now_ns=_NOW, color=color, ascii=ascii
+                        ).live_text([open_root], max_rows=12),
+                    ]
+                    for text in texts:
+                        for line in text.splitlines():
+                            assert _visible_width(line) <= width
+                            assert not line.endswith(" "), repr(line)
 
 
 class TestLiveArea:
@@ -514,7 +700,7 @@ class TestLiveArea:
         text = TTYRenderer(90, {}, now_ns=_NOW, color=False).live_text(
             roots, max_rows=4
         )
-        assert "3 not shown" in text or "not shown" in text
+        assert "── 4 open · 1 not shown" in text
         assert "r3" in text
         assert "r0" not in text
 
@@ -538,15 +724,15 @@ class TestLiveArea:
         )
         root_line = next(ln for ln in text.splitlines() if "GET /x" in ln)
         leaf_line = next(ln for ln in text.splitlines() if "render" in ln)
-        assert "◌" in root_line
-        assert any(g in leaf_line for g in _SPINNER)
+        assert root_line.startswith("○ GET /x")
+        assert any(f"└{g} render" in leaf_line for g in _SPINNER)
 
         solo = make_span("alone", end_ns=None)
         alone = TTYRenderer(90, {}, now_ns=_NOW, color=False).live_text(
             [solo], max_rows=12
         )
         assert any(g in alone for g in _SPINNER)
-        assert "◌" not in alone
+        assert "○" not in alone
 
     def test_meta_never_clips_mid_token(self):
         root, kids = self._open_tree()
@@ -572,14 +758,24 @@ class TestLiveArea:
         text = TTYRenderer(90, kids, now_ns=_NOW, color=False).live_text(
             [root], max_rows=12
         )
-        assert "sql.rows" in text
-        assert "root.attr" in text
+        assert "sql.rows=5" in text
+        assert "root.attr=1" in text
         # With a tight budget the running leaf keeps its attrs before the root's.
         tight = TTYRenderer(90, kids, now_ns=_NOW, color=False).live_text(
             [root], max_rows=4
         )
         assert "sql.rows" in tight
         assert "root.attr" not in tight
+
+    def test_live_attributes_clip_to_one_row(self):
+        root = make_span("request", end_ns=None, attributes={"payload": "x" * 300})
+        text = TTYRenderer(60, {}, now_ns=_NOW, color=False).live_text(
+            [root], max_rows=12
+        )
+        lines = text.splitlines()
+        assert len(lines) == 3
+        assert lines[2].startswith("  payload=xxx")
+        assert lines[2].endswith("…")
 
 
 class _CountingIO(io.StringIO):
@@ -747,19 +943,69 @@ class TestTracerIO:
         tracer.flush()
         assert "request" in out.getvalue()
 
-    def test_non_utf_stream_gets_replaced_text(self, monkeypatch):
+    def test_non_utf_stream_switches_to_ascii_glyphs(self, monkeypatch):
         _patch_terminal(monkeypatch)
         buf = io.BytesIO()
         out = io.TextIOWrapper(buf, encoding="ascii")
         tracer = _manual_tracer(out, live=False)
+        assert tracer._ascii
         root = _open_root(tracer)
+        root.attr("note", "東京")
         root.end()
 
         tracer._render()  # must not raise UnicodeEncodeError
         out.flush()
         data = buf.getvalue().decode("ascii")
-        assert "?" in data  # the ● glyph lossy-encoded
-        assert "request" in data
+        assert "* request" in data  # the ASCII glyph, not a lossy "?"
+        assert "note=??" in data  # user text still lossy-encodes
+
+    def test_ascii_can_be_forced_on_a_utf_stream(self, monkeypatch):
+        _patch_terminal(monkeypatch)
+        out = io.StringIO()
+        tracer = TTYTracer(out=out, live=False, ascii=True)
+        tracer._running = True
+        root = _open_root(tracer)
+        root.end()
+        tracer._render()
+        assert out.getvalue().split(" ", 1)[1].startswith("* request")
+
+    def test_dumb_terminal_gets_plain_history(self, monkeypatch):
+        _patch_terminal(monkeypatch)
+        monkeypatch.setenv("TERM", "dumb")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        out = _FakeTTY()
+        tracer = TTYTracer(out=out)
+        tracer._running = True
+        assert not tracer._live_enabled
+        assert not tracer._color
+        root = _open_root(tracer)
+        tracer._render()
+        root.end()
+        tracer._render()
+        assert "request" in out.getvalue()
+        assert "\x1b" not in out.getvalue()
+
+    def test_blank_line_around_multiline_blocks_only(self, monkeypatch):
+        _patch_terminal(monkeypatch)
+        out = io.StringIO()
+        tracer = _manual_tracer(out, live=False)
+        for name in ("one", "two"):
+            _open_root(tracer, name).end()
+        tree = _open_root(tracer, "tree")
+        tree.attr("k", "v")
+        tree.end()
+        _open_root(tracer, "three").end()
+        tracer._render()
+
+        lines = out.getvalue().splitlines()
+        assert len(lines) == 7
+        assert "one" in lines[0]
+        assert "two" in lines[1]
+        assert lines[2] == ""
+        assert "tree" in lines[3]
+        assert lines[4].strip() == "k=v"
+        assert lines[5] == ""
+        assert "three" in lines[6]
 
     def test_history_render_failure_emits_fallback(self, monkeypatch):
         class _BadStr:
@@ -1097,3 +1343,23 @@ class TestHelpers:
         clipped = _clip_visible("東京" * 10, 7)
         assert _visible_width(clipped) <= 7
         assert clipped.endswith("…")
+
+    def test_compact_durations(self):
+        assert _fmt_duration(4_200) == "4.2µs"
+        assert _fmt_duration(42_000) == "42µs"
+        assert _fmt_duration(7_300_000) == "7.3ms"
+        assert _fmt_duration(264_000_000) == "264ms"
+        assert _fmt_duration(28_260_000_000) == "28.26s"
+        assert _fmt_duration(65_000_000_000) == "1m05s"
+        assert _fmt_duration(3_720_000_000_000) == "1h02m"
+
+    def test_binary_byte_sizes(self):
+        assert _fmt_bytes(512) == "512B"
+        assert _fmt_bytes(65536) == "64KiB"
+        assert _fmt_bytes(10_485_760) == "10MiB"
+        assert _fmt_bytes(1_305_229) == "1.2MiB"
+
+    def test_cut_prefers_space_then_slash(self):
+        assert _cut("alpha beta gamma", 12) == ("alpha beta", "gamma")
+        assert _cut("/srv/yard/apps/data", 12) == ("/srv/yard/", "apps/data")
+        assert _cut("abcdefghij", 4) == ("abcd", "efghij")

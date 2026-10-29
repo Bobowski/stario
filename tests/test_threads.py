@@ -206,7 +206,7 @@ async def test_unix_threads_fall_back_to_one(
     startup = next(s for s in spans if s["name"] == "server.startup")
     assert startup["attributes"]["server.threads"] == 1
     assert startup["attributes"]["server.threads_requested"] == 4
-    assert startup["attributes"]["server.listen_balance"] == "single"
+    assert "server.listen_balance" not in startup["attributes"]
 
 
 @pytest.mark.asyncio
@@ -310,10 +310,10 @@ async def test_threaded_serve_records_thread_count(
     spans = [json.loads(line) for line in output.getvalue().splitlines()]
     startup = next(s for s in spans if s["name"] == "server.startup")
     assert startup["attributes"]["server.threads"] == 2
-    assert startup["attributes"]["server.threads_requested"] == 2
+    assert "server.threads_requested" not in startup["attributes"]
     assert startup["attributes"]["server.event_loop"] == "asyncio"
     assert startup["attributes"]["server.worker_event_loop"] == "asyncio"
-    assert startup["attributes"]["server.listen_balance"] == "reuseport"
+    assert "server.listen_balance" not in startup["attributes"]
 
 
 @pytest.mark.asyncio
