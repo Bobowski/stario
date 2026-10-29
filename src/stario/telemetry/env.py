@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from stario._env import env_str
+from stario._env import env_bool, env_optional_str, env_str
 from stario.exceptions import StarioError
 
 from .core import Tracer
@@ -72,16 +72,12 @@ def tracer_from_env() -> Tracer:
     try:
         if builtin == "auto":
             if sys.stdout.isatty():
-                from .tty import TTYTracer
-
-                return TTYTracer()
+                return _tty_tracer_from_env()
             from .json import json_tracer_from_env
 
             return json_tracer_from_env()
         if builtin == "tty":
-            from .tty import TTYTracer
-
-            return TTYTracer()
+            return _tty_tracer_from_env()
         if builtin == "json":
             from .json import json_tracer_from_env
 
@@ -95,6 +91,15 @@ def tracer_from_env() -> Tracer:
     except ValueError as exc:
         raise StarioError(str(exc)) from exc
     return _custom_tracer_from_spec(effective)
+
+
+def _tty_tracer_from_env() -> Tracer:
+    """`TTYTracer`; `STARIO_TRACERS_TTY_ASCII` forces (1) or forbids (0) ASCII glyphs."""
+    from .tty import TTYTracer
+
+    if env_optional_str("STARIO_TRACERS_TTY_ASCII") is None:
+        return TTYTracer()
+    return TTYTracer(ascii=env_bool("STARIO_TRACERS_TTY_ASCII", False))
 
 
 def _custom_tracer_from_spec(spec: str) -> Tracer:
