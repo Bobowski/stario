@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -87,7 +88,14 @@ def tracer_from_env() -> Tracer:
         if builtin == "sqlite":
             from .sqlite import sqlite_tracer_from_env
 
-            return sqlite_tracer_from_env()
+            sys.stderr.write(
+                "[stario] STARIO_TRACER=sqlite is deprecated: set "
+                "STARIO_TRACER=json and STARIO_TRACERS_JSON=<path>. "
+                "Removed in 6.0.\n"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                return sqlite_tracer_from_env()
     except ValueError as exc:
         raise StarioError(str(exc)) from exc
     return _custom_tracer_from_spec(effective)

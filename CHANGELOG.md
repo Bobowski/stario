@@ -6,6 +6,26 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0
 
 ## Unreleased
 
+## 5.3.0 - 2026-10-29
+
+### Added
+
+- `JsonTracer` writes to a file. `JsonTracer(path=...)` opens the file on
+  enter in append mode — one JSON object per line, the same NDJSON that
+  went to stdout — creates missing parent directories, and closes it on
+  exit. Enter and exit again appends to the same file. `output` and `path`
+  cannot both be given. `STARIO_TRACERS_JSON` is the environment form:
+  `STARIO_TRACER=json` with `STARIO_TRACERS_JSON=/var/log/app/spans.ndjson`
+  writes there instead of stdout; unset or empty keeps stdout.
+
+### Deprecated
+
+- `SqliteTracer` and `STARIO_TRACER=sqlite` are deprecated and will be
+  removed in 6.0. Constructing the class warns with `DeprecationWarning`;
+  the environment path writes one line to stderr. Migrate with
+  `STARIO_TRACER=json` and `STARIO_TRACERS_JSON=<path>`, then query the
+  NDJSON file with DuckDB `read_json` or the SQLite JSON functions.
+
 ## 5.2.1 - 2026-10-29
 
 ### Changed

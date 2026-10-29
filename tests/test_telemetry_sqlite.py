@@ -5,12 +5,20 @@ import sqlite3
 from contextlib import closing
 from uuid import uuid4
 
+import pytest
+
 from stario.telemetry.sqlite import SqliteTracer
+
+
+def test_sqlite_tracer_is_deprecated(tmp_path) -> None:
+    with pytest.warns(DeprecationWarning, match="Removed in 6.0"):
+        SqliteTracer(tmp_path / "traces.sqlite3")
 
 
 def test_sqlite_tracer_context_manager_persists_span_tree(tmp_path) -> None:
     db_path = tmp_path / "traces.sqlite3"
-    tracer = SqliteTracer(db_path)
+    with pytest.warns(DeprecationWarning, match="Removed in 6.0"):
+        tracer = SqliteTracer(db_path)
 
     target_id = uuid4()
     with tracer, tracer.create("request") as span:

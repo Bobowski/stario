@@ -1,5 +1,6 @@
 """Tests for STARIO_TRACER / STARIO_* environment configuration."""
 
+import json
 import sys
 import types
 from typing import Any, cast
@@ -11,6 +12,7 @@ from stario.http.config import server_config_from_env
 from stario.telemetry import tracer_from_env
 from stario.telemetry.json import JsonTracer
 from stario.telemetry.noop import NoOpTracer
+from stario.telemetry.sqlite import SqliteTracer
 from stario.telemetry.tty import TTYTracer
 
 
@@ -93,6 +95,47 @@ def test_tracer_from_env_tty_ascii(monkeypatch) -> None:
     monkeypatch.setenv("STARIO_TRACERS_TTY_ASCII", "maybe")
     with pytest.raises(StarioError, match="STARIO_TRACERS_TTY_ASCII"):
         tracer_from_env()
+
+
+def test_tracer_from_env_json_writes_to_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("STARIO_TRACER", "json")
+    path = tmp_path / "spans.ndjson"
+    monkeypatch.setenv("STARIO_TRACERS_JSON", str(path))
+
+    tracer = tracer_from_env()
+    assert isinstance(tracer, JsonTracer)
+    with tracer, tracer.create("request"):
+        pass
+
+    assert json.loads(path.read_text())["name"] == "request"
+
+
+def test_tracer_from_env_json_defaults_to_stdout(monkeypatch) -> None:
+    monkeypatch.setenv("STARIO_TRACER", "json")
+    monkeypatch.delenv("STARIO_TRACERS_JSON", raising=False)
+    tracer = tracer_from_env()
+    assert isinstance(tracer, JsonTracer)
+    assert tracer._path is None
+
+    monkeypatch.setenv("STARIO_TRACERS_JSON", "   ")
+    tracer = tracer_from_env()
+    assert isinstance(tracer, JsonTracer)
+    assert tracer._path is None
+
+
+def test_tracer_from_env_sqlite_is_deprecated(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setenv("STARIO_TRACER", "sqlite")
+    monkeypatch.setenv("STARIO_TRACERS_SQLITE", str(tmp_path / "traces.sqlite3"))
+
+    tracer = tracer_from_env()
+
+    assert isinstance(tracer, SqliteTracer)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "[stario] STARIO_TRACER=sqlite is deprecated: set STARIO_TRACER=json "
+        "and STARIO_TRACERS_JSON=<path>. Removed in 6.0.\n"
+    )
 
 
 def test_tracer_from_env_invalid_sqlite_env_raises(monkeypatch) -> None:
