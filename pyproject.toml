@@ -29,9 +29,9 @@ dependencies = []
 [project.urls]
 Homepage = "https://stario.dev"
 Documentation = "https://stario.dev/docs"
-Repository = "https://github.com/bobowski/stario"
-Changelog = "https://github.com/bobowski/stario/blob/main/CHANGELOG.md"
-Issues = "https://github.com/bobowski/stario/issues"
+Repository = "https://github.com/stariodev/stario"
+Changelog = "https://github.com/stariodev/stario/blob/main/CHANGELOG.md"
+Issues = "https://github.com/stariodev/stario/issues"
 
 [project.optional-dependencies]
 uvloop = ["uvloop>=0.21.0,<1"]

@@ -8,7 +8,7 @@ This example is Stario only. It does not load Datastar. For the live board
 ## Run
 
 ```bash
-git clone https://github.com/bobowski/stario.git
+git clone https://github.com/stariodev/stario.git
 cd stario/examples/hello-world
 uv sync
 uv run python -m main

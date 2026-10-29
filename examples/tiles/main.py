@@ -22,7 +22,7 @@ Three routes, three jobs (CQRS-shaped, not a framework):
 
 Handlers use c.span for request telemetry; bootstrap uses span.attrs at startup.
 For a multi-file layout, clone examples/chat-room from the stario repo
-(https://github.com/bobowski/stario/tree/main/examples/chat-room).
+(https://github.com/stariodev/stario/tree/main/examples/chat-room).
 """
 
 import random
