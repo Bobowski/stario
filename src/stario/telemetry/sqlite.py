@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import warnings
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from stario._env import env_float, env_int, env_path
@@ -13,6 +15,18 @@ from stario._env import env_float, env_int, env_path
 from .buffered import _BufferedTracer
 from .formatters import serialize_json
 from .spans import RecordingSpan
+
+if TYPE_CHECKING:
+    from typing_extensions import deprecated
+else:
+    # The decorator only informs type checkers. Runtime warnings are explicit
+    # warnings.warn calls, so warnings.deprecated would warn a second time.
+    def deprecated(message: str, /) -> Callable[[Any], Any]:
+        def decorator(obj: Any) -> Any:
+            return obj
+
+        return decorator
+
 
 _DEFAULT_SQLITE_PATH = "stario-traces.sqlite3"
 _DEFAULT_FLUSH_INTERVAL = 0.25
@@ -159,6 +173,10 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(_SCHEMA_SQL)
 
 
+@deprecated(
+    "SqliteTracer is deprecated: use JsonTracer(path=...) and query the "
+    "NDJSON file. Removed in 6.0."
+)
 class SqliteTracer(_BufferedTracer):
     """Local SQLite span store with a batched background writer.
 
@@ -178,6 +196,12 @@ class SqliteTracer(_BufferedTracer):
         max_pending_spans: int = _DEFAULT_MAX_PENDING_SPANS,
         max_batch_spans: int = _DEFAULT_MAX_BATCH_SPANS,
     ) -> None:
+        warnings.warn(
+            "SqliteTracer is deprecated: use JsonTracer(path=...) and query "
+            "the NDJSON file. Removed in 6.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(
             tracer_label="sqlite tracer",
             tracer_type_name="SqliteTracer",
@@ -187,7 +211,7 @@ class SqliteTracer(_BufferedTracer):
         )
         self._path = Path(path)
 
-    def __enter__(self) -> SqliteTracer:
+    def __enter__(self) -> SqliteTracer:  # pyright: ignore[reportDeprecated]
         super().__enter__()
         return self
 
@@ -374,9 +398,9 @@ class SqliteTracer(_BufferedTracer):
             )
 
 
-def sqlite_tracer_from_env() -> SqliteTracer:
+def sqlite_tracer_from_env() -> SqliteTracer:  # pyright: ignore[reportDeprecated]
     """Build a `SqliteTracer` from `STARIO_TRACERS_SQLITE*` environment variables."""
-    return SqliteTracer(
+    return SqliteTracer(  # pyright: ignore[reportDeprecated]
         path=env_path("STARIO_TRACERS_SQLITE", _DEFAULT_SQLITE_PATH),
         flush_interval=env_float(
             "STARIO_TRACERS_SQLITE_FLUSH_INTERVAL", _DEFAULT_FLUSH_INTERVAL

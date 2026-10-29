@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
+from pathlib import Path
 from typing import Any, TextIO
 
-from stario._env import env_float, env_int
+from stario._env import env_float, env_int, env_optional_str
 
 from .buffered import _BufferedTracer
 from .formatters import dumps_json
@@ -75,19 +77,27 @@ class JsonTracer(_BufferedTracer):
     Enter before `create()`. A background thread batches finished spans;
     `flush_each` controls whether each batch flushes the output stream.
     Overflow drops spans and increments `stats().dropped_spans`.
+
+    Spans go to `output`, or stdout when it is omitted. `path` names an
+    NDJSON file instead: it opens in append mode on enter — missing parent
+    directories are created — and the tracer flushes and closes it on exit.
+    `output` and `path` cannot both be given.
     """
 
-    __slots__ = ("_flush_each", "_output", "_write_lock")
+    __slots__ = ("_flush_each", "_output", "_path", "_write_lock")
 
     def __init__(
         self,
         output: TextIO | None = None,
         *,
+        path: str | os.PathLike[str] | None = None,
         flush_each: bool = True,
         flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
         max_pending_spans: int = _DEFAULT_MAX_PENDING_SPANS,
         max_batch_spans: int = _DEFAULT_MAX_BATCH_SPANS,
     ) -> None:
+        if output is not None and path is not None:
+            raise ValueError("JsonTracer takes output or path, not both")
         super().__init__(
             tracer_label="json tracer",
             tracer_type_name="JsonTracer",
@@ -95,6 +105,7 @@ class JsonTracer(_BufferedTracer):
             max_pending_spans=max_pending_spans,
             max_batch_spans=max_batch_spans,
         )
+        self._path = Path(path) if path is not None else None
         self._output: TextIO = output if output is not None else sys.stdout
         self._write_lock = threading.Lock()
         self._flush_each = flush_each
@@ -102,6 +113,13 @@ class JsonTracer(_BufferedTracer):
     def __enter__(self) -> JsonTracer:
         super().__enter__()
         return self
+
+    def _on_start_writer(self) -> None:
+        # Fail fast on path errors before the writer thread starts.
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._output = self._path.open("a", encoding="utf-8", newline="\n")
 
     def _on_exit(
         self,
@@ -115,6 +133,14 @@ class JsonTracer(_BufferedTracer):
         except Exception as exc:
             self._record_writer_error(exc)
             self._emit_stderr(f"json tracer flush error: {type(exc).__name__}: {exc}")
+        if self._path is not None:
+            try:
+                self._output.close()
+            except Exception as exc:
+                self._record_writer_error(exc)
+                self._emit_stderr(
+                    f"json tracer close error: {type(exc).__name__}: {exc}"
+                )
 
     def _thread_name(self) -> str:
         return "stario-json-tracer"
@@ -147,8 +173,13 @@ class JsonTracer(_BufferedTracer):
 
 
 def json_tracer_from_env() -> JsonTracer:
-    """Build a `JsonTracer` from `STARIO_TRACERS_JSON_*` environment variables."""
+    """Build a `JsonTracer` from `STARIO_TRACERS_JSON*` environment variables.
+
+    `STARIO_TRACERS_JSON` names the NDJSON file; unset or empty writes to
+    stdout.
+    """
     return JsonTracer(
+        path=env_optional_str("STARIO_TRACERS_JSON"),
         flush_interval=env_float(
             "STARIO_TRACERS_JSON_FLUSH_INTERVAL", _DEFAULT_FLUSH_INTERVAL
         ),
