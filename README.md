@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img alt="Stario" src="https://raw.githubusercontent.com/bobowski/stario/main/docs/img/stario.png" style="height: 160px; width: auto;">
+    <img alt="Stario" src="https://raw.githubusercontent.com/stariodev/stario/main/docs/img/stario.png" style="height: 160px; width: auto;">
   </picture>
 </p>
 
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://stario.dev">Documentation</a>
   ·
-  <a href="https://github.com/bobowski/stario">Source</a>
+  <a href="https://github.com/stariodev/stario">Source</a>
 </p>
 
 ---
@@ -87,7 +87,7 @@ in application code.
 Clone the repo (or copy an example directory) and run:
 
 ```bash
-git clone https://github.com/bobowski/stario.git
+git clone https://github.com/stariodev/stario.git
 cd stario/examples/tiles
 uv sync
 uv run python -m main
@@ -103,7 +103,7 @@ cd my-app
 uv add stario
 ```
 
-For an app rather than a one-file experiment, start from the app guide in [bobowski/stario-create](https://github.com/bobowski/stario-create): copy its `AGENTS.md` into the repo root and install the skills with `npx skills add bobowski/stario-create`.
+For an app rather than a one-file experiment, start from the app guide in [stariodev/stario-create](https://github.com/stariodev/stario-create): copy its `AGENTS.md` into the repo root and install the skills with `npx skills add stariodev/stario-create`.
 
 Put this in `main.py`:
 

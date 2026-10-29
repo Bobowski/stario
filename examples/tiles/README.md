@@ -5,7 +5,7 @@ Collaborative painting board — the recommended **first Stario app**. Single-fi
 ## Run
 
 ```bash
-git clone https://github.com/bobowski/stario.git
+git clone https://github.com/stariodev/stario.git
 cd stario/examples/tiles
 uv sync
 uv run python -m main

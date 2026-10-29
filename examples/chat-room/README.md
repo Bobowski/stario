@@ -7,7 +7,7 @@ Rooms live in SQLite — the lobby starts empty. Create or delete from the lobby
 ## Run
 
 ```bash
-git clone https://github.com/bobowski/stario.git
+git clone https://github.com/stariodev/stario.git
 cd stario/examples/chat-room
 uv sync
 uv run python -m app.main

@@ -1,6 +1,6 @@
 # Stario examples
 
-Runnable reference apps for Stario. Clone the [stario repository](https://github.com/bobowski/stario) and run one locally, or copy an example directory into your own project. Each example runs with `uv run python -m …` — `serve()` is the only server entry point.
+Runnable reference apps for Stario. Clone the [stario repository](https://github.com/stariodev/stario) and run one locally, or copy an example directory into your own project. Each example runs with `uv run python -m …` — `serve()` is the only server entry point.
 
 | Example | Size | Start here? |
 |---------|------|-------------|
@@ -12,7 +12,7 @@ Runnable reference apps for Stario. Clone the [stario repository](https://github
 ## Quick start (tiles)
 
 ```bash
-git clone https://github.com/bobowski/stario.git
+git clone https://github.com/stariodev/stario.git
 cd stario/examples/tiles
 uv sync
 uv run python -m main
